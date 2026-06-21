@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output / cache
+output/
+*.mp4
+*.mkv
+*.png
+*.jpg
+*.npy
+*.pt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights (too large for git)
+models/
+!models/.gitkeep
+
+# Config with local paths
+.env
+*.local.yaml
