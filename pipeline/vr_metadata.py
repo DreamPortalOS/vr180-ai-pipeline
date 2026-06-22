@@ -128,6 +128,7 @@ class VRMetadataEmbedder:
                 "-preset", self.preset,
                 "-crf", str(self.crf),
                 "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
                 temp_path,
             ]
 

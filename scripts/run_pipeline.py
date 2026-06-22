@@ -5,9 +5,15 @@ Usage:
     # Full pipeline
     python scripts/run_pipeline.py --input video.mp4 --output vr180.mp4
 
-    # With config
+    # With temporal smoothing + H.265
     python scripts/run_pipeline.py --input video.mp4 --output vr180.mp4 \
-        --model-size base --codec h265 --fps 30
+        --model-size base --codec h265 --fps 30 --temporal-smoothing 0.3
+
+    # With pixel upscaling
+    python scripts/run_pipeline.py --input video.mp4 --output vr180.mp4 --upscale 2
+
+    # Validate input format
+    python scripts/run_pipeline.py --input video.mp4 --validate-input
 
     # Individual stages with temp dir
     python scripts/run_pipeline.py --input video.mp4 --stage depth
@@ -31,6 +37,7 @@ from pipeline.depth_estimator import DepthEstimator
 from pipeline.stereo_renderer import StereoRenderer
 from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.vr_metadata import VRMetadataEmbedder
+from pipeline.upscaler import PixelUpscaler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +88,33 @@ def parse_args():
                         help="Directory for intermediate files")
     parser.add_argument("--no-ffmpeg-v360", action="store_true",
                         help="Disable ffmpeg v360, use OpenCV fallback")
+
+    # New: temporal smoothing
+    parser.add_argument("--temporal-smoothing", type=float, default=0.0,
+                        help="Temporal EMA alpha for depth smoothing (0=off, 0.3-0.5)")
+    parser.add_argument("--stereo-smoothing", type=float, default=0.0,
+                        help="Temporal EMA alpha for stereo shift (0=off)")
+    parser.add_argument("--baseline", type=int, default=0,
+                        help="Override stereo baseline shift in pixels (0=use IPD-based)")
+
+    # New: pixel upscaling
+    parser.add_argument("--upscale", type=int, default=0, choices=[0, 2, 4],
+                        help="Upscale factor (0=off, 2=2×, 4=4×)")
+    parser.add_argument("--upscale-model", default=None,
+                        help="Real-ESRGAN model name (auto if omitted)")
+    parser.add_argument("--upscale-ffmpeg", action="store_true",
+                        help="Use ffmpeg/OpenCV lanczos upscale instead of Real-ESRGAN")
+
+    # New: output encoding options
+    parser.add_argument("--bitrate", default=None,
+                        help="Target bitrate (e.g., 50M). Overrides CRF if set.")
+    parser.add_argument("--hardware-encoder", action="store_true",
+                        help="Use hardware encoder (VideoToolbox)")
+
+    # New: input validation
+    parser.add_argument("--validate-input", action="store_true",
+                        help="Validate input video format and print recommendations")
+
     return parser.parse_args()
 
 
@@ -142,15 +176,26 @@ def get_temp_dir(args, subdir=None):
 def run_depth_stage(args, frames):
     """Stage 1: Estimate depth for all frames."""
     log.info("=== Stage 1: Depth Estimation ===")
+
     estimator = DepthEstimator(
         model_size=args.model_size,
         device=args.device,
+        calibrate=True,
     )
 
     out_dir = get_temp_dir(args, "depth")
     depths = []
+    prev_depth = None
+    temporal_alpha = args.temporal_smoothing if args.temporal_smoothing > 0 else None
+
     for i, frame in enumerate(tqdm(frames, desc="Estimating depth")):
         depth = estimator.estimate(frame)
+
+        # Pipeline-level temporal smoothing (EMA)
+        if temporal_alpha and prev_depth is not None:
+            depth = temporal_alpha * depth + (1 - temporal_alpha) * prev_depth
+        prev_depth = depth
+
         depths.append(depth)
         # Save depth map for inspection
         dmax = float(np.nanmax(depth))
@@ -241,8 +286,191 @@ def run_metadata_stage(args, sbs_frames):
     return result
 
 
+def run_upscale_stage(args, frames):
+    """Stage 0: Pixel upscaling (optional)."""
+    log.info(f"=== Stage 0: Pixel Upscaling ({args.upscale}×) ===")
+
+    if args.upscale_ffmpeg:
+        log.info("Using OpenCV lanczos upscale (fallback)")
+        upscaled = []
+        for frame in tqdm(frames, desc="Upscaling (lanczos)"):
+            h, w = frame.shape[:2]
+            result = cv2.resize(frame, (w * args.upscale, h * args.upscale),
+                                interpolation=cv2.INTER_LANCZOS4)
+            upscaled.append(result)
+        return upscaled
+
+    try:
+        upscaler = PixelUpscaler(
+            scale=args.upscale,
+            model_name=args.upscale_model,
+            device=args.device,
+        )
+    except ImportError:
+        log.warning("realesrgan not installed, falling back to OpenCV lanczos")
+        upscaled = []
+        for frame in tqdm(frames, desc="Upscaling (lanczos)"):
+            h, w = frame.shape[:2]
+            result = cv2.resize(frame, (w * args.upscale, h * args.upscale),
+                                interpolation=cv2.INTER_LANCZOS4)
+            upscaled.append(result)
+        return upscaled
+
+    upscaled = []
+    for frame in tqdm(frames, desc=f"Upscaling ({args.upscale}× Real-ESRGAN)"):
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        result_bgr = upscaler.upscale_frame(frame_bgr)
+        result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+        upscaled.append(result_rgb)
+
+    log.info(f"Upscaled {len(upscaled)} frames: "
+             f"{frames[0].shape[1]}×{frames[0].shape[0]} → "
+             f"{upscaled[0].shape[1]}×{upscaled[0].shape[0]}")
+    return upscaled
+
+
+def validate_input_format(input_path: str):
+    """Validate input video format and print VR180 recommendations."""
+    import json
+    import subprocess
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print(f"❌ Cannot open: {input_path}")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = total / fps if fps > 0 else 0
+    cap.release()
+
+    # Get codec info via ffprobe
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name,pix_fmt,bit_rate,profile",
+             "-show_entries", "format=format_name,bit_rate",
+             "-of", "json", input_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        info = json.loads(result.stdout) if result.returncode == 0 else {}
+    except Exception:
+        info = {}
+
+    codec = info.get("streams", [{}])[0].get("codec_name", "unknown")
+    pix_fmt = info.get("streams", [{}])[0].get("pix_fmt", "unknown")
+    bitrate = info.get("format", {}).get("bit_rate", "unknown")
+    fmt = info.get("format", {}).get("format_name", "unknown")
+
+    print("=" * 60)
+    print("INPUT VIDEO FORMAT ANALYSIS")
+    print("=" * 60)
+    print(f"  File:      {os.path.basename(input_path)}")
+    print(f"  Format:    {fmt}")
+    print(f"  Codec:     {codec}")
+    print(f"  Pixel fmt: {pix_fmt}")
+    print(f"  Resolution: {w}×{h}")
+    print(f"  FPS:       {fps:.2f}")
+    print(f"  Duration:  {duration:.2f}s ({total} frames)")
+    print(f"  Bitrate:   {int(bitrate)//1000 if bitrate != 'unknown' else '?'} kbps")
+    print()
+
+    score = 0
+    issues = []
+    recommendations = []
+
+    # Resolution
+    if w >= 1920 and h >= 1080:
+        score += 2
+        print("  ✅ Resolution: Good (≥1080p)")
+    elif w >= 1280:
+        score += 1
+        issues.append("Resolution is 720p — consider 1080p+ input")
+        recommendations.append("Re-record at 1080p+ or use --upscale 2")
+    else:
+        issues.append(f"Resolution {w}×{h} is low")
+        recommendations.append("Use --upscale 2 or --upscale 4 to compensate")
+
+    # Codec
+    if codec in ("h264", "hevc", "h265"):
+        score += 2
+        print(f"  ✅ Codec: {codec} (recommended)")
+    elif codec in ("prores", "dnxhd"):
+        score += 2
+        print(f"  ✅ Codec: {codec} (professional quality)")
+    else:
+        score += 1
+        issues.append(f"Codec '{codec}' may cause quality loss")
+        recommendations.append("Transcode to H.264 or H.265 first")
+
+    # FPS
+    if 24 <= fps <= 60:
+        score += 2
+        print(f"  ✅ FPS: {fps:.0f} (good for VR)")
+    elif fps > 60:
+        score += 1
+        issues.append(f"FPS {fps:.0f} is very high — will increase processing time")
+        recommendations.append("Consider --fps 30 to reduce processing")
+    else:
+        score += 1
+        issues.append(f"FPS {fps:.0f} is low — may cause motion sickness in VR")
+        recommendations.append("Record at 24-60fps")
+
+    # Bitrate
+    if bitrate != "unknown":
+        br_mbps = int(bitrate) / 1_000_000
+        if br_mbps >= 20:
+            score += 2
+            print(f"  ✅ Bitrate: {br_mbps:.1f} Mbps (high quality)")
+        elif br_mbps >= 8:
+            score += 1
+            print(f"  ⚠️  Bitrate: {br_mbps:.1f} Mbps (moderate)")
+            recommendations.append("Use higher bitrate source if available")
+        else:
+            issues.append(f"Bitrate {br_mbps:.1f} Mbps is very low")
+
+    # Duration
+    if duration <= 120:
+        print(f"  ✅ Duration: {duration:.0f}s (manageable)")
+    else:
+        print(f"  ⚠️  Duration: {duration:.0f}s (long — will take significant time)")
+
+    print()
+    print(f"  INPUT QUALITY SCORE: {score}/8")
+    print()
+
+    if issues:
+        print("  ISSUES:")
+        for issue in issues:
+            print(f"    ⚠️  {issue}")
+        print()
+
+    if recommendations:
+        print("  RECOMMENDATIONS:")
+        for rec in recommendations:
+            print(f"    💡 {rec}")
+        print()
+
+    print("  OUTPUT RESOLUTION GUIDE:")
+    if w <= 1280:
+        print(f"    Input {w}×{h} → Upscale 4× → SBS output (--upscale 4)")
+    elif w <= 1920:
+        print(f"    Input {w}×{h} → Upscale 2× → SBS output (--upscale 2)")
+    else:
+        print(f"    Input {w}×{h} → Direct → SBS output (no upscale needed)")
+
+    print("=" * 60)
+
+
 def main():
     args = parse_args()
+
+    # Handle --validate-input mode
+    if args.validate_input:
+        validate_input_format(args.input)
+        return
 
     if args.stage == "all":
         # Read frames once, pass through all stages
@@ -258,6 +486,10 @@ def main():
                     f"⚠️  Frame buffer uses ~{mem_mb:.0f} MB in RAM. "
                     f"For large videos, consider using --max-frames or --temp-dir."
                 )
+
+        # Stage 0: Upscaling (optional)
+        if args.upscale > 0:
+            frames = run_upscale_stage(args, frames)
 
         depths = run_depth_stage(args, frames)
         left_frames, right_frames = run_stereo_stage(args, frames, depths)
