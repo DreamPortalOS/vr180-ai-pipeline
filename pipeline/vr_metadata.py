@@ -35,7 +35,7 @@ SPHERICAL_XML_TEMPLATE = """<?xml version="1.0"?>
   <GSpherical:Stitched>true</GSpherical:Stitched>
   <GSpherical:StitchingSoftware>vr180-ai-pipeline v0.2.0</GSpherical:StitchingSoftware>
   <GSpherical:ProjectionType>equirectangular</GSpherical:ProjectionType>
-  <GSpherical:StereoMode>side-by-side</GSpherical:StereoMode>
+  <GSpherical:StereoMode>{stereo_mode}</GSpherical:StereoMode>
   <GSpherical:SourceCount>2</GSpherical:SourceCount>
   <GSpherical:InitialViewHeadingDegrees>0</GSpherical:InitialViewHeadingDegrees>
   <GSpherical:InitialViewPitchDegrees>0</GSpherical:InitialViewPitchDegrees>
@@ -244,31 +244,21 @@ class VRMetadataEmbedder:
         width: int = 7680,
         height: int = 1920,
     ) -> str:
-        """Embed VR metadata into an already-encoded video file."""
-        xml_content = self._spherical_xml(width, height)
+        """Embed VR metadata into an already-encoded video file.
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".xml", delete=False
-        ) as f:
-            f.write(xml_content)
-            xml_path = f.name
+        Uses ISOBMFF binary injection (sv3d + st3d boxes) for proper
+        Spherical Video V2 metadata that VR players can recognize.
 
-        try:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", input_path,
-                "-c", "copy",
-                "-metadata:s:v", f"spherical-v2={xml_content}",
-                "-metadata:s:v", "stereo_mode=side-by-side",
-                output_path,
-            ]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Metadata embedding failed:\n{e.stderr}") from e
-        finally:
-            try:
-                os.unlink(xml_path)
-            except OSError:
-                pass
+        Args:
+            input_path: Path to input MP4 video
+            output_path: Path to output MP4 with VR metadata
+            width: Full panorama width in pixels
+            height: Full panorama height in pixels
 
+        Returns:
+            Path to output file
+        """
+        inject_spherical_metadata(input_path, output_path,
+                                  width=width, height=height,
+                                  stereo_mode=self.stereo_mode)
         return output_path

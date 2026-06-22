@@ -119,11 +119,18 @@ def get_output_path(args, suffix=".mp4"):
 
 
 def get_temp_dir(args, subdir=None):
-    """Get or create temp directory for intermediate files."""
+    """Get or create temp directory for intermediate files.
+
+    If --temp-dir is specified, uses that directory.
+    Otherwise, uses a default directory next to the input file
+    for consistent cross-stage access.
+    """
     if args.temp_dir:
         base = Path(args.temp_dir)
     else:
-        base = Path(tempfile.mkdtemp(prefix="vr180_"))
+        # Default: use a directory next to the input file for stage persistence
+        input_stem = Path(args.input).stem
+        base = Path(args.input).parent / f"{input_stem}_vr180_temp"
     if subdir:
         path = base / subdir
     else:
@@ -146,7 +153,8 @@ def run_depth_stage(args, frames):
         depth = estimator.estimate(frame)
         depths.append(depth)
         # Save depth map for inspection
-        depth_vis = (depth / depth.max() * 255).astype(np.uint8) if depth.max() > 0 else depth.astype(np.uint8)
+        dmax = float(np.nanmax(depth))
+        depth_vis = (depth / dmax * 255).astype(np.uint8) if dmax > 0 else depth.astype(np.uint8)
         cv2.imwrite(os.path.join(out_dir, f"depth_{i:06d}.png"),
                     cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO))
         np.save(os.path.join(out_dir, f"depth_{i:06d}.npy"), depth)
@@ -240,6 +248,16 @@ def main():
         # Read frames once, pass through all stages
         frames = list(read_frames(args.input, args.max_frames))
         log.info(f"Loaded {len(frames)} frames")
+
+        # Memory estimate for large videos
+        if frames:
+            H, W = frames[0].shape[:2]
+            mem_mb = len(frames) * H * W * 3 / (1024 * 1024)
+            if mem_mb > 1024:
+                log.warning(
+                    f"⚠️  Frame buffer uses ~{mem_mb:.0f} MB in RAM. "
+                    f"For large videos, consider using --max-frames or --temp-dir."
+                )
 
         depths = run_depth_stage(args, frames)
         left_frames, right_frames = run_stereo_stage(args, frames, depths)

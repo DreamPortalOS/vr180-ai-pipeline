@@ -34,18 +34,31 @@ def parse_args():
 
 
 def download_model(size: str, output_dir: str):
-    """Download a Depth Anything V2 model from HuggingFace."""
+    """Download a Depth Anything V2 model from HuggingFace.
+
+    Uses transformers to download and cache the model, then saves
+    it to the specified output directory for offline use.
+    """
     repo = MODEL_REPOS[size]
     log.info(f"Downloading Depth Anything V2 ({size}) from {repo}...")
     try:
         from transformers import pipeline
-        _ = pipeline(
+
+        # Create the pipeline to trigger download and caching
+        pipe = pipeline(
             task="depth-estimation",
             model=repo,
         )
+
+        # Save model to the specified output directory
         save_dir = os.path.join(output_dir, f"depth-anything-v2-{size}")
         os.makedirs(save_dir, exist_ok=True)
-        log.info(f"  ✅ Model cached. Cached in HuggingFace cache directory.")
+
+        # Save the model and processor for offline use
+        pipe.model.save_pretrained(save_dir)
+        pipe.processor.save_pretrained(save_dir)
+        log.info(f"  ✅ Model saved to {save_dir}")
+
     except Exception as e:
         log.error(f"  ❌ Failed: {e}")
         raise

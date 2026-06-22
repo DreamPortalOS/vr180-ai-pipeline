@@ -56,13 +56,14 @@ class StereoRenderer:
 
         H, W = frame.shape[:2]
 
-        # Auto-compute focal length in pixels
-        if self.focal_length_px is None:
+        # Auto-compute focal length in pixels (use local variable to avoid side effects)
+        focal_length_px = self.focal_length_px
+        if focal_length_px is None:
             # Assume ~70° horizontal FOV
-            self.focal_length_px = W / (2 * np.tan(np.radians(35)))
+            focal_length_px = W / (2 * np.tan(np.radians(35)))
 
         # Compute per-pixel disparity shift
-        disparity = self._compute_disparity(depth)
+        disparity = self._compute_disparity(depth, focal_length_px)
 
         # Temporal smoothing
         if self.temporal_smooth and self._prev_disparity is not None:
@@ -91,7 +92,7 @@ class StereoRenderer:
 
         return left_view, right_view
 
-    def _compute_disparity(self, depth: np.ndarray) -> np.ndarray:
+    def _compute_disparity(self, depth: np.ndarray, focal_length_px: float) -> np.ndarray:
         """Convert depth to pixel disparity.
 
         Formula: disparity = (ipd * focal_length_px) / depth
@@ -117,12 +118,29 @@ class StereoRenderer:
         return np.clip(disp, -max_px, max_px).astype(np.float32)
 
     def _inpaint_holes(self, image: np.ndarray) -> np.ndarray:
-        """Find and inpaint disocclusion holes (black/zero strips at edges)."""
+        """Find and inpaint disocclusion holes (black/zero strips at edges).
+
+        Uses edge-aware detection: only detects holes near image borders
+        to avoid false positives on legitimately dark regions in the scene.
+        """
         import cv2
 
         # Detect black regions (holes from shifting)
         gray = image.mean(axis=2)
-        mask = (gray < 1).astype(np.uint8) * 255
+        raw_mask = (gray < 1).astype(np.uint8)
+
+        # Only consider holes within a border region (where disocclusion occurs)
+        # This prevents false positives on legitimately dark scene content
+        H, W = raw_mask.shape
+        border_width = max(int(W * 0.05), 5)  # 5% of width or at least 5px
+        border_mask = np.zeros_like(raw_mask)
+        border_mask[:border_width, :] = 1        # top
+        border_mask[-border_width:, :] = 1       # bottom
+        border_mask[:, :border_width] = 1        # left
+        border_mask[:, -border_width:] = 1       # right
+
+        # Combine: only inpaint dark pixels near borders
+        mask = (raw_mask & border_mask).astype(np.uint8) * 255
 
         if mask.sum() > 0:
             # Dilate mask slightly to catch edge pixels
