@@ -39,6 +39,8 @@ from pipeline.stereo_renderer import StereoRenderer
 from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.vr_metadata import VRMetadataEmbedder
 from pipeline.upscaler import PixelUpscaler
+from pipeline.device_utils import detect_best_device, resolve_device
+from pipeline.streaming_pipeline import StreamingPipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,6 +123,20 @@ def parse_args():
     # New: checkpoint/resume
     parser.add_argument("--resume", action="store_true",
                         help="Resume from last completed checkpoint stage")
+
+    # Phase 1: Streaming pipeline (PRD §7.2)
+    parser.add_argument("--streaming", action="store_true",
+                        help="Use streaming pipeline (O(1) memory, pipes to ffmpeg)")
+
+    # Phase 1: Tiled upscaling (PRD §7.4)
+    parser.add_argument("--tiled-upscale", action="store_true",
+                        help="Use tiled upscaling for large frames (8K-safe)")
+    parser.add_argument("--tile-size", type=int, default=512,
+                        help="Tile size for tiled upscaling (default: 512)")
+    
+    # Phase 2: Smart SBS detection (Task 1.1)
+    parser.add_argument("--force-sbs", action="store_true",
+                        help="Force treat input as SBS stereo (skip depth/stereo stages)")
 
     return parser.parse_args()
 
@@ -325,9 +341,18 @@ def run_upscale_stage(args, frames):
         return upscaled
 
     upscaled = []
-    for frame in tqdm(frames, desc=f"Upscaling ({args.upscale}× Real-ESRGAN)"):
+    use_tiled = getattr(args, "tiled_upscale", False)
+    tile_size = getattr(args, "tile_size", 512)
+
+    for frame in tqdm(frames, desc=f"Upscaling ({args.upscale}× Real-ESRGAN{' tiled' if use_tiled else ''})"):
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        result_bgr = upscaler.upscale_frame(frame_bgr)
+        if use_tiled:
+            result_bgr = upscaler.upscale_tiled(
+                frame_bgr, tile_size=tile_size,
+                progress_callback=None,
+            )
+        else:
+            result_bgr = upscaler.upscale_frame(frame_bgr)
         result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
         upscaled.append(result_rgb)
 
@@ -493,6 +518,53 @@ def load_checkpoint(temp_dir: str):
 
 
 STAGE_ORDER = ["upscale", "depth", "stereo", "equirect", "metadata"]
+STAGE_ORDER_SBS = ["upscale", "equirect", "metadata"]  # Skip depth & stereo for SBS input
+
+
+def detect_sbs_input(video_path: str, force_sbs: bool = False) -> bool:
+    """Detect if input video is already a Side-by-Side (SBS) stereo frame.
+    
+    Detection logic:
+    - If --force-sbs is set, always return True
+    - If width/height ratio >= 3.5:1 (e.g., 7680×1920 = 4:1), treat as SBS
+    
+    Args:
+        video_path: Path to input video file
+        force_sbs: Manual override flag
+        
+    Returns:
+        True if input should be treated as SBS stereo
+    """
+    if force_sbs:
+        log.info("🔒 --force-sbs flag set: treating input as SBS stereo")
+        return True
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return False
+    
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    
+    if h == 0:
+        return False
+    
+    ratio = w / h
+    is_sbs = ratio >= 3.5
+    
+    if is_sbs:
+        log.info(
+            f"🔍 SBS auto-detection: {w}×{h} (ratio {ratio:.2f}:1) → "
+            f"SBS stereo detected! Skipping depth/stereo stages."
+        )
+    else:
+        log.info(
+            f"🔍 SBS auto-detection: {w}×{h} (ratio {ratio:.2f}:1) → "
+            f"Standard 2D input. Running full pipeline."
+        )
+    
+    return is_sbs
 
 
 def get_resume_start_stage(temp_dir: str):
@@ -512,12 +584,44 @@ def get_resume_start_stage(temp_dir: str):
 def main():
     args = parse_args()
 
+    # Auto-detect device if not specified
+    if args.device is None:
+        args.device = detect_best_device()
+    else:
+        args.device = resolve_device(args.device)
+
     # Handle --validate-input mode
     if args.validate_input:
         validate_input_format(args.input)
         return
 
+    # Streaming pipeline mode (PRD §7.2)
+    if args.streaming and args.stage == "all":
+        log.info("🚀 Streaming pipeline mode (O(1) memory)")
+        pipeline = StreamingPipeline(
+            model_size=args.model_size,
+            device=args.device,
+            ipd=args.ipd,
+            max_disparity=args.max_disparity,
+            output_width=args.output_width,
+            output_height=args.output_height,
+            src_hfov=args.src_hfov,
+            codec=args.codec,
+            crf=args.crf,
+            fps=args.fps,
+            flip_vertical=not args.no_flip,
+        )
+        output = get_output_path(args)
+        result = pipeline.process_stream(
+            args.input, output, max_frames=args.max_frames
+        )
+        log.info(f"✅ Streaming pipeline complete → {result}")
+        return
+
     if args.stage == "all":
+        # Smart SBS detection: if input is already SBS, skip depth/stereo
+        is_sbs = detect_sbs_input(args.input, force_sbs=args.force_sbs)
+
         temp_dir = get_temp_dir(args)
 
         # Determine resume point
@@ -525,8 +629,10 @@ def main():
         if args.resume:
             start_idx = get_resume_start_stage(temp_dir)
 
-        need_frames = start_idx == 0  # only load frames if starting from scratch
-        stages_to_run = STAGE_ORDER[start_idx:] if start_idx > 0 else STAGE_ORDER
+        # Use SBS stage order if input is already stereo
+        base_order = STAGE_ORDER_SBS if is_sbs else STAGE_ORDER
+        need_frames = start_idx == 0
+        stages_to_run = base_order[start_idx:] if start_idx > 0 else base_order
 
         # Filter: only run upscale if --upscale is set
         if "upscale" in stages_to_run and args.upscale == 0:
@@ -578,7 +684,24 @@ def main():
                 save_checkpoint(temp_dir, "stereo", {"num_frames": len(left_frames)})
 
             elif stage == "equirect":
-                if left_frames is None:
+                if is_sbs and left_frames is None:
+                    # SBS input: split each frame into left/right halves
+                    log.info("🔲 SBS input detected — splitting frames into left/right")
+                    if frames is None:
+                        frames = list(read_frames(args.input, args.max_frames))
+                    left_frames, right_frames = [], []
+                    for frame in frames:
+                        h, w = frame.shape[:2]
+                        mid = w // 2
+                        left_frames.append(frame[:, :mid, :])
+                        right_frames.append(frame[:, mid:, :])
+                    log.info(
+                        f"  Split {len(frames)} SBS frames: "
+                        f"{frames[0].shape[1]}×{frames[0].shape[0]} → "
+                        f"left/right {left_frames[0].shape[1]}×{left_frames[0].shape[0]}"
+                    )
+                elif left_frames is None:
+                    # Standard input: load from checkpoint
                     import glob
                     left_dir = get_temp_dir(args, "left")
                     right_dir = get_temp_dir(args, "right")

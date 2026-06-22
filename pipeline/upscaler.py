@@ -53,6 +53,7 @@ class PixelUpscaler:
         self.device = self._resolve_device(device)
         self.half = half_precision and self.device == "cuda"
         self._upsampler = None
+        self._use_opencv_fallback = False
 
     @staticmethod
     def _resolve_device(device: Optional[str]) -> str:
@@ -75,12 +76,12 @@ class PixelUpscaler:
         try:
             from realesrgan import RealESRGANer
             from basicsr.archs.rrdbnet_arch import RRDBNet
-        except ImportError as e:
-            raise ImportError(
-                "Real-ESRGAN not installed. Run: "
-                "pip install realesrgan basicsr\n"
-                f"Original error: {e}"
-            )
+        except ImportError:
+            # Fall back to OpenCV-based upscaling
+            self._use_opencv_fallback = True
+            self._upsampler = "opencv_fallback"
+            print(f"[Upscale] Real-ESRGAN not installed, using OpenCV bicubic fallback (scale={self.scale}×)")
+            return
 
         model_info = self.MODELS.get(self.model_name)
         if not model_info:
@@ -149,6 +150,14 @@ class PixelUpscaler:
             Upscaled image as numpy array (H*scale, W*scale, 3) in BGR uint8
         """
         self._load_model()
+
+        if getattr(self, "_use_opencv_fallback", False):
+            h, w = frame.shape[:2]
+            return cv2.resize(
+                frame,
+                (w * self.scale, h * self.scale),
+                interpolation=cv2.INTER_CUBIC,
+            )
 
         # Real-ESRGAN expects BGR uint8
         output, _ = self._upsampler.enhance(frame, outscale=self._outscale)

@@ -124,7 +124,7 @@ class TestEquirectangularMapper:
         )
         sbs = mapper.map_stereo_pair(dummy_frame, dummy_frame)
         assert sbs.shape[0] == 320
-        assert sbs.shape[1] == 640
+        assert sbs.shape[1] == 1280  # SBS = 2× per-eye width
 
     def test_sbs_layout(self, dummy_frame):
         """SBS output width should be 2× per-eye width."""
