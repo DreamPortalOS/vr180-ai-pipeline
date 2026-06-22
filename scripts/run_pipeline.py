@@ -89,6 +89,8 @@ def parse_args():
                         help="Directory for intermediate files")
     parser.add_argument("--no-ffmpeg-v360", action="store_true",
                         help="Disable ffmpeg v360, use OpenCV fallback")
+    parser.add_argument("--no-flip", action="store_true",
+                        help="Disable vertical flip (default: flip on for VR headset)")
 
     # New: temporal smoothing
     parser.add_argument("--temporal-smoothing", type=float, default=0.0,
@@ -253,6 +255,7 @@ def run_equirect_stage(args, left_frames, right_frames):
         output_height=args.output_height,
         src_hfov=args.src_hfov,
         use_ffmpeg=not args.no_ffmpeg_v360,
+        flip_vertical=not args.no_flip,
     )
 
     out_dir = get_temp_dir(args, "equirect")
