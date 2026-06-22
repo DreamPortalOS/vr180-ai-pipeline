@@ -2,112 +2,62 @@
 Stage 1 — Depth Estimation
 ===========================
 
-Per-frame metric depth map generation from 2D video input.
+Per-frame metric depth map generation from 2D video input using
+Depth Anything V2 via HuggingFace transformers pipeline.
 
-Models
-------
-- **Depth Anything V2** (recommended) — robust zero-shot depth estimation
-  with fine-grained detail preservation. SOTA on monocular depth.
-- **MiDaS 3.1** — lightweight alternative with good generalisation across
-  indoor/outdoor scenes.
+Supports:
+- Depth Anything V2 (Small / Base / Large) — robust zero-shot depth estimation
+- Apple MPS acceleration on M-series Macs
+- Batch processing with temporal smoothing hints
 
-Architecture
-------------
-::
-
-   Input Frame (720p RGB)
-          │
-          ▼
-   ┌──────────────────┐
-   │  Image Encoder   │  DINOv2 / ViT backbone
-   │  (patch embed)   │
-   └────────┬─────────┘
-            │
-   ┌────────▼─────────┐
-   │  DPT Head        │  Dense Prediction Transformer
-   │  (multiscale     │  reassembles patch features
-   │   fusion)        │  into per-pixel depth
-   └────────┬─────────┘
-            │
-   ┌────────▼─────────┐
-   │  Depth Head      │  Relative → metric depth
-   │  (inverse depth  │  shift + scale calibration
-   │   → metric)      │  (optional — uses focal length
-   │                  │   from EXIF or user config)
-   └────────┬─────────┘
-            │
-            ▼
-   Depth Map (720p, float32, range [0, d_max])
-
-Usage
------
-.. code:: python
-
+Usage:
     from pipeline.depth_estimator import DepthEstimator
 
-    estimator = DepthEstimator(model_name="depth-anything-v2")
+    estimator = DepthEstimator(model_size="small")
     depth_map = estimator.estimate(frame)          # single frame
     depth_maps = estimator.estimate_batch(frames)  # batch
-
-Output Format
--------------
-- **Shape**: ``(H, W)`` — same resolution as input
-- **Dtype**: ``float32`` — metric depth in meters (when calibrated),
-  or relative depth in [0, 1] (raw mode)
-- **Range**: calibrated to real-world units via focal-length heuristic
-  when available
-
-Configuration
--------------
-+-------------------+----------+----------------------------------------------------+
-| Parameter         | Default  | Description                                        |
-+===================+==========+====================================================+
-| ``model_name``    | depth-   | ``"depth-anything-v2"`` (ViT-giant) or             |
-|                   | anything-| ``"midas-3.1"`` (ViT-large)                        |
-|                   | v2       |                                                    |
-+-------------------+----------+----------------------------------------------------+
-| ``device``        | auto     | ``"cuda"``, ``"mps"``, or ``"cpu"``               |
-+-------------------+----------+----------------------------------------------------+
-| ``calibrate``     | True     | Enable metric-depth calibration                    |
-+-------------------+----------+----------------------------------------------------+
-| ``focal_length``  | None     | Override camera focal length (mm). Auto-detect     |
-|                   |          | from EXIF when available.                          |
-+-------------------+----------+----------------------------------------------------+
-
-References
-----------
-- Depth Anything V2: https://github.com/DepthAnything/Depth-Anything-V2
-- MiDaS: https://github.com/isl-org/MiDaS
-- DPT: Vision Transformers for Dense Prediction
-  (Ranftl et al., ICCV 2021)
 """
 
 import numpy as np
-from typing import Optional
+from typing import Optional, List
 
 
 class DepthEstimator:
-    """Per-frame depth estimation using monocular depth models.
+    """Per-frame depth estimation using Depth Anything V2.
 
-    Supports Depth Anything V2 and MiDaS backends with automatic
-    device detection and optional metric-depth calibration.
+    Uses the HuggingFace transformers pipeline API for easy model loading.
     """
+
+    # Valid HuggingFace model repos
+    MODEL_REPOS = {
+        "small": "depth-anything/Depth-Anything-V2-Small-hf",
+        "base": "depth-anything/Depth-Anything-V2-Base-hf",
+        "large": "depth-anything/Depth-Anything-V2-Large-hf",
+    }
 
     def __init__(
         self,
-        model_name: str = "depth-anything-v2",
+        model_size: str = "small",
         device: Optional[str] = None,
         calibrate: bool = True,
-        focal_length: Optional[float] = None,
     ):
-        self.model_name = model_name
+        """
+        Args:
+            model_size: "small" (24.8M params), "base" (97.5M), or "large" (335M)
+            device: "cuda", "mps", "cpu". Auto-detected if None.
+            calibrate: Scale relative depth to approximate metric depth.
+        """
+        if model_size not in self.MODEL_REPOS:
+            raise ValueError(
+                f"Unknown model size '{model_size}'. Choose from: {list(self.MODEL_REPOS.keys())}"
+            )
+        self.model_size = model_size
         self.device = device or self._auto_device()
         self.calibrate = calibrate
-        self.focal_length = focal_length
-        self._model = None
-        self._transform = None
+        self._pipe = None
 
     def _auto_device(self) -> str:
+        """Auto-detect best available device."""
         import torch
         if torch.cuda.is_available():
             return "cuda"
@@ -116,36 +66,19 @@ class DepthEstimator:
         return "cpu"
 
     def _load_model(self):
-        """Lazy-load the depth estimation model."""
-        if self._model is not None:
+        """Lazy-load the depth estimation pipeline."""
+        if self._pipe is not None:
             return
+        from transformers import pipeline
 
-        if "midas" in self.model_name:
-            self._load_midas()
-        else:
-            self._load_depth_anything()
+        print(f"[Depth] Loading {self.MODEL_REPOS[self.model_size]} on {self.device}...")
+        self._pipe = pipeline(
+            task="depth-estimation",
+            model=self.MODEL_REPOS[self.model_size],
+            device=self.device,
+        )
+        print(f"[Depth] Model loaded successfully.")
 
-    def _load_depth_anything(self):
-        """Load Depth Anything V2 model via HuggingFace."""
-        import torch
-        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-
-        repo = "depth-anything/Depth-Anything-V2-Giant"
-        self._transform = AutoImageProcessor.from_pretrained(repo)
-        self._model = AutoModelForDepthEstimation.from_pretrained(repo).to(self.device)
-        self._model.eval()
-
-    def _load_midas(self):
-        """Load MiDaS 3.1 model via torch.hub."""
-        import torch
-
-        self._model = torch.hub.load("intel-isl/MiDaS", "MiDaS", trust_repo=True)
-        self._model.eval()
-        self._model.to(self.device)
-        self._transform = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
-        self._transform = self._transform.dpt_transform
-
-    @torch.no_grad()
     def estimate(self, frame: np.ndarray) -> np.ndarray:
         """Estimate depth for a single RGB frame.
 
@@ -153,46 +86,58 @@ class DepthEstimator:
             frame: RGB image (H, W, 3), uint8 [0, 255] or float [0, 1]
 
         Returns:
-            Depth map (H, W), float32.
+            Depth map (H, W), float32. Metric depth when calibrate=True.
         """
+        from PIL import Image
+
         self._load_model()
-        import torch
 
+        # Convert numpy to PIL
         if frame.dtype == np.uint8:
-            frame = frame.astype(np.float32) / 255.0
-
-        if "midas" in self.model_name:
-            img_tensor = self._transform(frame).to(self.device)
-            prediction = self._model(img_tensor)
-            depth = torch.nn.functional.interpolate(
-                prediction.unsqueeze(1),
-                size=frame.shape[:2],
-                mode="bicubic",
-                align_corners=False,
-            ).squeeze().cpu().numpy()
+            pil_img = Image.fromarray(frame)
+        elif frame.dtype == np.float32 or frame.dtype == np.float64:
+            pil_img = Image.fromarray((frame * 255).astype(np.uint8))
         else:
-            inputs = self._transform(images=frame, return_tensors="pt").to(self.device)
-            outputs = self._model(**inputs)
-            depth = outputs.predicted_depth.squeeze().cpu().numpy()
+            pil_img = Image.fromarray(frame.astype(np.uint8))
 
+        # Run inference
+        result = self._pipe(pil_img)
+        depth = result["depth"]  # PIL Image
+
+        # Convert back to numpy
+        depth_np = np.array(depth, dtype=np.float32)
+
+        # Resize to match input resolution if needed
+        if depth_np.shape[:2] != frame.shape[:2]:
+            import cv2
+            depth_np = cv2.resize(depth_np, (frame.shape[1], frame.shape[0]),
+                                  interpolation=cv2.INTER_LINEAR)
+
+        # Normalize to [0, 1] range
+        d_min, d_max = depth_np.min(), depth_np.max()
+        if d_max > d_min:
+            depth_np = (depth_np - d_min) / (d_max - d_min)
+        else:
+            depth_np = np.zeros_like(depth_np)
+
+        # Optional metric calibration
         if self.calibrate:
-            depth = self._calibrate_metric(depth)
+            depth_np = self._calibrate_metric(depth_np)
 
-        return depth.astype(np.float32)
+        return depth_np
 
-    def estimate_batch(self, frames: list) -> list:
+    def estimate_batch(self, frames: List[np.ndarray]) -> List[np.ndarray]:
         """Estimate depth for a list of frames."""
         return [self.estimate(f) for f in frames]
 
-    def _calibrate_metric(self, relative_depth: np.ndarray) -> np.ndarray:
-        """Convert relative depth to approximate metric depth using
-        focal-length heuristic. Based on the inverse-depth relationship:
-        depth = f * baseline / disparity.
+    @staticmethod
+    def _calibrate_metric(relative_depth: np.ndarray) -> np.ndarray:
+        """Convert relative depth to approximate metric depth.
 
-        Without known camera intrinsics, we apply a global scale factor
-        that maps the median relative depth to a plausible scene depth.
+        Maps median depth to a plausible scene depth (~5m for FPV flight).
+        The output is still in [0, ~10m] range but with a more intuitive scale.
         """
-        # Typical indoor-outdoor median depth heuristic: ~5m
         target_median = 5.0
-        scale = target_median / max(np.median(relative_depth), 1e-6)
+        safe_median = max(np.median(relative_depth), 0.01)
+        scale = target_median / safe_median
         return relative_depth * scale

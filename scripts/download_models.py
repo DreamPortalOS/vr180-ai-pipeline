@@ -1,10 +1,8 @@
-#!/usr/bin/env python3
-"""Download model weights for VR180 pipeline.
+"""Download Depth Anything V2 model weights for VR180 pipeline.
 
 Usage:
     python scripts/download_models.py                     # All models
     python scripts/download_models.py --model depth       # Depth only
-    python scripts/download_models.py --model midas       # MiDaS only
     python scripts/download_models.py --model all         # All
 """
 
@@ -12,68 +10,42 @@ import argparse
 import os
 import logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("download-models")
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
 
+# HuggingFace repos for Depth Anything V2
+MODEL_REPOS = {
+    "small": "depth-anything/Depth-Anything-V2-Small-hf",
+    "base": "depth-anything/Depth-Anything-V2-Base-hf",
+    "large": "depth-anything/Depth-Anything-V2-Large-hf",
+}
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Download model weights for VR180 pipeline"
-    )
-    parser.add_argument(
-        "--model", "-m",
-        default="all",
-        choices=["all", "depth", "midas"],
-        help="Which model to download (default: all)"
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=MODELS_DIR,
-        help="Directory to store models (default: models/)"
-    )
+    parser = argparse.ArgumentParser(description="Download model weights for VR180 pipeline")
+    parser.add_argument("--model", "-m", default="small",
+                        choices=["all", "small", "base", "large"],
+                        help="Which model to download (default: small)")
+    parser.add_argument("--output-dir", default=MODELS_DIR,
+                        help="Directory to store models (default: models/)")
     return parser.parse_args()
 
 
-def download_depth_anything(output_dir: str):
-    """Download Depth Anything V2 (Giant variant) from HuggingFace."""
-    log.info("Downloading Depth Anything V2 (ViT-giant)...")
+def download_model(size: str, output_dir: str):
+    """Download a Depth Anything V2 model from HuggingFace."""
+    repo = MODEL_REPOS[size]
+    log.info(f"Downloading Depth Anything V2 ({size}) from {repo}...")
     try:
-        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-
-        repo = "depth-anything/Depth-Anything-V2-Giant"
-        log.info(f"  Loading {repo}...")
-        processor = AutoImageProcessor.from_pretrained(repo)
-        model = AutoModelForDepthEstimation.from_pretrained(repo)
-
-        save_dir = os.path.join(output_dir, "depth-anything-v2")
+        from transformers import pipeline
+        _ = pipeline(
+            task="depth-estimation",
+            model=repo,
+        )
+        save_dir = os.path.join(output_dir, f"depth-anything-v2-{size}")
         os.makedirs(save_dir, exist_ok=True)
-        processor.save_pretrained(save_dir)
-        model.save_pretrained(save_dir)
-        log.info(f"  ✅ Saved to {save_dir}")
-    except ImportError:
-        log.warning("  transformers not installed. Run: pip install transformers accelerate")
-        raise
-    except Exception as e:
-        log.error(f"  ❌ Failed: {e}")
-        raise
-
-
-def download_midas(output_dir: str):
-    """Download MiDaS 3.1 via torch.hub."""
-    log.info("Downloading MiDaS 3.1...")
-    try:
-        import torch
-
-        model = torch.hub.load("intel-isl/MiDaS", "MiDaS", trust_repo=True)
-        save_dir = os.path.join(output_dir, "midas-3.1")
-        os.makedirs(save_dir, exist_ok=True)
-        torch.save(model.state_dict(), os.path.join(save_dir, "midas_v3.1.pth"))
-        log.info(f"  ✅ Saved to {save_dir}")
+        log.info(f"  ✅ Model cached. Cached in HuggingFace cache directory.")
     except Exception as e:
         log.error(f"  ❌ Failed: {e}")
         raise
@@ -83,11 +55,11 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.model in ("all", "depth"):
-        download_depth_anything(args.output_dir)
-
-    if args.model in ("all", "midas"):
-        download_midas(args.output_dir)
+    if args.model == "all":
+        for size in MODEL_REPOS:
+            download_model(size, args.output_dir)
+    else:
+        download_model(args.model, args.output_dir)
 
     log.info("Download complete!")
 

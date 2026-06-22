@@ -7,81 +7,11 @@ horizontal parallax shift based on depth values.
 
 Core Algorithm
 --------------
-For each pixel at position ``(x, y)`` with depth ``d``:
+For each pixel at position (x, y) with depth d:
 
-.. math::
-
-   shift = \\frac{B \\cdot f}{d}
-
-   x_L = x + \\frac{shift}{2}
-   x_R = x - \\frac{shift}{2}
-
-Where:
-- ``B`` = interpupillary distance (default 0.064 m)
-- ``f`` = focal length in pixels
-- ``d`` = metric depth from Stage 1
-
-Disocclusion Handling
----------------------
-Shifting creates holes where previously occluded background is revealed.
-Three inpainting strategies (configurable):
-
-1. **Edge-aware inpainting** (default) — Navier-Stokes based, preserves
-   edges around disoccluded regions
-2. **Optical-flow guided** — use bi-directional flow to fill holes with
-   temporally consistent content from neighbouring frames
-3. **Depth-aware fill** — extend background colour from nearest pixel
-   at similar depth
-
-Pipeline
---------
-::
-
-   Frame + Depth Map
-          │
-          ▼
-   ┌──────────────────────────┐
-   │  Compute Disparity Map   │
-   │  d(x,y) → shift(x,y)     │
-   └────────────┬─────────────┘
-                │
-        ┌───────┴───────┐
-        ▼               ▼
-   ┌──────────┐   ┌──────────┐
-   │ Left     │   │ Right    │
-   │ Shift    │   │ Shift    │
-   └────┬─────┘   └────┬─────┘
-        │              │
-   ┌────▼─────┐   ┌────▼─────┐
-   │ Inpaint  │   │ Inpaint  │
-   │ Holes    │   │ Holes    │
-   └────┬─────┘   └────┬─────┘
-        │              │
-        ▼              ▼
-   Left View       Right View
-   (SBS Pair)
-
-Configuration
--------------
-+-----------------------+----------+--------------------------------------------+
-| Parameter             | Default  | Description                                |
-+=======================+==========+============================================+
-| ``ipd``               | 0.064    | Interpupillary distance (meters)           |
-+-----------------------+----------+--------------------------------------------+
-| ``focal_length_px``   | auto     | Focal length in pixels (from video width)  |
-+-----------------------+----------+--------------------------------------------+
-| ``inpaint_method``    | edge     | ``"edge"``, ``"flow"``, or ``"depth"``     |
-+-----------------------+----------+--------------------------------------------+
-| ``max_disparity``     | 0.05     | Max shift as fraction of image width       |
-+-----------------------+----------+--------------------------------------------+
-| ``temporal_smooth``   | True     | Temporal smoothing of disparity across     |
-|                       |          | frames to reduce flicker                   |
-+-----------------------+----------+--------------------------------------------+
-
-References
-----------
-- "A Critical Review of 2D-to-3D Conversion Methods" (Xing et al., 2023)
-- "Depth Image Based Rendering" (Fehn, 2004)
+    shift = (ipd * focal_length_px) / d
+    x_L = x + shift / 2   (left eye — shift right)
+    x_R = x - shift / 2   (right eye — shift left)
 """
 
 import numpy as np
@@ -91,23 +21,23 @@ from typing import Optional, Tuple
 class StereoRenderer:
     """Generate stereoscopic left/right views from monocular frames + depth.
 
-    Uses geometric parallax based on metric depth maps to produce a
+    Uses geometric parallax based on depth maps to produce a
     side-by-side stereo pair suitable for VR180 projection.
     """
 
     def __init__(
         self,
-        ipd: float = 0.064,
+        ipd: float = 0.064,           # Interpupillary distance in meters
         focal_length_px: Optional[float] = None,
-        inpaint_method: str = "edge",
-        max_disparity: float = 0.05,
+        max_disparity: float = 0.05,   # Max shift as fraction of image width
         temporal_smooth: bool = True,
+        convergence: float = 0.3,      # Convergence plane depth (fraction of max depth)
     ):
         self.ipd = ipd
         self.focal_length_px = focal_length_px
-        self.inpaint_method = inpaint_method
         self.max_disparity = max_disparity
         self.temporal_smooth = temporal_smooth
+        self.convergence = convergence
         self._prev_disparity: Optional[np.ndarray] = None
 
     def render(
@@ -117,16 +47,18 @@ class StereoRenderer:
 
         Args:
             frame: Input RGB image (H, W, 3), uint8
-            depth: Depth map (H, W), float32 (metric meters)
+            depth: Depth map (H, W), float32 (normalized [0,1] or metric)
 
         Returns:
             Tuple of (left_view, right_view), each (H, W, 3), uint8
         """
+        import cv2
+
         H, W = frame.shape[:2]
 
-        # Auto-compute focal length in pixels if not set
+        # Auto-compute focal length in pixels
         if self.focal_length_px is None:
-            # Assume a ~70° horizontal FOV for typical AI-generated video
+            # Assume ~70° horizontal FOV
             self.focal_length_px = W / (2 * np.tan(np.radians(35)))
 
         # Compute per-pixel disparity shift
@@ -138,63 +70,67 @@ class StereoRenderer:
             disparity = alpha * disparity + (1 - alpha) * self._prev_disparity
         self._prev_disparity = disparity.copy()
 
-        # Generate left and right views via remapping
-        left = self._shift_view(frame, disparity, direction="left")
-        right = self._shift_view(frame, disparity, direction="right")
+        # Build remap grids
+        grid_x, grid_y = np.meshgrid(np.arange(W), np.arange(H))
+        grid_x = grid_x.astype(np.float32)
+        grid_y = grid_y.astype(np.float32)
 
-        return left, right
+        # Left eye: shift right (positive x direction)
+        left_x = grid_x + disparity
+        left_view = cv2.remap(frame, left_x, grid_y, cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_REPLICATE)
+
+        # Right eye: shift left (negative x direction)
+        right_x = grid_x - disparity
+        right_view = cv2.remap(frame, right_x, grid_y, cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE)
+
+        # Inpaint disocclusion holes
+        left_view = self._inpaint_holes(left_view)
+        right_view = self._inpaint_holes(right_view)
+
+        return left_view, right_view
 
     def _compute_disparity(self, depth: np.ndarray) -> np.ndarray:
-        """Convert metric depth to pixel disparity.
+        """Convert depth to pixel disparity.
 
-        Uses the standard stereo geometry formula:
-            disparity = (ipd * focal_length_px) / depth
+        Formula: disparity = (ipd * focal_length_px) / depth
+        Closer objects get larger disparity (more 3D pop-out).
         """
-        safe_depth = np.maximum(depth, 0.1)  # avoid division by zero
-        disp = (self.ipd * self.focal_length_px) / safe_depth
+        # Normalize depth to a meaningful range
+        d_min, d_max = depth.min(), depth.max()
+        if d_max > d_min:
+            depth_norm = (depth - d_min) / (d_max - d_min)
+        else:
+            depth_norm = np.zeros_like(depth)
 
-        # Clamp to max disparity (fraction of image width)
+        # Convergence plane: objects at convergence depth have zero disparity
+        # Objects closer than convergence pop out (positive disparity)
+        # Objects farther recede (negative disparity)
+        d_conv = self.convergence
+        depth_rel = d_conv - depth_norm  # positive = closer than convergence
+
+        # Compute disparity
         max_px = self.max_disparity * depth.shape[1]
-        disp = np.clip(disp, 0, max_px)
+        disp = depth_rel * max_px * 2  # Scale to use full range
 
-        return disp.astype(np.float32)
+        return np.clip(disp, -max_px, max_px).astype(np.float32)
 
-    def _shift_view(
-        self, frame: np.ndarray, disparity: np.ndarray, direction: str
-    ) -> np.ndarray:
-        """Shift pixels horizontally based on disparity.
-
-        Uses OpenCV's remap with bilinear interpolation.
-        Direction 'left' shifts right (for left eye) and vice versa.
-        """
+    def _inpaint_holes(self, image: np.ndarray) -> np.ndarray:
+        """Find and inpaint disocclusion holes (black/zero strips at edges)."""
         import cv2
 
-        H, W = frame.shape[:2]
-
-        # Build horizontal displacement map
-        sign = 1.0 if direction == "left" else -1.0
-        map_x, map_y = np.meshgrid(np.arange(W), np.arange(H))
-        map_x = (map_x + sign * disparity).astype(np.float32)
-        map_y = map_y.astype(np.float32)
-
-        shifted = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR)
-
-        # Inpaint holes (black pixels at disoccluded edges)
-        if self.inpaint_method == "edge":
-            mask = self._find_holes(shifted)
-            if mask.any():
-                shifted = cv2.inpaint(shifted, mask, 3, cv2.INPAINT_TELEA)
-
-        return shifted
-
-    def _find_holes(self, image: np.ndarray) -> np.ndarray:
-        """Find black disocclusion holes in a shifted view.
-
-        Returns a binary mask suitable for cv2.inpaint.
-        """
-        gray = image.mean(axis=2) if image.ndim == 3 else image
+        # Detect black regions (holes from shifting)
+        gray = image.mean(axis=2)
         mask = (gray < 1).astype(np.uint8) * 255
-        return mask
+
+        if mask.sum() > 0:
+            # Dilate mask slightly to catch edge pixels
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+            image = cv2.inpaint(image, mask, 5, cv2.INPAINT_TELEA)
+
+        return image
 
     def render_batch(
         self, frames: list, depths: list

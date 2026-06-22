@@ -1,3 +1,3 @@
-"""VR180 AI Pipeline — 2D to VR180 video conversion."""
+"""VR180 AI Pipeline — 2D to VR180 immersive video conversion."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
