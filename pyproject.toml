@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vr180-ai-pipeline"
-version = "0.2.0"
+version = "0.3.0"
 description = "2D AI video to VR180 immersive experience conversion pipeline"
 readme = "README.md"
 license = {text = "MIT"}
@@ -48,3 +48,45 @@ include = ["pipeline*"]
 
 [project.scripts]
 vr180-pipeline = "scripts.run_pipeline:main"
+
+# ---------------------------------------------------------------------------
+# Ruff — fast Python linter + formatter
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["pipeline", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # function call in default arg (typer/fastapi pattern)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pipeline"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]

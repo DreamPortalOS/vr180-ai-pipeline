@@ -29,10 +29,24 @@ Thumbs.db
 output/
 *.mp4
 *.mkv
+*.webm
+*.mov
+*.avi
 *.png
 *.jpg
+*.jpeg
 *.npy
+*.npz
 *.pt
+*.pth
+*.onnx
+*_vr180_temp/
+*_vr180_temp*/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
 
 # Jupyter
 .ipynb_checkpoints/

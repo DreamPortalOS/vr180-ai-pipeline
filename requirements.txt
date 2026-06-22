@@ -1,18 +1,33 @@
-torch>=2.0.0
-torchvision>=0.15.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-pillow>=10.0.0
-tqdm>=4.65.0
-ffmpeg-python>=0.2.0
+# Core dependencies (locked to major version)
+torch>=2.0.0,<3.0.0
+torchvision>=0.15.0,<1.0.0
+opencv-python>=4.8.0,<5.0.0
+numpy>=1.24.0,<2.0.0
+pillow>=10.0.0,<11.0.0
+tqdm>=4.65.0,<5.0.0
+ffmpeg-python>=0.2.0,<1.0.0
 
-# Depth estimation (optional — pick one)
-# transformers>=4.35.0      # Depth Anything V2 via HuggingFace
-# accelerate>=0.24.0
-# safetensors>=0.4.0
+# Depth estimation (required for full pipeline)
+transformers>=4.35.0,<5.0.0
+accelerate>=0.24.0,<1.0.0
+safetensors>=0.4.0,<1.0.0
 
-# Optical flow (optional)
-# raft-stereo>=1.0.0
+# VR metadata (required)
+spatialmedia>=0.2.0
 
-# Video codec
-# ffmpeg (system package)
+# Pixel upscaling (optional — install with: pip install realesrgan)
+# realesrgan>=0.3.0
+
+# Web UI (optional — install with: pip install gradio)
+# gradio>=4.0.0
+
+# Testing
+pytest>=7.0.0,<9.0.0
+pytest-cov>=4.0.0,<6.0.0
+
+# Linting
+ruff>=0.4.0,<1.0.0
+
+# Video codec (system dependency)
+# ffmpeg (install via: brew install ffmpeg)
+# spatial-media (install via: pip install spatialmedia)

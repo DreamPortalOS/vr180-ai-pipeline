@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -114,6 +115,10 @@ def parse_args():
     # New: input validation
     parser.add_argument("--validate-input", action="store_true",
                         help="Validate input video format and print recommendations")
+
+    # New: checkpoint/resume
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from last completed checkpoint stage")
 
     return parser.parse_args()
 
@@ -464,6 +469,43 @@ def validate_input_format(input_path: str):
     print("=" * 60)
 
 
+def save_checkpoint(temp_dir: str, stage: str, info: dict = None):
+    """Save a checkpoint file indicating which stage completed."""
+    checkpoint_path = os.path.join(temp_dir, "checkpoint.json")
+    data = {"last_completed_stage": stage}
+    if info:
+        data.update(info)
+    with open(checkpoint_path, "w") as f:
+        json.dump(data, f, indent=2)
+    log.info(f"💾 Checkpoint saved: {stage}")
+
+
+def load_checkpoint(temp_dir: str):
+    """Load checkpoint info. Returns dict or None."""
+    checkpoint_path = os.path.join(temp_dir, "checkpoint.json")
+    if os.path.exists(checkpoint_path):
+        with open(checkpoint_path) as f:
+            return json.load(f)
+    return None
+
+
+STAGE_ORDER = ["upscale", "depth", "stereo", "equirect", "metadata"]
+
+
+def get_resume_start_stage(temp_dir: str):
+    """Determine which stage to resume from based on checkpoint."""
+    ckpt = load_checkpoint(temp_dir)
+    if not ckpt:
+        return 0  # start from beginning
+    last = ckpt.get("last_completed_stage", "")
+    if last in STAGE_ORDER:
+        idx = STAGE_ORDER.index(last) + 1
+        if idx < len(STAGE_ORDER):
+            log.info(f"📂 Resuming after stage '{last}' → starting '{STAGE_ORDER[idx]}'")
+            return idx
+    return 0
+
+
 def main():
     args = parse_args()
 
@@ -473,29 +515,89 @@ def main():
         return
 
     if args.stage == "all":
-        # Read frames once, pass through all stages
-        frames = list(read_frames(args.input, args.max_frames))
-        log.info(f"Loaded {len(frames)} frames")
+        temp_dir = get_temp_dir(args)
 
-        # Memory estimate for large videos
-        if frames:
-            H, W = frames[0].shape[:2]
-            mem_mb = len(frames) * H * W * 3 / (1024 * 1024)
-            if mem_mb > 1024:
-                log.warning(
-                    f"⚠️  Frame buffer uses ~{mem_mb:.0f} MB in RAM. "
-                    f"For large videos, consider using --max-frames or --temp-dir."
-                )
+        # Determine resume point
+        start_idx = 0
+        if args.resume:
+            start_idx = get_resume_start_stage(temp_dir)
 
-        # Stage 0: Upscaling (optional)
-        if args.upscale > 0:
-            frames = run_upscale_stage(args, frames)
+        need_frames = start_idx == 0  # only load frames if starting from scratch
+        stages_to_run = STAGE_ORDER[start_idx:] if start_idx > 0 else STAGE_ORDER
 
-        depths = run_depth_stage(args, frames)
-        left_frames, right_frames = run_stereo_stage(args, frames, depths)
-        sbs_frames = run_equirect_stage(args, left_frames, right_frames)
-        output = run_metadata_stage(args, sbs_frames)
-        log.info(f"✅ Pipeline complete → {output}")
+        # Filter: only run upscale if --upscale is set
+        if "upscale" in stages_to_run and args.upscale == 0:
+            stages_to_run = [s for s in stages_to_run if s != "upscale"]
+
+        # Load frames if needed
+        frames = None
+        if need_frames or "depth" in stages_to_run:
+            frames = list(read_frames(args.input, args.max_frames))
+            log.info(f"Loaded {len(frames)} frames")
+
+            if frames:
+                H, W = frames[0].shape[:2]
+                mem_mb = len(frames) * H * W * 3 / (1024 * 1024)
+                if mem_mb > 1024:
+                    log.warning(
+                        f"⚠️  Frame buffer uses ~{mem_mb:.0f} MB in RAM. "
+                        f"For large videos, consider using --max-frames or --temp-dir."
+                    )
+
+        # Run stages sequentially with checkpointing
+        depths = None
+        left_frames, right_frames = None, None
+        sbs_frames = None
+        output = None
+
+        for stage in stages_to_run:
+            if stage == "upscale":
+                frames = run_upscale_stage(args, frames)
+                save_checkpoint(temp_dir, "upscale")
+
+            elif stage == "depth":
+                if frames is None:
+                    frames = list(read_frames(args.input, args.max_frames))
+                depths = run_depth_stage(args, frames)
+                save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
+
+            elif stage == "stereo":
+                if depths is None:
+                    # Load depth maps from disk
+                    depth_dir = get_temp_dir(args, "depth")
+                    import glob
+                    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
+                    depths = [np.load(f) for f in depth_files]
+                    log.info(f"📂 Loaded {len(depths)} depth maps from checkpoint")
+                if frames is None:
+                    frames = list(read_frames(args.input, args.max_frames))
+                left_frames, right_frames = run_stereo_stage(args, frames, depths)
+                save_checkpoint(temp_dir, "stereo", {"num_frames": len(left_frames)})
+
+            elif stage == "equirect":
+                if left_frames is None:
+                    import glob
+                    left_dir = get_temp_dir(args, "left")
+                    right_dir = get_temp_dir(args, "right")
+                    left_files = sorted(glob.glob(os.path.join(left_dir, "*.png")))
+                    right_files = sorted(glob.glob(os.path.join(right_dir, "*.png")))
+                    left_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in left_files]
+                    right_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in right_files]
+                    log.info(f"📂 Loaded {len(left_frames)} stereo frames from checkpoint")
+                sbs_frames = run_equirect_stage(args, left_frames, right_frames)
+                save_checkpoint(temp_dir, "equirect", {"num_frames": len(sbs_frames)})
+
+            elif stage == "metadata":
+                if sbs_frames is None:
+                    import glob
+                    eq_dir = get_temp_dir(args, "equirect")
+                    files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
+                    sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
+                    log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint")
+                output = run_metadata_stage(args, sbs_frames)
+
+        if output:
+            log.info(f"✅ Pipeline complete → {output}")
 
     elif args.stage == "depth":
         frames = list(read_frames(args.input, args.max_frames))
