@@ -20,7 +20,84 @@
 
 ---
 
-## 🔴 Phase A — 基础设施补全（当前阶段）
+## 🌙 今夜自主长任务（Cline 执行 · 2026-06-24 夜 · 预计 4-5h）
+
+> **目标**：用户休息期间自主开发。按 **T1 → T2 → T3** 严格顺序，每个独立 commit + push + 开 PR。
+> 全部为后端，Mac 本地可跑，**不依赖 GPU / 外部真实 API / 用户在场**。明天主脑逐个审查。
+
+### ⚙️ 前置（开始前必做，按序）
+1. `git checkout main && git pull`（基于最新 main，含 PR#1/#2）
+2. `pip install pre-commit && pre-commit install`（**激活质量门禁**；之后每次 commit 自动 ruff check+format，避免再出现 432 个 lint 错误）
+3. `pytest tests/ -q --ignore=tests/e2e` 确认基线全绿（261 passed）
+
+### 📏 通用纪律（每个 T 都遵守）
+- 每个 T 独立分支：`feat/t1-database`、`feat/t2-auth`、`feat/t3-videogen`
+- commit 前 pre-commit 自动跑 ruff+format；若被拦截 → 修复 → 重新 commit（**禁止 `--no-verify` 跳过**）
+- 每个 T 完成必须：`pytest` 全绿 + `ruff check .` 干净 + push + `gh pr create`（标题注明 T 编号）
+- **不修改** `pipeline/` 现有转换逻辑、不碰前端、不改现有测试（只新增测试）
+- 两次相同报错后停止重试，换思路并在本文件记录（见 .clinerules 熔断规则）
+
+---
+
+### [ ] T1 — 数据库持久化（SQLAlchemy 2.0 + SQLite）｜必做
+**目标**：把 `web/task_store.py`（内存 dict）和 `web/quota.py` 迁移到数据库，重启后数据不丢。
+
+**新建文件**：
+- `db/__init__.py`
+- `db/engine.py` — 读 `DATABASE_URL`（默认 `sqlite:///./vr180.db`），SQLAlchemy 2.0 engine + sessionmaker
+- `db/models.py` — `TaskRecord`、`QuotaRecord` ORM 模型（字段对齐现有 `PipelineTask` / quota 数据）
+- `alembic.ini` + `db/migrations/`（Alembic 初始化 + 首个迁移）
+- `tests/test_database.py`
+
+**关键约束（向后兼容，最重要）**：
+- `TaskStore` 公开方法签名**保持不变**：`create_task / get_task / list_tasks / count_tasks / update_status / delete_task / cancel_task`。内部改用 DB，**现有 `test_web_api.py` / `test_phase4.py` 不许改动且必须继续通过**
+- `quota.py` 的 `QuotaManager` 同理保持接口，内部走 DB
+
+**测试要求**：模型 CRUD、TaskStore 的 DB 后端行为、quota 持久化、用临时 sqlite 文件验证「重启后数据保留」
+
+**验收**：全量测试绿 + `alembic upgrade head` 成功 + ruff 干净 → 开 PR
+
+---
+
+### [ ] T2 — API Key 认证（依赖 T1）｜必做
+**目标**：写操作端点需 `X-API-Key`，key 存数据库。
+
+**新建/修改**：
+- `db/models.py` 增加 `ApiKey` 模型（key_hash、name、created_at、active）
+- `web/auth.py` — `verify_api_key` FastAPI dependency：读 `X-API-Key` header → 查 DB → 无效返回 401
+- `scripts/create_api_key.py` — CLI 生成并入库一个 key（打印明文一次）
+- `web/app.py` — 给 `/api/v1/*` 的**写操作**端点（POST/PUT/DELETE 创建任务等）加 `Depends(verify_api_key)`；GET 健康检查保持公开
+- `tests/test_auth.py`
+
+**测试要求**：无 key→401、错误 key→401、有效 key→通过、key 生成与校验、哈希存储（不存明文）
+
+**验收**：全量测试绿 + ruff 干净 → 开 PR
+
+---
+
+### [ ] T3 — VideoGen 抽象层（尽力，时间够再做）
+**目标**：视频生成 provider 抽象，为「prompt → 生成 FPV 视频」打基础。**真实 API 调用明天接 key 联调**，今夜只做抽象 + mock 测试。
+
+**新建文件**：
+- `integrations/__init__.py`
+- `integrations/base.py` — `VideoGenProvider` ABC：`submit(prompt, params) -> job_id`、`poll(job_id) -> JobStatus`、`download(job_id, out_path) -> path`；`GenerationResult` dataclass
+- `integrations/kling.py` / `seedance.py` / `veo.py` — 用 `httpx` 实现「提交-轮询-下载」三段式。endpoint/payload 参考各家公开 API 文档（**可联网查**）；凭证走环境变量 `KLING_API_KEY` / `SEEDANCE_API_KEY` / `VEO_API_KEY`；未确认的真实参数标 `# TODO: verify against live API`
+- `integrations/factory.py` — `get_provider(name) -> VideoGenProvider`
+- `web/app.py` — `POST /api/v1/generate`（body: prompt + provider + scene_type → 调用 `wrap_prompt_for_vr180` 包装后提交生成任务，返回 job_id）
+- `tests/test_integrations.py`
+
+**测试要求**：用 `unittest.mock` / `httpx` mock，测 submit/poll/download 逻辑、工厂分发、prompt_builder 集成、错误处理；**不真实调用网络**
+
+**验收**：mock 测试全绿 + ruff 干净 → 开 PR（PR 描述注明「真实 API 待明天接 key 验证」）
+
+---
+
+### ✅ 完成后
+在本文件把 T1/T2/T3 标记 `[x]` 并填 PR 链接。若中途卡死，记录在此处供明天主脑排查。
+
+---
+
+## 🔴 Phase A — 基础设施补全（原始规格，T1=A2 / T2=A3 的细化版）
 
 > **目标**：解决 3 个 P0 问题，让系统具备真正的生产能力。
 > **执行顺序**：A1 → A2 → A3（严格按序，每个完成后再开始下一个）
