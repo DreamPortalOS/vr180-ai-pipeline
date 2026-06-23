@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from celery.result import AsyncResult
+from db.engine import init_db
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
@@ -35,12 +36,12 @@ from web.schemas import (
     TaskStatusEnum,
     TaskUpdateRequest,
 )
-from web.task_store import TaskStatus, TaskStore
+from web.task_store_db import TaskStatus, TaskStoreDB
 
 log = logging.getLogger("vr180-api")
 
-# Global task store instance
-task_store = TaskStore()
+# Global task store instance (DB-backed)
+task_store = TaskStoreDB()
 
 # Application start time for uptime calculation
 _start_time: float = 0.0
@@ -58,6 +59,7 @@ async def lifespan(app: FastAPI):
     _start_time = time.monotonic()
     _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    init_db()
     log.info("VR180 Studio API started")
     yield
     log.info("VR180 Studio API shutting down")
@@ -457,8 +459,8 @@ async def list_results_v1(
         meta = t.metadata or {}
         results.append(
             {
-                "task_id": t.task_id,
-                "filename": meta.get("original_filename", Path(t.output_path).name if t.output_path else t.task_id),
+                "task_id": t.id,
+                "filename": meta.get("original_filename", Path(t.output_path).name if t.output_path else t.id),
                 "output_path": t.output_path,
                 "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
                 "file_size_bytes": Path(t.output_path).stat().st_size
