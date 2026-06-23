@@ -7,13 +7,11 @@ import os
 import shutil
 import struct
 import tempfile
-import time
 
 import pytest
 
 # --- Quota Manager Tests ---
-
-from web.quota import QuotaExceeded, QuotaManager, UserQuota, UserTier, UsageRecord
+from web.quota import QuotaExceededError, QuotaManager, UsageRecord, UserTier
 
 
 class TestQuotaManager:
@@ -52,7 +50,7 @@ class TestQuotaManager:
         for i in range(3):
             self.quota.record_usage("user1", f"task{i}")
         assert self.quota.check("user1") is False
-        with pytest.raises(QuotaExceeded) as exc_info:
+        with pytest.raises(QuotaExceededError) as exc_info:
             self.quota.check_or_raise("user1")
         assert exc_info.value.used == 3
         assert exc_info.value.limit == 3
@@ -60,7 +58,7 @@ class TestQuotaManager:
     def test_record_usage_raises_after_limit(self):
         for i in range(3):
             self.quota.record_usage("user1", f"task{i}")
-        with pytest.raises(QuotaExceeded):
+        with pytest.raises(QuotaExceededError):
             self.quota.record_usage("user1", "task_overflow")
 
     def test_premium_user_unlimited(self):
@@ -118,7 +116,8 @@ class TestQuotaManager:
 
     def test_custom_limit(self):
         quota2 = QuotaManager(
-            db_path=os.path.join(self.tmp_dir, "custom.db"), max_free_conversions=1,
+            db_path=os.path.join(self.tmp_dir, "custom.db"),
+            max_free_conversions=1,
         )
         quota2.record_usage("user1", "task1")
         assert quota2.check("user1") is False
@@ -140,7 +139,7 @@ class TestQuotaManager:
         assert self.quota.get_usage_count("user2") == 0
 
     def test_quota_exceeded_message(self):
-        exc = QuotaExceeded("u1", used=3, limit=3)
+        exc = QuotaExceededError("u1", used=3, limit=3)
         assert "u1" in str(exc)
         assert "3/3" in str(exc)
 
@@ -152,7 +151,7 @@ class TestQuotaManager:
 
 # --- Result Storage Tests ---
 
-from web.storage import ResultStorage, ResultNotFoundError, StoredResult
+from web.storage import ResultNotFoundError, ResultStorage  # noqa: E402
 
 
 class TestResultStorage:
@@ -170,9 +169,16 @@ class TestResultStorage:
 
     def test_save_and_get_result(self):
         result_id = self.storage.save_result(
-            task_id="task1", output_path=self.fake_video, user_id="user1",
-            input_filename="test.mp4", duration_seconds=10.5,
-            width=7680, height=3840, fps=30.0, codec="h264", copy_file=False,
+            task_id="task1",
+            output_path=self.fake_video,
+            user_id="user1",
+            input_filename="test.mp4",
+            duration_seconds=10.5,
+            width=7680,
+            height=3840,
+            fps=30.0,
+            codec="h264",
+            copy_file=False,
         )
         result = self.storage.get_result(result_id)
         assert result.task_id == "task1"
@@ -184,7 +190,10 @@ class TestResultStorage:
 
     def test_save_with_file_copy(self):
         result_id = self.storage.save_result(
-            task_id="task1", output_path=self.fake_video, user_id="user1", copy_file=True,
+            task_id="task1",
+            output_path=self.fake_video,
+            user_id="user1",
+            copy_file=True,
         )
         result = self.storage.get_result(result_id)
         assert os.path.exists(result.output_path)
@@ -200,7 +209,9 @@ class TestResultStorage:
     def test_list_results_with_data(self):
         for i in range(5):
             self.storage.save_result(
-                task_id=f"task{i}", output_path=self.fake_video, copy_file=False,
+                task_id=f"task{i}",
+                output_path=self.fake_video,
+                copy_file=False,
             )
         results = self.storage.list_results()
         assert len(results) == 5
@@ -229,7 +240,9 @@ class TestResultStorage:
 
     def test_delete_result(self):
         result_id = self.storage.save_result(
-            task_id="task1", output_path=self.fake_video, copy_file=True,
+            task_id="task1",
+            output_path=self.fake_video,
+            copy_file=True,
         )
         result = self.storage.get_result(result_id)
         assert os.path.exists(result.output_path)
@@ -249,8 +262,10 @@ class TestResultStorage:
 
     def test_save_with_metadata(self):
         result_id = self.storage.save_result(
-            task_id="task1", output_path=self.fake_video,
-            metadata={"quality": "high", "upscaled": True}, copy_file=False,
+            task_id="task1",
+            output_path=self.fake_video,
+            metadata={"quality": "high", "upscaled": True},
+            copy_file=False,
         )
         result = self.storage.get_result(result_id)
         meta = json.loads(result.metadata_json)
@@ -258,9 +273,11 @@ class TestResultStorage:
         assert meta["upscaled"] is True
 
     def test_save_with_expiration(self):
-        result_id = self.storage.save_result(
-            task_id="task1", output_path=self.fake_video,
-            expires_at="2020-01-01T00:00:00Z", copy_file=False,
+        self.storage.save_result(
+            task_id="task1",
+            output_path=self.fake_video,
+            expires_at="2020-01-01T00:00:00Z",
+            copy_file=False,
         )
         cleaned = self.storage.cleanup_expired()
         assert cleaned == 1
@@ -272,7 +289,9 @@ class TestResultStorage:
 
     def test_stored_result_defaults(self):
         result_id = self.storage.save_result(
-            task_id="task1", output_path=self.fake_video, copy_file=False,
+            task_id="task1",
+            output_path=self.fake_video,
+            copy_file=False,
         )
         result = self.storage.get_result(result_id)
         assert result.stereoscopic_mode == "side-by-side"
@@ -287,7 +306,7 @@ class TestResultStorage:
 
 # --- Spatial Converter Tests ---
 
-from pipeline.spatial_converter import (
+from pipeline.spatial_converter import (  # noqa: E402
     SpatialConverter,
     SpatialFormat,
     SpatialProjection,
@@ -310,10 +329,16 @@ class TestSpatialConverter:
 
     def test_spatial_video_info_dataclass(self):
         info = SpatialVideoInfo(
-            width=7680, height=3840, fps=30.0, duration=10.0,
-            codec="h264", format=SpatialProjection.EQUIRECTANGULAR,
-            is_stereoscopic=True, stereo_mode="side-by-side",
-            has_spatial_metadata=False, file_size=1024,
+            width=7680,
+            height=3840,
+            fps=30.0,
+            duration=10.0,
+            codec="h264",
+            format=SpatialProjection.EQUIRECTANGULAR,
+            is_stereoscopic=True,
+            stereo_mode="side-by-side",
+            has_spatial_metadata=False,
+            file_size=1024,
         )
         assert info.width == 7680
         assert info.is_stereoscopic is True

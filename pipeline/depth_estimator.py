@@ -18,8 +18,9 @@ Usage:
     depth_maps = estimator.estimate_batch(frames)  # batch
 """
 
+from typing import ClassVar
+
 import numpy as np
-from typing import Optional, List
 
 
 class DepthEstimator:
@@ -29,7 +30,7 @@ class DepthEstimator:
     """
 
     # Valid HuggingFace model repos
-    MODEL_REPOS = {
+    MODEL_REPOS: ClassVar[dict[str, str]] = {
         "small": "depth-anything/Depth-Anything-V2-Small-hf",
         "base": "depth-anything/Depth-Anything-V2-Base-hf",
         "large": "depth-anything/Depth-Anything-V2-Large-hf",
@@ -38,7 +39,7 @@ class DepthEstimator:
     def __init__(
         self,
         model_size: str = "small",
-        device: Optional[str] = None,
+        device: str | None = None,
         calibrate: bool = True,
     ):
         """
@@ -48,9 +49,7 @@ class DepthEstimator:
             calibrate: Scale relative depth to approximate metric depth.
         """
         if model_size not in self.MODEL_REPOS:
-            raise ValueError(
-                f"Unknown model size '{model_size}'. Choose from: {list(self.MODEL_REPOS.keys())}"
-            )
+            raise ValueError(f"Unknown model size '{model_size}'. Choose from: {list(self.MODEL_REPOS.keys())}")
         self.model_size = model_size
         self.device = device or self._auto_device()
         self.calibrate = calibrate
@@ -59,6 +58,7 @@ class DepthEstimator:
     def _auto_device(self) -> str:
         """Auto-detect best available device."""
         import torch
+
         if torch.cuda.is_available():
             return "cuda"
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -77,7 +77,7 @@ class DepthEstimator:
             model=self.MODEL_REPOS[self.model_size],
             device=self.device,
         )
-        print(f"[Depth] Model loaded successfully.")
+        print("[Depth] Model loaded successfully.")
 
     def estimate(self, frame: np.ndarray) -> np.ndarray:
         """Estimate depth for a single RGB frame.
@@ -110,15 +110,12 @@ class DepthEstimator:
         # Resize to match input resolution if needed
         if depth_np.shape[:2] != frame.shape[:2]:
             import cv2
-            depth_np = cv2.resize(depth_np, (frame.shape[1], frame.shape[0]),
-                                  interpolation=cv2.INTER_LINEAR)
+
+            depth_np = cv2.resize(depth_np, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
 
         # Normalize to [0, 1] range
         d_min, d_max = depth_np.min(), depth_np.max()
-        if d_max > d_min:
-            depth_np = (depth_np - d_min) / (d_max - d_min)
-        else:
-            depth_np = np.zeros_like(depth_np)
+        depth_np = (depth_np - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(depth_np)
 
         # Optional metric calibration
         if self.calibrate:
@@ -126,7 +123,7 @@ class DepthEstimator:
 
         return depth_np
 
-    def estimate_batch(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+    def estimate_batch(self, frames: list[np.ndarray]) -> list[np.ndarray]:
         """Estimate depth for a list of frames."""
         return [self.estimate(f) for f in frames]
 

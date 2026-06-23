@@ -17,7 +17,6 @@ Usage:
 """
 
 import numpy as np
-from typing import Optional, Tuple
 
 
 class EquirectangularMapper:
@@ -35,16 +34,16 @@ class EquirectangularMapper:
         self,
         output_width: int = 3840,
         output_height: int = 1920,
-        src_hfov: float = 70.0,    # Source camera horizontal FOV (degrees)
-        use_ffmpeg: bool = True,   # Prefer ffmpeg v360 when available
-        flip_vertical: bool = True,  # Flip output vertically for VR headsets
+        src_hfov: float = 120.0,  # Source camera horizontal FOV (degrees)
+        # 120° matches typical AI-generated FPV video FOV.
+        # Use 70° for narrow/normal lenses, 90° for action cams.
+        use_ffmpeg: bool = True,  # Prefer ffmpeg v360 when available
     ):
         self.output_width = output_width
         self.output_height = output_height
         self.src_hfov = src_hfov
         self.use_ffmpeg = use_ffmpeg
-        self.flip_vertical = flip_vertical
-        self._mesh: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self._mesh: tuple[np.ndarray, np.ndarray] | None = None
 
     def map_single(self, frame: np.ndarray) -> np.ndarray:
         """Map a single planar frame to equirectangular VR180.
@@ -62,14 +61,13 @@ class EquirectangularMapper:
 
     def _ffmpeg_available(self) -> bool:
         """Check if ffmpeg with v360 filter is available."""
-        import subprocess, shutil
+        import shutil
+        import subprocess
+
         if not shutil.which("ffmpeg"):
             return False
         try:
-            result = subprocess.run(
-                ["ffmpeg", "-filters"],
-                capture_output=True, text=True, timeout=5
-            )
+            result = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True, timeout=5)
             return "v360" in result.stdout
         except Exception:
             return False
@@ -80,6 +78,7 @@ class EquirectangularMapper:
         For a pinhole camera: vfov = 2 * atan(tan(hfov/2) * height/width)
         """
         import math
+
         hfov_rad = math.radians(self.src_hfov)
         vfov_rad = 2.0 * math.atan(math.tan(hfov_rad / 2.0) * src_height / src_width)
         return math.degrees(vfov_rad)
@@ -94,7 +93,10 @@ class EquirectangularMapper:
         to src_hfov. This prevents stretching the content to fill the
         full 180° vertical range when the source only covers ~40-50°.
         """
-        import subprocess, tempfile, os
+        import os
+        import subprocess
+        import tempfile
+
         import cv2
 
         H, W = frame.shape[:2]
@@ -107,12 +109,9 @@ class EquirectangularMapper:
 
         out_path = in_path.replace(".png", "_eq.png")
         try:
-            # Build v360 filter chain
-            # - input=flat: flat perspective projection
-            # - output=hequirect: half equirectangular (180° horizontal)
-            # - ih_fov/iv_fov: source camera FOV (correct aspect ratio)
-            # - h_fov=180/v_fov=180: full 180° hemisphere output
-            # - fill_black=1: areas outside source FOV → black (not stretched)
+            # v360 filter: perspective → half-equirectangular (VR180)
+            # ih_fov/iv_fov = source camera FOV; h_fov=180/v_fov=180 = full hemisphere output.
+            # No vflip: ffmpeg v360 hequirect output is already Quest/YouTube-compatible.
             vfilter = (
                 f"v360=input=flat:output=hequirect:"
                 f"ih_fov={self.src_hfov}:iv_fov={src_vfov:.2f}:"
@@ -120,15 +119,15 @@ class EquirectangularMapper:
                 f"w={self.output_width}:h={self.output_height}"
             )
 
-            # Add vertical flip if needed (Quest expects top=up)
-            if self.flip_vertical:
-                vfilter += ",vflip"
-
             cmd = [
-                "ffmpeg", "-y",
-                "-i", in_path,
-                "-vf", vfilter,
-                "-frames:v", "1",
+                "ffmpeg",
+                "-y",
+                "-i",
+                in_path,
+                "-vf",
+                vfilter,
+                "-frames:v",
+                "1",
                 out_path,
             ]
             subprocess.run(cmd, check=True, capture_output=True, timeout=30)
@@ -154,7 +153,7 @@ class EquirectangularMapper:
         import cv2
 
         H_src, W_src = frame.shape[:2]
-        W_out, H_out = self.output_width, self.output_height
+        _W_out, _H_out = self.output_width, self.output_height
 
         if self._mesh is None:
             self._build_mesh(W_src, H_src)
@@ -168,17 +167,13 @@ class EquirectangularMapper:
         sx_safe = np.where(valid_mask, sx, 0.0).astype(np.float32)
         sy_safe = np.where(valid_mask, sy, 0.0).astype(np.float32)
 
-        equirect = cv2.remap(frame, sx_safe, sy_safe, cv2.INTER_LANCZOS4,
-                             borderMode=cv2.BORDER_CONSTANT,
-                             borderValue=(0, 0, 0))
+        equirect = cv2.remap(
+            frame, sx_safe, sy_safe, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)
+        )
 
         # Apply black fill for out-of-FOV regions
         if not np.all(valid_mask):
             equirect[~valid_mask] = [0, 0, 0]
-
-        # Flip vertically for VR headset convention
-        if self.flip_vertical:
-            equirect = cv2.flip(equirect, 0)  # 0 = vertical flip
 
         return equirect
 
@@ -204,8 +199,8 @@ class EquirectangularMapper:
 
         # Spherical coordinates for a 180° hemisphere
         # theta: -90° to +90° (horizontal), phi: 0° (top) to 180° (bottom)
-        theta = (u / W_out - 0.5) * np.pi      # [-π/2, π/2]
-        phi = (v / H_out) * np.pi               # [0, π]
+        theta = (u / W_out - 0.5) * np.pi  # [-π/2, π/2]
+        phi = (v / H_out) * np.pi  # [0, π]
 
         # Ray direction in 3D
         ray_x = np.sin(theta) * np.sin(phi)
@@ -224,15 +219,12 @@ class EquirectangularMapper:
         # and within the source FOV
         valid = ray_z > 0.01  # slightly above zero for stability
 
+        # ray_y is positive-up; image y is positive-down → negate for correct mapping
         sx = np.where(valid, fx * ray_x / np.maximum(ray_z, 1e-6) + cx, -1.0)
-        sy = np.where(valid, fy * ray_y / np.maximum(ray_z, 1e-6) + cy, -1.0)
+        sy = np.where(valid, -fy * ray_y / np.maximum(ray_z, 1e-6) + cy, -1.0)
 
         # Check if projected point is within source image bounds
-        in_bounds = (
-            valid &
-            (sx >= 0) & (sx < src_width) &
-            (sy >= 0) & (sy < src_height)
-        )
+        in_bounds = valid & (sx >= 0) & (sx < src_width) & (sy >= 0) & (sy < src_height)
 
         # Mark out-of-bounds pixels for black fill
         sx = np.where(in_bounds, sx, -1.0)
@@ -240,9 +232,7 @@ class EquirectangularMapper:
 
         self._mesh = (sx.astype(np.float32), sy.astype(np.float32))
 
-    def map_stereo_pair(
-        self, left_frame: np.ndarray, right_frame: np.ndarray
-    ) -> np.ndarray:
+    def map_stereo_pair(self, left_frame: np.ndarray, right_frame: np.ndarray) -> np.ndarray:
         """Map left+right views into a SBS equirectangular frame.
 
         Each view is independently mapped to equirectangular,

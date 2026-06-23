@@ -7,15 +7,13 @@ No frame buffers accumulate in RAM.
 
 import logging
 import subprocess
-from typing import Optional, List
 
 import cv2
-import numpy as np
 
 from pipeline.depth_estimator import DepthEstimator
-from pipeline.stereo_renderer import StereoRenderer
-from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.device_utils import resolve_device
+from pipeline.equirectangular_mapper import EquirectangularMapper
+from pipeline.stereo_renderer import StereoRenderer
 
 log = logging.getLogger("vr180-streaming")
 
@@ -37,16 +35,15 @@ class StreamingPipeline:
     def __init__(
         self,
         model_size: str = "small",
-        device: Optional[str] = None,
+        device: str | None = None,
         ipd: float = 0.064,
         max_disparity: float = 0.05,
         output_width: int = 3840,
         output_height: int = 1920,
-        src_hfov: float = 70.0,
+        src_hfov: float = 120.0,
         codec: str = "h264",
         crf: int = 23,
         fps: int = 30,
-        flip_vertical: bool = True,
     ):
         self.model_size = model_size
         self.device = resolve_device(device)
@@ -58,7 +55,6 @@ class StreamingPipeline:
         self.codec = codec
         self.crf = crf
         self.fps = fps
-        self.flip_vertical = flip_vertical
 
         # Initialise pipeline stages
         self.depth_estimator = DepthEstimator(
@@ -75,10 +71,9 @@ class StreamingPipeline:
             output_height=output_height,
             src_hfov=src_hfov,
             use_ffmpeg=True,
-            flip_vertical=flip_vertical,
         )
 
-    def _build_ffmpeg_cmd(self, output_path: str, width: int, height: int) -> List[str]:
+    def _build_ffmpeg_cmd(self, output_path: str, width: int, height: int) -> list[str]:
         """Build the ffmpeg command list for raw-frame piping.
 
         Returns:
@@ -88,36 +83,43 @@ class StreamingPipeline:
         enc_codec = codec_map.get(self.codec, "libx264")
 
         cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s", f"{width}x{height}",
-            "-r", str(self.fps),
-            "-i", "pipe:0",
-            "-c:v", enc_codec,
-            "-crf", str(self.crf),
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(self.fps),
+            "-i",
+            "pipe:0",
+            "-c:v",
+            enc_codec,
+            "-crf",
+            str(self.crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
             output_path,
         ]
         return cmd
 
-    def _open_ffmpeg_writer(
-        self, output_path: str, width: int, height: int
-    ) -> subprocess.Popen:
+    def _open_ffmpeg_writer(self, output_path: str, width: int, height: int) -> subprocess.Popen:
         """Open an ffmpeg subprocess that accepts raw RGB frames on stdin."""
         cmd = self._build_ffmpeg_cmd(output_path, width, height)
         log.info(f"ffmpeg cmd: {' '.join(cmd)}")
-        return subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     def process_stream(
         self,
         input_path: str,
         output_path: str,
-        max_frames: Optional[int] = None,
+        max_frames: int | None = None,
     ) -> str:
         """Process video frame-by-frame, writing directly to ffmpeg pipe.
 
@@ -193,7 +195,7 @@ def run_streaming_pipeline(
     input_path: str,
     output_path: str,
     model_size: str = "small",
-    device: Optional[str] = None,
+    device: str | None = None,
     ipd: float = 0.064,
     max_disparity: float = 0.05,
     output_width: int = 3840,
@@ -203,7 +205,7 @@ def run_streaming_pipeline(
     crf: int = 23,
     fps: int = 30,
     flip_vertical: bool = True,
-    max_frames: Optional[int] = None,
+    max_frames: int | None = None,
 ) -> str:
     """Convenience function to run the streaming pipeline in one call.
 

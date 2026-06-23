@@ -6,21 +6,19 @@ SQLite-backed for persistence across server restarts.
 
 Usage:
     quota = QuotaManager(max_free_conversions=3)
-    quota.check_or_raise("user123")  # raises QuotaExceeded if over limit
+    quota.check_or_raise("user123")  # raises QuotaExceededError if over limit
     quota.record_usage("user123", task_id="abc", file_size_bytes=1024000)
 """
 
 import sqlite3
 import threading
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
 
-class QuotaExceeded(Exception):
+class QuotaExceededError(Exception):
     """Raised when a user has exceeded their conversion quota."""
 
     def __init__(self, user_id: str, used: int, limit: int):
@@ -78,7 +76,7 @@ class QuotaManager:
 
     def __init__(
         self,
-        db_path: Optional[str] = None,
+        db_path: str | None = None,
         max_free_conversions: int = 3,
     ):
         self.db_path = db_path or self.DEFAULT_DB_PATH
@@ -135,9 +133,7 @@ class QuotaManager:
             "INSERT OR IGNORE INTO users (user_id, tier, created_at) VALUES (?, ?, ?)",
             (user_id, UserTier.FREE.value, now),
         )
-        row = conn.execute(
-            "SELECT tier FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
+        row = conn.execute("SELECT tier FROM users WHERE user_id = ?", (user_id,)).fetchone()
         return row[0] if row else UserTier.FREE.value
 
     def get_usage_count(self, user_id: str) -> int:
@@ -159,9 +155,7 @@ class QuotaManager:
             conn = self._get_conn()
             try:
                 self._ensure_user(conn, user_id)
-                row = conn.execute(
-                    "SELECT tier FROM users WHERE user_id = ?", (user_id,)
-                ).fetchone()
+                row = conn.execute("SELECT tier FROM users WHERE user_id = ?", (user_id,)).fetchone()
                 return row[0] if row else UserTier.FREE.value
             finally:
                 conn.close()
@@ -210,12 +204,12 @@ class QuotaManager:
 
     def check_or_raise(self, user_id: str):
         """
-        Check quota and raise QuotaExceeded if over limit.
+        Check quota and raise QuotaExceededError if over limit.
         Call this before starting a conversion task.
         """
         quota = self.get_quota(user_id)
         if not quota.unlimited and quota.used >= quota.limit:
-            raise QuotaExceeded(
+            raise QuotaExceededError(
                 user_id=user_id,
                 used=quota.used,
                 limit=quota.limit,
@@ -229,7 +223,7 @@ class QuotaManager:
     ):
         """
         Record a successful conversion. Call after task completes.
-        Raises QuotaExceeded if user is already over limit (race condition guard).
+        Raises QuotaExceededError if user is already over limit (race condition guard).
         """
         with self._lock:
             conn = self._get_conn()
@@ -245,7 +239,7 @@ class QuotaManager:
                     ).fetchone()
                     current_count = row[0] if row else 0
                     if current_count >= limit:
-                        raise QuotaExceeded(
+                        raise QuotaExceededError(
                             user_id=user_id,
                             used=current_count,
                             limit=limit,
@@ -318,9 +312,7 @@ class QuotaManager:
         with self._lock:
             conn = self._get_conn()
             try:
-                row = conn.execute(
-                    "SELECT COALESCE(SUM(file_size_bytes), 0) FROM usage_records"
-                ).fetchone()
+                row = conn.execute("SELECT COALESCE(SUM(file_size_bytes), 0) FROM usage_records").fetchone()
                 return row[0] if row else 0
             finally:
                 conn.close()

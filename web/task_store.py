@@ -16,13 +16,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from threading import Lock
-from typing import Optional
 
 log = logging.getLogger("task-store")
 
 
 class TaskStatus(str, Enum):
     """Pipeline task lifecycle states."""
+
     QUEUED = "queued"
     PROCESSING = "processing"
     COMPLETED = "completed"
@@ -33,16 +33,17 @@ class TaskStatus(str, Enum):
 @dataclass
 class PipelineTask:
     """Represents a single VR180 conversion task."""
+
     id: str
     input_path: str
-    output_path: Optional[str] = None
+    output_path: str | None = None
     status: TaskStatus = TaskStatus.QUEUED
     progress: float = 0.0  # 0.0 to 1.0
     stage: str = "init"  # current pipeline stage name
-    error: Optional[str] = None
+    error: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    completed_at: Optional[datetime] = None
+    completed_at: datetime | None = None
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -76,8 +77,8 @@ class TaskStore:
     def create_task(
         self,
         input_path: str,
-        output_path: Optional[str] = None,
-        metadata: Optional[dict] = None,
+        output_path: str | None = None,
+        metadata: dict | None = None,
     ) -> PipelineTask:
         """Create a new pipeline task in QUEUED state.
 
@@ -107,7 +108,7 @@ class TaskStore:
         log.info(f"Created task {task_id} for {input_path}")
         return task
 
-    def get_task(self, task_id: str) -> Optional[PipelineTask]:
+    def get_task(self, task_id: str) -> PipelineTask | None:
         """Retrieve a task by ID.
 
         Args:
@@ -121,7 +122,7 @@ class TaskStore:
 
     def list_tasks(
         self,
-        status: Optional[TaskStatus] = None,
+        status: TaskStatus | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[PipelineTask]:
@@ -142,9 +143,9 @@ class TaskStore:
             tasks = [t for t in tasks if t.status == status]
 
         tasks.sort(key=lambda t: t.created_at, reverse=True)
-        return tasks[offset: offset + limit]
+        return tasks[offset : offset + limit]
 
-    def count_tasks(self, status: Optional[TaskStatus] = None) -> int:
+    def count_tasks(self, status: TaskStatus | None = None) -> int:
         """Count tasks, optionally filtered by status."""
         with self._lock:
             if status is None:
@@ -155,11 +156,11 @@ class TaskStore:
         self,
         task_id: str,
         status: TaskStatus,
-        progress: Optional[float] = None,
-        stage: Optional[str] = None,
-        error: Optional[str] = None,
-        output_path: Optional[str] = None,
-    ) -> Optional[PipelineTask]:
+        progress: float | None = None,
+        stage: str | None = None,
+        error: str | None = None,
+        output_path: str | None = None,
+    ) -> PipelineTask | None:
         """Update a task's status and optional fields.
 
         Args:
@@ -214,7 +215,7 @@ class TaskStore:
                 return True
             return False
 
-    def cancel_task(self, task_id: str) -> Optional[PipelineTask]:
+    def cancel_task(self, task_id: str) -> PipelineTask | None:
         """Cancel a queued or processing task.
 
         Args:

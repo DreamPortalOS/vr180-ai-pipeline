@@ -19,8 +19,6 @@ Usage:
 import argparse
 import logging
 import os
-import subprocess
-import tempfile
 from pathlib import Path
 
 import cv2
@@ -51,11 +49,11 @@ COMBO_LABELS = {}  # populated at runtime
 
 def apply_flip(frame: np.ndarray, flip_type: str) -> np.ndarray:
     """Apply OpenCV flip to a frame.
-    
+
     Args:
         frame: RGB image (H, W, 3)
         flip_type: one of 'none', 'vflip', 'hflip', 'both'
-    
+
     Returns:
         Flipped frame
     """
@@ -73,17 +71,17 @@ def apply_flip(frame: np.ndarray, flip_type: str) -> np.ndarray:
 
 def apply_transpose(frame: np.ndarray, transpose_type: str) -> np.ndarray:
     """Apply ffmpeg-style transpose operation using OpenCV.
-    
+
     Transpose codes (matching ffmpeg):
         0 = 90° counter-clockwise and vertical flip (equivalent to rot90 + vflip)
         1 = 90° clockwise
         2 = 90° counter-clockwise
         3 = 90° clockwise and vertical flip
-    
+
     Args:
         frame: RGB image (H, W, 3)
         transpose_type: one of 'none', 't0', 't1', 't2', 't3'
-    
+
     Returns:
         Transposed frame
     """
@@ -107,16 +105,16 @@ def apply_transpose(frame: np.ndarray, transpose_type: str) -> np.ndarray:
 
 def generate_orientation_matrix(
     frame: np.ndarray,
-    flip_types: list[str] = None,
-    transpose_types: list[str] = None,
+    flip_types: list[str] | None = None,
+    transpose_types: list[str] | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Generate a grid of all orientation combinations.
-    
+
     Args:
         frame: RGB input frame
         flip_types: list of flip operations to test
         transpose_types: list of transpose operations to test
-    
+
     Returns:
         Tuple of (grid_image, combo_map) where combo_map maps
         (row, col) → (label, transformed_frame)
@@ -154,15 +152,20 @@ def generate_orientation_matrix(
             y_offset = row * (tile_h + label_h)
             x_offset = col * tile_w
 
-            grid[y_offset:y_offset + tile_h, x_offset:x_offset + tile_w] = transposed
+            grid[y_offset : y_offset + tile_h, x_offset : x_offset + tile_w] = transposed
 
             # Draw label
             label = f"{FLIP_LABELS[f_type]} + {TRANSPOSE_LABELS[t_type]}"
             short_label = f"{f_type}+{t_type}"
             cv2.putText(
-                grid, short_label,
+                grid,
+                short_label,
                 (x_offset + 5, y_offset + tile_h + 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
             )
 
             combo_map[(row, col)] = {
@@ -191,7 +194,7 @@ def save_individual_tiles(combo_map: dict, output_dir: str):
 
 def generate_ffmpeg_filter_map(combo_map: dict) -> str:
     """Generate equivalent ffmpeg filter strings for each orientation combo.
-    
+
     Returns a human-readable report of ffmpeg equivalents.
     """
     lines = ["# FFmpeg Filter Equivalents", ""]
@@ -216,25 +219,25 @@ def generate_ffmpeg_filter_map(combo_map: dict) -> str:
             filters.append("transpose=3")
 
         filter_str = ",".join(filters) if filters else "(no filter)"
-        lines.append(f"  [{row},{col}] {info['label']}: -vf \"{filter_str}\"")
+        lines.append(f'  [{row},{col}] {info["label"]}: -vf "{filter_str}"')
 
     return "\n".join(lines)
 
 
 def run_orientation_matrix(
     input_path: str,
-    output_path: str = None,
+    output_path: str | None = None,
     frame_idx: int = 0,
     save_tiles: bool = True,
 ) -> str:
     """Main entry: generate orientation diagnostic grid from a video.
-    
+
     Args:
         input_path: Path to input video
         output_path: Output path for grid image (PNG) or video
         frame_idx: Which frame to extract (0-indexed)
         save_tiles: Whether to save individual tile images
-    
+
     Returns:
         Path to output grid image
     """
@@ -283,15 +286,11 @@ def run_orientation_matrix(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="VR180 Orientation Matrix Diagnostic Tool"
-    )
+    parser = argparse.ArgumentParser(description="VR180 Orientation Matrix Diagnostic Tool")
     parser.add_argument("--input", "-i", required=True, help="Input video file")
     parser.add_argument("--output", "-o", default=None, help="Output grid image path")
-    parser.add_argument("--frame", type=int, default=0,
-                        help="Frame index to extract (default: 0)")
-    parser.add_argument("--no-tiles", action="store_true",
-                        help="Skip saving individual tile images")
+    parser.add_argument("--frame", type=int, default=0, help="Frame index to extract (default: 0)")
+    parser.add_argument("--no-tiles", action="store_true", help="Skip saving individual tile images")
 
     args = parser.parse_args()
     run_orientation_matrix(

@@ -1,21 +1,20 @@
 """Tests for pipeline.spherical_injector — ISOBMFF box building and injection."""
 
 import struct
-import pytest
 
 from pipeline.spherical_injector import (
-    _build_sv3d,
-    _build_st3d,
-    _u32,
-    _u8,
-    _box4,
-    _full_box,
-    _stereo_mode_byte,
+    _STEREO_LEFT_RIGHT,
     _STEREO_MONO,
     _STEREO_TOP_BOTTOM,
-    _STEREO_LEFT_RIGHT,
+    _box4,
+    _build_st3d,
+    _build_sv3d,
     _find_box_at,
     _find_box_recursive,
+    _full_box,
+    _stereo_mode_byte,
+    _u8,
+    _u32,
 )
 
 

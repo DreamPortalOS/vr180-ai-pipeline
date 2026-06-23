@@ -6,8 +6,8 @@ import pytest
 from pipeline.research.orientation_matrix import (
     apply_flip,
     apply_transpose,
-    generate_orientation_matrix,
     generate_ffmpeg_filter_map,
+    generate_orientation_matrix,
 )
 
 
@@ -87,7 +87,7 @@ class TestGenerateOrientationMatrix:
         # Grid should have correct dimensions
         label_h = 40
         expected_h = 5 * (60 + label_h)  # 5 transpose rows
-        expected_w = 4 * 80              # 4 flip cols
+        expected_w = 4 * 80  # 4 flip cols
         assert grid.shape == (expected_h, expected_w, 3)
 
     def test_combo_map_keys(self):
@@ -101,7 +101,7 @@ class TestGenerateOrientationMatrix:
     def test_combo_map_has_required_fields(self):
         frame = np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8)
         _, combo_map = generate_orientation_matrix(frame)
-        for key, info in combo_map.items():
+        for _key, info in combo_map.items():
             assert "label" in info
             assert "short" in info
             assert "flip" in info
@@ -110,16 +110,14 @@ class TestGenerateOrientationMatrix:
 
     def test_custom_flip_types(self):
         frame = np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8)
-        _, combo_map = generate_orientation_matrix(
-            frame, flip_types=["none", "vflip"], transpose_types=["none"]
-        )
+        _, combo_map = generate_orientation_matrix(frame, flip_types=["none", "vflip"], transpose_types=["none"])
         assert len(combo_map) == 2
 
     def test_transposed_frames_have_correct_size(self):
         """All frames in combo_map should be resized to original dimensions."""
         frame = np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8)
         _, combo_map = generate_orientation_matrix(frame)
-        for key, info in combo_map.items():
+        for _key, info in combo_map.items():
             assert info["frame"].shape[:2] == (60, 80)
 
 

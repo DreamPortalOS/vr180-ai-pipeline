@@ -4,9 +4,10 @@ Super-resolution using Real-ESRGAN for enhanced visual quality.
 Supports 2× and 4× upscaling with MPS/CUDA/CPU auto-detection.
 """
 
-import numpy as np
+from typing import ClassVar
+
 import cv2
-from typing import Optional, Tuple
+import numpy as np
 
 
 class PixelUpscaler:
@@ -26,7 +27,7 @@ class PixelUpscaler:
         half_precision: Use fp16 for faster inference on CUDA
     """
 
-    MODELS = {
+    MODELS: ClassVar[dict] = {
         "RealESRGAN_x2plus": {
             "scale": 2,
             "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
@@ -44,8 +45,8 @@ class PixelUpscaler:
     def __init__(
         self,
         scale: int = 2,
-        model_name: Optional[str] = None,
-        device: Optional[str] = None,
+        model_name: str | None = None,
+        device: str | None = None,
         half_precision: bool = False,
     ):
         self.scale = scale
@@ -56,11 +57,12 @@ class PixelUpscaler:
         self._use_opencv_fallback = False
 
     @staticmethod
-    def _resolve_device(device: Optional[str]) -> str:
+    def _resolve_device(device: str | None) -> str:
         if device:
             return device.lower()
         try:
             import torch
+
             if torch.cuda.is_available():
                 return "cuda"
             if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -74,8 +76,8 @@ class PixelUpscaler:
             return
 
         try:
-            from realesrgan import RealESRGANer
             from basicsr.archs.rrdbnet_arch import RRDBNet
+            from realesrgan import RealESRGANer
         except ImportError:
             # Fall back to OpenCV-based upscaling
             self._use_opencv_fallback = True
@@ -85,10 +87,7 @@ class PixelUpscaler:
 
         model_info = self.MODELS.get(self.model_name)
         if not model_info:
-            raise ValueError(
-                f"Unknown model: {self.model_name}. "
-                f"Available: {list(self.MODELS.keys())}"
-            )
+            raise ValueError(f"Unknown model: {self.model_name}. Available: {list(self.MODELS.keys())}")
 
         # Build network architecture
         model = RRDBNet(
@@ -127,6 +126,7 @@ class PixelUpscaler:
     def _get_model_path(model_name: str) -> str:
         """Get or download model weights."""
         import os
+
         weights_dir = os.path.join(os.path.expanduser("~"), ".cache", "realesrgan")
         os.makedirs(weights_dir, exist_ok=True)
         model_path = os.path.join(weights_dir, f"{model_name}.pth")
@@ -135,6 +135,7 @@ class PixelUpscaler:
             url = PixelUpscaler.MODELS[model_name]["url"]
             print(f"[Upscale] Downloading {model_name} weights...")
             import torch
+
             torch.hub.download_url_to_file(url, model_path)
             print(f"[Upscale] Downloaded to {model_path}")
 
@@ -251,9 +252,7 @@ class PixelUpscaler:
 
             # Upscale tile
             try:
-                upscaled_tile, _ = self._upsampler.enhance(
-                    tile, outscale=scale
-                )
+                upscaled_tile, _ = self._upsampler.enhance(tile, outscale=scale)
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     if torch.cuda.is_available():
@@ -280,17 +279,15 @@ class PixelUpscaler:
             out_y0 = y0 * scale
 
             # Generate 2D blending weight for this tile
-            weight = self._compute_tile_weight(
-                crop_h, crop_w, blend_margin * scale, blend_mode
-            )
+            weight = self._compute_tile_weight(crop_h, crop_w, blend_margin * scale, blend_mode)
 
             # Accumulate weighted pixels
-            output_accum[out_y0:out_y0 + crop_h, out_x0:out_x0 + crop_w] += (
+            output_accum[out_y0 : out_y0 + crop_h, out_x0 : out_x0 + crop_w] += (
                 cropped.astype(np.float64) * weight[:, :, np.newaxis]
             )
-            weight_map[out_y0:out_y0 + crop_h, out_x0:out_x0 + crop_w] += weight
+            weight_map[out_y0 : out_y0 + crop_h, out_x0 : out_x0 + crop_w] += weight
 
-            tile_count += 1
+            tile_count += 1  # noqa: SIM113 — explicit counter reads clearer than enumerate here
             if progress_callback:
                 progress_callback(tile_count, total_tiles)
 
@@ -301,9 +298,7 @@ class PixelUpscaler:
         return output
 
     @staticmethod
-    def _compute_tile_weight(
-        height: int, width: int, margin_px: int, mode: str = "gaussian"
-    ) -> np.ndarray:
+    def _compute_tile_weight(height: int, width: int, margin_px: int, mode: str = "gaussian") -> np.ndarray:
         """Compute a 2D blending weight map for a single tile.
 
         The weight is 1.0 in the center and ramps down to near 0 at the edges
@@ -391,13 +386,20 @@ class PixelUpscaler:
 
         vf = f"scale=iw*{scale}:ih*{scale}:flags=lanczos"
         cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-vf", vf,
-            "-c:v", "libx264",
-            "-preset", preset,
-            "-crf", str(crf),
-            "-c:a", "copy",
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_path,
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+            "-c:a",
+            "copy",
             output_path,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -451,9 +453,9 @@ def _gaussian_ramp(length: int, margin: int) -> np.ndarray:
 
 def create_upscaler(
     scale: int = 2,
-    model_name: Optional[str] = None,
-    device: Optional[str] = None,
-) -> Optional[PixelUpscaler]:
+    model_name: str | None = None,
+    device: str | None = None,
+) -> PixelUpscaler | None:
     """Factory: create upscaler with graceful fallback.
 
     Returns PixelUpscaler if realesrgan is installed, None otherwise.

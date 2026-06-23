@@ -16,15 +16,14 @@ Usage:
     embedder.embed_single_frame_batch(frames, "output.mp4")
 """
 
+import contextlib
 import os
-import struct
 import subprocess
 import tempfile
-from typing import Optional, List
 
 import numpy as np
-from pipeline.spherical_injector import inject_spherical_metadata
 
+from pipeline.spherical_injector import inject_spherical_metadata
 
 # Google Spherical Video V2 XML template (for VR180)
 SPHERICAL_XML_TEMPLATE = """<?xml version="1.0"?>
@@ -79,10 +78,10 @@ class VRMetadataEmbedder:
 
     def embed_single_frame_batch(
         self,
-        frames: List[np.ndarray],
+        frames: list[np.ndarray],
         output_path: str,
-        width: Optional[int] = None,
-        height: Optional[int] = None,
+        width: int | None = None,
+        height: int | None = None,
     ) -> str:
         """Write frames as VR180 video with metadata via ffmpeg pipe.
 
@@ -107,9 +106,7 @@ class VRMetadataEmbedder:
         xml_content = self._spherical_xml(out_w, out_h)
 
         # Write XML to temp file
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".xml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
             f.write(xml_content)
             xml_path = f.name
 
@@ -117,23 +114,34 @@ class VRMetadataEmbedder:
             # Encode with ffmpeg (no spherical metadata in encoding pass)
             temp_path = output_path + ".tmp.mp4"
             cmd = [
-                "ffmpeg", "-y",
-                "-f", "rawvideo",
-                "-vcodec", "rawvideo",
-                "-s", f"{W}x{H}",
-                "-pix_fmt", "rgb24",
-                "-r", str(self.fps),
-                "-i", "-",
-                "-c:v", self._codec_name(),
-                "-preset", self.preset,
-                "-crf", str(self.crf),
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
+                "ffmpeg",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-vcodec",
+                "rawvideo",
+                "-s",
+                f"{W}x{H}",
+                "-pix_fmt",
+                "rgb24",
+                "-r",
+                str(self.fps),
+                "-i",
+                "-",
+                "-c:v",
+                self._codec_name(),
+                "-preset",
+                self.preset,
+                "-crf",
+                str(self.crf),
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
                 temp_path,
             ]
 
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                    stderr=subprocess.PIPE)
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 for frame in frames:
                     proc.stdin.write(frame.astype(np.uint8).tobytes())
@@ -147,28 +155,23 @@ class VRMetadataEmbedder:
                 raise RuntimeError(f"FFmpeg encoding failed:\n{stderr}")
 
             # Post-process: inject spherical box via Python ISOBMFF writer
-            inject_spherical_metadata(temp_path, output_path,
-                                      width=out_w, height=out_h,
-                                      stereo_mode=self.stereo_mode)
-            try:
+            inject_spherical_metadata(temp_path, output_path, width=out_w, height=out_h, stereo_mode=self.stereo_mode)
+            with contextlib.suppress(OSError):
                 os.unlink(temp_path)
-            except OSError:
-                pass
 
         except FileNotFoundError:
             print("[Metadata] ffmpeg not found!")
             raise
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(xml_path)
-            except OSError:
-                pass
 
         print(f"[Metadata] ✅ VR180 video saved to {output_path}")
         return output_path
 
     def _embed_via_metadata_file(
-        self, frames: List[np.ndarray],
+        self,
+        frames: list[np.ndarray],
         output_path: str,
         xml_path: str,
     ) -> str:
@@ -181,22 +184,32 @@ class VRMetadataEmbedder:
 
         # First pass: encode without metadata
         cmd1 = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-s", f"{W}x{H}",
-            "-pix_fmt", "rgb24",
-            "-r", str(self.fps),
-            "-i", "-",
-            "-c:v", self._codec_name(),
-            "-preset", self.preset,
-            "-crf", str(self.crf),
-            "-pix_fmt", "yuv420p",
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-s",
+            f"{W}x{H}",
+            "-pix_fmt",
+            "rgb24",
+            "-r",
+            str(self.fps),
+            "-i",
+            "-",
+            "-c:v",
+            self._codec_name(),
+            "-preset",
+            self.preset,
+            "-crf",
+            str(self.crf),
+            "-pix_fmt",
+            "yuv420p",
             temp_path,
         ]
 
-        proc = subprocess.Popen(cmd1, stdin=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd1, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             for frame in frames:
                 proc.stdin.write(frame.astype(np.uint8).tobytes())
@@ -211,15 +224,20 @@ class VRMetadataEmbedder:
 
         # Second pass: inject spherical metadata
         # Read the XML content
-        with open(xml_path, "r") as f:
+        with open(xml_path) as f:
             xml_content = f.read()
 
         cmd2 = [
-            "ffmpeg", "-y",
-            "-i", temp_path,
-            "-c", "copy",
-            "-metadata:s:v", f"spherical-v2={xml_content}",
-            "-metadata:s:v", "stereo_mode=side-by-side",
+            "ffmpeg",
+            "-y",
+            "-i",
+            temp_path,
+            "-c",
+            "copy",
+            "-metadata:s:v",
+            f"spherical-v2={xml_content}",
+            "-metadata:s:v",
+            "stereo_mode=side-by-side",
             output_path,
         ]
 
@@ -228,12 +246,11 @@ class VRMetadataEmbedder:
             print(f"[Metadata] Warning: metadata injection failed: {result.stderr[:200]}")
             # Fall back to temp file
             import shutil
+
             shutil.move(temp_path, output_path)
         else:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(temp_path)
-            except OSError:
-                pass
 
         print(f"[Metadata] ✅ VR180 video saved to {output_path}")
         return output_path
@@ -259,7 +276,5 @@ class VRMetadataEmbedder:
         Returns:
             Path to output file
         """
-        inject_spherical_metadata(input_path, output_path,
-                                  width=width, height=height,
-                                  stereo_mode=self.stereo_mode)
+        inject_spherical_metadata(input_path, output_path, width=width, height=height, stereo_mode=self.stereo_mode)
         return output_path

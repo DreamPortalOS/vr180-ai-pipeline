@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ class SpatialVideoInfo:
     stereo_mode: str
     has_spatial_metadata: bool
     file_size: int
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 class SpatialConverter:
@@ -74,8 +74,8 @@ class SpatialConverter:
         target_format: SpatialFormat = SpatialFormat.MV_HEVC,
         projection: SpatialProjection = SpatialProjection.EQUIRECTANGULAR,
         crf: int = 18,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """
         Convert an SBS VR180 video to a spatial video format.
 
@@ -95,19 +95,34 @@ class SpatialConverter:
         width = input_info["width"]
         height = input_info["height"]
         fps = input_info.get("fps", 30.0)
-        duration = input_info.get("duration", 0.0)
+        input_info.get("duration", 0.0)
 
         if target_format == SpatialFormat.MV_HEVC:
             result = self._convert_mv_hevc(
-                input_path, output_path, width, height, fps, crf,
+                input_path,
+                output_path,
+                width,
+                height,
+                fps,
+                crf,
             )
         elif target_format == SpatialFormat.SBS_SPATIAL:
             result = self._convert_sbs_spatial(
-                input_path, output_path, width, height, fps, crf,
+                input_path,
+                output_path,
+                width,
+                height,
+                fps,
+                crf,
             )
         elif target_format == SpatialFormat.SBS_MONO:
             result = self._convert_sbs_mono(
-                input_path, output_path, width, height, fps, crf,
+                input_path,
+                output_path,
+                width,
+                height,
+                fps,
+                crf,
             )
         else:
             raise ValueError(f"Unsupported format: {target_format}")
@@ -130,7 +145,7 @@ class SpatialConverter:
         height: int,
         fps: float,
         crf: int,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Convert to MV-HEVC format for Apple Vision Pro."""
         eye_width = width // 2
         eye_height = height
@@ -138,19 +153,27 @@ class SpatialConverter:
         tmp_output = tempfile.mktemp(suffix=".mp4")
         try:
             cmd = [
-                self.ffmpeg, "-y",
-                "-i", input_path,
+                self.ffmpeg,
+                "-y",
+                "-i",
+                input_path,
                 "-filter_complex",
                 f"[0:v]split=2[left][right];"
                 f"[left]crop={eye_width}:{eye_height}:0:0[l];"
                 f"[right]crop={eye_width}:{eye_height}:{eye_width}:0[r];"
                 f"[l][r]hstack=inputs=2[out]",
-                "-map", "[out]",
-                "-c:v", "libx265",
-                "-crf", str(crf),
-                "-preset", "fast",
-                "-tag:v", "hvc1",
-                "-pix_fmt", "yuv420p",
+                "-map",
+                "[out]",
+                "-c:v",
+                "libx265",
+                "-crf",
+                str(crf),
+                "-preset",
+                "fast",
+                "-tag:v",
+                "hvc1",
+                "-pix_fmt",
+                "yuv420p",
                 tmp_output,
             ]
             self._run_ffmpeg(cmd)
@@ -180,15 +203,21 @@ class SpatialConverter:
         height: int,
         fps: float,
         crf: int,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Convert to SBS spatial format for Meta Quest."""
         cmd = [
-            self.ffmpeg, "-y",
-            "-i", input_path,
-            "-c:v", "libx264",
-            "-crf", str(crf),
-            "-preset", "fast",
-            "-pix_fmt", "yuv420p",
+            self.ffmpeg,
+            "-y",
+            "-i",
+            input_path,
+            "-c:v",
+            "libx264",
+            "-crf",
+            str(crf),
+            "-preset",
+            "fast",
+            "-pix_fmt",
+            "yuv420p",
             output_path,
         ]
         self._run_ffmpeg(cmd)
@@ -211,15 +240,21 @@ class SpatialConverter:
         height: int,
         fps: float,
         crf: int,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Convert to SBS mono format (legacy fallback)."""
         cmd = [
-            self.ffmpeg, "-y",
-            "-i", input_path,
-            "-c:v", "libx264",
-            "-crf", str(crf),
-            "-preset", "fast",
-            "-pix_fmt", "yuv420p",
+            self.ffmpeg,
+            "-y",
+            "-i",
+            input_path,
+            "-c:v",
+            "libx264",
+            "-crf",
+            str(crf),
+            "-preset",
+            "fast",
+            "-pix_fmt",
+            "yuv420p",
             output_path,
         ]
         self._run_ffmpeg(cmd)
@@ -235,7 +270,10 @@ class SpatialConverter:
         }
 
     def _inject_mv_hevc_metadata(
-        self, file_path: str, eye_width: int, eye_height: int,
+        self,
+        file_path: str,
+        eye_width: int,
+        eye_height: int,
     ) -> None:
         """
         Inject MV-HEVC spatial metadata into an MP4 file using ISOBMFF boxes.
@@ -271,7 +309,10 @@ class SpatialConverter:
         )
 
     def _inject_sbs_spatial_metadata(
-        self, file_path: str, width: int, height: int,
+        self,
+        file_path: str,
+        width: int,
+        height: int,
     ) -> None:
         """
         Inject SBS spatial metadata into an MP4 file.
@@ -307,7 +348,10 @@ class SpatialConverter:
         )
 
     def _inject_sbs_mono_metadata(
-        self, file_path: str, width: int, height: int,
+        self,
+        file_path: str,
+        width: int,
+        height: int,
     ) -> None:
         """
         Inject minimal SBS mono metadata.
@@ -322,23 +366,28 @@ class SpatialConverter:
 
         logger.info("Injected SBS mono metadata: st3d(mode=0) into %s", file_path)
 
-    def _run_ffmpeg(self, cmd: List[str]) -> None:
+    def _run_ffmpeg(self, cmd: list[str]) -> None:
         """Run an ffmpeg command and raise on failure."""
         logger.debug("Running ffmpeg: %s", " ".join(cmd))
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
         )
         if result.returncode != 0:
-            raise RuntimeError(
-                f"ffmpeg failed (exit {result.returncode}): {result.stderr}"
-            )
+            raise RuntimeError(f"ffmpeg failed (exit {result.returncode}): {result.stderr}")
 
-    def get_video_info(self, path: str) -> Dict[str, Any]:
+    def get_video_info(self, path: str) -> dict[str, Any]:
         """Get video metadata using ffprobe."""
         cmd = [
-            self.ffprobe, "-v", "quiet",
-            "-print_format", "json",
-            "-show_format", "-show_streams",
+            self.ffprobe,
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
             path,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -372,7 +421,7 @@ class SpatialConverter:
             "file_size": int(fmt.get("size", 0)),
         }
 
-    def get_supported_formats(self) -> Dict[str, str]:
+    def get_supported_formats(self) -> dict[str, str]:
         """Return supported spatial video formats with descriptions."""
         return {
             "mv-hevc": "MV-HEVC — Apple Vision Pro",
