@@ -133,9 +133,7 @@ class QuotaManager:
             "INSERT OR IGNORE INTO users (user_id, tier, created_at) VALUES (?, ?, ?)",
             (user_id, UserTier.FREE.value, now),
         )
-        row = conn.execute(
-            "SELECT tier FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
+        row = conn.execute("SELECT tier FROM users WHERE user_id = ?", (user_id,)).fetchone()
         return row[0] if row else UserTier.FREE.value
 
     def get_usage_count(self, user_id: str) -> int:
@@ -157,9 +155,7 @@ class QuotaManager:
             conn = self._get_conn()
             try:
                 self._ensure_user(conn, user_id)
-                row = conn.execute(
-                    "SELECT tier FROM users WHERE user_id = ?", (user_id,)
-                ).fetchone()
+                row = conn.execute("SELECT tier FROM users WHERE user_id = ?", (user_id,)).fetchone()
                 return row[0] if row else UserTier.FREE.value
             finally:
                 conn.close()
@@ -316,9 +312,7 @@ class QuotaManager:
         with self._lock:
             conn = self._get_conn()
             try:
-                row = conn.execute(
-                    "SELECT COALESCE(SUM(file_size_bytes), 0) FROM usage_records"
-                ).fetchone()
+                row = conn.execute("SELECT COALESCE(SUM(file_size_bytes), 0) FROM usage_records").fetchone()
                 return row[0] if row else 0
             finally:
                 conn.close()

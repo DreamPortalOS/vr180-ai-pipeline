@@ -185,10 +185,22 @@ class ResultStorage:
                      created_at, expires_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        result_id, task_id, user_id, input_filename,
-                        final_output_path, file_size_bytes, duration_seconds,
-                        width, height, fps, codec, stereoscopic_mode,
-                        projection, metadata_json, now, expires_at,
+                        result_id,
+                        task_id,
+                        user_id,
+                        input_filename,
+                        final_output_path,
+                        file_size_bytes,
+                        duration_seconds,
+                        width,
+                        height,
+                        fps,
+                        codec,
+                        stereoscopic_mode,
+                        projection,
+                        metadata_json,
+                        now,
+                        expires_at,
                     ),
                 )
                 conn.commit()
@@ -202,9 +214,7 @@ class ResultStorage:
         with self._lock:
             conn = self._get_conn()
             try:
-                row = conn.execute(
-                    "SELECT * FROM results WHERE id = ?", (result_id,)
-                ).fetchone()
+                row = conn.execute("SELECT * FROM results WHERE id = ?", (result_id,)).fetchone()
                 if not row:
                     raise ResultNotFoundError(result_id)
                 return self._row_to_result(row)
@@ -232,9 +242,12 @@ class ResultStorage:
         """
         # Validate order_by to prevent SQL injection
         allowed_order = {
-            "created_at DESC", "created_at ASC",
-            "file_size_bytes DESC", "file_size_bytes ASC",
-            "duration_seconds DESC", "duration_seconds ASC",
+            "created_at DESC",
+            "created_at ASC",
+            "file_size_bytes DESC",
+            "file_size_bytes ASC",
+            "duration_seconds DESC",
+            "duration_seconds ASC",
         }
         if order_by not in allowed_order:
             order_by = "created_at DESC"
@@ -281,9 +294,7 @@ class ResultStorage:
         with self._lock:
             conn = self._get_conn()
             try:
-                row = conn.execute(
-                    "SELECT output_path FROM results WHERE id = ?", (result_id,)
-                ).fetchone()
+                row = conn.execute("SELECT output_path FROM results WHERE id = ?", (result_id,)).fetchone()
                 if not row:
                     return False
 
@@ -315,9 +326,7 @@ class ResultStorage:
                         with contextlib.suppress(OSError):
                             os.remove(row[1])
 
-                conn.execute(
-                    "DELETE FROM results WHERE task_id = ?", (task_id,)
-                )
+                conn.execute("DELETE FROM results WHERE task_id = ?", (task_id,))
                 conn.commit()
                 return len(rows)
             finally:
@@ -353,9 +362,7 @@ class ResultStorage:
         with self._lock:
             conn = self._get_conn()
             try:
-                row = conn.execute(
-                    "SELECT COALESCE(SUM(file_size_bytes), 0) FROM results"
-                ).fetchone()
+                row = conn.execute("SELECT COALESCE(SUM(file_size_bytes), 0) FROM results").fetchone()
                 return row[0] if row else 0
             finally:
                 conn.close()

@@ -85,6 +85,7 @@ app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 # ─── Frontend SPA ─────────────────────────────────────────────────────────────
 
+
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def serve_frontend():
     """Serve the frontend SPA."""
@@ -95,6 +96,7 @@ async def serve_frontend():
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
+
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
@@ -117,6 +119,7 @@ async def health_check_v1():
 
 
 # ─── Task CRUD ────────────────────────────────────────────────────────────────
+
 
 @app.post(
     "/tasks",
@@ -382,6 +385,7 @@ async def download_task_result(task_id: str):
 
 # ─── Celery Progress ──────────────────────────────────────────────────────────
 
+
 @app.get(
     "/api/v1/tasks/{task_id}/progress",
     tags=["Tasks"],
@@ -415,6 +419,7 @@ async def get_task_progress(task_id: str):
 
 # ─── Quota (stub) ─────────────────────────────────────────────────────────────
 
+
 @app.get(
     "/api/v1/quota",
     tags=["Quota"],
@@ -435,6 +440,7 @@ async def get_quota_v1(
 
 # ─── Results ──────────────────────────────────────────────────────────────────
 
+
 @app.get(
     "/api/v1/results",
     tags=["Results"],
@@ -445,21 +451,23 @@ async def list_results_v1(
     x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     """List completed results for a user."""
-    completed_tasks = task_store.list_tasks(
-        status=TaskStatus.COMPLETED, limit=limit, offset=offset
-    )
+    completed_tasks = task_store.list_tasks(status=TaskStatus.COMPLETED, limit=limit, offset=offset)
     results = []
     for t in completed_tasks:
         meta = t.metadata or {}
-        results.append({
-            "task_id": t.task_id,
-            "filename": meta.get("original_filename", Path(t.output_path).name if t.output_path else t.task_id),
-            "output_path": t.output_path,
-            "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
-            "file_size_bytes": Path(t.output_path).stat().st_size if t.output_path and Path(t.output_path).exists() else meta.get("file_size_bytes"),
-            "output_format": meta.get("output_format", "equirectangular"),
-            "resolution": meta.get("resolution", "4k"),
-        })
+        results.append(
+            {
+                "task_id": t.task_id,
+                "filename": meta.get("original_filename", Path(t.output_path).name if t.output_path else t.task_id),
+                "output_path": t.output_path,
+                "created_at": t.created_at.isoformat() + "Z" if t.created_at else None,
+                "file_size_bytes": Path(t.output_path).stat().st_size
+                if t.output_path and Path(t.output_path).exists()
+                else meta.get("file_size_bytes"),
+                "output_format": meta.get("output_format", "equirectangular"),
+                "resolution": meta.get("resolution", "4k"),
+            }
+        )
     return {"results": results, "total": len(results)}
 
 

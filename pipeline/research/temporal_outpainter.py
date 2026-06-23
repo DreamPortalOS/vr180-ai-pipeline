@@ -32,6 +32,7 @@ log = logging.getLogger("temporal-outpainter")
 @dataclass
 class OutpaintQualityMetrics:
     """Quality metrics for outpainting validation."""
+
     ssim: float
     psnr: float
     coverage_pct: float  # percentage of mask filled
@@ -98,19 +99,17 @@ class TemporalOutpainter:
         # Top pole
         mask[:pole_h, :] = 255
         # Bottom pole
-        mask[h - pole_h:, :] = 255
+        mask[h - pole_h :, :] = 255
 
         # Edge regions: extreme left/right margins
         edge_w = int(w * self.edge_margin_pct)
         if edge_w > 0:
             mask[:, :edge_w] = 255
-            mask[:, w - edge_w:] = 255
+            mask[:, w - edge_w :] = 255
 
         return mask
 
-    def compute_optical_flow(
-        self, frame1: np.ndarray, frame2: np.ndarray
-    ) -> np.ndarray:
+    def compute_optical_flow(self, frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
         """Compute dense optical flow between two grayscale frames.
 
         Uses Farneback algorithm for dense flow estimation.
@@ -134,7 +133,8 @@ class TemporalOutpainter:
             gray2 = cv2.resize(gray2, (new_w, new_h))
 
         flow = cv2.calcOpticalFlowFarneback(
-            gray1, gray2,
+            gray1,
+            gray2,
             None,
             pyr_scale=0.5,
             levels=3,
@@ -155,9 +155,7 @@ class TemporalOutpainter:
 
         return flow
 
-    def warp_frame_by_flow(
-        self, frame: np.ndarray, flow: np.ndarray
-    ) -> np.ndarray:
+    def warp_frame_by_flow(self, frame: np.ndarray, flow: np.ndarray) -> np.ndarray:
         """Warp a frame using optical flow field.
 
         Args:
@@ -178,15 +176,15 @@ class TemporalOutpainter:
         map_y = y_grid + flow[:, :, 1]
 
         warped = cv2.remap(
-            frame, map_x, map_y,
+            frame,
+            map_x,
+            map_y,
             interpolation=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REFLECT_101,
         )
         return warped
 
-    def _compute_distance_weights(
-        self, h: int, w: int, mask: np.ndarray
-    ) -> np.ndarray:
+    def _compute_distance_weights(self, h: int, w: int, mask: np.ndarray) -> np.ndarray:
         """Compute distance-based blending weights from mask boundary.
 
         Pixels closer to the original content get higher weight when blending
@@ -234,8 +232,11 @@ class TemporalOutpainter:
 
         if not context_frames or not np.any(mask_bool):
             metrics = OutpaintQualityMetrics(
-                ssim=1.0, psnr=float('inf'),
-                coverage_pct=0.0, iterations_used=0, converged=True,
+                ssim=1.0,
+                psnr=float("inf"),
+                coverage_pct=0.0,
+                iterations_used=0,
+                converged=True,
             )
             return result, metrics
 
@@ -280,19 +281,13 @@ class TemporalOutpainter:
             result[mask_bool] = filled[mask_bool]
 
             # Check convergence
-            diff = np.abs(
-                result[mask_bool].astype(np.float64) -
-                prev_result[mask_bool].astype(np.float64)
-            )
+            diff = np.abs(result[mask_bool].astype(np.float64) - prev_result[mask_bool].astype(np.float64))
             mean_change = diff.mean() if diff.size > 0 else 0.0
             iterations_used = iteration + 1
 
             if mean_change < self.convergence_threshold:
                 converged = True
-                log.info(
-                    f"  Converged at iteration {iterations_used} "
-                    f"(mean change: {mean_change:.2f})"
-                )
+                log.info(f"  Converged at iteration {iterations_used} (mean change: {mean_change:.2f})")
                 break
 
             prev_result = result.copy()
@@ -338,10 +333,7 @@ class TemporalOutpainter:
 
         if mask is None:
             mask = self.detect_boundary_mask(frames[0])
-            log.info(
-                f"Auto-detected boundary mask: "
-                f"{np.sum(mask > 0) / mask.size * 100:.1f}% of frame"
-            )
+            log.info(f"Auto-detected boundary mask: {np.sum(mask > 0) / mask.size * 100:.1f}% of frame")
 
         outpainted = []
         all_metrics = []
@@ -357,10 +349,7 @@ class TemporalOutpainter:
 
             context_frames = [frames[j] for j in context_indices]
 
-            log.info(
-                f"Outpainting frame {i}/{n} "
-                f"(context: {len(context_frames)} frames)"
-            )
+            log.info(f"Outpainting frame {i}/{n} (context: {len(context_frames)} frames)")
 
             result, metrics = self.outpaint_frame(frame, context_frames, mask)
             outpainted.append(result)
@@ -368,18 +357,15 @@ class TemporalOutpainter:
 
         # Summary
         avg_ssim = np.mean([m.ssim for m in all_metrics])
-        avg_psnr = np.mean([m.psnr for m in all_metrics if m.psnr != float('inf')])
+        avg_psnr = np.mean([m.psnr for m in all_metrics if m.psnr != float("inf")])
         converged_count = sum(1 for m in all_metrics if m.converged)
         log.info(
-            f"Outpainting complete: {converged_count}/{n} converged, "
-            f"avg SSIM={avg_ssim:.4f}, avg PSNR={avg_psnr:.2f}dB"
+            f"Outpainting complete: {converged_count}/{n} converged, avg SSIM={avg_ssim:.4f}, avg PSNR={avg_psnr:.2f}dB"
         )
 
         return outpainted, all_metrics
 
-    def _compute_psnr(
-        self, original: np.ndarray, result: np.ndarray, mask: np.ndarray
-    ) -> float:
+    def _compute_psnr(self, original: np.ndarray, result: np.ndarray, mask: np.ndarray) -> float:
         """Compute PSNR between original and result in non-masked regions.
 
         Args:
@@ -393,20 +379,15 @@ class TemporalOutpainter:
         # Only compare in non-outpainted regions (original content preserved)
         inv_mask = ~mask
         if not np.any(inv_mask):
-            return float('inf')
+            return float("inf")
 
-        diff = (
-            original[inv_mask].astype(np.float64) -
-            result[inv_mask].astype(np.float64)
-        )
-        mse = np.mean(diff ** 2)
+        diff = original[inv_mask].astype(np.float64) - result[inv_mask].astype(np.float64)
+        mse = np.mean(diff**2)
         if mse == 0:
-            return float('inf')
-        return 10 * math.log10(255.0 ** 2 / mse)
+            return float("inf")
+        return 10 * math.log10(255.0**2 / mse)
 
-    def _compute_ssim(
-        self, original: np.ndarray, result: np.ndarray, mask: np.ndarray
-    ) -> float:
+    def _compute_ssim(self, original: np.ndarray, result: np.ndarray, mask: np.ndarray) -> float:
         """Compute a simplified SSIM between original and result in non-masked regions.
 
         Uses block-based SSIM computation on the non-outpainted content
@@ -432,14 +413,12 @@ class TemporalOutpainter:
         mu_r = gray_result[inv_mask].mean()
         sigma_o_sq = gray_orig[inv_mask].var()
         sigma_r_sq = gray_result[inv_mask].var()
-        sigma_or = np.mean(
-            (gray_orig[inv_mask] - mu_o) * (gray_result[inv_mask] - mu_r)
-        )
+        sigma_or = np.mean((gray_orig[inv_mask] - mu_o) * (gray_result[inv_mask] - mu_r))
 
         c1 = (0.01 * 255) ** 2
         c2 = (0.03 * 255) ** 2
 
         numerator = (2 * mu_o * mu_r + c1) * (2 * sigma_or + c2)
-        denominator = (mu_o ** 2 + mu_r ** 2 + c1) * (sigma_o_sq + sigma_r_sq + c2)
+        denominator = (mu_o**2 + mu_r**2 + c1) * (sigma_o_sq + sigma_r_sq + c2)
 
         return float(numerator / denominator) if denominator != 0 else 1.0

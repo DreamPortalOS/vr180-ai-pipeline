@@ -21,6 +21,7 @@ def client():
 
 # ─── Health ───────────────────────────────────────────────────────────────────
 
+
 class TestHealthEndpoint:
     def test_health_returns_200(self, client):
         resp = client.get("/health")
@@ -35,6 +36,7 @@ class TestHealthEndpoint:
 
 
 # ─── Create Task ─────────────────────────────────────────────────────────────
+
 
 class TestCreateTask:
     def test_create_returns_201(self, client):
@@ -52,17 +54,23 @@ class TestCreateTask:
         assert data["error"] is None
 
     def test_create_with_output_path(self, client):
-        data = client.post("/tasks", json={
-            "input_path": "/tmp/test.mp4",
-            "output_path": "/tmp/out_vr180.mp4",
-        }).json()
+        data = client.post(
+            "/tasks",
+            json={
+                "input_path": "/tmp/test.mp4",
+                "output_path": "/tmp/out_vr180.mp4",
+            },
+        ).json()
         assert data["output_path"] == "/tmp/out_vr180.mp4"
 
     def test_create_with_metadata(self, client):
-        data = client.post("/tasks", json={
-            "input_path": "/tmp/test.mp4",
-            "metadata": {"codec": "h264", "fps": 30},
-        }).json()
+        data = client.post(
+            "/tasks",
+            json={
+                "input_path": "/tmp/test.mp4",
+                "metadata": {"codec": "h264", "fps": 30},
+            },
+        ).json()
         assert data["metadata"]["codec"] == "h264"
         assert data["metadata"]["fps"] == 30
 
@@ -72,6 +80,7 @@ class TestCreateTask:
 
 
 # ─── Get Task ────────────────────────────────────────────────────────────────
+
 
 class TestGetTask:
     def test_get_existing_task(self, client):
@@ -86,6 +95,7 @@ class TestGetTask:
 
 
 # ─── List Tasks ──────────────────────────────────────────────────────────────
+
 
 class TestListTasks:
     def test_list_empty(self, client):
@@ -120,15 +130,19 @@ class TestListTasks:
 
 # ─── Update Task ─────────────────────────────────────────────────────────────
 
+
 class TestUpdateTask:
     def test_update_status(self, client):
         create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
         task_id = create_resp.json()["id"]
-        data = client.patch(f"/tasks/{task_id}", json={
-            "status": "processing",
-            "progress": 0.5,
-            "stage": "depth_estimation",
-        }).json()
+        data = client.patch(
+            f"/tasks/{task_id}",
+            json={
+                "status": "processing",
+                "progress": 0.5,
+                "stage": "depth_estimation",
+            },
+        ).json()
         assert data["status"] == "processing"
         assert data["progress"] == 0.5
         assert data["stage"] == "depth_estimation"
@@ -140,10 +154,13 @@ class TestUpdateTask:
     def test_update_to_completed(self, client):
         create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
         task_id = create_resp.json()["id"]
-        data = client.patch(f"/tasks/{task_id}", json={
-            "status": "completed",
-            "output_path": "/tmp/out.mp4",
-        }).json()
+        data = client.patch(
+            f"/tasks/{task_id}",
+            json={
+                "status": "completed",
+                "output_path": "/tmp/out.mp4",
+            },
+        ).json()
         assert data["status"] == "completed"
         assert data["progress"] == 1.0
         assert data["output_path"] == "/tmp/out.mp4"
@@ -152,15 +169,19 @@ class TestUpdateTask:
     def test_update_to_failed_with_error(self, client):
         create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
         task_id = create_resp.json()["id"]
-        data = client.patch(f"/tasks/{task_id}", json={
-            "status": "failed",
-            "error": "GPU out of memory",
-        }).json()
+        data = client.patch(
+            f"/tasks/{task_id}",
+            json={
+                "status": "failed",
+                "error": "GPU out of memory",
+            },
+        ).json()
         assert data["status"] == "failed"
         assert data["error"] == "GPU out of memory"
 
 
 # ─── Delete Task ─────────────────────────────────────────────────────────────
+
 
 class TestDeleteTask:
     def test_delete_existing(self, client):
@@ -177,6 +198,7 @@ class TestDeleteTask:
 
 
 # ─── Cancel Task ─────────────────────────────────────────────────────────────
+
 
 class TestCancelTask:
     def test_cancel_queued(self, client):
@@ -198,6 +220,7 @@ class TestCancelTask:
 
 
 # ─── TaskStore Unit Tests ────────────────────────────────────────────────────
+
 
 class TestTaskStore:
     def test_create_and_get(self):

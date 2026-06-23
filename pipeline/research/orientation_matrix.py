@@ -152,15 +152,20 @@ def generate_orientation_matrix(
             y_offset = row * (tile_h + label_h)
             x_offset = col * tile_w
 
-            grid[y_offset:y_offset + tile_h, x_offset:x_offset + tile_w] = transposed
+            grid[y_offset : y_offset + tile_h, x_offset : x_offset + tile_w] = transposed
 
             # Draw label
             label = f"{FLIP_LABELS[f_type]} + {TRANSPOSE_LABELS[t_type]}"
             short_label = f"{f_type}+{t_type}"
             cv2.putText(
-                grid, short_label,
+                grid,
+                short_label,
                 (x_offset + 5, y_offset + tile_h + 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
             )
 
             combo_map[(row, col)] = {
@@ -214,7 +219,7 @@ def generate_ffmpeg_filter_map(combo_map: dict) -> str:
             filters.append("transpose=3")
 
         filter_str = ",".join(filters) if filters else "(no filter)"
-        lines.append(f"  [{row},{col}] {info['label']}: -vf \"{filter_str}\"")
+        lines.append(f'  [{row},{col}] {info["label"]}: -vf "{filter_str}"')
 
     return "\n".join(lines)
 
@@ -281,15 +286,11 @@ def run_orientation_matrix(
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="VR180 Orientation Matrix Diagnostic Tool"
-    )
+    parser = argparse.ArgumentParser(description="VR180 Orientation Matrix Diagnostic Tool")
     parser.add_argument("--input", "-i", required=True, help="Input video file")
     parser.add_argument("--output", "-o", default=None, help="Output grid image path")
-    parser.add_argument("--frame", type=int, default=0,
-                        help="Frame index to extract (default: 0)")
-    parser.add_argument("--no-tiles", action="store_true",
-                        help="Skip saving individual tile images")
+    parser.add_argument("--frame", type=int, default=0, help="Frame index to extract (default: 0)")
+    parser.add_argument("--no-tiles", action="store_true", help="Skip saving individual tile images")
 
     args = parser.parse_args()
     run_orientation_matrix(

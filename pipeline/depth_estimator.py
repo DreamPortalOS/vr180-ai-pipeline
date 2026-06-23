@@ -49,9 +49,7 @@ class DepthEstimator:
             calibrate: Scale relative depth to approximate metric depth.
         """
         if model_size not in self.MODEL_REPOS:
-            raise ValueError(
-                f"Unknown model size '{model_size}'. Choose from: {list(self.MODEL_REPOS.keys())}"
-            )
+            raise ValueError(f"Unknown model size '{model_size}'. Choose from: {list(self.MODEL_REPOS.keys())}")
         self.model_size = model_size
         self.device = device or self._auto_device()
         self.calibrate = calibrate
@@ -60,6 +58,7 @@ class DepthEstimator:
     def _auto_device(self) -> str:
         """Auto-detect best available device."""
         import torch
+
         if torch.cuda.is_available():
             return "cuda"
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -111,8 +110,8 @@ class DepthEstimator:
         # Resize to match input resolution if needed
         if depth_np.shape[:2] != frame.shape[:2]:
             import cv2
-            depth_np = cv2.resize(depth_np, (frame.shape[1], frame.shape[0]),
-                                  interpolation=cv2.INTER_LINEAR)
+
+            depth_np = cv2.resize(depth_np, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
 
         # Normalize to [0, 1] range
         d_min, d_max = depth_np.min(), depth_np.max()

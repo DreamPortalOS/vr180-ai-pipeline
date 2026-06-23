@@ -34,14 +34,13 @@ log = logging.getLogger("inversion-test")
 OUTPUT_DIR = Path(__file__).parent.parent.parent / "video" / "inversion_tests"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+
 def get_video_info(video_path):
     """Extract video metadata using ffprobe."""
-    cmd = [
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", str(video_path)
-    ]
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(video_path)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     import json
+
     data = json.loads(result.stdout)
     for stream in data.get("streams", []):
         if stream.get("codec_type") == "video":
@@ -49,9 +48,10 @@ def get_video_info(video_path):
                 "width": int(stream.get("width", 0)),
                 "height": int(stream.get("height", 0)),
                 "duration": float(stream.get("duration", 0)),
-                "fps": eval(stream.get("r_frame_rate", "30/1"))
+                "fps": eval(stream.get("r_frame_rate", "30/1")),
             }
     return None
+
 
 def apply_cv2_flip(input_path, output_path, flip_code=0):
     """Apply vertical flip using OpenCV (frame-by-frame)."""
@@ -63,7 +63,7 @@ def apply_cv2_flip(input_path, output_path, flip_code=0):
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
     frame_count = 0
@@ -82,13 +82,24 @@ def apply_cv2_flip(input_path, output_path, flip_code=0):
     log.info(f"cv2.flip (code={flip_code}) applied: {frame_count} frames -> {output_path}")
     return True
 
+
 def apply_ffmpeg_vflip(input_path, output_path):
     """Apply vertical flip using ffmpeg vflip filter."""
     cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
-        "-vf", "vflip",
-        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-        "-an", str(output_path)
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        "vflip",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "medium",
+        "-an",
+        str(output_path),
     ]
     log.info(f"Running ffmpeg vflip: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -99,15 +110,26 @@ def apply_ffmpeg_vflip(input_path, output_path):
         log.error(f"ffmpeg vflip failed: {result.stderr[-500:]}")
         return False
 
+
 def apply_ffmpeg_v360_pitch(input_path, output_path, pitch=180):
     """Apply v360 pitch rotation using ffmpeg."""
     # v360 filter with pitch=180 rotates the equirectangular projection
     # vertically, effectively flipping the top and bottom.
     cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
-        "-vf", f"v360=e:e:pitch={pitch}",
-        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-        "-an", str(output_path)
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        f"v360=e:e:pitch={pitch}",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "medium",
+        "-an",
+        str(output_path),
     ]
     log.info(f"Running ffmpeg v360 (pitch={pitch}): {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -118,13 +140,24 @@ def apply_ffmpeg_v360_pitch(input_path, output_path, pitch=180):
         log.error(f"ffmpeg v360 failed: {result.stderr[-500:]}")
         return False
 
+
 def apply_ffmpeg_v360_roll(input_path, output_path, roll=180):
     """Apply v360 roll rotation using ffmpeg."""
     cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
-        "-vf", f"v360=e:e:roll={roll}",
-        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-        "-an", str(output_path)
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        f"v360=e:e:roll={roll}",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "medium",
+        "-an",
+        str(output_path),
     ]
     log.info(f"Running ffmpeg v360 (roll={roll}): {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -134,6 +167,7 @@ def apply_ffmpeg_v360_roll(input_path, output_path, roll=180):
     else:
         log.error(f"ffmpeg v360 roll failed: {result.stderr[-500:]}")
         return False
+
 
 def main():
     input_video = sys.argv[1] if len(sys.argv) > 1 else "video/testfpv_vr180.mp4"
@@ -151,7 +185,11 @@ def main():
     # Define test matrix
     tests = [
         ("01_original", None, "No transformation (baseline)"),
-        ("02_cv2_flip_vertical", lambda i, o: apply_cv2_flip(i, o, flip_code=0), "cv2.flip(frame, 0) - vertical flip around x-axis"),
+        (
+            "02_cv2_flip_vertical",
+            lambda i, o: apply_cv2_flip(i, o, flip_code=0),
+            "cv2.flip(frame, 0) - vertical flip around x-axis",
+        ),
         ("03_ffmpeg_vflip", apply_ffmpeg_vflip, "ffmpeg vflip filter"),
         ("04_ffmpeg_v360_pitch180", lambda i, o: apply_ffmpeg_v360_pitch(i, o, pitch=180), "ffmpeg v360=e:e:pitch=180"),
         ("05_ffmpeg_v360_roll180", lambda i, o: apply_ffmpeg_v360_roll(i, o, roll=180), "ffmpeg v360=e:e:roll=180"),
@@ -160,13 +198,14 @@ def main():
     # Generate test clips
     for name, transform_func, description in tests:
         output_path = OUTPUT_DIR / f"{name}.mp4"
-        log.info(f"\n{'='*60}")
+        log.info(f"\n{'=' * 60}")
         log.info(f"Test: {name}")
         log.info(f"Description: {description}")
 
         if transform_func is None:
             # Copy original
             import shutil
+
             shutil.copy2(input_video, output_path)
             log.info(f"Copied original -> {output_path}")
         else:
@@ -174,7 +213,7 @@ def main():
             if not success:
                 log.error(f"Failed to generate {name}")
 
-    log.info(f"\n{'='*60}")
+    log.info(f"\n{'=' * 60}")
     log.info(f"All test clips generated in: {OUTPUT_DIR}")
     log.info("Transfer these to Quest 3 and test playback orientation.")
     log.info("Expected correct orientation: right-side-up when viewed in VR.")
@@ -195,6 +234,7 @@ def main():
         f.write("4. The winning transformation will be integrated into the pipeline\n")
 
     log.info(f"Summary written to {summary}")
+
 
 if __name__ == "__main__":
     main()

@@ -83,30 +83,37 @@ class StreamingPipeline:
         enc_codec = codec_map.get(self.codec, "libx264")
 
         cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s", f"{width}x{height}",
-            "-r", str(self.fps),
-            "-i", "pipe:0",
-            "-c:v", enc_codec,
-            "-crf", str(self.crf),
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(self.fps),
+            "-i",
+            "pipe:0",
+            "-c:v",
+            enc_codec,
+            "-crf",
+            str(self.crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
             output_path,
         ]
         return cmd
 
-    def _open_ffmpeg_writer(
-        self, output_path: str, width: int, height: int
-    ) -> subprocess.Popen:
+    def _open_ffmpeg_writer(self, output_path: str, width: int, height: int) -> subprocess.Popen:
         """Open an ffmpeg subprocess that accepts raw RGB frames on stdin."""
         cmd = self._build_ffmpeg_cmd(output_path, width, height)
         log.info(f"ffmpeg cmd: {' '.join(cmd)}")
-        return subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     def process_stream(
         self,

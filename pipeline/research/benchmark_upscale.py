@@ -42,6 +42,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 @dataclass
 class BenchmarkResult:
     """Stores benchmark results for a single configuration."""
+
     method: str
     scale_factor: int
     total_frames: int
@@ -53,8 +54,7 @@ class BenchmarkResult:
     notes: str = ""
 
 
-def extract_frames(video_path: str, max_frames: int = 100,
-                   output_dir: str | None = None) -> list[str]:
+def extract_frames(video_path: str, max_frames: int = 100, output_dir: str | None = None) -> list[str]:
     """Extract frames from video for benchmarking."""
     if output_dir is None:
         output_dir = str(OUTPUT_DIR / "input_frames")
@@ -94,7 +94,7 @@ def measure_tile_discontinuity(image: np.ndarray, tile_size: int = 512) -> float
     # Check horizontal tile boundaries
     for y in range(tile_size, h, tile_size):
         if y < h:
-            row_above = image[y-1, :].astype(np.float32)
+            row_above = image[y - 1, :].astype(np.float32)
             row_below = image[y, :].astype(np.float32)
             diff = np.max(np.abs(row_above - row_below))
             max_diff = max(max_diff, diff)
@@ -102,7 +102,7 @@ def measure_tile_discontinuity(image: np.ndarray, tile_size: int = 512) -> float
     # Check vertical tile boundaries
     for x in range(tile_size, w, tile_size):
         if x < w:
-            col_left = image[:, x-1].astype(np.float32)
+            col_left = image[:, x - 1].astype(np.float32)
             col_right = image[:, x].astype(np.float32)
             diff = np.max(np.abs(col_left - col_right))
             max_diff = max(max_diff, diff)
@@ -110,8 +110,7 @@ def measure_tile_discontinuity(image: np.ndarray, tile_size: int = 512) -> float
     return max_diff
 
 
-def benchmark_ffmpeg_resize(frame_paths: list[str], scale: int,
-                            method: str = "lanczos") -> BenchmarkResult:
+def benchmark_ffmpeg_resize(frame_paths: list[str], scale: int, method: str = "lanczos") -> BenchmarkResult:
     """Benchmark ffmpeg-based resizing (Lanczos or Bicubic)."""
     log.info(f"Benchmarking ffmpeg {method} x{scale}...")
 
@@ -126,11 +125,7 @@ def benchmark_ffmpeg_resize(frame_paths: list[str], scale: int,
 
         # Use ffmpeg to resize
         interp = "lanczos" if method == "lanczos" else "bicubic"
-        cmd = [
-            "ffmpeg", "-y", "-i", frame_path,
-            "-vf", f"scale=iw*{scale}:ih*{scale}:flags={interp}",
-            out_path
-        ]
+        cmd = ["ffmpeg", "-y", "-i", frame_path, "-vf", f"scale=iw*{scale}:ih*{scale}:flags={interp}", out_path]
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode == 0 and os.path.exists(out_path):
@@ -140,7 +135,7 @@ def benchmark_ffmpeg_resize(frame_paths: list[str], scale: int,
                 max_discontinuity = max(max_discontinuity, disc)
 
         if (i + 1) % 20 == 0:
-            log.info(f"  {method}: {i+1}/{len(frame_paths)} frames")
+            log.info(f"  {method}: {i + 1}/{len(frame_paths)} frames")
 
     elapsed = time.time() - start
     avg_ms = (elapsed / len(frame_paths)) * 1000 if frame_paths else 0
@@ -162,12 +157,13 @@ def benchmark_ffmpeg_resize(frame_paths: list[str], scale: int,
         peak_memory_mb=0,  # ffmpeg is external process
         tile_edge_discontinuity=round(max_discontinuity, 2),
         output_resolution=resolution,
-        notes="External ffmpeg process; VRAM not measured"
+        notes="External ffmpeg process; VRAM not measured",
     )
 
 
-def benchmark_realesrgan(frame_paths: list[str], scale: int = 2,
-                          model_name: str = "RealESRGAN_x2plus") -> BenchmarkResult:
+def benchmark_realesrgan(
+    frame_paths: list[str], scale: int = 2, model_name: str = "RealESRGAN_x2plus"
+) -> BenchmarkResult:
     """
     Benchmark Real-ESRGAN upscaling.
 
@@ -182,8 +178,9 @@ def benchmark_realesrgan(frame_paths: list[str], scale: int = 2,
     # Check if realesrgan-ncnn-vulkan is available
     ncnn_available = False
     try:
-        subprocess.run(["realesrgan-ncnn-vulkan", "-i", "test", "-o", "test"],
-                                capture_output=True, text=True, timeout=5)
+        subprocess.run(
+            ["realesrgan-ncnn-vulkan", "-i", "test", "-o", "test"], capture_output=True, text=True, timeout=5
+        )
         ncnn_available = True
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
@@ -201,10 +198,14 @@ def benchmark_realesrgan(frame_paths: list[str], scale: int = 2,
     input_dir = str(Path(frame_paths[0]).parent)
     cmd = [
         "realesrgan-ncnn-vulkan",
-        "-i", input_dir,
-        "-o", str(output_dir),
-        "-s", str(scale),
-        "-n", model_name,
+        "-i",
+        input_dir,
+        "-o",
+        str(output_dir),
+        "-s",
+        str(scale),
+        "-n",
+        model_name,
     ]
     subprocess.run(cmd, capture_output=True, text=True)
     elapsed = time.time() - start
@@ -236,12 +237,13 @@ def benchmark_realesrgan(frame_paths: list[str], scale: int = 2,
         peak_memory_mb=round(peak_mem / 1024 / 1024, 2),
         tile_edge_discontinuity=round(max_discontinuity, 2),
         output_resolution=resolution,
-        notes="Used realesrgan-ncnn-vulkan"
+        notes="Used realesrgan-ncnn-vulkan",
     )
 
 
-def _benchmark_realesrgan_python(frame_paths: list[str], scale: int,
-                                  model_name: str, output_dir: Path) -> BenchmarkResult:
+def _benchmark_realesrgan_python(
+    frame_paths: list[str], scale: int, model_name: str, output_dir: Path
+) -> BenchmarkResult:
     """Python-based Real-ESRGAN benchmark using basicsr/realesrgan."""
     try:
         import torch
@@ -292,7 +294,7 @@ def _benchmark_realesrgan_python(frame_paths: list[str], scale: int,
             max_discontinuity = max(max_discontinuity, disc)
 
             if (i + 1) % 20 == 0:
-                log.info(f"  realesrgan x{scale}: {i+1}/{len(frame_paths)} frames")
+                log.info(f"  realesrgan x{scale}: {i + 1}/{len(frame_paths)} frames")
 
         elapsed = time.time() - start
         _, peak_mem = tracemalloc.get_traced_memory()
@@ -316,7 +318,7 @@ def _benchmark_realesrgan_python(frame_paths: list[str], scale: int,
             peak_memory_mb=round(peak_mem / 1024 / 1024, 2),
             tile_edge_discontinuity=round(max_discontinuity, 2),
             output_resolution=resolution,
-            notes=f"Python basicsr; device={device}"
+            notes=f"Python basicsr; device={device}",
         )
 
     except ImportError as e:
@@ -330,7 +332,7 @@ def _benchmark_realesrgan_python(frame_paths: list[str], scale: int,
             peak_memory_mb=0,
             tile_edge_discontinuity=0,
             output_resolution="N/A",
-            notes=f"SKIPPED: {e}"
+            notes=f"SKIPPED: {e}",
         )
 
 
@@ -347,10 +349,12 @@ def generate_report(results: list[BenchmarkResult], output_path: str):
         for r in results:
             if r.total_frames == 0:
                 continue
-            f.write(f"| {r.method} | x{r.scale_factor} | {r.total_frames} | "
-                    f"{r.total_time_sec:.1f}s | {r.avg_time_per_frame_ms:.0f}ms | "
-                    f"{r.peak_memory_mb:.0f}MB | {r.tile_edge_discontinuity:.0f} | "
-                    f"{r.output_resolution} |\n")
+            f.write(
+                f"| {r.method} | x{r.scale_factor} | {r.total_frames} | "
+                f"{r.total_time_sec:.1f}s | {r.avg_time_per_frame_ms:.0f}ms | "
+                f"{r.peak_memory_mb:.0f}MB | {r.tile_edge_discontinuity:.0f} | "
+                f"{r.output_resolution} |\n"
+            )
 
         f.write("\n## Key Findings\n\n")
 
@@ -362,7 +366,9 @@ def generate_report(results: list[BenchmarkResult], output_path: str):
 
             # Find lowest seam artifact
             best_seam = min(valid, key=lambda r: r.tile_edge_discontinuity)
-            f.write(f"- **Best tile seam**: {best_seam.method} (discontinuity={best_seam.tile_edge_discontinuity:.0f})\n")
+            f.write(
+                f"- **Best tile seam**: {best_seam.method} (discontinuity={best_seam.tile_edge_discontinuity:.0f})\n"
+            )
 
             # Find most memory efficient
             mem_valid = [r for r in valid if r.peak_memory_mb > 0]
@@ -385,14 +391,14 @@ def generate_report(results: list[BenchmarkResult], output_path: str):
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser(description="Upscale Model Benchmark")
-    parser.add_argument("input", nargs="?", default="video/testfpv.mp4",
-                        help="Input video path")
+    parser.add_argument("input", nargs="?", default="video/testfpv.mp4", help="Input video path")
     parser.add_argument("--frames", type=int, default=50, help="Number of frames to benchmark")
     parser.add_argument("--scale", type=int, default=2, help="Upscale factor (2 or 4)")
-    parser.add_argument("--methods", nargs="+",
-                        default=["ffmpeg_lanczos", "ffmpeg_bicubic", "realesrgan"],
-                        help="Methods to benchmark")
+    parser.add_argument(
+        "--methods", nargs="+", default=["ffmpeg_lanczos", "ffmpeg_bicubic", "realesrgan"], help="Methods to benchmark"
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.input):

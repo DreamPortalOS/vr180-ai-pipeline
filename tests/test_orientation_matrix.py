@@ -87,7 +87,7 @@ class TestGenerateOrientationMatrix:
         # Grid should have correct dimensions
         label_h = 40
         expected_h = 5 * (60 + label_h)  # 5 transpose rows
-        expected_w = 4 * 80              # 4 flip cols
+        expected_w = 4 * 80  # 4 flip cols
         assert grid.shape == (expected_h, expected_w, 3)
 
     def test_combo_map_keys(self):
@@ -110,9 +110,7 @@ class TestGenerateOrientationMatrix:
 
     def test_custom_flip_types(self):
         frame = np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8)
-        _, combo_map = generate_orientation_matrix(
-            frame, flip_types=["none", "vflip"], transpose_types=["none"]
-        )
+        _, combo_map = generate_orientation_matrix(frame, flip_types=["none", "vflip"], transpose_types=["none"])
         assert len(combo_map) == 2
 
     def test_transposed_frames_have_correct_size(self):

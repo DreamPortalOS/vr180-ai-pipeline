@@ -161,20 +161,14 @@ class TestOutpaintSequence:
 
     def test_outpaint_returns_correct_count(self):
         outpainter = TemporalOutpainter(max_iterations=1)
-        frames = [
-            np.random.randint(0, 255, (40, 60, 3), dtype=np.uint8)
-            for _ in range(5)
-        ]
+        frames = [np.random.randint(0, 255, (40, 60, 3), dtype=np.uint8) for _ in range(5)]
         results, metrics_list = outpainter.outpaint(frames)
         assert len(results) == 5
         assert len(metrics_list) == 5
 
     def test_auto_mask_detection(self):
         outpainter = TemporalOutpainter(max_iterations=1)
-        frames = [
-            np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8)
-            for _ in range(3)
-        ]
+        frames = [np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8) for _ in range(3)]
         results, _metrics_list = outpainter.outpaint(frames, mask=None)
         assert len(results) == 3
 
@@ -193,7 +187,7 @@ class TestQualityMetrics:
         frame = np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8)
         mask = np.zeros((60, 80), dtype=bool)
         psnr = outpainter._compute_psnr(frame, frame.copy(), mask)
-        assert psnr == float('inf')
+        assert psnr == float("inf")
 
     def test_ssim_identical_frames(self):
         outpainter = TemporalOutpainter()

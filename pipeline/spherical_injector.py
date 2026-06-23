@@ -7,6 +7,7 @@ References:
 - Google spatial-media: https://github.com/google/spatial-media
 - Google Spherical Video V2 spec
 """
+
 import contextlib
 import os
 import shutil
@@ -108,10 +109,10 @@ def _find_box_at(buf: bytearray, box_type: bytes, start: int, end: int) -> int:
     """
     pos = start
     while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos:pos + 4])[0]
+        size = struct.unpack(">I", buf[pos : pos + 4])[0]
         if size < 8:
             break
-        if buf[pos + 4:pos + 8] == box_type:
+        if buf[pos + 4 : pos + 8] == box_type:
             return pos
         pos += size
     return -1
@@ -126,10 +127,10 @@ def _find_box_recursive(buf: bytearray, box_type: bytes, start: int, end: int) -
     containers = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
     pos = start
     while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos:pos + 4])[0]
+        size = struct.unpack(">I", buf[pos : pos + 4])[0]
         if size < 8 or pos + size > end:
             break
-        btype = bytes(buf[pos + 4:pos + 8])
+        btype = bytes(buf[pos + 4 : pos + 8])
         if btype == box_type:
             return pos
         if btype in containers:
@@ -164,9 +165,7 @@ def inject_spherical_metadata(
     Returns:
         Path to output file
     """
-    success = _inject_via_spatialmedia_cli(
-        input_path, output_path, stereo_mode
-    )
+    success = _inject_via_spatialmedia_cli(input_path, output_path, stereo_mode)
     if not success:
         # Fallback: copy file and inject via udta XML
         print("[Metadata] spatial-media not available, using ffmpeg fallback")
@@ -188,10 +187,15 @@ def _inject_via_spatialmedia_cli(
     try:
         sm_stereo = "left-right" if stereo_mode == "sbs" else "top-bottom"
         cmd = [
-            "python3", "-m", "spatialmedia",
-            "-i", "-2",
-            "-s", sm_stereo,
-            "-p", "equirectangular",
+            "python3",
+            "-m",
+            "spatialmedia",
+            "-i",
+            "-2",
+            "-s",
+            sm_stereo,
+            "-p",
+            "equirectangular",
             input_path,
             output_path,
         ]
@@ -239,11 +243,16 @@ def _inject_via_ffmpeg_udta(output_path: str, stereo_mode: str):
     try:
         tmp = output_path + ".remux.mp4"
         cmd = [
-            "ffmpeg", "-y",
-            "-i", output_path,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            "-metadata:s:v", f"spherical-video={xml}",
+            "ffmpeg",
+            "-y",
+            "-i",
+            output_path,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-metadata:s:v",
+            f"spherical-video={xml}",
             tmp,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)

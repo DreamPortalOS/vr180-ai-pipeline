@@ -48,93 +48,79 @@ log = logging.getLogger("vr180-pipeline")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="2D AI Video → VR180 Conversion Pipeline"
+    parser = argparse.ArgumentParser(description="2D AI Video → VR180 Conversion Pipeline")
+    parser.add_argument("--input", "-i", required=True, help="Input video file (MP4, MOV, etc.)")
+    parser.add_argument("--output", "-o", default=None, help="Output VR180 video path")
+    parser.add_argument(
+        "--stage",
+        "-s",
+        choices=["all", "depth", "stereo", "equirect", "metadata"],
+        default="all",
+        help="Pipeline stage to run (default: all)",
     )
-    parser.add_argument("--input", "-i", required=True,
-                        help="Input video file (MP4, MOV, etc.)")
-    parser.add_argument("--output", "-o", default=None,
-                        help="Output VR180 video path")
-    parser.add_argument("--stage", "-s",
-                        choices=["all", "depth", "stereo", "equirect", "metadata"],
-                        default="all",
-                        help="Pipeline stage to run (default: all)")
-    parser.add_argument("--model-size",
-                        default="small",
-                        choices=["small", "base", "large"],
-                        help="Depth Anything V2 model size")
-    parser.add_argument("--device", default=None,
-                        help="Compute device (cuda, mps, cpu)")
-    parser.add_argument("--ipd", type=float, default=0.064,
-                        help="Interpupillary distance in meters")
-    parser.add_argument("--max-disparity", type=float, default=0.05,
-                        help="Max disparity as fraction of image width")
-    parser.add_argument("--codec", choices=["h264", "h265"], default="h264",
-                        help="Output video codec")
-    parser.add_argument("--crf", type=int, default=23,
-                        help="Constant rate factor")
-    parser.add_argument("--fps", type=int, default=None,
-                        help="Output frame rate (default: inherit from source video)")
-    parser.add_argument("--output-width", type=int, default=3840,
-                        help="Equirectangular output width per eye")
-    parser.add_argument("--output-height", type=int, default=1920,
-                        help="Equirectangular output height per eye")
-    parser.add_argument("--src-hfov", type=float, default=70.0,
-                        help="Source camera horizontal FOV (degrees)")
-    parser.add_argument("--max-frames", type=int, default=None,
-                        help="Limit number of frames (for testing)")
-    parser.add_argument("--no-temporal", action="store_true",
-                        help="Disable temporal smoothing")
-    parser.add_argument("--temp-dir", default=None,
-                        help="Directory for intermediate files")
-    parser.add_argument("--no-ffmpeg-v360", action="store_true",
-                        help="Disable ffmpeg v360, use OpenCV fallback")
-    parser.add_argument("--no-flip", action="store_true",
-                        help="Disable vertical flip (default: flip on for VR headset)")
+    parser.add_argument(
+        "--model-size", default="small", choices=["small", "base", "large"], help="Depth Anything V2 model size"
+    )
+    parser.add_argument("--device", default=None, help="Compute device (cuda, mps, cpu)")
+    parser.add_argument("--ipd", type=float, default=0.064, help="Interpupillary distance in meters")
+    parser.add_argument("--max-disparity", type=float, default=0.05, help="Max disparity as fraction of image width")
+    parser.add_argument("--codec", choices=["h264", "h265"], default="h264", help="Output video codec")
+    parser.add_argument("--crf", type=int, default=23, help="Constant rate factor")
+    parser.add_argument("--fps", type=int, default=None, help="Output frame rate (default: inherit from source video)")
+    parser.add_argument("--output-width", type=int, default=3840, help="Equirectangular output width per eye")
+    parser.add_argument("--output-height", type=int, default=1920, help="Equirectangular output height per eye")
+    parser.add_argument("--src-hfov", type=float, default=70.0, help="Source camera horizontal FOV (degrees)")
+    parser.add_argument("--max-frames", type=int, default=None, help="Limit number of frames (for testing)")
+    parser.add_argument("--no-temporal", action="store_true", help="Disable temporal smoothing")
+    parser.add_argument("--temp-dir", default=None, help="Directory for intermediate files")
+    parser.add_argument("--no-ffmpeg-v360", action="store_true", help="Disable ffmpeg v360, use OpenCV fallback")
+    parser.add_argument(
+        "--no-flip", action="store_true", help="Disable vertical flip (default: flip on for VR headset)"
+    )
 
     # New: temporal smoothing
-    parser.add_argument("--temporal-smoothing", type=float, default=0.0,
-                        help="Temporal EMA alpha for depth smoothing (0=off, 0.3-0.5)")
-    parser.add_argument("--stereo-smoothing", type=float, default=0.0,
-                        help="Temporal EMA alpha for stereo shift (0=off)")
-    parser.add_argument("--baseline", type=int, default=0,
-                        help="Override stereo baseline shift in pixels (0=use IPD-based)")
+    parser.add_argument(
+        "--temporal-smoothing", type=float, default=0.0, help="Temporal EMA alpha for depth smoothing (0=off, 0.3-0.5)"
+    )
+    parser.add_argument(
+        "--stereo-smoothing", type=float, default=0.0, help="Temporal EMA alpha for stereo shift (0=off)"
+    )
+    parser.add_argument(
+        "--baseline", type=int, default=0, help="Override stereo baseline shift in pixels (0=use IPD-based)"
+    )
 
     # New: pixel upscaling
-    parser.add_argument("--upscale", type=int, default=0, choices=[0, 2, 4],
-                        help="Upscale factor (0=off, 2=2×, 4=4×)")
-    parser.add_argument("--upscale-model", default=None,
-                        help="Real-ESRGAN model name (auto if omitted)")
-    parser.add_argument("--upscale-ffmpeg", action="store_true",
-                        help="Use ffmpeg/OpenCV lanczos upscale instead of Real-ESRGAN")
+    parser.add_argument("--upscale", type=int, default=0, choices=[0, 2, 4], help="Upscale factor (0=off, 2=2×, 4=4×)")
+    parser.add_argument("--upscale-model", default=None, help="Real-ESRGAN model name (auto if omitted)")
+    parser.add_argument(
+        "--upscale-ffmpeg", action="store_true", help="Use ffmpeg/OpenCV lanczos upscale instead of Real-ESRGAN"
+    )
 
     # New: output encoding options
-    parser.add_argument("--bitrate", default=None,
-                        help="Target bitrate (e.g., 50M). Overrides CRF if set.")
-    parser.add_argument("--hardware-encoder", action="store_true",
-                        help="Use hardware encoder (VideoToolbox)")
+    parser.add_argument("--bitrate", default=None, help="Target bitrate (e.g., 50M). Overrides CRF if set.")
+    parser.add_argument("--hardware-encoder", action="store_true", help="Use hardware encoder (VideoToolbox)")
 
     # New: input validation
-    parser.add_argument("--validate-input", action="store_true",
-                        help="Validate input video format and print recommendations")
+    parser.add_argument(
+        "--validate-input", action="store_true", help="Validate input video format and print recommendations"
+    )
 
     # New: checkpoint/resume
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from last completed checkpoint stage")
+    parser.add_argument("--resume", action="store_true", help="Resume from last completed checkpoint stage")
 
     # Phase 1: Streaming pipeline (PRD §7.2)
-    parser.add_argument("--streaming", action="store_true",
-                        help="Use streaming pipeline (O(1) memory, pipes to ffmpeg)")
+    parser.add_argument(
+        "--streaming", action="store_true", help="Use streaming pipeline (O(1) memory, pipes to ffmpeg)"
+    )
 
     # Phase 1: Tiled upscaling (PRD §7.4)
-    parser.add_argument("--tiled-upscale", action="store_true",
-                        help="Use tiled upscaling for large frames (8K-safe)")
-    parser.add_argument("--tile-size", type=int, default=512,
-                        help="Tile size for tiled upscaling (default: 512)")
+    parser.add_argument("--tiled-upscale", action="store_true", help="Use tiled upscaling for large frames (8K-safe)")
+    parser.add_argument("--tile-size", type=int, default=512, help="Tile size for tiled upscaling (default: 512)")
 
     # Phase 2: Smart SBS detection (Task 1.1)
-    parser.add_argument("--force-sbs", action="store_true",
-                        help="Force treat input as SBS stereo (skip depth/stereo stages)")
+    parser.add_argument(
+        "--force-sbs", action="store_true", help="Force treat input as SBS stereo (skip depth/stereo stages)"
+    )
 
     return parser.parse_args()
 
@@ -150,9 +136,11 @@ def read_frames(video_path: str, max_frames: int | None = None):
     if max_frames:
         total = min(total, max_frames)
 
-    log.info(f"Video: {fps:.2f} fps, {total} frames, "
-             f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
-             f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+    log.info(
+        f"Video: {fps:.2f} fps, {total} frames, "
+        f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+        f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
+    )
 
     count = 0
     while count < total:
@@ -218,8 +206,7 @@ def run_depth_stage(args, frames):
         # Save depth map for inspection
         dmax = float(np.nanmax(depth))
         depth_vis = (depth / dmax * 255).astype(np.uint8) if dmax > 0 else depth.astype(np.uint8)
-        cv2.imwrite(os.path.join(out_dir, f"depth_{i:06d}.png"),
-                    cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO))
+        cv2.imwrite(os.path.join(out_dir, f"depth_{i:06d}.png"), cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO))
         np.save(os.path.join(out_dir, f"depth_{i:06d}.npy"), depth)
 
     log.info(f"Depth maps saved to {out_dir}/")
@@ -248,10 +235,8 @@ def run_stereo_stage(args, frames, depths):
         right_frames.append(right)
 
         # Save intermediate files
-        cv2.imwrite(os.path.join(left_dir, f"left_{i:06d}.png"),
-                    cv2.cvtColor(left, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(os.path.join(right_dir, f"right_{i:06d}.png"),
-                    cv2.cvtColor(right, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(left_dir, f"left_{i:06d}.png"), cv2.cvtColor(left, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(right_dir, f"right_{i:06d}.png"), cv2.cvtColor(right, cv2.COLOR_RGB2BGR))
 
     log.info(f"Stereo views: {len(left_frames)} frames each")
     return left_frames, right_frames
@@ -271,16 +256,15 @@ def run_equirect_stage(args, left_frames, right_frames):
     out_dir = get_temp_dir(args, "equirect")
     sbs_frames = []
     for i, (left, right) in enumerate(
-        tqdm(zip(left_frames, right_frames, strict=False),
-             desc="Mapping to equirect", total=len(left_frames))
+        tqdm(zip(left_frames, right_frames, strict=False), desc="Mapping to equirect", total=len(left_frames))
     ):
         sbs = mapper.map_stereo_pair(left, right)
         sbs_frames.append(sbs)
-        cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"),
-                    cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
 
-    log.info(f"Generated {len(sbs_frames)} equirectangular SBS frames "
-             f"({sbs_frames[0].shape[1]}×{sbs_frames[0].shape[0]})")
+    log.info(
+        f"Generated {len(sbs_frames)} equirectangular SBS frames ({sbs_frames[0].shape[1]}×{sbs_frames[0].shape[0]})"
+    )
     return sbs_frames
 
 
@@ -299,7 +283,10 @@ def run_metadata_stage(args, sbs_frames):
     H, W = sbs_frames[0].shape[:2]
     log.info(f"Encoding {len(sbs_frames)} frames ({W}×{H}) → {output_path}")
     result = embedder.embed_single_frame_batch(
-        sbs_frames, output_path, width=W, height=H,
+        sbs_frames,
+        output_path,
+        width=W,
+        height=H,
     )
     return result
 
@@ -313,8 +300,7 @@ def run_upscale_stage(args, frames):
         upscaled = []
         for frame in tqdm(frames, desc="Upscaling (lanczos)"):
             h, w = frame.shape[:2]
-            result = cv2.resize(frame, (w * args.upscale, h * args.upscale),
-                                interpolation=cv2.INTER_LANCZOS4)
+            result = cv2.resize(frame, (w * args.upscale, h * args.upscale), interpolation=cv2.INTER_LANCZOS4)
             upscaled.append(result)
         return upscaled
 
@@ -329,8 +315,7 @@ def run_upscale_stage(args, frames):
         upscaled = []
         for frame in tqdm(frames, desc="Upscaling (lanczos)"):
             h, w = frame.shape[:2]
-            result = cv2.resize(frame, (w * args.upscale, h * args.upscale),
-                                interpolation=cv2.INTER_LANCZOS4)
+            result = cv2.resize(frame, (w * args.upscale, h * args.upscale), interpolation=cv2.INTER_LANCZOS4)
             upscaled.append(result)
         return upscaled
 
@@ -342,7 +327,8 @@ def run_upscale_stage(args, frames):
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         if use_tiled:
             result_bgr = upscaler.upscale_tiled(
-                frame_bgr, tile_size=tile_size,
+                frame_bgr,
+                tile_size=tile_size,
                 progress_callback=None,
             )
         else:
@@ -350,9 +336,11 @@ def run_upscale_stage(args, frames):
         result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
         upscaled.append(result_rgb)
 
-    log.info(f"Upscaled {len(upscaled)} frames: "
-             f"{frames[0].shape[1]}×{frames[0].shape[0]} → "
-             f"{upscaled[0].shape[1]}×{upscaled[0].shape[0]}")
+    log.info(
+        f"Upscaled {len(upscaled)} frames: "
+        f"{frames[0].shape[1]}×{frames[0].shape[0]} → "
+        f"{upscaled[0].shape[1]}×{upscaled[0].shape[0]}"
+    )
     return upscaled
 
 
@@ -376,11 +364,23 @@ def validate_input_format(input_path: str):
     # Get codec info via ffprobe
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=codec_name,pix_fmt,bit_rate,profile",
-             "-show_entries", "format=format_name,bit_rate",
-             "-of", "json", input_path],
-            capture_output=True, text=True, timeout=10,
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,pix_fmt,bit_rate,profile",
+                "-show_entries",
+                "format=format_name,bit_rate",
+                "-of",
+                "json",
+                input_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         info = json.loads(result.stdout) if result.returncode == 0 else {}
     except Exception:
@@ -401,7 +401,7 @@ def validate_input_format(input_path: str):
     print(f"  Resolution: {w}×{h}")
     print(f"  FPS:       {fps:.2f}")
     print(f"  Duration:  {duration:.2f}s ({total} frames)")
-    print(f"  Bitrate:   {int(bitrate)//1000 if bitrate != 'unknown' else '?'} kbps")
+    print(f"  Bitrate:   {int(bitrate) // 1000 if bitrate != 'unknown' else '?'} kbps")
     print()
 
     score = 0
@@ -549,14 +549,10 @@ def detect_sbs_input(video_path: str, force_sbs: bool = False) -> bool:
 
     if is_sbs:
         log.info(
-            f"🔍 SBS auto-detection: {w}×{h} (ratio {ratio:.2f}:1) → "
-            f"SBS stereo detected! Skipping depth/stereo stages."
+            f"🔍 SBS auto-detection: {w}×{h} (ratio {ratio:.2f}:1) → SBS stereo detected! Skipping depth/stereo stages."
         )
     else:
-        log.info(
-            f"🔍 SBS auto-detection: {w}×{h} (ratio {ratio:.2f}:1) → "
-            f"Standard 2D input. Running full pipeline."
-        )
+        log.info(f"🔍 SBS auto-detection: {w}×{h} (ratio {ratio:.2f}:1) → Standard 2D input. Running full pipeline.")
 
     return is_sbs
 
@@ -614,9 +610,7 @@ def main():
             fps=args.fps,
         )
         output = get_output_path(args)
-        result = pipeline.process_stream(
-            args.input, output, max_frames=args.max_frames
-        )
+        result = pipeline.process_stream(args.input, output, max_frames=args.max_frames)
         log.info(f"✅ Streaming pipeline complete → {result}")
         return
 
@@ -677,6 +671,7 @@ def main():
                     # Load depth maps from disk
                     depth_dir = get_temp_dir(args, "depth")
                     import glob
+
                     depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
                     depths = [np.load(f) for f in depth_files]
                     log.info(f"📂 Loaded {len(depths)} depth maps from checkpoint")
@@ -705,6 +700,7 @@ def main():
                 elif left_frames is None:
                     # Standard input: load from checkpoint
                     import glob
+
                     left_dir = get_temp_dir(args, "left")
                     right_dir = get_temp_dir(args, "right")
                     left_files = sorted(glob.glob(os.path.join(left_dir, "*.png")))
@@ -718,6 +714,7 @@ def main():
             elif stage == "metadata":
                 if sbs_frames is None:
                     import glob
+
                     eq_dir = get_temp_dir(args, "equirect")
                     files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
                     sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
@@ -744,6 +741,7 @@ def main():
         left_dir = get_temp_dir(args, "left")
         right_dir = get_temp_dir(args, "right")
         import glob
+
         left_files = sorted(glob.glob(os.path.join(left_dir, "*.png")))
         right_files = sorted(glob.glob(os.path.join(right_dir, "*.png")))
         left_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in left_files]
@@ -753,6 +751,7 @@ def main():
     elif args.stage == "metadata":
         eq_dir = get_temp_dir(args, "equirect")
         import glob
+
         files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
         frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
         run_metadata_stage(args, frames)

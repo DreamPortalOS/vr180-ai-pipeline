@@ -38,6 +38,7 @@ log = logging.getLogger("ai-outpainter")
 @dataclass
 class OutpaintRegion:
     """Defines a region to outpaint in equirectangular space."""
+
     name: str
     y_start: int
     y_end: int
@@ -66,9 +67,9 @@ class MockOmniOutpainter:
             try:
                 import torch
                 from diffusers import StableDiffusionInpaintPipeline
+
                 self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
-                    model_path,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                    model_path, torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
                 )
                 if torch.cuda.is_available():
                     self.pipe = self.pipe.to("cuda")
@@ -79,8 +80,9 @@ class MockOmniOutpainter:
             except Exception as e:
                 log.warning(f"Failed to load SD model: {e}, using OpenCV fallback")
 
-    def outpaint_region(self, frame: np.ndarray, mask: np.ndarray,
-                        prompt: str = "seamless sky environment") -> np.ndarray:
+    def outpaint_region(
+        self, frame: np.ndarray, mask: np.ndarray, prompt: str = "seamless sky environment"
+    ) -> np.ndarray:
         """
         Outpaint a masked region of the frame.
 
@@ -97,8 +99,7 @@ class MockOmniOutpainter:
         else:
             return self._outpaint_with_opencv(frame, mask)
 
-    def _outpaint_with_sd(self, frame: np.ndarray, mask: np.ndarray,
-                          prompt: str) -> np.ndarray:
+    def _outpaint_with_sd(self, frame: np.ndarray, mask: np.ndarray, prompt: str) -> np.ndarray:
         """Outpaint using Stable Diffusion inpainting."""
         from PIL import Image
 
@@ -151,10 +152,7 @@ class MockOmniOutpainter:
 
         if np.any(transition_zone > 0):
             # Create Gaussian weight for smooth blending
-            weight = cv2.GaussianBlur(
-                transition_zone.astype(np.float32) / 255.0,
-                (21, 21), 0
-            )
+            weight = cv2.GaussianBlur(transition_zone.astype(np.float32) / 255.0, (21, 21), 0)
             weight = np.stack([weight] * 3, axis=-1)
             filled = (filled * weight + frame * (1 - weight)).astype(np.uint8)
 
@@ -187,38 +185,29 @@ class EquirectangularOutpainter:
         regions = []
 
         # Detect if top/bottom regions are black (unfilled)
-        top_strip = frame[0:h//10, :, :]
-        bottom_strip = frame[h*9//10:h, :, :]
+        top_strip = frame[0 : h // 10, :, :]
+        bottom_strip = frame[h * 9 // 10 : h, :, :]
 
         # Check if regions are mostly black (unfilled equirectangular areas)
         if np.mean(top_strip) < 30:
             # Top needs outpainting (sky/zenith region)
             top_mask = np.zeros((h, w), dtype=np.uint8)
-            top_mask[0:h//6, :] = 255
+            top_mask[0 : h // 6, :] = 255
             mask = cv2.bitwise_or(mask, top_mask)
-            regions.append(OutpaintRegion(
-                name="zenith",
-                y_start=0,
-                y_end=h//6,
-                description="Top pole / sky region"
-            ))
+            regions.append(OutpaintRegion(name="zenith", y_start=0, y_end=h // 6, description="Top pole / sky region"))
 
         if np.mean(bottom_strip) < 30:
             # Bottom needs outpainting (ground/nadir region)
             bottom_mask = np.zeros((h, w), dtype=np.uint8)
-            bottom_mask[h*5//6:h, :] = 255
+            bottom_mask[h * 5 // 6 : h, :] = 255
             mask = cv2.bitwise_or(mask, bottom_mask)
-            regions.append(OutpaintRegion(
-                name="nadir",
-                y_start=h*5//6,
-                y_end=h,
-                description="Bottom pole / ground region"
-            ))
+            regions.append(
+                OutpaintRegion(name="nadir", y_start=h * 5 // 6, y_end=h, description="Bottom pole / ground region")
+            )
 
         return mask, regions
 
-    def expand_to_full_equirect(self, frame: np.ndarray,
-                                 outpainter: MockOmniOutpainter) -> np.ndarray:
+    def expand_to_full_equirect(self, frame: np.ndarray, outpainter: MockOmniOutpainter) -> np.ndarray:
         """
         Expand a partial equirectangular frame to fill the full sphere.
 
@@ -242,8 +231,7 @@ class EquirectangularOutpainter:
 
         # Outpaint the masked regions
         result = outpainter.outpaint_region(
-            frame, mask,
-            prompt="seamless equirectangular sky environment, continuous panorama"
+            frame, mask, prompt="seamless equirectangular sky environment, continuous panorama"
         )
 
         return result
@@ -266,12 +254,12 @@ class TemporalOutpaintPropagator:
         self.keyframe_borders = None
         self.keyframe_gray = None
 
-    def _compute_optical_flow(self, prev_gray: np.ndarray,
-                               curr_gray: np.ndarray) -> np.ndarray:
+    def _compute_optical_flow(self, prev_gray: np.ndarray, curr_gray: np.ndarray) -> np.ndarray:
         """Compute optical flow between two grayscale frames."""
         if self.method == "farneback":
             flow = cv2.calcOpticalFlowFarneback(
-                prev_gray, curr_gray,
+                prev_gray,
+                curr_gray,
                 None,
                 pyr_scale=0.5,
                 levels=3,
@@ -279,13 +267,14 @@ class TemporalOutpaintPropagator:
                 iterations=3,
                 poly_n=5,
                 poly_sigma=1.2,
-                flags=0
+                flags=0,
             )
         elif self.method == "lucaskanade":
             # Sparse Lucas-Kanade (for keypoint-based tracking)
             # Convert to dense flow representation
             flow = cv2.calcOpticalFlowFarneback(
-                prev_gray, curr_gray,
+                prev_gray,
+                curr_gray,
                 None,
                 pyr_scale=0.5,
                 levels=3,
@@ -293,7 +282,7 @@ class TemporalOutpaintPropagator:
                 iterations=3,
                 poly_n=5,
                 poly_sigma=1.2,
-                flags=0
+                flags=0,
             )
         else:
             raise ValueError(f"Unknown flow method: {self.method}")
@@ -303,10 +292,9 @@ class TemporalOutpaintPropagator:
     def _warp_frame(self, frame: np.ndarray, flow: np.ndarray) -> np.ndarray:
         """Warp a frame using optical flow field."""
         h, w = frame.shape[:2]
-        flow_map = np.column_stack((
-            np.repeat(np.arange(w), h),
-            np.tile(np.arange(h), w)
-        )).reshape(h, w, 2).astype(np.float32)
+        flow_map = (
+            np.column_stack((np.repeat(np.arange(w), h), np.tile(np.arange(h), w))).reshape(h, w, 2).astype(np.float32)
+        )
 
         # Add flow to create mapping
         flow_map += flow
@@ -317,7 +305,7 @@ class TemporalOutpaintPropagator:
             flow_map[:, :, 0].astype(np.float32),
             flow_map[:, :, 1].astype(np.float32),
             cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT
+            borderMode=cv2.BORDER_REFLECT,
         )
         return warped
 
@@ -333,8 +321,7 @@ class TemporalOutpaintPropagator:
         self.keyframe_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.prev_gray = self.keyframe_gray.copy()
 
-    def propagate(self, current_frame: np.ndarray,
-                  border_mask: np.ndarray) -> np.ndarray:
+    def propagate(self, current_frame: np.ndarray, border_mask: np.ndarray) -> np.ndarray:
         """
         Propagate keyframe borders to current frame using optical flow.
 
@@ -364,8 +351,7 @@ class TemporalOutpaintPropagator:
         mask_smooth = cv2.GaussianBlur(mask_3ch, (21, 21), 0)
 
         # Composite: current frame in center, warped borders at edges
-        result = (current_frame * (1 - mask_smooth) +
-                  warped_borders * mask_smooth).astype(np.uint8)
+        result = (current_frame * (1 - mask_smooth) + warped_borders * mask_smooth).astype(np.uint8)
 
         # Update state
         self.prev_gray = current_gray.copy()
@@ -422,21 +408,33 @@ def process_video_with_outpainting(
 
     # Setup ffmpeg output pipe
     ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-pix_fmt", "bgr24", "-s", f"{width}x{height}",
-        "-r", str(fps), "-i", "pipe:0",
-        "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-        "-pix_fmt", "yuv420p", "-an",
-        output_path
+        "ffmpeg",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "pipe:0",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "medium",
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        output_path,
     ]
 
-    proc = subprocess.Popen(
-        ffmpeg_cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
+    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     frame_idx = 0
     keyframe_set = False
@@ -459,8 +457,8 @@ def process_video_with_outpainting(
                 if not np.any(border_mask > 0):
                     # Create default border mask (top and bottom 15%)
                     border_mask = np.zeros((height, width), dtype=np.uint8)
-                    border_mask[0:height//7, :] = 255
-                    border_mask[height*6//7:height, :] = 255
+                    border_mask[0 : height // 7, :] = 255
+                    border_mask[height * 6 // 7 : height, :] = 255
 
                 # Set keyframe for propagation
                 propagator.set_keyframe(frame, outpainted)
@@ -494,7 +492,7 @@ def process_video_with_outpainting(
     proc.wait()
 
     elapsed = time.time() - start_time
-    log.info(f"Complete: {frame_idx} frames in {elapsed:.1f}s ({frame_idx/elapsed:.1f} fps)")
+    log.info(f"Complete: {frame_idx} frames in {elapsed:.1f}s ({frame_idx / elapsed:.1f} fps)")
     log.info(f"Output: {output_path}")
 
     if proc.returncode != 0:
@@ -506,12 +504,11 @@ def process_video_with_outpainting(
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser(description="AI Outpainting for VR180")
-    parser.add_argument("input", nargs="?", default="video/testfpv_vr180.mp4",
-                        help="Input video path")
+    parser.add_argument("input", nargs="?", default="video/testfpv_vr180.mp4", help="Input video path")
     parser.add_argument("--output", default=None, help="Output video path")
-    parser.add_argument("--method", choices=["mock", "local_sd"], default="mock",
-                        help="Outpainting method")
+    parser.add_argument("--method", choices=["mock", "local_sd"], default="mock", help="Outpainting method")
     parser.add_argument("--model-path", default=None, help="Path to SD inpaint model")
     parser.add_argument("--max-frames", type=int, default=30, help="Max frames to process")
     args = parser.parse_args()

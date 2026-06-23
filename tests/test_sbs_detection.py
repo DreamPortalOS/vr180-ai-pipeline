@@ -12,11 +12,21 @@ def standard_video(tmp_path):
     """Create a 16:9 video (standard 2D input)."""
     video_path = str(tmp_path / "standard.mp4")
     subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi", "-i",
-         "color=c=blue:s=1920x1080:d=0.125:r=24",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-         video_path],
-        capture_output=True, timeout=30,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=1920x1080:d=0.125:r=24",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            video_path,
+        ],
+        capture_output=True,
+        timeout=30,
     )
     return video_path
 
@@ -26,11 +36,21 @@ def sbs_video(tmp_path):
     """Create a 4:1 SBS video (e.g., 7680x1920)."""
     video_path = str(tmp_path / "sbs.mp4")
     subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi", "-i",
-         "color=c=red:s=7680x1920:d=0.125:r=24",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-         video_path],
-        capture_output=True, timeout=30,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=7680x1920:d=0.125:r=24",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            video_path,
+        ],
+        capture_output=True,
+        timeout=30,
     )
     return video_path
 
@@ -40,11 +60,21 @@ def ultra_wide_video(tmp_path):
     """Create a 3.6:1 video (just above threshold)."""
     video_path = str(tmp_path / "ultrawide.mp4")
     subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi", "-i",
-         "color=c=green:s=3600x1000:d=0.125:r=24",
-         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-         video_path],
-        capture_output=True, timeout=30,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=green:s=3600x1000:d=0.125:r=24",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            video_path,
+        ],
+        capture_output=True,
+        timeout=30,
     )
     return video_path
 
@@ -80,6 +110,7 @@ class TestSBSDetection:
     def test_stage_order_sbs_skips_depth_stereo(self):
         """STAGE_ORDER_SBS should not contain 'depth' or 'stereo'."""
         from scripts.run_pipeline import STAGE_ORDER_SBS
+
         assert "depth" not in STAGE_ORDER_SBS
         assert "stereo" not in STAGE_ORDER_SBS
         assert "equirect" in STAGE_ORDER_SBS
@@ -94,8 +125,8 @@ class TestSBSPipelineIntegration:
         # Create a synthetic SBS frame (left=red, right=blue)
         h, w = 480, 1920  # 4:1 SBS
         frame = np.zeros((h, w, 3), dtype=np.uint8)
-        frame[:, :w // 2, 2] = 255   # left half = red
-        frame[:, w // 2:, 0] = 255   # right half = blue
+        frame[:, : w // 2, 2] = 255  # left half = red
+        frame[:, w // 2 :, 0] = 255  # right half = blue
 
         mid = w // 2
         left = frame[:, :mid, :]

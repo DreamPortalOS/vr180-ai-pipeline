@@ -16,7 +16,6 @@ Usage:
     sbs_frame = mapper.map_stereo_pair(left_frame, right_frame)
 """
 
-
 import numpy as np
 
 
@@ -35,10 +34,10 @@ class EquirectangularMapper:
         self,
         output_width: int = 3840,
         output_height: int = 1920,
-        src_hfov: float = 120.0,   # Source camera horizontal FOV (degrees)
-                                   # 120° matches typical AI-generated FPV video FOV.
-                                   # Use 70° for narrow/normal lenses, 90° for action cams.
-        use_ffmpeg: bool = True,   # Prefer ffmpeg v360 when available
+        src_hfov: float = 120.0,  # Source camera horizontal FOV (degrees)
+        # 120° matches typical AI-generated FPV video FOV.
+        # Use 70° for narrow/normal lenses, 90° for action cams.
+        use_ffmpeg: bool = True,  # Prefer ffmpeg v360 when available
     ):
         self.output_width = output_width
         self.output_height = output_height
@@ -64,13 +63,11 @@ class EquirectangularMapper:
         """Check if ffmpeg with v360 filter is available."""
         import shutil
         import subprocess
+
         if not shutil.which("ffmpeg"):
             return False
         try:
-            result = subprocess.run(
-                ["ffmpeg", "-filters"],
-                capture_output=True, text=True, timeout=5
-            )
+            result = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True, timeout=5)
             return "v360" in result.stdout
         except Exception:
             return False
@@ -81,6 +78,7 @@ class EquirectangularMapper:
         For a pinhole camera: vfov = 2 * atan(tan(hfov/2) * height/width)
         """
         import math
+
         hfov_rad = math.radians(self.src_hfov)
         vfov_rad = 2.0 * math.atan(math.tan(hfov_rad / 2.0) * src_height / src_width)
         return math.degrees(vfov_rad)
@@ -122,10 +120,14 @@ class EquirectangularMapper:
             )
 
             cmd = [
-                "ffmpeg", "-y",
-                "-i", in_path,
-                "-vf", vfilter,
-                "-frames:v", "1",
+                "ffmpeg",
+                "-y",
+                "-i",
+                in_path,
+                "-vf",
+                vfilter,
+                "-frames:v",
+                "1",
                 out_path,
             ]
             subprocess.run(cmd, check=True, capture_output=True, timeout=30)
@@ -165,9 +167,9 @@ class EquirectangularMapper:
         sx_safe = np.where(valid_mask, sx, 0.0).astype(np.float32)
         sy_safe = np.where(valid_mask, sy, 0.0).astype(np.float32)
 
-        equirect = cv2.remap(frame, sx_safe, sy_safe, cv2.INTER_LANCZOS4,
-                             borderMode=cv2.BORDER_CONSTANT,
-                             borderValue=(0, 0, 0))
+        equirect = cv2.remap(
+            frame, sx_safe, sy_safe, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)
+        )
 
         # Apply black fill for out-of-FOV regions
         if not np.all(valid_mask):
@@ -197,8 +199,8 @@ class EquirectangularMapper:
 
         # Spherical coordinates for a 180° hemisphere
         # theta: -90° to +90° (horizontal), phi: 0° (top) to 180° (bottom)
-        theta = (u / W_out - 0.5) * np.pi      # [-π/2, π/2]
-        phi = (v / H_out) * np.pi               # [0, π]
+        theta = (u / W_out - 0.5) * np.pi  # [-π/2, π/2]
+        phi = (v / H_out) * np.pi  # [0, π]
 
         # Ray direction in 3D
         ray_x = np.sin(theta) * np.sin(phi)
@@ -218,15 +220,11 @@ class EquirectangularMapper:
         valid = ray_z > 0.01  # slightly above zero for stability
 
         # ray_y is positive-up; image y is positive-down → negate for correct mapping
-        sx = np.where(valid,  fx * ray_x / np.maximum(ray_z, 1e-6) + cx, -1.0)
+        sx = np.where(valid, fx * ray_x / np.maximum(ray_z, 1e-6) + cx, -1.0)
         sy = np.where(valid, -fy * ray_y / np.maximum(ray_z, 1e-6) + cy, -1.0)
 
         # Check if projected point is within source image bounds
-        in_bounds = (
-            valid &
-            (sx >= 0) & (sx < src_width) &
-            (sy >= 0) & (sy < src_height)
-        )
+        in_bounds = valid & (sx >= 0) & (sx < src_width) & (sy >= 0) & (sy < src_height)
 
         # Mark out-of-bounds pixels for black fill
         sx = np.where(in_bounds, sx, -1.0)
@@ -234,9 +232,7 @@ class EquirectangularMapper:
 
         self._mesh = (sx.astype(np.float32), sy.astype(np.float32))
 
-    def map_stereo_pair(
-        self, left_frame: np.ndarray, right_frame: np.ndarray
-    ) -> np.ndarray:
+    def map_stereo_pair(self, left_frame: np.ndarray, right_frame: np.ndarray) -> np.ndarray:
         """Map left+right views into a SBS equirectangular frame.
 
         Each view is independently mapped to equirectangular,

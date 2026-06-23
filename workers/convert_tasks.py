@@ -1,4 +1,5 @@
 """Celery tasks for VR180 conversion pipeline."""
+
 import logging
 from pathlib import Path
 
@@ -28,9 +29,7 @@ def convert_to_vr180(self, input_path: str, output_dir: str, params: dict) -> di
             depth_model=params.get("depth_model", "small"),
         )
 
-        self.update_state(
-            state="PROGRESS", meta={"stage": "depth_estimation", "progress": 10}
-        )
+        self.update_state(state="PROGRESS", meta={"stage": "depth_estimation", "progress": 10})
 
         output_path = pipeline.process(
             input_path=input_path,
@@ -50,9 +49,7 @@ def convert_to_vr180(self, input_path: str, output_dir: str, params: dict) -> di
 
 
 @app.task(bind=True, name="convert.depth_only", max_retries=1)
-def estimate_depth_only(
-    self, input_path: str, output_dir: str, model_size: str = "small"
-) -> dict:
+def estimate_depth_only(self, input_path: str, output_dir: str, model_size: str = "small") -> dict:
     """Standalone depth estimation task (for preview)."""
     import cv2
     import numpy as np

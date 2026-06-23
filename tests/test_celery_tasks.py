@@ -1,4 +1,5 @@
 """Tests for Celery tasks (mocked, no real Celery broker needed)."""
+
 from unittest.mock import MagicMock, patch
 
 

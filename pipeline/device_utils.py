@@ -32,15 +32,13 @@ def detect_best_device() -> str:
             vram_gb = props.total_mem / 1e9
             log.info(f"🟢 CUDA detected: {gpu_name} ({vram_gb:.0f} GB VRAM)")
             if vram_gb < 4.0:
-                log.warning(
-                    f"⚠️  Low VRAM ({vram_gb:.1f} GB). "
-                    "Consider --upscale-ffmpeg or smaller tile-size."
-                )
+                log.warning(f"⚠️  Low VRAM ({vram_gb:.1f} GB). Consider --upscale-ffmpeg or smaller tile-size.")
             return "cuda"
 
         # --- MPS ---
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             import platform
+
             chip = platform.processor() or platform.machine()
             log.info(f"🟢 MPS detected: Apple {chip}")
             return "mps"
@@ -67,10 +65,12 @@ def get_device_info() -> dict:
 
     try:
         import torch
+
         if dev == "cuda":
             name = torch.cuda.get_device_name(0)
         elif dev == "mps":
             import platform
+
             name = f"Apple {platform.processor() or platform.machine()}"
     except ImportError:
         pass
@@ -100,19 +100,16 @@ def resolve_device(device: str) -> str:
     if device.startswith("cuda"):
         try:
             import torch
+
             if not torch.cuda.is_available():
                 raise ValueError(
-                    "CUDA requested but not available. "
-                    "Install PyTorch with CUDA support or use --device mps/cpu."
+                    "CUDA requested but not available. Install PyTorch with CUDA support or use --device mps/cpu."
                 )
             # Validate device index if specified
             if ":" in device:
                 idx = int(device.split(":")[1])
                 if idx >= torch.cuda.device_count():
-                    raise ValueError(
-                        f"CUDA device {idx} not found. "
-                        f"Available: {torch.cuda.device_count()} device(s)."
-                    )
+                    raise ValueError(f"CUDA device {idx} not found. Available: {torch.cuda.device_count()} device(s).")
             return device
         except ImportError:
             raise ValueError("PyTorch not installed — cannot use CUDA.") from None
@@ -120,11 +117,9 @@ def resolve_device(device: str) -> str:
     if device == "mps":
         try:
             import torch
+
             if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-                raise ValueError(
-                    "MPS requested but not available. "
-                    "Requires Apple Silicon + macOS 13+ + PyTorch 2.0+."
-                )
+                raise ValueError("MPS requested but not available. Requires Apple Silicon + macOS 13+ + PyTorch 2.0+.")
             return device
         except ImportError:
             raise ValueError("PyTorch not installed — cannot use MPS.") from None

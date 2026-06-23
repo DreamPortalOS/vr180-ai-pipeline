@@ -22,6 +22,7 @@ log = logging.getLogger("task-store")
 
 class TaskStatus(str, Enum):
     """Pipeline task lifecycle states."""
+
     QUEUED = "queued"
     PROCESSING = "processing"
     COMPLETED = "completed"
@@ -32,6 +33,7 @@ class TaskStatus(str, Enum):
 @dataclass
 class PipelineTask:
     """Represents a single VR180 conversion task."""
+
     id: str
     input_path: str
     output_path: str | None = None
@@ -141,7 +143,7 @@ class TaskStore:
             tasks = [t for t in tasks if t.status == status]
 
         tasks.sort(key=lambda t: t.created_at, reverse=True)
-        return tasks[offset: offset + limit]
+        return tasks[offset : offset + limit]
 
     def count_tasks(self, status: TaskStatus | None = None) -> int:
         """Count tasks, optionally filtered by status."""

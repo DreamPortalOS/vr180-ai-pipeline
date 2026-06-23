@@ -25,11 +25,14 @@ MODEL_REPOS = {
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Download model weights for VR180 pipeline")
-    parser.add_argument("--model", "-m", default="small",
-                        choices=["all", "small", "base", "large"],
-                        help="Which model to download (default: small)")
-    parser.add_argument("--output-dir", default=MODELS_DIR,
-                        help="Directory to store models (default: models/)")
+    parser.add_argument(
+        "--model",
+        "-m",
+        default="small",
+        choices=["all", "small", "base", "large"],
+        help="Which model to download (default: small)",
+    )
+    parser.add_argument("--output-dir", default=MODELS_DIR, help="Directory to store models (default: models/)")
     return parser.parse_args()
 
 

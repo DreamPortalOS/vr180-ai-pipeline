@@ -1,4 +1,5 @@
 """Celery tasks for video upscaling."""
+
 import logging
 
 from workers.celery_app import app
@@ -7,9 +8,7 @@ log = logging.getLogger(__name__)
 
 
 @app.task(bind=True, name="upscale.video", max_retries=1)
-def upscale_video(
-    self, input_path: str, output_path: str, factor: int = 2
-) -> dict:
+def upscale_video(self, input_path: str, output_path: str, factor: int = 2) -> dict:
     """Upscale a video file using the pipeline upscaler.
 
     Args:
@@ -27,8 +26,6 @@ def upscale_video(
     upscaler.upscale_video(
         input_path=input_path,
         output_path=output_path,
-        progress_callback=lambda pct: self.update_state(
-            state="PROGRESS", meta={"stage": "upscaling", "progress": pct}
-        ),
+        progress_callback=lambda pct: self.update_state(state="PROGRESS", meta={"stage": "upscaling", "progress": pct}),
     )
     return {"output_path": output_path}
