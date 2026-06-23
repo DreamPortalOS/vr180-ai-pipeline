@@ -34,6 +34,9 @@ from web.schemas import (
     TaskStatusEnum,
 )
 from web.task_store import TaskStore, TaskStatus
+from workers.convert_tasks import convert_to_vr180
+from celery.result import AsyncResult
+from workers.celery_app import app as celery_app
 
 log = logging.getLogger("vr180-api")
 
@@ -177,6 +180,28 @@ async def create_task_v1(
             "file_size_bytes": len(content),
         },
     )
+
+    # Dispatch async Celery conversion task
+    celery_task = convert_to_vr180.apply_async(
+        kwargs={
+            "input_path": str(upload_path),
+            "output_dir": str(_OUTPUT_DIR / task_id),
+            "params": {
+                "depth_model": "small",
+                "output_format": output_format,
+                "resolution": resolution,
+                "codec": codec,
+            },
+        }
+    )
+    # Store Celery task id in metadata for progress tracking
+    task_store.update_status(
+        task.id,
+        status=TaskStatus.PROCESSING,
+        stage="queued",
+    )
+    task.metadata["celery_task_id"] = celery_task.id
+
     return TaskResponse(**task.to_dict())
 
 
@@ -354,6 +379,39 @@ async def download_task_result(task_id: str):
         media_type="video/mp4",
         filename=Path(output_path).name,
     )
+
+
+# ─── Celery Progress ──────────────────────────────────────────────────────────
+
+@app.get(
+    "/api/v1/tasks/{task_id}/progress",
+    tags=["Tasks"],
+    responses={404: {"model": ErrorResponse}},
+)
+async def get_task_progress(task_id: str):
+    """Get real-time progress of a Celery conversion task.
+
+    Returns the Celery task state, progress percentage, and current stage.
+    """
+    task = task_store.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+    celery_task_id = (task.metadata or {}).get("celery_task_id")
+    if not celery_task_id:
+        return {
+            "state": task.status.value,
+            "progress": task.progress,
+            "stage": task.stage,
+        }
+
+    result = AsyncResult(celery_task_id, app=celery_app)
+    info = result.info if isinstance(result.info, dict) else {}
+    return {
+        "state": result.state,
+        "progress": info.get("progress", 0),
+        "stage": info.get("stage", ""),
+    }
 
 
 # ─── Quota (stub) ─────────────────────────────────────────────────────────────

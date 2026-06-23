@@ -35,15 +35,15 @@ class EquirectangularMapper:
         self,
         output_width: int = 3840,
         output_height: int = 1920,
-        src_hfov: float = 70.0,    # Source camera horizontal FOV (degrees)
+        src_hfov: float = 120.0,   # Source camera horizontal FOV (degrees)
+                                   # 120° matches typical AI-generated FPV video FOV.
+                                   # Use 70° for narrow/normal lenses, 90° for action cams.
         use_ffmpeg: bool = True,   # Prefer ffmpeg v360 when available
-        flip_vertical: bool = True,  # Flip output vertically for VR headsets
     ):
         self.output_width = output_width
         self.output_height = output_height
         self.src_hfov = src_hfov
         self.use_ffmpeg = use_ffmpeg
-        self.flip_vertical = flip_vertical
         self._mesh: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
     def map_single(self, frame: np.ndarray) -> np.ndarray:
@@ -107,22 +107,15 @@ class EquirectangularMapper:
 
         out_path = in_path.replace(".png", "_eq.png")
         try:
-            # Build v360 filter chain
-            # - input=flat: flat perspective projection
-            # - output=hequirect: half equirectangular (180° horizontal)
-            # - ih_fov/iv_fov: source camera FOV (correct aspect ratio)
-            # - h_fov=180/v_fov=180: full 180° hemisphere output
-            # - fill_black=1: areas outside source FOV → black (not stretched)
+            # v360 filter: perspective → half-equirectangular (VR180)
+            # ih_fov/iv_fov = source camera FOV; h_fov=180/v_fov=180 = full hemisphere output.
+            # No vflip: ffmpeg v360 hequirect output is already Quest/YouTube-compatible.
             vfilter = (
                 f"v360=input=flat:output=hequirect:"
                 f"ih_fov={self.src_hfov}:iv_fov={src_vfov:.2f}:"
                 f"h_fov=180:v_fov=180:"
                 f"w={self.output_width}:h={self.output_height}"
             )
-
-            # Add vertical flip if needed (Quest expects top=up)
-            if self.flip_vertical:
-                vfilter += ",vflip"
 
             cmd = [
                 "ffmpeg", "-y",
@@ -176,10 +169,6 @@ class EquirectangularMapper:
         if not np.all(valid_mask):
             equirect[~valid_mask] = [0, 0, 0]
 
-        # Flip vertically for VR headset convention
-        if self.flip_vertical:
-            equirect = cv2.flip(equirect, 0)  # 0 = vertical flip
-
         return equirect
 
     def _build_mesh(self, src_width: int, src_height: int):
@@ -224,8 +213,9 @@ class EquirectangularMapper:
         # and within the source FOV
         valid = ray_z > 0.01  # slightly above zero for stability
 
-        sx = np.where(valid, fx * ray_x / np.maximum(ray_z, 1e-6) + cx, -1.0)
-        sy = np.where(valid, fy * ray_y / np.maximum(ray_z, 1e-6) + cy, -1.0)
+        # ray_y is positive-up; image y is positive-down → negate for correct mapping
+        sx = np.where(valid,  fx * ray_x / np.maximum(ray_z, 1e-6) + cx, -1.0)
+        sy = np.where(valid, -fy * ray_y / np.maximum(ray_z, 1e-6) + cy, -1.0)
 
         # Check if projected point is within source image bounds
         in_bounds = (

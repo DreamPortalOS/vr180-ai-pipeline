@@ -19,8 +19,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy project
 COPY pipeline/ pipeline/
+COPY workers/ workers/
+COPY web/ web/
 COPY scripts/ scripts/
 COPY pyproject.toml .
 
-# Default entrypoint
+# Default entrypoint (pipeline CLI)
 ENTRYPOINT ["python", "scripts/run_pipeline.py"]

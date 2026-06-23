@@ -21,6 +21,10 @@ spatialmedia>=0.2.0
 # Web UI (optional — install with: pip install gradio)
 # gradio>=4.0.0
 
+# Async task queue
+celery[redis]>=5.4.0,<6.0.0
+redis>=5.0.7,<6.0.0
+
 # Web API
 fastapi>=0.104.0,<1.0.0
 uvicorn>=0.24.0,<1.0.0
