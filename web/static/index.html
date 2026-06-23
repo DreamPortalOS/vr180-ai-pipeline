@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VR180 Studio — Convert 2D Video to VR180</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="header">
+    <div class="header-inner">
+      <h1 class="logo">🎬 VR180 Studio</h1>
+      <nav class="nav">
+        <a href="#" class="nav-link active" data-view="convert">Convert</a>
+        <a href="#" class="nav-link" data-view="tasks">My Tasks</a>
+        <a href="#" class="nav-link" data-view="results">Results</a>
+      </nav>
+      <div class="quota-badge" id="quotaBadge">
+        <span class="quota-icon">⚡</span>
+        <span id="quotaText">--/--</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="main">
+    <!-- ===== CONVERT VIEW ===== -->
+    <section id="viewConvert" class="view active">
+      <div class="hero">
+        <h2>Transform any 2D video into immersive VR180</h2>
+        <p class="hero-sub">AI-powered depth estimation → stereoscopic rendering → equirectangular projection → spatial metadata injection</p>
+      </div>
+
+      <form id="convertForm" class="convert-form">
+        <div class="form-group">
+          <label for="inputFile">Input Video</label>
+          <div class="file-drop" id="fileDrop">
+            <input type="file" id="inputFile" accept="video/*" hidden />
+            <div class="file-drop-content" id="fileDropContent">
+              <span class="file-icon">📁</span>
+              <p>Drop a video file here or <strong>click to browse</strong></p>
+              <p class="file-hint">MP4, MOV, AVI, MKV up to 2GB</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="outputFormat">Output Format</label>
+            <select id="outputFormat">
+              <option value="equirectangular" selected>Equirectangular (VR180)</option>
+              <option value="sbs">Side-by-Side (SBS)</option>
+              <option value="sbs-spatial">SBS + Spatial Metadata (Quest/AVP)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="resolution">Resolution</label>
+            <select id="resolution">
+              <option value="4k" selected>4K (7680×3840)</option>
+              <option value="8k">8K (15360×7680)</option>
+              <option value="2k">2K (3840×1920)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="codec">Codec</label>
+            <select id="codec">
+              <option value="h265" selected>H.265 (HEVC)</option>
+              <option value="h264">H.264 (AVC)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group checkbox-group">
+            <label>
+              <input type="checkbox" id="upscale" checked />
+              AI Upscale (Real-ESRGAN)
+            </label>
+          </div>
+          <div class="form-group checkbox-group">
+            <label>
+              <input type="checkbox" id="injectMetadata" checked />
+              Inject VR Metadata
+            </label>
+          </div>
+        </div>
+
+        <button type="submit" class="btn btn-primary" id="submitBtn">
+          <span class="btn-text">🚀 Start Conversion</span>
+          <span class="btn-spinner hidden"></span>
+        </button>
+      </form>
+    </section>
+
+    <!-- ===== TASKS VIEW ===== -->
+    <section id="viewTasks" class="view">
+      <div class="section-header">
+        <h2>My Tasks</h2>
+        <button class="btn btn-sm" id="refreshTasks">↻ Refresh</button>
+      </div>
+      <div id="tasksList" class="tasks-list">
+        <div class="empty-state" id="tasksEmpty">
+          <span class="empty-icon">📋</span>
+          <p>No tasks yet. <a href="#" data-view="convert">Start a conversion</a></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== RESULTS VIEW ===== -->
+    <section id="viewResults" class="view">
+      <div class="section-header">
+        <h2>Conversion Results</h2>
+        <button class="btn btn-sm" id="refreshResults">↻ Refresh</button>
+      </div>
+      <div id="resultsGrid" class="results-grid">
+        <div class="empty-state" id="resultsEmpty">
+          <span class="empty-icon">🎬</span>
+          <p>No results yet. Complete a conversion to see your VR180 videos here.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ===== TASK DETAIL MODAL ===== -->
+  <div class="modal-overlay hidden" id="taskModal">
+    <div class="modal">
+      <button class="modal-close" id="modalClose">&times;</button>
+      <div id="modalContent"></div>
+    </div>
+  </div>
+
+  <!-- ===== TOAST CONTAINER ===== -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <footer class="footer">
+    <p>VR180 Studio — AI-Powered Stereoscopic Video Pipeline &copy; 2026</p>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
