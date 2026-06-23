@@ -18,6 +18,18 @@ To avoid `Invalid API Response` caused by Max Output Token exhaustion:
 - **Keep It Modular:** If a newly written script is getting too long, autonomously refactor and break it down into smaller, modular sub-components or utility scripts.
 
 ## 🔄 4. AUTONOMOUS QA & SELF-HEALING LOOP (全自动测试闭环)
+
+**⚠️ MANDATORY FIRST-RUN SETUP — do this before your first commit each session:**
+```bash
+pip install -r requirements.txt        # also verifies deps actually install
+pip install pre-commit && pre-commit install --hook-type pre-commit --hook-type pre-push
+```
+Pre-commit then auto-runs `ruff --fix` + `ruff format` on every commit and `pytest` on every push.
+- NEVER bypass hooks with `git commit --no-verify` or `git push --no-verify`.
+- If a hook fails, READ the error, fix the code, and retry until green.
+- The `ruff` rev in `.pre-commit-config.yaml` MUST equal the version CI uses. Never downgrade it — a mismatch makes lint pass locally but fail in CI.
+- A commit is only "done" when `ruff check .`, `ruff format --check .`, and `pytest` all pass.
+
 You are entirely responsible for the stability of your code. You must act as your own QA Sub-Agent:
 1. **Setup Test Framework:** Identify the project's tech stack and verify/install the appropriate local testing framework (e.g., pytest, jest, vitest, dotnet test).
 2. **Write Concurrently:** For every major logic block or class you write, you MUST concurrently write corresponding automated test cases in a local test directory.

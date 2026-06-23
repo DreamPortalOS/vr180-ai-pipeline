@@ -1,8 +1,13 @@
-# Install: pip install pre-commit && pre-commit install
+# Setup (REQUIRED per clone — without this, hooks do NOT run):
+#   pip install pre-commit
+#   pre-commit install --hook-type pre-commit --hook-type pre-push
 # Run all: pre-commit run --all-files
+#
+# IMPORTANT: ruff rev MUST match CI (.github/workflows/ci.yml installs latest ruff)
+# and the local venv. A version mismatch is why lint can pass locally but fail in CI.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.0
+    rev: v0.15.18
     hooks:
       - id: ruff
         args: [--fix]
@@ -16,3 +21,14 @@ repos:
       - id: check-yaml
       - id: check-added-large-files
         args: ['--maxkb=500']
+
+  # Run the unit test suite before push (kept off per-commit to stay fast)
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (unit, excludes e2e)
+        entry: python -m pytest tests/ -q --ignore=tests/e2e
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
