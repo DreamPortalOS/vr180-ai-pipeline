@@ -16,15 +16,14 @@ Usage:
     embedder.embed_single_frame_batch(frames, "output.mp4")
 """
 
+import contextlib
 import os
-import struct
 import subprocess
 import tempfile
-from typing import Optional, List
 
 import numpy as np
-from pipeline.spherical_injector import inject_spherical_metadata
 
+from pipeline.spherical_injector import inject_spherical_metadata
 
 # Google Spherical Video V2 XML template (for VR180)
 SPHERICAL_XML_TEMPLATE = """<?xml version="1.0"?>
@@ -79,10 +78,10 @@ class VRMetadataEmbedder:
 
     def embed_single_frame_batch(
         self,
-        frames: List[np.ndarray],
+        frames: list[np.ndarray],
         output_path: str,
-        width: Optional[int] = None,
-        height: Optional[int] = None,
+        width: int | None = None,
+        height: int | None = None,
     ) -> str:
         """Write frames as VR180 video with metadata via ffmpeg pipe.
 
@@ -150,25 +149,21 @@ class VRMetadataEmbedder:
             inject_spherical_metadata(temp_path, output_path,
                                       width=out_w, height=out_h,
                                       stereo_mode=self.stereo_mode)
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(temp_path)
-            except OSError:
-                pass
 
         except FileNotFoundError:
             print("[Metadata] ffmpeg not found!")
             raise
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(xml_path)
-            except OSError:
-                pass
 
         print(f"[Metadata] ✅ VR180 video saved to {output_path}")
         return output_path
 
     def _embed_via_metadata_file(
-        self, frames: List[np.ndarray],
+        self, frames: list[np.ndarray],
         output_path: str,
         xml_path: str,
     ) -> str:
@@ -211,7 +206,7 @@ class VRMetadataEmbedder:
 
         # Second pass: inject spherical metadata
         # Read the XML content
-        with open(xml_path, "r") as f:
+        with open(xml_path) as f:
             xml_content = f.read()
 
         cmd2 = [
@@ -230,10 +225,8 @@ class VRMetadataEmbedder:
             import shutil
             shutil.move(temp_path, output_path)
         else:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(temp_path)
-            except OSError:
-                pass
 
         print(f"[Metadata] ✅ VR180 video saved to {output_path}")
         return output_path

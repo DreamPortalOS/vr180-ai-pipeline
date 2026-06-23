@@ -12,8 +12,11 @@ transformers>=4.35.0,<5.0.0
 accelerate>=0.24.0,<1.0.0
 safetensors>=0.4.0,<1.0.0
 
-# VR metadata (required)
-spatialmedia>=0.2.0
+# VR metadata: Google spatial-media is an OPTIONAL CLI tool invoked via
+# `python3 -m spatialmedia` (see pipeline/spherical_injector.py). It is NOT on
+# PyPI — install from source if needed. The pipeline falls back to ffmpeg remux
+# when it is unavailable, so it is intentionally not a hard dependency here.
+#   pip install git+https://github.com/google/spatial-media.git
 
 # Pixel upscaling (optional — install with: pip install realesrgan)
 # realesrgan>=0.3.0

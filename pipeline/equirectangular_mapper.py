@@ -16,8 +16,8 @@ Usage:
     sbs_frame = mapper.map_stereo_pair(left_frame, right_frame)
 """
 
+
 import numpy as np
-from typing import Optional, Tuple
 
 
 class EquirectangularMapper:
@@ -44,7 +44,7 @@ class EquirectangularMapper:
         self.output_height = output_height
         self.src_hfov = src_hfov
         self.use_ffmpeg = use_ffmpeg
-        self._mesh: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self._mesh: tuple[np.ndarray, np.ndarray] | None = None
 
     def map_single(self, frame: np.ndarray) -> np.ndarray:
         """Map a single planar frame to equirectangular VR180.
@@ -62,7 +62,8 @@ class EquirectangularMapper:
 
     def _ffmpeg_available(self) -> bool:
         """Check if ffmpeg with v360 filter is available."""
-        import subprocess, shutil
+        import shutil
+        import subprocess
         if not shutil.which("ffmpeg"):
             return False
         try:
@@ -94,7 +95,10 @@ class EquirectangularMapper:
         to src_hfov. This prevents stretching the content to fill the
         full 180° vertical range when the source only covers ~40-50°.
         """
-        import subprocess, tempfile, os
+        import os
+        import subprocess
+        import tempfile
+
         import cv2
 
         H, W = frame.shape[:2]
@@ -147,7 +151,7 @@ class EquirectangularMapper:
         import cv2
 
         H_src, W_src = frame.shape[:2]
-        W_out, H_out = self.output_width, self.output_height
+        _W_out, _H_out = self.output_width, self.output_height
 
         if self._mesh is None:
             self._build_mesh(W_src, H_src)

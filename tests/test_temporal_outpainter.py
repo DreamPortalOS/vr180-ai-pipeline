@@ -1,11 +1,10 @@
 """Tests for Temporal Outpainter (Phase 3 R&D)."""
 
 import numpy as np
-import pytest
 
 from pipeline.research.temporal_outpainter import (
-    TemporalOutpainter,
     OutpaintQualityMetrics,
+    TemporalOutpainter,
 )
 
 
@@ -102,7 +101,7 @@ class TestOutpaintFrame:
         mask = np.zeros((h, w), dtype=np.uint8)
         mask[:5, :] = 255  # Only mask top 5 rows
 
-        result, metrics = outpainter.outpaint_frame(frame, [ctx], mask)
+        result, _metrics = outpainter.outpaint_frame(frame, [ctx], mask)
 
         # Non-masked region should be identical
         np.testing.assert_array_equal(result[10:, :], frame[10:, :])
@@ -116,7 +115,7 @@ class TestOutpaintFrame:
         mask = np.zeros((h, w), dtype=np.uint8)
         mask[:10, :] = 255
 
-        result, metrics = outpainter.outpaint_frame(frame, [ctx], mask)
+        result, _metrics = outpainter.outpaint_frame(frame, [ctx], mask)
 
         # Masked region should not be all zeros
         assert result[:10, :].mean() > 0
@@ -138,7 +137,7 @@ class TestOutpaintFrame:
         ctx = np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8)
         mask = np.zeros((60, 80), dtype=np.uint8)
 
-        result, metrics = outpainter.outpaint_frame(frame, [ctx], mask)
+        result, _metrics = outpainter.outpaint_frame(frame, [ctx], mask)
         np.testing.assert_array_equal(result, frame)
 
     def test_metrics_have_required_fields(self):
@@ -176,7 +175,7 @@ class TestOutpaintSequence:
             np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8)
             for _ in range(3)
         ]
-        results, metrics_list = outpainter.outpaint(frames, mask=None)
+        results, _metrics_list = outpainter.outpaint(frames, mask=None)
         assert len(results) == 3
 
     def test_empty_frames_returns_empty(self):

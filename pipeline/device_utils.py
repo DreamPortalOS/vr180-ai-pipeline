@@ -115,7 +115,7 @@ def resolve_device(device: str) -> str:
                     )
             return device
         except ImportError:
-            raise ValueError("PyTorch not installed — cannot use CUDA.")
+            raise ValueError("PyTorch not installed — cannot use CUDA.") from None
 
     if device == "mps":
         try:
@@ -127,7 +127,7 @@ def resolve_device(device: str) -> str:
                 )
             return device
         except ImportError:
-            raise ValueError("PyTorch not installed — cannot use MPS.")
+            raise ValueError("PyTorch not installed — cannot use MPS.") from None
 
     if device == "cpu":
         return device

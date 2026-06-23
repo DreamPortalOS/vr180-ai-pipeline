@@ -7,15 +7,13 @@ No frame buffers accumulate in RAM.
 
 import logging
 import subprocess
-from typing import Optional, List
 
 import cv2
-import numpy as np
 
 from pipeline.depth_estimator import DepthEstimator
-from pipeline.stereo_renderer import StereoRenderer
-from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.device_utils import resolve_device
+from pipeline.equirectangular_mapper import EquirectangularMapper
+from pipeline.stereo_renderer import StereoRenderer
 
 log = logging.getLogger("vr180-streaming")
 
@@ -37,7 +35,7 @@ class StreamingPipeline:
     def __init__(
         self,
         model_size: str = "small",
-        device: Optional[str] = None,
+        device: str | None = None,
         ipd: float = 0.064,
         max_disparity: float = 0.05,
         output_width: int = 3840,
@@ -75,7 +73,7 @@ class StreamingPipeline:
             use_ffmpeg=True,
         )
 
-    def _build_ffmpeg_cmd(self, output_path: str, width: int, height: int) -> List[str]:
+    def _build_ffmpeg_cmd(self, output_path: str, width: int, height: int) -> list[str]:
         """Build the ffmpeg command list for raw-frame piping.
 
         Returns:
@@ -114,7 +112,7 @@ class StreamingPipeline:
         self,
         input_path: str,
         output_path: str,
-        max_frames: Optional[int] = None,
+        max_frames: int | None = None,
     ) -> str:
         """Process video frame-by-frame, writing directly to ffmpeg pipe.
 
@@ -190,7 +188,7 @@ def run_streaming_pipeline(
     input_path: str,
     output_path: str,
     model_size: str = "small",
-    device: Optional[str] = None,
+    device: str | None = None,
     ipd: float = 0.064,
     max_disparity: float = 0.05,
     output_width: int = 3840,
@@ -200,7 +198,7 @@ def run_streaming_pipeline(
     crf: int = 23,
     fps: int = 30,
     flip_vertical: bool = True,
-    max_frames: Optional[int] = None,
+    max_frames: int | None = None,
 ) -> str:
     """Convenience function to run the streaming pipeline in one call.
 

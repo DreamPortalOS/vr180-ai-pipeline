@@ -17,12 +17,14 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Header, Request
+from celery.result import AsyncResult
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from workers.celery_app import app as celery_app
+from workers.convert_tasks import convert_to_vr180
 
 from web.schemas import (
     ErrorResponse,
@@ -30,13 +32,10 @@ from web.schemas import (
     TaskCreateRequest,
     TaskListResponse,
     TaskResponse,
-    TaskUpdateRequest,
     TaskStatusEnum,
+    TaskUpdateRequest,
 )
-from web.task_store import TaskStore, TaskStatus
-from workers.convert_tasks import convert_to_vr180
-from celery.result import AsyncResult
-from workers.celery_app import app as celery_app
+from web.task_store import TaskStatus, TaskStore
 
 log = logging.getLogger("vr180-api")
 
@@ -153,7 +152,7 @@ async def create_task_v1(
     codec: str = Form("h265"),
     upscale: str = Form("true"),
     inject_metadata: str = Form("true"),
-    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     """Create a new VR180 conversion task with file upload."""
     user_id = x_user_id or "default-user"
@@ -236,7 +235,7 @@ async def list_tasks_v1(
     status: TaskStatusEnum = None,
     limit: int = 50,
     offset: int = 0,
-    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     """List all tasks with optional status filter and pagination (v1)."""
     store_status = TaskStatus(status.value) if status else None
@@ -421,7 +420,7 @@ async def get_task_progress(task_id: str):
     tags=["Quota"],
 )
 async def get_quota_v1(
-    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     """Get current user's quota."""
     user_id = x_user_id or "default-user"
@@ -443,7 +442,7 @@ async def get_quota_v1(
 async def list_results_v1(
     limit: int = 50,
     offset: int = 0,
-    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
 ):
     """List completed results for a user."""
     completed_tasks = task_store.list_tasks(

@@ -41,14 +41,14 @@ class OutpaintQualityMetrics:
 
 class TemporalOutpainter:
     """Optical flow-based temporal outpainter for VR180 boundary regions.
-    
+
     Algorithm:
     1. Detect boundary regions (poles, extreme edges) that need outpainting
     2. For each frame, compute dense optical flow (Farneback) to adjacent frames
     3. Warp adjacent frames' boundary content using the flow field
     4. Blend warped contributions using a distance-weighted average
     5. Iterate until convergence (pixel change < threshold)
-    
+
     Args:
         max_iterations: Maximum outpainting iterations per frame
         convergence_threshold: Pixel change threshold for convergence (0-255)
@@ -76,13 +76,13 @@ class TemporalOutpainter:
 
     def detect_boundary_mask(self, frame: np.ndarray) -> np.ndarray:
         """Generate a binary mask of VR180 boundary regions that need outpainting.
-        
+
         In equirectangular projection, the poles (top/bottom) and extreme
         left/right edges lack content when projecting from a flat 2D source.
-        
+
         Args:
             frame: RGB equirectangular frame (H, W, 3)
-            
+
         Returns:
             Binary mask (H, W) where 255 = needs outpainting, 0 = original content
         """
@@ -112,24 +112,18 @@ class TemporalOutpainter:
         self, frame1: np.ndarray, frame2: np.ndarray
     ) -> np.ndarray:
         """Compute dense optical flow between two grayscale frames.
-        
+
         Uses Farneback algorithm for dense flow estimation.
-        
+
         Args:
             frame1: First frame (RGB or grayscale)
             frame2: Second frame (RGB or grayscale)
-            
+
         Returns:
             Flow array (H, W, 2) with dx, dy per pixel
         """
-        if len(frame1.shape) == 3:
-            gray1 = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
-        else:
-            gray1 = frame1
-        if len(frame2.shape) == 3:
-            gray2 = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
-        else:
-            gray2 = frame2
+        gray1 = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY) if len(frame1.shape) == 3 else frame1
+        gray2 = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY) if len(frame2.shape) == 3 else frame2
 
         # Downscale for speed if configured
         if self.flow_pyramid_scale < 1.0:
@@ -165,11 +159,11 @@ class TemporalOutpainter:
         self, frame: np.ndarray, flow: np.ndarray
     ) -> np.ndarray:
         """Warp a frame using optical flow field.
-        
+
         Args:
             frame: RGB frame (H, W, 3)
             flow: Optical flow (H, W, 2) with dx, dy
-            
+
         Returns:
             Warped frame
         """
@@ -194,15 +188,15 @@ class TemporalOutpainter:
         self, h: int, w: int, mask: np.ndarray
     ) -> np.ndarray:
         """Compute distance-based blending weights from mask boundary.
-        
+
         Pixels closer to the original content get higher weight when blending
         outpainted contributions.
-        
+
         Args:
             h: Frame height
             w: Frame width
             mask: Binary boundary mask
-            
+
         Returns:
             Weight map (H, W) float32, range [0, 1]
         """
@@ -212,10 +206,7 @@ class TemporalOutpainter:
 
         # Normalize to [0, 1]
         dmax = dist.max()
-        if dmax > 0:
-            weights = dist / dmax
-        else:
-            weights = np.ones((h, w), dtype=np.float32)
+        weights = dist / dmax if dmax > 0 else np.ones((h, w), dtype=np.float32)
 
         # Invert: pixels near boundary get high weight
         weights = 1.0 - weights
@@ -228,12 +219,12 @@ class TemporalOutpainter:
         mask: np.ndarray,
     ) -> tuple[np.ndarray, OutpaintQualityMetrics]:
         """Outpaint boundary regions of a single frame using temporal context.
-        
+
         Args:
             target_frame: The frame to outpaint (RGB)
             context_frames: List of adjacent frames for temporal propagation
             mask: Binary mask of regions to fill
-            
+
         Returns:
             Tuple of (outpainted_frame, quality_metrics)
         """
@@ -267,7 +258,7 @@ class TemporalOutpainter:
             accumulator = np.zeros((h, w, 3), dtype=np.float64)
             weight_sum = np.zeros((h, w), dtype=np.float64)
 
-            for ctx, flow in zip(context_frames, flow_fields):
+            for ctx, flow in zip(context_frames, flow_fields, strict=False):
                 # Warp context frame's content into target's coordinate space
                 warped = self.warp_frame_by_flow(ctx, flow)
 
@@ -334,11 +325,11 @@ class TemporalOutpainter:
         mask: np.ndarray = None,
     ) -> tuple[list[np.ndarray], list[OutpaintQualityMetrics]]:
         """Outpaint boundary regions for an entire sequence of frames.
-        
+
         Args:
             frames: List of RGB equirectangular frames
             mask: Optional pre-computed boundary mask. If None, auto-detected.
-            
+
         Returns:
             Tuple of (outpainted_frames, per_frame_metrics)
         """
@@ -390,12 +381,12 @@ class TemporalOutpainter:
         self, original: np.ndarray, result: np.ndarray, mask: np.ndarray
     ) -> float:
         """Compute PSNR between original and result in non-masked regions.
-        
+
         Args:
             original: Original frame
             result: Outpainted frame
             mask: Boolean mask (True = outpainted region)
-            
+
         Returns:
             PSNR in dB
         """
@@ -417,15 +408,15 @@ class TemporalOutpainter:
         self, original: np.ndarray, result: np.ndarray, mask: np.ndarray
     ) -> float:
         """Compute a simplified SSIM between original and result in non-masked regions.
-        
+
         Uses block-based SSIM computation on the non-outpainted content
         to verify the outpainting didn't corrupt original pixels.
-        
+
         Args:
             original: Original frame (RGB)
             result: Outpainted frame (RGB)
             mask: Boolean mask
-            
+
         Returns:
             SSIM value (0 to 1)
         """

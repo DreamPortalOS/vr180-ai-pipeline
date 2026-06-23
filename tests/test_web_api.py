@@ -2,9 +2,8 @@
 
 import pytest
 from fastapi.testclient import TestClient
-
 from web.app import app, task_store
-from web.task_store import TaskStore, TaskStatus, PipelineTask
+from web.task_store import TaskStatus, TaskStore
 
 
 @pytest.fixture(autouse=True)

@@ -6,8 +6,8 @@ import pytest
 from pipeline.research.orientation_matrix import (
     apply_flip,
     apply_transpose,
-    generate_orientation_matrix,
     generate_ffmpeg_filter_map,
+    generate_orientation_matrix,
 )
 
 
@@ -101,7 +101,7 @@ class TestGenerateOrientationMatrix:
     def test_combo_map_has_required_fields(self):
         frame = np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8)
         _, combo_map = generate_orientation_matrix(frame)
-        for key, info in combo_map.items():
+        for _key, info in combo_map.items():
             assert "label" in info
             assert "short" in info
             assert "flip" in info
@@ -119,7 +119,7 @@ class TestGenerateOrientationMatrix:
         """All frames in combo_map should be resized to original dimensions."""
         frame = np.random.randint(0, 255, (60, 80, 3), dtype=np.uint8)
         _, combo_map = generate_orientation_matrix(frame)
-        for key, info in combo_map.items():
+        for _key, info in combo_map.items():
             assert info["frame"].shape[:2] == (60, 80)
 
 

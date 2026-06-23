@@ -7,8 +7,8 @@ Usage:
 """
 
 import argparse
-import os
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("download-models")

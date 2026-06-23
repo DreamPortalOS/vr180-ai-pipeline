@@ -7,13 +7,11 @@ import os
 import shutil
 import struct
 import tempfile
-import time
 
 import pytest
 
 # --- Quota Manager Tests ---
-
-from web.quota import QuotaExceeded, QuotaManager, UserQuota, UserTier, UsageRecord
+from web.quota import QuotaExceededError, QuotaManager, UsageRecord, UserTier
 
 
 class TestQuotaManager:
@@ -52,7 +50,7 @@ class TestQuotaManager:
         for i in range(3):
             self.quota.record_usage("user1", f"task{i}")
         assert self.quota.check("user1") is False
-        with pytest.raises(QuotaExceeded) as exc_info:
+        with pytest.raises(QuotaExceededError) as exc_info:
             self.quota.check_or_raise("user1")
         assert exc_info.value.used == 3
         assert exc_info.value.limit == 3
@@ -60,7 +58,7 @@ class TestQuotaManager:
     def test_record_usage_raises_after_limit(self):
         for i in range(3):
             self.quota.record_usage("user1", f"task{i}")
-        with pytest.raises(QuotaExceeded):
+        with pytest.raises(QuotaExceededError):
             self.quota.record_usage("user1", "task_overflow")
 
     def test_premium_user_unlimited(self):
@@ -140,7 +138,7 @@ class TestQuotaManager:
         assert self.quota.get_usage_count("user2") == 0
 
     def test_quota_exceeded_message(self):
-        exc = QuotaExceeded("u1", used=3, limit=3)
+        exc = QuotaExceededError("u1", used=3, limit=3)
         assert "u1" in str(exc)
         assert "3/3" in str(exc)
 
@@ -152,7 +150,7 @@ class TestQuotaManager:
 
 # --- Result Storage Tests ---
 
-from web.storage import ResultStorage, ResultNotFoundError, StoredResult
+from web.storage import ResultNotFoundError, ResultStorage  # noqa: E402
 
 
 class TestResultStorage:
@@ -258,7 +256,7 @@ class TestResultStorage:
         assert meta["upscaled"] is True
 
     def test_save_with_expiration(self):
-        result_id = self.storage.save_result(
+        self.storage.save_result(
             task_id="task1", output_path=self.fake_video,
             expires_at="2020-01-01T00:00:00Z", copy_file=False,
         )
@@ -287,7 +285,7 @@ class TestResultStorage:
 
 # --- Spatial Converter Tests ---
 
-from pipeline.spatial_converter import (
+from pipeline.spatial_converter import (  # noqa: E402
     SpatialConverter,
     SpatialFormat,
     SpatialProjection,

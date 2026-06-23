@@ -46,7 +46,7 @@ def convert_to_vr180(self, input_path: str, output_dir: str, params: dict) -> di
         }
     except Exception as exc:
         log.exception("convert_to_vr180 failed: %s", exc)
-        raise self.retry(exc=exc, countdown=30)
+        raise self.retry(exc=exc, countdown=30) from exc
 
 
 @app.task(bind=True, name="convert.depth_only", max_retries=1)
@@ -54,9 +54,10 @@ def estimate_depth_only(
     self, input_path: str, output_dir: str, model_size: str = "small"
 ) -> dict:
     """Standalone depth estimation task (for preview)."""
-    from pipeline.depth_estimator import DepthEstimator
     import cv2
     import numpy as np
+
+    from pipeline.depth_estimator import DepthEstimator
 
     self.update_state(state="STARTED", meta={"stage": "loading_model", "progress": 0})
 

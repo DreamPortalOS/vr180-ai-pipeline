@@ -6,21 +6,19 @@ SQLite-backed for persistence across server restarts.
 
 Usage:
     quota = QuotaManager(max_free_conversions=3)
-    quota.check_or_raise("user123")  # raises QuotaExceeded if over limit
+    quota.check_or_raise("user123")  # raises QuotaExceededError if over limit
     quota.record_usage("user123", task_id="abc", file_size_bytes=1024000)
 """
 
 import sqlite3
 import threading
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
 
-class QuotaExceeded(Exception):
+class QuotaExceededError(Exception):
     """Raised when a user has exceeded their conversion quota."""
 
     def __init__(self, user_id: str, used: int, limit: int):
@@ -78,7 +76,7 @@ class QuotaManager:
 
     def __init__(
         self,
-        db_path: Optional[str] = None,
+        db_path: str | None = None,
         max_free_conversions: int = 3,
     ):
         self.db_path = db_path or self.DEFAULT_DB_PATH
@@ -210,12 +208,12 @@ class QuotaManager:
 
     def check_or_raise(self, user_id: str):
         """
-        Check quota and raise QuotaExceeded if over limit.
+        Check quota and raise QuotaExceededError if over limit.
         Call this before starting a conversion task.
         """
         quota = self.get_quota(user_id)
         if not quota.unlimited and quota.used >= quota.limit:
-            raise QuotaExceeded(
+            raise QuotaExceededError(
                 user_id=user_id,
                 used=quota.used,
                 limit=quota.limit,
@@ -229,7 +227,7 @@ class QuotaManager:
     ):
         """
         Record a successful conversion. Call after task completes.
-        Raises QuotaExceeded if user is already over limit (race condition guard).
+        Raises QuotaExceededError if user is already over limit (race condition guard).
         """
         with self._lock:
             conn = self._get_conn()
@@ -245,7 +243,7 @@ class QuotaManager:
                     ).fetchone()
                     current_count = row[0] if row else 0
                     if current_count >= limit:
-                        raise QuotaExceeded(
+                        raise QuotaExceededError(
                             user_id=user_id,
                             used=current_count,
                             limit=limit,

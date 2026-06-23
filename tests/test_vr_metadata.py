@@ -2,7 +2,7 @@
 
 import pytest
 
-from pipeline.vr_metadata import VRMetadataEmbedder, SPHERICAL_XML_TEMPLATE
+from pipeline.vr_metadata import SPHERICAL_XML_TEMPLATE, VRMetadataEmbedder
 
 
 class TestSphericalXml:
@@ -85,7 +85,6 @@ class TestVRMetadataEmbedder:
         assert embedder.stereo_mode == "tb"
 
     def test_embed_raises_on_empty_frames(self):
-        import numpy as np
         embedder = VRMetadataEmbedder()
         with pytest.raises(ValueError, match="No frames"):
             embedder.embed_single_frame_batch([], "/tmp/test.mp4")

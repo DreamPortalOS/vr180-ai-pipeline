@@ -11,16 +11,16 @@ Usage:
     results = storage.list_results(user_id="user123")
 """
 
+import contextlib
 import json
 import os
 import shutil
 import sqlite3
 import threading
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass
@@ -42,7 +42,7 @@ class StoredResult:
     projection: str
     metadata_json: str
     created_at: str
-    expires_at: Optional[str]
+    expires_at: str | None
 
 
 class ResultNotFoundError(Exception):
@@ -66,7 +66,7 @@ class ResultStorage:
 
     DEFAULT_BASE_DIR = "data/results"
 
-    def __init__(self, base_dir: Optional[str] = None):
+    def __init__(self, base_dir: str | None = None):
         self.base_dir = Path(base_dir or self.DEFAULT_BASE_DIR)
         self.db_path = self.base_dir / "results.db"
         self.videos_dir = self.base_dir / "videos"
@@ -131,9 +131,9 @@ class ResultStorage:
         codec: str = "h264",
         stereoscopic_mode: str = "side-by-side",
         projection: str = "equirectangular",
-        metadata: Optional[dict] = None,
+        metadata: dict | None = None,
         copy_file: bool = True,
-        expires_at: Optional[str] = None,
+        expires_at: str | None = None,
     ) -> str:
         """
         Save a conversion result.
@@ -213,7 +213,7 @@ class ResultStorage:
 
     def list_results(
         self,
-        user_id: Optional[str] = None,
+        user_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
         order_by: str = "created_at DESC",
@@ -256,7 +256,7 @@ class ResultStorage:
             finally:
                 conn.close()
 
-    def count_results(self, user_id: Optional[str] = None) -> int:
+    def count_results(self, user_id: str | None = None) -> int:
         """Count total results, optionally filtered by user."""
         with self._lock:
             conn = self._get_conn()
@@ -293,10 +293,8 @@ class ResultStorage:
 
                 # Delete the stored file
                 if delete_file and output_path and os.path.exists(output_path):
-                    try:
+                    with contextlib.suppress(OSError):
                         os.remove(output_path)
-                    except OSError:
-                        pass
 
                 return True
             finally:
@@ -314,10 +312,8 @@ class ResultStorage:
 
                 for row in rows:
                     if delete_file and row[1] and os.path.exists(row[1]):
-                        try:
+                        with contextlib.suppress(OSError):
                             os.remove(row[1])
-                        except OSError:
-                            pass
 
                 conn.execute(
                     "DELETE FROM results WHERE task_id = ?", (task_id,)
@@ -340,10 +336,8 @@ class ResultStorage:
 
                 for row in rows:
                     if row[1] and os.path.exists(row[1]):
-                        try:
+                        with contextlib.suppress(OSError):
                             os.remove(row[1])
-                        except OSError:
-                            pass
 
                 conn.execute(
                     "DELETE FROM results WHERE expires_at IS NOT NULL AND expires_at < ?",

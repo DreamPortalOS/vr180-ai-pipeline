@@ -1,13 +1,9 @@
 """Tests for Smart SBS Input Detection (Task 1.1)."""
 
-import os
 import subprocess
-import tempfile
 
-import cv2
 import numpy as np
 import pytest
-
 from scripts.run_pipeline import detect_sbs_input
 
 

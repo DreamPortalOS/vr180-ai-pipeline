@@ -3,14 +3,11 @@
 Run with: pytest tests/ -v
 """
 import os
-import struct
 import subprocess
-import tempfile
 
 import cv2
 import numpy as np
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -223,7 +220,7 @@ class TestRunPipelineCLI:
             "run_pipeline",
             os.path.join(os.path.dirname(__file__), "..", "scripts", "run_pipeline.py"),
         )
-        mod = importlib.util.module_from_spec(spec)
+        importlib.util.module_from_spec(spec)
         # Don't execute main, just verify it loads
         assert spec is not None
 
@@ -239,8 +236,8 @@ class TestEndToEnd:
         import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         from pipeline.depth_estimator import DepthEstimator
-        from pipeline.stereo_renderer import StereoRenderer
         from pipeline.equirectangular_mapper import EquirectangularMapper
+        from pipeline.stereo_renderer import StereoRenderer
         from pipeline.vr_metadata import VRMetadataEmbedder
 
         # Read 2 frames
@@ -260,18 +257,18 @@ class TestEndToEnd:
         # Stereo
         renderer = StereoRenderer()
         lefts, rights = [], []
-        for frame, depth in zip(frames, depths):
-            l, r = renderer.render(frame, depth)
-            lefts.append(l)
-            rights.append(r)
+        for frame, depth in zip(frames, depths, strict=False):
+            left, right = renderer.render(frame, depth)
+            lefts.append(left)
+            rights.append(right)
 
         # Equirect
         mapper = EquirectangularMapper(
             output_width=320, output_height=320, src_hfov=70.0, use_ffmpeg=False,
         )
         sbs_frames = []
-        for l, r in zip(lefts, rights):
-            sbs_frames.append(mapper.map_stereo_pair(l, r))
+        for left, right in zip(lefts, rights, strict=False):
+            sbs_frames.append(mapper.map_stereo_pair(left, right))
 
         # Encode
         embedder = VRMetadataEmbedder(codec="h264", crf=23, fps=24)

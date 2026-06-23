@@ -4,9 +4,10 @@ Super-resolution using Real-ESRGAN for enhanced visual quality.
 Supports 2× and 4× upscaling with MPS/CUDA/CPU auto-detection.
 """
 
-import numpy as np
+from typing import ClassVar
+
 import cv2
-from typing import Optional, Tuple
+import numpy as np
 
 
 class PixelUpscaler:
@@ -26,7 +27,7 @@ class PixelUpscaler:
         half_precision: Use fp16 for faster inference on CUDA
     """
 
-    MODELS = {
+    MODELS: ClassVar[dict] = {
         "RealESRGAN_x2plus": {
             "scale": 2,
             "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
@@ -44,8 +45,8 @@ class PixelUpscaler:
     def __init__(
         self,
         scale: int = 2,
-        model_name: Optional[str] = None,
-        device: Optional[str] = None,
+        model_name: str | None = None,
+        device: str | None = None,
         half_precision: bool = False,
     ):
         self.scale = scale
@@ -56,7 +57,7 @@ class PixelUpscaler:
         self._use_opencv_fallback = False
 
     @staticmethod
-    def _resolve_device(device: Optional[str]) -> str:
+    def _resolve_device(device: str | None) -> str:
         if device:
             return device.lower()
         try:
@@ -74,8 +75,8 @@ class PixelUpscaler:
             return
 
         try:
-            from realesrgan import RealESRGANer
             from basicsr.archs.rrdbnet_arch import RRDBNet
+            from realesrgan import RealESRGANer
         except ImportError:
             # Fall back to OpenCV-based upscaling
             self._use_opencv_fallback = True
@@ -290,7 +291,7 @@ class PixelUpscaler:
             )
             weight_map[out_y0:out_y0 + crop_h, out_x0:out_x0 + crop_w] += weight
 
-            tile_count += 1
+            tile_count += 1  # noqa: SIM113 — explicit counter reads clearer than enumerate here
             if progress_callback:
                 progress_callback(tile_count, total_tiles)
 
@@ -451,9 +452,9 @@ def _gaussian_ramp(length: int, margin: int) -> np.ndarray:
 
 def create_upscaler(
     scale: int = 2,
-    model_name: Optional[str] = None,
-    device: Optional[str] = None,
-) -> Optional[PixelUpscaler]:
+    model_name: str | None = None,
+    device: str | None = None,
+) -> PixelUpscaler | None:
     """Factory: create upscaler with graceful fallback.
 
     Returns PixelUpscaler if realesrgan is installed, None otherwise.

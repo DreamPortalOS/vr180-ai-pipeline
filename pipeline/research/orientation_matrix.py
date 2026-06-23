@@ -19,8 +19,6 @@ Usage:
 import argparse
 import logging
 import os
-import subprocess
-import tempfile
 from pathlib import Path
 
 import cv2
@@ -51,11 +49,11 @@ COMBO_LABELS = {}  # populated at runtime
 
 def apply_flip(frame: np.ndarray, flip_type: str) -> np.ndarray:
     """Apply OpenCV flip to a frame.
-    
+
     Args:
         frame: RGB image (H, W, 3)
         flip_type: one of 'none', 'vflip', 'hflip', 'both'
-    
+
     Returns:
         Flipped frame
     """
@@ -73,17 +71,17 @@ def apply_flip(frame: np.ndarray, flip_type: str) -> np.ndarray:
 
 def apply_transpose(frame: np.ndarray, transpose_type: str) -> np.ndarray:
     """Apply ffmpeg-style transpose operation using OpenCV.
-    
+
     Transpose codes (matching ffmpeg):
         0 = 90° counter-clockwise and vertical flip (equivalent to rot90 + vflip)
         1 = 90° clockwise
         2 = 90° counter-clockwise
         3 = 90° clockwise and vertical flip
-    
+
     Args:
         frame: RGB image (H, W, 3)
         transpose_type: one of 'none', 't0', 't1', 't2', 't3'
-    
+
     Returns:
         Transposed frame
     """
@@ -107,16 +105,16 @@ def apply_transpose(frame: np.ndarray, transpose_type: str) -> np.ndarray:
 
 def generate_orientation_matrix(
     frame: np.ndarray,
-    flip_types: list[str] = None,
-    transpose_types: list[str] = None,
+    flip_types: list[str] | None = None,
+    transpose_types: list[str] | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Generate a grid of all orientation combinations.
-    
+
     Args:
         frame: RGB input frame
         flip_types: list of flip operations to test
         transpose_types: list of transpose operations to test
-    
+
     Returns:
         Tuple of (grid_image, combo_map) where combo_map maps
         (row, col) → (label, transformed_frame)
@@ -191,7 +189,7 @@ def save_individual_tiles(combo_map: dict, output_dir: str):
 
 def generate_ffmpeg_filter_map(combo_map: dict) -> str:
     """Generate equivalent ffmpeg filter strings for each orientation combo.
-    
+
     Returns a human-readable report of ffmpeg equivalents.
     """
     lines = ["# FFmpeg Filter Equivalents", ""]
@@ -223,18 +221,18 @@ def generate_ffmpeg_filter_map(combo_map: dict) -> str:
 
 def run_orientation_matrix(
     input_path: str,
-    output_path: str = None,
+    output_path: str | None = None,
     frame_idx: int = 0,
     save_tiles: bool = True,
 ) -> str:
     """Main entry: generate orientation diagnostic grid from a video.
-    
+
     Args:
         input_path: Path to input video
         output_path: Output path for grid image (PNG) or video
         frame_idx: Which frame to extract (0-indexed)
         save_tiles: Whether to save individual tile images
-    
+
     Returns:
         Path to output grid image
     """

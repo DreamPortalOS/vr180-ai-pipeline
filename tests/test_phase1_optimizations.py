@@ -12,9 +12,7 @@ import ast
 import os
 import sys
 import unittest
-from unittest.mock import patch, MagicMock
-
-import numpy as np
+from unittest.mock import patch
 
 # Ensure project root is on sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -177,11 +175,12 @@ class TestTiledUpscaling(unittest.TestCase):
         """PixelUpscaler has upscale_tiled method."""
         from pipeline.upscaler import PixelUpscaler
         self.assertTrue(hasattr(PixelUpscaler, "upscale_tiled"))
-        self.assertTrue(callable(getattr(PixelUpscaler, "upscale_tiled")))
+        self.assertTrue(callable(PixelUpscaler.upscale_tiled))
 
     def test_upscale_tiled_params(self):
         """upscale_tiled accepts tile_size, tile_pad, progress_callback."""
         import inspect
+
         from pipeline.upscaler import PixelUpscaler
         sig = inspect.signature(PixelUpscaler.upscale_tiled)
         params = list(sig.parameters.keys())
@@ -194,6 +193,7 @@ class TestTiledUpscaling(unittest.TestCase):
     def test_upscale_tiled_tile_size_default(self):
         """upscale_tiled default tile_size is 512."""
         import inspect
+
         from pipeline.upscaler import PixelUpscaler
         sig = inspect.signature(PixelUpscaler.upscale_tiled)
         default = sig.parameters["tile_size"].default

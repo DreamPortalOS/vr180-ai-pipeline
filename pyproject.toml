@@ -72,6 +72,10 @@ select = [
 ignore = [
     "E501",   # line too long (handled by formatter)
     "B008",   # function call in default arg (typer/fastapi pattern)
+    "RUF001", # ambiguous unicode in strings — we use °/×/→ technical symbols
+    "RUF002", # ambiguous unicode in docstrings — same (°/×/→/—)
+    "RUF003", # ambiguous unicode in comments — same
+    "N806",   # non-lowercase var in function — H/W/R/G/B image-processing convention
 ]
 
 [tool.ruff.lint.isort]

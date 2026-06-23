@@ -14,8 +14,8 @@ For each pixel at position (x, y) with depth d:
     x_R = x - shift / 2   (right eye — shift left)
 """
 
+
 import numpy as np
-from typing import Optional, Tuple
 
 
 class StereoRenderer:
@@ -28,7 +28,7 @@ class StereoRenderer:
     def __init__(
         self,
         ipd: float = 0.064,           # Interpupillary distance in meters
-        focal_length_px: Optional[float] = None,
+        focal_length_px: float | None = None,
         max_disparity: float = 0.05,   # Max shift as fraction of image width
         temporal_smooth: bool = True,
         convergence: float = 0.3,      # Convergence plane depth (fraction of max depth)
@@ -38,11 +38,11 @@ class StereoRenderer:
         self.max_disparity = max_disparity
         self.temporal_smooth = temporal_smooth
         self.convergence = convergence
-        self._prev_disparity: Optional[np.ndarray] = None
+        self._prev_disparity: np.ndarray | None = None
 
     def render(
         self, frame: np.ndarray, depth: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Generate left and right views.
 
         Args:
@@ -100,10 +100,7 @@ class StereoRenderer:
         """
         # Normalize depth to a meaningful range
         d_min, d_max = depth.min(), depth.max()
-        if d_max > d_min:
-            depth_norm = (depth - d_min) / (d_max - d_min)
-        else:
-            depth_norm = np.zeros_like(depth)
+        depth_norm = (depth - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(depth)
 
         # Convergence plane: objects at convergence depth have zero disparity
         # Objects closer than convergence pop out (positive disparity)
@@ -131,7 +128,7 @@ class StereoRenderer:
 
         # Only consider holes within a border region (where disocclusion occurs)
         # This prevents false positives on legitimately dark scene content
-        H, W = raw_mask.shape
+        _H, W = raw_mask.shape
         border_width = max(int(W * 0.05), 5)  # 5% of width or at least 5px
         border_mask = np.zeros_like(raw_mask)
         border_mask[:border_width, :] = 1        # top
@@ -154,7 +151,7 @@ class StereoRenderer:
         self, frames: list, depths: list
     ) -> list:
         """Process a batch of frame/depth pairs."""
-        return [self.render(f, d) for f, d in zip(frames, depths)]
+        return [self.render(f, d) for f, d in zip(frames, depths, strict=False)]
 
     def reset_temporal_state(self):
         """Clear temporal smoothing state for a new video sequence."""

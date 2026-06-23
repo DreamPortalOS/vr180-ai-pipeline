@@ -18,8 +18,9 @@ Usage:
     depth_maps = estimator.estimate_batch(frames)  # batch
 """
 
+from typing import ClassVar
+
 import numpy as np
-from typing import Optional, List
 
 
 class DepthEstimator:
@@ -29,7 +30,7 @@ class DepthEstimator:
     """
 
     # Valid HuggingFace model repos
-    MODEL_REPOS = {
+    MODEL_REPOS: ClassVar[dict[str, str]] = {
         "small": "depth-anything/Depth-Anything-V2-Small-hf",
         "base": "depth-anything/Depth-Anything-V2-Base-hf",
         "large": "depth-anything/Depth-Anything-V2-Large-hf",
@@ -38,7 +39,7 @@ class DepthEstimator:
     def __init__(
         self,
         model_size: str = "small",
-        device: Optional[str] = None,
+        device: str | None = None,
         calibrate: bool = True,
     ):
         """
@@ -77,7 +78,7 @@ class DepthEstimator:
             model=self.MODEL_REPOS[self.model_size],
             device=self.device,
         )
-        print(f"[Depth] Model loaded successfully.")
+        print("[Depth] Model loaded successfully.")
 
     def estimate(self, frame: np.ndarray) -> np.ndarray:
         """Estimate depth for a single RGB frame.
@@ -115,10 +116,7 @@ class DepthEstimator:
 
         # Normalize to [0, 1] range
         d_min, d_max = depth_np.min(), depth_np.max()
-        if d_max > d_min:
-            depth_np = (depth_np - d_min) / (d_max - d_min)
-        else:
-            depth_np = np.zeros_like(depth_np)
+        depth_np = (depth_np - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(depth_np)
 
         # Optional metric calibration
         if self.calibrate:
@@ -126,7 +124,7 @@ class DepthEstimator:
 
         return depth_np
 
-    def estimate_batch(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+    def estimate_batch(self, frames: list[np.ndarray]) -> list[np.ndarray]:
         """Estimate depth for a list of frames."""
         return [self.estimate(f) for f in frames]
 

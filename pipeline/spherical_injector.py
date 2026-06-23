@@ -7,12 +7,12 @@ References:
 - Google spatial-media: https://github.com/google/spatial-media
 - Google Spherical Video V2 spec
 """
+import contextlib
 import os
 import shutil
 import struct
 import subprocess
 import tempfile
-
 
 # ─── ISOBMFF constants ────────────────────────────────────────────────────────
 
@@ -202,7 +202,7 @@ def _inject_via_spatialmedia_cli(
             timeout=30,
         )
         if result.returncode == 0:
-            print(f"[Metadata] ✅ VR180 sv3d+st3d injected via spatial-media")
+            print("[Metadata] ✅ VR180 sv3d+st3d injected via spatial-media")
             return True
         else:
             print(f"[Metadata] spatialmedia error: {result.stderr[:200]}")
@@ -252,12 +252,8 @@ def _inject_via_ffmpeg_udta(output_path: str, stereo_mode: str):
             print("[Metadata] Injected via ffmpeg metadata remux (V1 XML)")
         else:
             print(f"[Metadata] ffmpeg remux failed: {result.stderr[:200]}")
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(tmp)
-            except OSError:
-                pass
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(xml_path)
-        except OSError:
-            pass

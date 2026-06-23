@@ -20,17 +20,16 @@ Requires:
     pip install opencv-python numpy torch diffusers
 """
 
+import logging
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
 import cv2
 import numpy as np
-import subprocess
-import os
-import sys
-import logging
-import json
-import time
-from pathlib import Path
-from typing import Optional, Tuple, Dict, List
-from dataclasses import dataclass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("ai-outpainter")
@@ -48,16 +47,16 @@ class OutpaintRegion:
 class MockOmniOutpainter:
     """
     Mock implementation of Google Omni/Seedance-style API outpainting.
-    
+
     In production, replace with actual API calls to:
     - Google Gemini Omni (video understanding + generation)
     - Seedance 1.0 (video generation with temporal consistency)
     - Local Stable Diffusion InpaintPipeline
-    
+
     For now, uses edge-aware content-aware fill via OpenCV inpainting.
     """
 
-    def __init__(self, model_path: Optional[str] = None):
+    def __init__(self, model_path: str | None = None):
         self.model_path = model_path
         self.use_sd = False
         self.pipe = None
@@ -65,8 +64,8 @@ class MockOmniOutpainter:
         # Try to load local Stable Diffusion if available
         if model_path and os.path.exists(model_path):
             try:
-                from diffusers import StableDiffusionInpaintPipeline
                 import torch
+                from diffusers import StableDiffusionInpaintPipeline
                 self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
                     model_path,
                     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
@@ -80,16 +79,16 @@ class MockOmniOutpainter:
             except Exception as e:
                 log.warning(f"Failed to load SD model: {e}, using OpenCV fallback")
 
-    def outpaint_region(self, frame: np.ndarray, mask: np.ndarray, 
+    def outpaint_region(self, frame: np.ndarray, mask: np.ndarray,
                         prompt: str = "seamless sky environment") -> np.ndarray:
         """
         Outpaint a masked region of the frame.
-        
+
         Args:
             frame: Input frame (H, W, 3) BGR
             mask: Binary mask (H, W) where 255 = region to fill
             prompt: Text prompt for generation (used with SD)
-            
+
         Returns:
             Outpainted frame
         """
@@ -98,11 +97,10 @@ class MockOmniOutpainter:
         else:
             return self._outpaint_with_opencv(frame, mask)
 
-    def _outpaint_with_sd(self, frame: np.ndarray, mask: np.ndarray, 
+    def _outpaint_with_sd(self, frame: np.ndarray, mask: np.ndarray,
                           prompt: str) -> np.ndarray:
         """Outpaint using Stable Diffusion inpainting."""
         from PIL import Image
-        import torch
 
         # Convert BGR to RGB PIL
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -122,13 +120,13 @@ class MockOmniOutpainter:
     def _outpaint_with_opencv(self, frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """
         Outpaint using OpenCV content-aware fill (inpainting).
-        
+
         Uses a combination of:
         1. Navier-Stokes inpainting for small gaps
         2. Edge-aware blending for larger regions
         3. Gaussian blur to smooth seams
         """
-        h, w = frame.shape[:2]
+        _h, _w = frame.shape[:2]
 
         # Step 1: Use cv2.inpaint for initial fill
         # INPAINT_NS = Navier-Stokes based (better for texture)
@@ -166,7 +164,7 @@ class MockOmniOutpainter:
 class EquirectangularOutpainter:
     """
     Outpaints a flat equirectangular frame to fill missing regions.
-    
+
     The equirectangular projection has specific regions that need filling:
     - Top pole (zenith): sky/ceiling
     - Bottom pole (nadir): ground/floor
@@ -177,10 +175,10 @@ class EquirectangularOutpainter:
         self.target_width = target_width
         self.target_height = target_height
 
-    def create_outpaint_mask(self, frame: np.ndarray) -> Tuple[np.ndarray, List[OutpaintRegion]]:
+    def create_outpaint_mask(self, frame: np.ndarray) -> tuple[np.ndarray, list[OutpaintRegion]]:
         """
         Analyze the frame and create masks for regions that need outpainting.
-        
+
         Returns:
             Tuple of (combined_mask, list of regions)
         """
@@ -219,19 +217,19 @@ class EquirectangularOutpainter:
 
         return mask, regions
 
-    def expand_to_full_equirect(self, frame: np.ndarray, 
+    def expand_to_full_equirect(self, frame: np.ndarray,
                                  outpainter: MockOmniOutpainter) -> np.ndarray:
         """
         Expand a partial equirectangular frame to fill the full sphere.
-        
+
         Args:
             frame: Input frame (may have black unfilled regions)
             outpainter: The outpainting backend
-            
+
         Returns:
             Full equirectangular frame with all regions filled
         """
-        h, w = frame.shape[:2]
+        _h, _w = frame.shape[:2]
 
         # Create outpaint mask
         mask, regions = self.create_outpaint_mask(frame)
@@ -255,7 +253,7 @@ class TemporalOutpaintPropagator:
     """
     Propagates outpainted keyframe borders across subsequent frames
     using Optical Flow for temporal consistency.
-    
+
     This prevents flickering by:
     1. Computing optical flow between consecutive frames
     2. Warping the keyframe outpainted borders using the flow
@@ -268,7 +266,7 @@ class TemporalOutpaintPropagator:
         self.keyframe_borders = None
         self.keyframe_gray = None
 
-    def _compute_optical_flow(self, prev_gray: np.ndarray, 
+    def _compute_optical_flow(self, prev_gray: np.ndarray,
                                curr_gray: np.ndarray) -> np.ndarray:
         """Compute optical flow between two grayscale frames."""
         if self.method == "farneback":
@@ -326,7 +324,7 @@ class TemporalOutpaintPropagator:
     def set_keyframe(self, frame: np.ndarray, outpainted_frame: np.ndarray):
         """
         Set the keyframe with its outpainted borders.
-        
+
         Args:
             frame: Original keyframe
             outpainted_frame: Keyframe with outpainted borders
@@ -335,15 +333,15 @@ class TemporalOutpaintPropagator:
         self.keyframe_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.prev_gray = self.keyframe_gray.copy()
 
-    def propagate(self, current_frame: np.ndarray, 
+    def propagate(self, current_frame: np.ndarray,
                   border_mask: np.ndarray) -> np.ndarray:
         """
         Propagate keyframe borders to current frame using optical flow.
-        
+
         Args:
             current_frame: Current frame from video
             border_mask: Mask indicating border regions (255 = border)
-            
+
         Returns:
             Frame with propagated stable borders
         """
@@ -366,7 +364,7 @@ class TemporalOutpaintPropagator:
         mask_smooth = cv2.GaussianBlur(mask_3ch, (21, 21), 0)
 
         # Composite: current frame in center, warped borders at edges
-        result = (current_frame * (1 - mask_smooth) + 
+        result = (current_frame * (1 - mask_smooth) +
                   warped_borders * mask_smooth).astype(np.uint8)
 
         # Update state
@@ -380,14 +378,14 @@ def process_video_with_outpainting(
     input_path: str,
     output_path: str,
     method: str = "mock",
-    model_path: Optional[str] = None,
-    max_frames: Optional[int] = None,
+    model_path: str | None = None,
+    max_frames: int | None = None,
     target_width: int = 7680,
     target_height: int = 3840,
 ) -> str:
     """
     Process a video with temporal-consistent AI outpainting.
-    
+
     Args:
         input_path: Input video path
         output_path: Output video path
@@ -396,7 +394,7 @@ def process_video_with_outpainting(
         max_frames: Maximum frames to process
         target_width: Target equirectangular width
         target_height: Target equirectangular height
-        
+
     Returns:
         Output video path
     """
@@ -471,10 +469,7 @@ def process_video_with_outpainting(
                 result = outpainted
             else:
                 # Propagate borders from keyframe using optical flow
-                if keyframe_set:
-                    result = propagator.propagate(frame, border_mask)
-                else:
-                    result = frame
+                result = propagator.propagate(frame, border_mask) if keyframe_set else frame
 
             # Write to output
             proc.stdin.write(result.tobytes())

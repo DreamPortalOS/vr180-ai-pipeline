@@ -1,8 +1,6 @@
 """Pydantic schemas for VR180 Studio API request/response models."""
 
-from datetime import datetime
 from enum import Enum
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -26,22 +24,22 @@ class HealthResponse(BaseModel):
 class TaskCreateRequest(BaseModel):
     """Request to create a new VR180 conversion task."""
     input_path: str = Field(..., description="Path to source video file")
-    output_path: Optional[str] = Field(None, description="Output file path (auto-generated if omitted)")
-    metadata: Optional[dict] = Field(default_factory=dict, description="Optional metadata")
+    output_path: str | None = Field(None, description="Output file path (auto-generated if omitted)")
+    metadata: dict | None = Field(default_factory=dict, description="Optional metadata")
 
 
 class TaskResponse(BaseModel):
     """Full task state response."""
     id: str
     input_path: str
-    output_path: Optional[str] = None
+    output_path: str | None = None
     status: TaskStatusEnum
     progress: float = Field(0.0, ge=0.0, le=1.0)
     stage: str = "init"
-    error: Optional[str] = None
+    error: str | None = None
     created_at: str
     updated_at: str
-    completed_at: Optional[str] = None
+    completed_at: str | None = None
     metadata: dict = Field(default_factory=dict)
 
 
@@ -56,13 +54,13 @@ class TaskListResponse(BaseModel):
 class TaskUpdateRequest(BaseModel):
     """Request to update task status (used by internal workers)."""
     status: TaskStatusEnum
-    progress: Optional[float] = Field(None, ge=0.0, le=1.0)
-    stage: Optional[str] = None
-    error: Optional[str] = None
-    output_path: Optional[str] = None
+    progress: float | None = Field(None, ge=0.0, le=1.0)
+    stage: str | None = None
+    error: str | None = None
+    output_path: str | None = None
 
 
 class ErrorResponse(BaseModel):
     """Standard error response."""
     error: str
-    detail: Optional[str] = None
+    detail: str | None = None

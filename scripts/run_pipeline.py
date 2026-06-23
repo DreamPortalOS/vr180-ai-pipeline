@@ -26,8 +26,6 @@ import argparse
 import json
 import logging
 import os
-import sys
-import tempfile
 from pathlib import Path
 
 import cv2
@@ -35,12 +33,12 @@ import numpy as np
 from tqdm import tqdm
 
 from pipeline.depth_estimator import DepthEstimator
-from pipeline.stereo_renderer import StereoRenderer
-from pipeline.equirectangular_mapper import EquirectangularMapper
-from pipeline.vr_metadata import VRMetadataEmbedder
-from pipeline.upscaler import PixelUpscaler
 from pipeline.device_utils import detect_best_device, resolve_device
+from pipeline.equirectangular_mapper import EquirectangularMapper
+from pipeline.stereo_renderer import StereoRenderer
 from pipeline.streaming_pipeline import StreamingPipeline
+from pipeline.upscaler import PixelUpscaler
+from pipeline.vr_metadata import VRMetadataEmbedder
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,7 +131,7 @@ def parse_args():
                         help="Use tiled upscaling for large frames (8K-safe)")
     parser.add_argument("--tile-size", type=int, default=512,
                         help="Tile size for tiled upscaling (default: 512)")
-    
+
     # Phase 2: Smart SBS detection (Task 1.1)
     parser.add_argument("--force-sbs", action="store_true",
                         help="Force treat input as SBS stereo (skip depth/stereo stages)")
@@ -141,7 +139,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def read_frames(video_path: str, max_frames: int = None):
+def read_frames(video_path: str, max_frames: int | None = None):
     """Yield RGB frames from a video file."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -188,10 +186,7 @@ def get_temp_dir(args, subdir=None):
         # Default: use a directory next to the input file for stage persistence
         input_stem = Path(args.input).stem
         base = Path(args.input).parent / f"{input_stem}_vr180_temp"
-    if subdir:
-        path = base / subdir
-    else:
-        path = base
+    path = base / subdir if subdir else base
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
 
@@ -246,7 +241,7 @@ def run_stereo_stage(args, frames, depths):
 
     left_frames, right_frames = [], []
     for i, (frame, depth) in enumerate(
-        tqdm(zip(frames, depths), desc="Rendering stereo", total=len(frames))
+        tqdm(zip(frames, depths, strict=False), desc="Rendering stereo", total=len(frames))
     ):
         left, right = renderer.render(frame, depth)
         left_frames.append(left)
@@ -276,7 +271,7 @@ def run_equirect_stage(args, left_frames, right_frames):
     out_dir = get_temp_dir(args, "equirect")
     sbs_frames = []
     for i, (left, right) in enumerate(
-        tqdm(zip(left_frames, right_frames),
+        tqdm(zip(left_frames, right_frames, strict=False),
              desc="Mapping to equirect", total=len(left_frames))
     ):
         sbs = mapper.map_stereo_pair(left, right)
@@ -496,7 +491,7 @@ def validate_input_format(input_path: str):
     print("=" * 60)
 
 
-def save_checkpoint(temp_dir: str, stage: str, info: dict = None):
+def save_checkpoint(temp_dir: str, stage: str, info: dict | None = None):
     """Save a checkpoint file indicating which stage completed."""
     checkpoint_path = os.path.join(temp_dir, "checkpoint.json")
     data = {"last_completed_stage": stage}
@@ -522,36 +517,36 @@ STAGE_ORDER_SBS = ["upscale", "equirect", "metadata"]  # Skip depth & stereo for
 
 def detect_sbs_input(video_path: str, force_sbs: bool = False) -> bool:
     """Detect if input video is already a Side-by-Side (SBS) stereo frame.
-    
+
     Detection logic:
     - If --force-sbs is set, always return True
     - If width/height ratio >= 3.5:1 (e.g., 7680×1920 = 4:1), treat as SBS
-    
+
     Args:
         video_path: Path to input video file
         force_sbs: Manual override flag
-        
+
     Returns:
         True if input should be treated as SBS stereo
     """
     if force_sbs:
         log.info("🔒 --force-sbs flag set: treating input as SBS stereo")
         return True
-    
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return False
-    
+
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
-    
+
     if h == 0:
         return False
-    
+
     ratio = w / h
     is_sbs = ratio >= 3.5
-    
+
     if is_sbs:
         log.info(
             f"🔍 SBS auto-detection: {w}×{h} (ratio {ratio:.2f}:1) → "
@@ -562,7 +557,7 @@ def detect_sbs_input(video_path: str, force_sbs: bool = False) -> bool:
             f"🔍 SBS auto-detection: {w}×{h} (ratio {ratio:.2f}:1) → "
             f"Standard 2D input. Running full pipeline."
         )
-    
+
     return is_sbs
 
 
@@ -600,7 +595,7 @@ def main():
         cap = cv2.VideoCapture(args.input)
         src_fps = cap.get(cv2.CAP_PROP_FPS)
         cap.release()
-        args.fps = int(round(src_fps)) if src_fps and src_fps > 0 else 30
+        args.fps = round(src_fps) if src_fps and src_fps > 0 else 30
         log.info(f"📹 Output fps inherited from source: {args.fps}")
 
     # Streaming pipeline mode (PRD §7.2)
@@ -698,7 +693,7 @@ def main():
                         frames = list(read_frames(args.input, args.max_frames))
                     left_frames, right_frames = [], []
                     for frame in frames:
-                        h, w = frame.shape[:2]
+                        _h, w = frame.shape[:2]
                         mid = w // 2
                         left_frames.append(frame[:, :mid, :])
                         right_frames.append(frame[:, mid:, :])

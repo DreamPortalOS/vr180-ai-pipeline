@@ -1,6 +1,5 @@
 """Tests for Celery tasks (mocked, no real Celery broker needed)."""
-import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 
 def test_convert_task_exists():
@@ -67,8 +66,8 @@ def test_convert_task_calls_pipeline(mock_pipeline_cls):
     mock_instance.process.return_value = "/tmp/output.mp4"
     mock_pipeline_cls.return_value = mock_instance
 
-    from workers.convert_tasks import convert_to_vr180
     from workers.celery_app import app
+    from workers.convert_tasks import convert_to_vr180
 
     old_backend = app.conf.result_backend
     app.conf.task_always_eager = True
@@ -101,8 +100,8 @@ def test_convert_task_default_params(mock_pipeline_cls):
     mock_instance.process.return_value = "/tmp/output.mp4"
     mock_pipeline_cls.return_value = mock_instance
 
-    from workers.convert_tasks import convert_to_vr180
     from workers.celery_app import app
+    from workers.convert_tasks import convert_to_vr180
 
     old_backend = app.conf.result_backend
     app.conf.task_always_eager = True
