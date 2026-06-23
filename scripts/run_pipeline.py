@@ -75,8 +75,8 @@ def parse_args():
                         help="Output video codec")
     parser.add_argument("--crf", type=int, default=23,
                         help="Constant rate factor")
-    parser.add_argument("--fps", type=int, default=30,
-                        help="Output frame rate")
+    parser.add_argument("--fps", type=int, default=None,
+                        help="Output frame rate (default: inherit from source video)")
     parser.add_argument("--output-width", type=int, default=3840,
                         help="Equirectangular output width per eye")
     parser.add_argument("--output-height", type=int, default=1920,
@@ -271,7 +271,6 @@ def run_equirect_stage(args, left_frames, right_frames):
         output_height=args.output_height,
         src_hfov=args.src_hfov,
         use_ffmpeg=not args.no_ffmpeg_v360,
-        flip_vertical=not args.no_flip,
     )
 
     out_dir = get_temp_dir(args, "equirect")
@@ -595,6 +594,15 @@ def main():
         validate_input_format(args.input)
         return
 
+    # Inherit output fps from source video unless explicitly overridden.
+    # Prevents speed-up/duration-mismatch when source != 30fps.
+    if args.fps is None:
+        cap = cv2.VideoCapture(args.input)
+        src_fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        args.fps = int(round(src_fps)) if src_fps and src_fps > 0 else 30
+        log.info(f"📹 Output fps inherited from source: {args.fps}")
+
     # Streaming pipeline mode (PRD §7.2)
     if args.streaming and args.stage == "all":
         log.info("🚀 Streaming pipeline mode (O(1) memory)")
@@ -609,7 +617,6 @@ def main():
             codec=args.codec,
             crf=args.crf,
             fps=args.fps,
-            flip_vertical=not args.no_flip,
         )
         output = get_output_path(args)
         result = pipeline.process_stream(

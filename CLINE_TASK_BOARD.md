@@ -403,11 +403,45 @@ Cline 完成后需在本文件写入以下信息：
 
 ---
 
+## 🔵 Phase Q — 画质提升（核心竞争力）
+
+> 战略依据：`docs/STRATEGY_AI_VR180.md`
+> ⚠️ **依赖 NVIDIA CUDA GPU**。Mac 本机无法真实验证；Cline 可完成代码封装 + mock 测试，真实跑通需云端/本地 GPU。
+> 优先级与排期待用户确认（质量优先 vs 平台优先）。
+
+### [ ] Q1 — 抽象 depth/stereo 后端接口
+
+- 定义 `pipeline/backends/base.py`：`DepthBackend` / `StereoBackend` 抽象基类
+- 现有 Depth Anything V2 + 简单视差封装为 `baseline` 后端（Mac 可跑，快速预览档）
+- 通过 `--quality {fast,high}` 或环境变量切换后端
+
+### [ ] Q2 — 集成 Video-Depth-Anything（时序一致深度）
+
+- 仓库：https://github.com/DepthAnything/Video-Depth-Anything
+- 替换逐帧深度，消除闪烁/抖动
+- 作为 `high` 档 DepthBackend
+
+### [ ] Q3 — 集成 StereoCrafter（高保真立体对 + AI 补全）
+
+- 仓库：https://github.com/TencentARC/StereoCrafter
+- depth-based splatting + stereo inpainting，解决左右眼空洞/背景不一致
+- 作为 `high` 档 StereoBackend
+
+### [ ] Q4 — 上下黑边 AI outpainting
+
+- 等距投影后上下约 30% 为黑边
+- 复用现有 `temporal_outpainter.py` 或接入扩散模型补全天空/地面
+
+---
+
 ## 🟡 Phase B — AI 视频生成接入（等待 Phase A 全部完成）
 
 ### [ ] B1 — VideoGen 抽象接口 + Kling API 接入
 
 **状态**: 等待 Phase A 完成  
+
+> ⚠️ 调研结论：Kling/Veo/Seedance **均不支持原生立体输出**，B1 仅生成 2D 源视频，
+> 立体化由 Phase Q 完成。Prompt 需内置广角/低空/FPV 关键词（见 STRATEGY 文档第七节）。
 
 - 创建 `integrations/base.py` 抽象基类
 - 实现 `integrations/kling.py`（快手可灵 API）

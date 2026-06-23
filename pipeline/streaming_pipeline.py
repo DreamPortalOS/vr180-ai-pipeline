@@ -42,11 +42,10 @@ class StreamingPipeline:
         max_disparity: float = 0.05,
         output_width: int = 3840,
         output_height: int = 1920,
-        src_hfov: float = 70.0,
+        src_hfov: float = 120.0,
         codec: str = "h264",
         crf: int = 23,
         fps: int = 30,
-        flip_vertical: bool = True,
     ):
         self.model_size = model_size
         self.device = resolve_device(device)
@@ -58,7 +57,6 @@ class StreamingPipeline:
         self.codec = codec
         self.crf = crf
         self.fps = fps
-        self.flip_vertical = flip_vertical
 
         # Initialise pipeline stages
         self.depth_estimator = DepthEstimator(
@@ -75,7 +73,6 @@ class StreamingPipeline:
             output_height=output_height,
             src_hfov=src_hfov,
             use_ffmpeg=True,
-            flip_vertical=flip_vertical,
         )
 
     def _build_ffmpeg_cmd(self, output_path: str, width: int, height: int) -> List[str]:
