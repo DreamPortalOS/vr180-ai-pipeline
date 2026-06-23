@@ -19,13 +19,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from celery.result import AsyncResult
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from workers.celery_app import app as celery_app
 from workers.convert_tasks import convert_to_vr180
 
+from web.auth import verify_api_key
 from web.schemas import (
     ErrorResponse,
     HealthResponse,
@@ -150,6 +151,7 @@ async def create_task(request: TaskCreateRequest):
 )
 async def create_task_v1(
     file: UploadFile = File(...),
+    _api_key: object = Depends(verify_api_key),
     output_format: str = Form("equirectangular"),
     resolution: str = Form("4k"),
     codec: str = Form("h265"),
@@ -325,7 +327,10 @@ async def delete_task(task_id: str):
     tags=["Tasks"],
     responses={404: {"model": ErrorResponse}},
 )
-async def delete_task_v1(task_id: str):
+async def delete_task_v1(
+    task_id: str,
+    _api_key: object = Depends(verify_api_key),
+):
     """Delete a task from the store (v1)."""
     deleted = task_store.delete_task(task_id)
     if not deleted:
@@ -477,7 +482,10 @@ async def list_results_v1(
     tags=["Results"],
     responses={404: {"model": ErrorResponse}},
 )
-async def delete_result_v1(task_id: str):
+async def delete_result_v1(
+    task_id: str,
+    _api_key: object = Depends(verify_api_key),
+):
     """Delete a result and its output file."""
     task = task_store.get_task(task_id)
     if task is None:

@@ -303,6 +303,7 @@ class TestEndToEnd:
     @pytest.mark.slow
     def test_full_pipeline_mini(self, tmp_video, tmp_path):
         """Run the full pipeline on a 3-frame video and verify output."""
+        pytest.importorskip("spatialmedia")
         import sys
 
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
