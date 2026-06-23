@@ -73,5 +73,5 @@
 ## VERIFICATION
 - [x] All new modules import successfully
 - [x] All new tests pass (30/30 web API + 7 SBS + 17 orientation + 19 outpainter)
-- [ ] Full test suite passes (no regressions) — run next
+- [x] Full test suite passes (152/152, 0 regressions) — fixed 3 pre-existing failures
 - [x] CLINE_TASK_BOARD.md kept updated throughout

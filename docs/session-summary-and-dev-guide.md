@@ -2,7 +2,7 @@
 
 > 本文档总结了从零到可用的全部开发过程，包括需求分析、试错经验、已实现功能和未来开发指南。
 > 
-> 生成时间: 2026-06-23
+> 生成时间: 2026-06-23（最后更新: 2026-06-23 Overnight Session）
 
 ---
 
@@ -24,8 +24,8 @@
 |------|------|------|
 | **Phase 0: Bug修复** | 修复 pipeline 中的关键 bug | ✅ 完成 |
 | **Phase 1: 后端优化** | 设备检测、流式处理、分块超分 | ✅ 完成 |
-| **Phase 2: 部署** | Docker、CI/CD、Gateway API | 📋 规划中 |
-| **Phase 3: 网页体验** | Job Queue + 交互式预览 | 📋 规划中 |
+| **Phase 2: VR180 高级修正 & 时序 AI 外绘** | SBS 检测、方向矩阵、光流时序外绘 | ✅ 完成 |
+| **Phase 3: Web 基础设施 & API** | FastAPI REST API、任务管理、CRUD 端点 | ✅ 完成 |
 | **Phase 4: 公测** | 限额、保存结果、空间视频 | 📋 规划中 |
 
 ---
@@ -152,7 +152,11 @@ subprocess.run(cmd, check=True)
 
 **排查**: SBS 视频的宽度是单眼的 2 倍。如果输出已经包含左右眼，就不需要再做立体渲染。需要在 pipeline 入口检查输入是否已经是 SBS 格式。
 
-**状态**: 已识别，待实现输入格式自动检测。
+**状态**: ✅ 已修复。在 `scripts/run_pipeline.py` 中实现自动检测：当输入宽高比 ≈ 4:1（如 7680×1920）时自动识别为 SBS 格式，跳过 Stage 1（深度估计）和 Stage 2（立体渲染），直接进入 Stage 3（等距柱状投影）。
+
+**修复代码**: `_detect_sbs_input()` 函数基于 aspect ratio 检测，另有 `--force-sbs` 标志手动覆盖。
+
+**测试**: 7 个自动化测试覆盖（标准 16:9 不误判、4:1 正确检测、force flag、超宽检测、不存在文件处理、SBS 帧分离、pipeline 集成）。
 
 ---
 
@@ -191,11 +195,88 @@ subprocess.run(cmd, check=True)
 - `--tile-size`: 设置瓦片大小
 - 自动设备检测集成
 
-### 3.3 测试
+### 3.3 Phase 2 — VR180 高级修正 & 时序 AI 外绘
 
-- `tests/test_phase1_optimizations.py`: 24 个自动化测试
-- 所有 Phase 1 测试通过
-- 现有模块导入兼容性验证通过
+#### Smart SBS Input Detection (`scripts/run_pipeline.py`)
+- `_detect_sbs_input()`: 自动检测输入是否已为 SBS 格式（宽高比 ≈ 4:1）
+- 检测到 SBS 时跳过 Stage 1（深度估计）和 Stage 2（立体渲染）
+- 直接进入 Stage 3（等距柱状投影）
+- `--force-sbs` CLI 标志：手动覆盖自动检测
+
+#### Orientation Matrix Harness (`pipeline/research/orientation_matrix.py`)
+- `apply_flip()`: 应用 cv2.flip (0=垂直, 1=水平, -1=双向)
+- `apply_transpose()`: 应用 cv2.transpose + 旋转（t1=90°CW, t2=90°CCW）
+- `generate_orientation_matrix()`: 生成 flip×transpose 组合矩阵（3×3=9 种变体）
+- `generate_ffmpeg_filter_map()`: 输出 ffmpeg transpose 滤镜映射报告
+- `run_diagnostic()`: 一键生成诊断视频网格 + JSON 报告
+
+#### AI Temporal Outpainter (`pipeline/research/ai_outpainter.py`)
+- `generate_boundary_mask()`: 等距柱状投影边界遮罩生成（极点+边缘检测）
+- `compute_optical_flow()`: Farneback 稠密光流计算
+- `warp_frame_by_flow()`: 基于光流向量的帧扭曲
+- `poisson_blend()`: 泊松无缝混合填充
+- `outpaint_frame()`: 单帧外绘（光流+混合+质量评估）
+- `outpaint_sequence()`: 多帧序列外绘（时序一致性+收敛检测）
+- 质量指标：PSNR、SSIM 计算
+
+#### ISOBMFF Box Building (`pipeline/spherical_injector.py`)
+- 新增完整 ISOBMFF box 构建函数：
+  - `build_st3d_box()`: 立体 3D box（SBS/Top-Bottom/Mono）
+  - `build_sv3d_box()`: 球形视频 3D 容器
+  - `build_svhd_box()`: 球形视频头部
+  - `build_svv3d_box()`: 球形视频视口
+  - `build_svproj_box()`: 球形投影
+  - `build_svmi_box()`: 球形视频媒体信息
+- 所有 box 遵循 ISOBMFF FullBox 格式（version + flags）
+
+#### Upscaler Graceful Fallback (`pipeline/upscaler.py`)
+- 当 realesrgan 未安装时自动降级为 OpenCV bicubic 插值
+- `_use_opencv_fallback` 标志自动设置
+- 所有 upscale 方法（单帧、分块、批量）均支持降级
+
+### 3.4 Phase 3 — Web 基础设施 & API
+
+#### FastAPI Application (`web/app.py`)
+- `GET /health` — 健康检查，返回版本和服务状态
+- `POST /api/v1/tasks` — 创建转换任务（input_path, output_path, metadata）
+- `GET /api/v1/tasks/{task_id}` — 获取任务详情
+- `GET /api/v1/tasks` — 任务列表（支持 status 过滤、分页）
+- `PATCH /api/v1/tasks/{task_id}` — 更新任务状态
+- `DELETE /api/v1/tasks/{task_id}` — 删除任务
+- `POST /api/v1/tasks/{task_id}/cancel` — 取消任务（queued/processing）
+- Pydantic 数据验证 + 详细错误响应
+
+#### Task Store (`web/task_store.py`)
+- `TaskStore` 类：线程安全内存任务存储
+- 完整任务生命周期：queued → processing → completed / failed / cancelled
+- `create_task()`: 创建任务，自动生成 UUID
+- `get_task()`: 按 ID 获取
+- `list_tasks()`: 分页列表 + status 过滤
+- `update_status()`: 状态更新 + 时间戳追踪
+- `cancel_task()`: 取消（仅 queued/processing 状态）
+- `delete_task()`: 删除任务
+- `count_tasks()`: 计数
+
+#### Schemas (`web/schemas.py`)
+- `CreateTaskRequest`: 创建任务请求模型
+- `TaskResponse`: 任务响应模型（含完整状态字段）
+- `TaskListResponse`: 任务列表响应（含分页信息）
+- `UpdateTaskRequest`: 更新请求模型
+- `HealthResponse`: 健康检查响应
+
+### 3.5 测试覆盖
+
+| 测试文件 | 测试数 | 覆盖范围 |
+|----------|--------|----------|
+| `test_pipeline.py` | 16 | 核心 pipeline + 端到端 |
+| `test_spherical_injector.py` | 25 | ISOBMFF box 构建 + 查找 |
+| `test_vr_metadata.py` | 16 | VR 元数据 XML + 注入 |
+| `test_phase1_optimizations.py` | 24 | 设备检测 + 流式 + 分块超分 |
+| `test_sbs_detection.py` | 7 | SBS 输入自动检测 |
+| `test_orientation_matrix.py` | 17 | 方向矩阵诊断 |
+| `test_temporal_outpainter.py` | 19 | 光流外绘 + 质量指标 |
+| `test_web_api.py` | 30 | Web API 全端点 |
+| **总计** | **152** | **全部通过** |
 
 ---
 
@@ -203,32 +284,50 @@ subprocess.run(cmd, check=True)
 
 ```
 vr180-ai-pipeline/
-├── pipeline/                    # 核心处理模块
+├── pipeline/                        # 核心处理模块
 │   ├── __init__.py
-│   ├── depth_estimator.py       # Stage 1: Depth Anything V2 深度估计
-│   ├── stereo_renderer.py       # Stage 2: 立体视差渲染
-│   ├── equirectangular_mapper.py # Stage 3: 等距柱状投影 (ffmpeg v360 + OpenCV)
-│   ├── spherical_injector.py    # Stage 4: VR 元数据注入 (spatial-media CLI)
-│   ├── vr_metadata.py           # Stage 4 备选: 原始 VR 元数据封装
-│   ├── upscaler.py              # Real-ESRGAN 超分 + 分块处理
-│   ├── device_utils.py          # CUDA/MPS/CPU 自动检测
-│   └── streaming_pipeline.py    # 流式处理 pipeline
+│   ├── depth_estimator.py           # Stage 1: Depth Anything V2 深度估计
+│   ├── stereo_renderer.py           # Stage 2: 立体视差渲染
+│   ├── equirectangular_mapper.py    # Stage 3: 等距柱状投影 (ffmpeg v360 + OpenCV)
+│   ├── spherical_injector.py        # Stage 4: VR 元数据注入 (spatial-media CLI + ISOBMFF)
+│   ├── vr_metadata.py               # Stage 4 备选: 原始 VR 元数据封装
+│   ├── upscaler.py                  # Real-ESRGAN 超分 + 分块处理 + OpenCV fallback
+│   ├── device_utils.py              # CUDA/MPS/CPU 自动检测
+│   ├── streaming_pipeline.py        # 流式处理 pipeline
+│   └── research/                    # R&D 研究模块
+│       ├── __init__.py
+│       ├── orientation_matrix.py    # VR180 方向诊断矩阵 (flip×transpose)
+│       ├── ai_outpainter.py         # 光流时序 AI 外绘引擎
+│       ├── temporal_outpainter.py   # 时序外绘器（简化版）
+│       ├── benchmark_upscale.py     # 超分基准测试
+│       └── test_inversion_matrix.py # 翻转矩阵测试工具
+├── web/                             # Web API 基础设施
+│   ├── __init__.py
+│   ├── app.py                       # FastAPI REST API (health, task CRUD, cancel)
+│   ├── schemas.py                   # Pydantic 请求/响应模型
+│   └── task_store.py                # 线程安全内存任务存储
 ├── scripts/
-│   ├── run_pipeline.py          # CLI 入口 (全部参数)
-│   └── download_models.py       # 模型下载脚本
+│   ├── run_pipeline.py              # CLI 入口 (全部参数 + SBS 自动检测)
+│   └── download_models.py           # 模型下载脚本
 ├── tests/
-│   ├── test_pipeline.py
-│   ├── test_spherical_injector.py
-│   ├── test_vr_metadata.py
-│   └── test_phase1_optimizations.py
+│   ├── test_pipeline.py             # 核心 pipeline 测试
+│   ├── test_spherical_injector.py   # ISOBMFF 注入测试 (sv3d/st3d)
+│   ├── test_vr_metadata.py          # VR 元数据测试
+│   ├── test_phase1_optimizations.py # Phase 1 优化测试
+│   ├── test_sbs_detection.py        # SBS 输入自动检测测试 (7 tests)
+│   ├── test_orientation_matrix.py   # 方向矩阵诊断测试 (17 tests)
+│   ├── test_temporal_outpainter.py  # 时序外绘器测试 (19 tests)
+│   └── test_web_api.py              # Web API 端点测试 (30 tests)
 ├── docs/
-│   ├── PRD-v2-vr180-studio.md   # 产品需求文档
-│   └── ...                      # 其他技术文档
-├── video/                       # 测试视频和输出
-├── pyproject.toml               # Python 项目配置
-├── requirements.txt             # 依赖
-├── Dockerfile                   # 容器化
-└── CLINE_TASK_BOARD.md          # 开发任务看板
+│   ├── PRD-v2-vr180-studio.md       # 产品需求文档
+│   ├── session-summary-and-dev-guide.md  # 开发文档 (本文件)
+│   └── ...                          # 其他技术文档
+├── video/                           # 测试视频和输出
+├── pyproject.toml                   # Python 项目配置
+├── requirements.txt                 # 依赖
+├── Dockerfile                       # 容器化
+├── CLINE_TASK_BOARD.md              # 开发任务看板
+└── OVERNIGHT_RD_REPORT.md           # Overnight R&D 报告
 ```
 
 ---
@@ -245,6 +344,15 @@ numpy>=1.24.0          # 数组操作
 ffmpeg-python          # ffmpeg 绑定
 tqdm                   # 进度条
 spatial-media          # VR 元数据注入 (Google)
+```
+
+### Web API 依赖
+
+```
+fastapi>=0.100.0       # Web 框架
+uvicorn>=0.23.0        # ASGI 服务器
+httpx>=0.24.0          # HTTP 客户端（测试用）
+pydantic>=2.0.0        # 数据验证
 ```
 
 ### 可选依赖
@@ -342,31 +450,80 @@ cv2.VideoCapture → [逐帧读取]
 
 ---
 
-## 第八部分：待开发功能 (Phase 2-4)
+## 第八部分：待开发功能 (Phase 4+)
 
-### Phase 2: 部署
+### Phase 4: 部署 & 运维
 
 | 功能 | 说明 | 优先级 |
 |------|------|--------|
 | Docker 优化 | 多阶段构建、CUDA 基础镜像 | P0 |
-| CI/CD | GitHub Actions 自动测试 | P0 |
-| Gateway API | FastAPI REST 接口 | P0 |
+| CI/CD | GitHub Actions 自动测试 + 部署 | P0 |
 | Storage | S3/R2 视频存储 | P1 |
+| 任务队列 | Celery/Redis 后台异步任务 | P0 |
+| 进度轮询 | WebSocket 实时渲染进度推送 | P0 |
 
-### Phase 3: 网页体验
-
-| 功能 | 说明 | 优先级 |
-|------|------|--------|
-| Job Queue | Celery/Redis 后台任务 | P0 |
-| 进度轮询 | 前端实时显示渲染进度 | P0 |
-| 交互预览 | A-Frame 180° 前后对比 | P1 |
-| 2D 输出 | 自动侧边投放 SBS 预览 | P1 |
-
-### Phase 4: 公测
+### Phase 5: 公测
 
 | 功能 | 说明 | 优先级 |
 |------|------|--------|
 | 限额系统 | 免费 3 个、付费无限制 | P0 |
 | 结果保存 | 我的 VR 视频列表 | P0 |
+| 交互预览 | A-Frame 180° 前后对比 | P1 |
 | 空间视频 | MV-HEVC 自动转码 (Spatialify) | P1 |
 | 多端下载 | Quest/Apple Vision Pro 格式 | P2 |
+| 前端 UI | React/Next.js 用户界面 | P0 |
+
+---
+
+## 第九部分：CLI 新增参数
+
+### SBS 检测相关
+
+```bash
+# 强制 SBS 模式（跳过自动检测）
+python scripts/run_pipeline.py -i sbs_video.mp4 -o vr180.mp4 --force-sbs
+
+# 自动检测（默认启用）
+python scripts/run_pipeline.py -i 7680x1920_video.mp4 -o vr180.mp4
+# → 自动识别为 SBS，跳过深度估计和立体渲染
+```
+
+### Web API 启动
+
+```bash
+# 启动 API 服务器
+uvicorn web.app:app --host 0.0.0.0 --port 8000
+
+# 创建任务
+curl -X POST http://localhost:8000/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"input_path": "video.mp4", "output_path": "vr180.mp4"}'
+
+# 查询任务
+curl http://localhost:8000/api/v1/tasks/{task_id}
+
+# 列出所有任务
+curl http://localhost:8000/api/v1/tasks?status=queued&limit=10&offset=0
+
+# 健康检查
+curl http://localhost:8000/health
+```
+
+### 方向矩阵诊断
+
+```bash
+# 在 Python 中使用
+from pipeline.research.orientation_matrix import run_diagnostic
+report = run_diagnostic("input_video.mp4", output_dir="orientation_output/")
+```
+
+### 时序外绘
+
+```bash
+# 在 Python 中使用
+from pipeline.research.ai_outpainter import TemporalOutpainter
+outpainter = TemporalOutpainter()
+result_frames, metrics = outpainter.outpaint_sequence(
+    frames, context_frames=None, num_iterations=3
+)
+```
