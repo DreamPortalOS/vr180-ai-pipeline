@@ -22,13 +22,8 @@ repos:
       - id: check-added-large-files
         args: ['--maxkb=500']
 
-  # Run the unit test suite before push (kept off per-commit to stay fast)
-  - repo: local
-    hooks:
-      - id: pytest
-        name: pytest (unit, excludes e2e)
-        entry: python -m pytest tests/ -q --ignore=tests/e2e
-        language: system
-        pass_filenames: false
-        always_run: true
-        stages: [pre-push]
+  # NOTE: pytest is intentionally NOT a pre-push hook.
+  # `language: system` ran `python` from whatever shell did the push, which is
+  # often NOT the project venv → missing deps → false-positive failures that
+  # block pushes. The full test suite runs in CI (.github/workflows/ci.yml),
+  # which is the authoritative gate. Run tests locally with: pytest tests/ -q
