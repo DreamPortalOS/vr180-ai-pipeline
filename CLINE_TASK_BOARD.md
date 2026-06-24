@@ -5,6 +5,34 @@
 
 ---
 
+## 📍 最新状态（2026-06-24）
+- ✅ **T1 数据库**（PR #4，已合并 main）
+- ✅ **T3 视频生成抽象**（PR #6，已合并 main；主脑修了 pytest-asyncio）
+- ⚠️ **T2 认证（PR #5）作废**：它从旧 main 并行建分支，重写了 `db/engine.py`/`db/models.py`，与 T1 冲突。**需按下方 T2-REDO 重做**，旧 PR #5 关闭。
+
+---
+
+## 🔴 T2-REDO — API Key 认证（重做，最高优先级）
+
+**关键纪律**：分支 `feat/t2-auth-v2` **从最新 main 建**（main 已含 T1 的 `db/`）。**不要重建 `db/engine.py`/`db/models.py`**，只 import 并扩展。
+
+**前置**：`git checkout main && git pull` → `pip install pre-commit && pre-commit install`
+
+**复用 T1（已在 main）**：
+- `db/engine.py` 已有 `get_session_factory()` / `SessionLocal` / `init_db` — 直接用
+- 若需 FastAPI 依赖式 `get_session()` generator，**追加**到 `db/engine.py`（不重写文件）
+- `db/models.py` 已有 TaskRecord 等 — **追加** `ApiKey` 模型（key_hash / name / created_at / active）
+
+**新增**：
+- `web/auth.py` — `verify_api_key` FastAPI dependency：读 `X-API-Key` → 查 DB → 无效 401；用 passlib bcrypt 哈希
+- `scripts/create_api_key.py` — CLI 生成 key 并入库（明文只打印一次）
+- `web/app.py` — 给 `/api/v1/*` 写操作端点加 `Depends(verify_api_key)`；GET 健康检查保持公开
+- `tests/test_auth.py` — 无 key→401 / 错误 key→401 / 有效 key→通过 / 哈希存储（不存明文）
+
+**验收**：`pytest tests/ -q --ignore=tests/e2e` 全绿 + `ruff check .` 干净 → push → 开 PR。完成后本文件标记 ✅。
+
+---
+
 ## ✅ 已完成阶段（历史）
 
 <details>

@@ -41,6 +41,11 @@ To prevent triggering Cline's `Too many consecutive mistakes (3)` protection:
 - **Two-Strike Rule:** If an execution command or compilation fails **2 times consecutively** with the same error, you are FORBIDDEN from running the exact same command or code block a third time.
 - **Pivot Radically:** Stop, take a step back, read the code context again, radically change your technical approach (e.g., choose an alternative library, change the logic flow), document the pivot in `CLINE_TASK_BOARD.md`, and execute the new approach.
 
+## 🔗 6. DEPENDENT TASKS MUST BE SERIAL (依赖任务必须串行)
+- If task B depends on task A's code (shared modules like `db/`), branch B **from A's branch**, NOT from main. Building both from main in parallel causes duplicate implementations + rebase conflicts (this happened: T1 vs T2 both wrote `db/engine.py`).
+- Before each task: `git checkout main && git pull` to build on latest merged work.
+- Never re-create a module a prior task already added — import and extend it.
+
 ---
 ## 🚀 START MANDATE
 Read the current workspace, immediately create/update `CLINE_TASK_BOARD.md`, and invoke your first tool call to begin development. Move swiftly, silently, and autonomously.
