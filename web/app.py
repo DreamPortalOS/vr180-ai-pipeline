@@ -20,7 +20,7 @@ from pathlib import Path
 
 from celery.result import AsyncResult
 from db.engine import init_db
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -30,6 +30,7 @@ from workers.celery_app import app as celery_app
 from workers.convert_tasks import convert_to_vr180
 
 from pipeline.prompt_builder import wrap_prompt_for_vr180
+from web.auth import verify_api_key
 from web.schemas import (
     ErrorResponse,
     GenerateRequest,
@@ -135,7 +136,10 @@ async def health_check_v1():
     tags=["Tasks"],
     responses={400: {"model": ErrorResponse}},
 )
-async def create_task(request: TaskCreateRequest):
+async def create_task(
+    request: TaskCreateRequest,
+    _: str | None = Depends(verify_api_key),
+):
     """Create a new VR180 conversion task.
 
     The task will be queued for processing. Use GET /tasks/{id} to poll status.
@@ -163,6 +167,7 @@ async def create_task_v1(
     upscale: str = Form("true"),
     inject_metadata: str = Form("true"),
     x_user_id: str | None = Header(None, alias="X-User-Id"),
+    _: str | None = Depends(verify_api_key),
 ):
     """Create a new VR180 conversion task with file upload."""
     user_id = x_user_id or "default-user"
@@ -293,7 +298,11 @@ async def get_task_v1(task_id: str):
     tags=["Tasks"],
     responses={404: {"model": ErrorResponse}},
 )
-async def update_task(task_id: str, request: TaskUpdateRequest):
+async def update_task(
+    task_id: str,
+    request: TaskUpdateRequest,
+    _: str | None = Depends(verify_api_key),
+):
     """Update a task's status, progress, or metadata.
 
     Used by internal pipeline workers to report progress.
@@ -318,7 +327,10 @@ async def update_task(task_id: str, request: TaskUpdateRequest):
     tags=["Tasks"],
     responses={404: {"model": ErrorResponse}},
 )
-async def delete_task(task_id: str):
+async def delete_task(
+    task_id: str,
+    _: str | None = Depends(verify_api_key),
+):
     """Delete a task from the store."""
     deleted = task_store.delete_task(task_id)
     if not deleted:
@@ -332,7 +344,10 @@ async def delete_task(task_id: str):
     tags=["Tasks"],
     responses={404: {"model": ErrorResponse}},
 )
-async def delete_task_v1(task_id: str):
+async def delete_task_v1(
+    task_id: str,
+    _: str | None = Depends(verify_api_key),
+):
     """Delete a task from the store (v1)."""
     deleted = task_store.delete_task(task_id)
     if not deleted:
@@ -346,7 +361,10 @@ async def delete_task_v1(task_id: str):
     tags=["Tasks"],
     responses={404: {"model": ErrorResponse}},
 )
-async def cancel_task(task_id: str):
+async def cancel_task(
+    task_id: str,
+    _: str | None = Depends(verify_api_key),
+):
     """Cancel a queued or processing task."""
     task = task_store.cancel_task(task_id)
     if task is None:
@@ -360,7 +378,10 @@ async def cancel_task(task_id: str):
     tags=["Tasks"],
     responses={404: {"model": ErrorResponse}},
 )
-async def cancel_task_v1(task_id: str):
+async def cancel_task_v1(
+    task_id: str,
+    _: str | None = Depends(verify_api_key),
+):
     """Cancel a queued or processing task (v1)."""
     task = task_store.cancel_task(task_id)
     if task is None:
@@ -484,7 +505,10 @@ async def list_results_v1(
     tags=["Results"],
     responses={404: {"model": ErrorResponse}},
 )
-async def delete_result_v1(task_id: str):
+async def delete_result_v1(
+    task_id: str,
+    _: str | None = Depends(verify_api_key),
+):
     """Delete a result and its output file."""
     task = task_store.get_task(task_id)
     if task is None:
@@ -511,7 +535,10 @@ async def delete_result_v1(task_id: str):
         502: {"model": ErrorResponse},
     },
 )
-async def generate_video(request: GenerateRequest):
+async def generate_video(
+    request: GenerateRequest,
+    _: str | None = Depends(verify_api_key),
+):
     """Generate a video using an external AI video generation provider.
 
     Wraps the user prompt with VR180 constraints via ``wrap_prompt_for_vr180``,
