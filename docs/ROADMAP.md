@@ -40,11 +40,15 @@ the pipeline DEFAULT, not ad-hoc CLI flags.
    Tune convergence so the main subject sits at the zero-parallax plane.
 - [ ] [cline] bake these as defaults in `run_pipeline.py` / `EquirectangularMapper` / `StereoRenderer`; add a test.
 
-### M1b — Resolution / sharpness (the "pixel upgrade") · [lead] + [GPU optional]  ← NEXT
-Target per-eye **2560²–3840²** (research: ~2560²/eye saturates; Quest 3 panel 2064×2208/eye, Quest 2 1832×1920).
-Source here is only 720p, so mapping straight to 2880² is soft. Plan: **upscale the source first** (Real-ESRGAN,
-`pipeline/upscaler.py`) before depth/stereo/equirect. Bump bitrate (the early 15MB h264/CRF20 file was low; v2 is
-h265/CRF18 at 35MB). Decide canonical output res by target device (Quest vs Vision Pro).
+### M1b — Resolution / sharpness (the "pixel upgrade") · [cline build] + [user GPU run]  ← ACTIVE (board R-1)
+Target per-eye **2560²–3840²** (Quest 3 panel 2064×2208/eye, Quest 2 1832×1920). Source here is only 720p,
+so mapping straight to 2880² is soft — the dominant cause of "completely unclear".
+**Decision (2026-06-24): upscale the SOURCE first with SeedVR2** (ByteDance, ICLR2026 — 2026 SOTA video SR,
+temporal-aware, best on short AI-generated compressed clips). Runs on the user's RTX 4070S/3060 (12GB; 3B model
+≥8GB, GGUF for less). `batch_size` must be `4n+1` for temporal consistency. This supersedes the old per-frame
+Real-ESRGAN in `pipeline/upscaler.py` (fast but flickers, "enhanced" not "reconstructed"). Bump bitrate for hi-res.
+Root-cause alternative (M2): generate the source natively at 1080p–4K instead of 720p. Pick canonical output res by
+target device (Quest vs Vision Pro).
 
 ### M1c — Temporal depth + stereo fidelity · [GPU]
 DepthCrafter (temporal-stable depth, stops shimmer) + StereoCrafter (clean disocclusions). Current

@@ -1,1 +1,0 @@
-# VR180 Studio — Celery Workers Package
