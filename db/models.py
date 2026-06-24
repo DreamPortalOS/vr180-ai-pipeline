@@ -57,12 +57,17 @@ class User(Base):
 
 
 class APIKey(Base):
-    """API keys for authentication (T2-ready)."""
+    """API keys for authentication (T2-ready).
+
+    Stores bcrypt hash of the key in ``key_hash``. The plaintext ``key`` column
+    exists for backward compatibility with legacy records; new keys store hash only.
+    """
 
     __tablename__ = "api_keys"
 
     id = Column(String(64), primary_key=True, default=_short_id)
-    key = Column(String(128), unique=True, nullable=False, index=True)
+    key = Column(String(128), unique=True, nullable=True, index=True)
+    key_hash = Column(String(128), unique=False, nullable=True)
     user_id = Column(String(64), ForeignKey("users.id"), nullable=False)
     name = Column(String(128), nullable=True)  # human-friendly label
     is_active = Column(Boolean, nullable=False, default=True)
@@ -72,7 +77,8 @@ class APIKey(Base):
     user = relationship("User", back_populates="api_keys")
 
     def __repr__(self) -> str:
-        return f"<APIKey {self.key[:8]}… user={self.user_id!r}>"
+        prefix = (self.key or self.key_hash or "?")[:8]
+        return f"<APIKey {prefix}… user={self.user_id!r}>"
 
 
 class ConversionTask(Base):

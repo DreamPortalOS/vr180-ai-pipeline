@@ -37,6 +37,8 @@ fastapi>=0.104.0,<1.0.0
 uvicorn>=0.24.0,<1.0.0
 httpx>=0.25.0,<1.0.0
 python-multipart>=0.0.6,<1.0.0
+passlib[bcrypt]>=1.7.4,<2.0.0    # auth password hashing (T2 auth)
+bcrypt>=4.0.0,<5.0.0             # pin bcrypt<5 for passlib compatibility
 
 # Testing
 pytest>=7.0.0,<9.0.0

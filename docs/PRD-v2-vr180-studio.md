@@ -1,9 +1,9 @@
 # VR180 Studio — 产品需求文档 (PRD) v2.0
 
-> **项目名称**: VR180 Studio  
-> **版本**: v2.0  
-> **日期**: 2026-06-22  
-> **状态**: DRAFT — 待确认  
+> **项目名称**: VR180 Studio
+> **版本**: v2.0
+> **日期**: 2026-06-22
+> **状态**: DRAFT — 待确认
 
 ---
 
@@ -489,15 +489,15 @@ VR180 行业标准本身就是**不需要完整球面覆盖**的。YouTube VR、
 ```python
 class SphericalOutpainter:
     """将 VR180 半球面补全为完整 360° 球面。"""
-    
+
     def __init__(self, model="sdxl-inpaint"):
         self.model = model
-    
+
     def complete_sphere(self, equirect_frame, depth_map=None):
         """
         输入: 半球面等距柱状帧 (中间有内容, 上下黑色)
         输出: 完整球面等距柱状帧
-        
+
         步骤:
         1. 识别内容区域和待补全区域
         2. 从内容区域提取风格特征
@@ -507,15 +507,15 @@ class SphericalOutpainter:
         """
         # 1. 创建 mask (黑色区域)
         mask = self._create_completion_mask(equirect_frame)
-        
+
         # 2. 生成上下区域
         # 上部: 基于场景类型 (室内→天花板, 室外→天空)
         # 下部: 基于场景类型 (室内→地板, 室外→地面)
         prompt = self._analyze_scene(equirect_frame)
-        
+
         # 3. SD inpaint
         completed = self._inpaint(equirect_frame, mask, prompt)
-        
+
         return completed
 ```
 
@@ -538,10 +538,10 @@ class SphericalOutpainter:
 ```python
 class StreamingPipeline:
     """流式处理: 一次只处理 N 帧, 不全部加载到内存。"""
-    
+
     def __init__(self, buffer_size=16):
         self.buffer_size = buffer_size  # 每次处理 16 帧
-    
+
     def process_stream(self, video_path, output_path):
         """
         处理流程:
@@ -552,30 +552,30 @@ class StreamingPipeline:
         """
         cap = cv2.VideoCapture(video_path)
         encoder = ffmpeg.pipe(output_path)
-        
+
         frame_idx = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            
+
             # 深度估计 (GPU上)
             depth = self.depth_estimator.estimate(frame)
-            
+
             # 立体渲染
             left, right = self.stereo_renderer.render(frame, depth)
-            
+
             # 等距投影
             sbs = self.eq_mapper.map_stereo_pair(left, right)
-            
+
             # 直接写入编码器 (不保存到磁盘)
             encoder.write_frame(sbs)
-            
+
             # 释放内存
             del depth, left, right, sbs
-            
+
             frame_idx += 1
-        
+
         encoder.close()
 ```
 
@@ -638,19 +638,19 @@ python scripts/run_pipeline.py --input video.mp4 --output vr180.mp4 \
 def detect_best_device():
     """自动检测最优计算设备。"""
     import torch
-    
+
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         vram = torch.cuda.get_device_properties(0).total_mem / 1e9
         print(f"🟢 CUDA: {gpu_name} ({vram:.0f} GB)")
         return "cuda"
-    
+
     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         import platform
         chip = platform.processor()
         print(f"🟢 MPS: Apple {chip}")
         return "mps"
-    
+
     print("🟡 CPU only (处理会很慢)")
     return "cpu"
 ```
@@ -660,21 +660,21 @@ def detect_best_device():
 ```python
 def upscale_tiled(frame, upscaler, scale=4, tile_size=512):
     """分块超分, 避免大分辨率导致 OOM。
-    
+
     7680×3840 → 4× → 30720×15360 会 OOM
     分块处理: 每个 512×512 块独立超分后拼接
     """
     H, W = frame.shape[:2]
     out_H, out_H = H * scale, W * scale
     output = np.zeros((out_H, out_W, 3), dtype=np.uint8)
-    
+
     for y in range(0, H, tile_size):
         for x in range(0, W, tile_size):
             tile = frame[y:y+tile_size, x:x+tile_size]
             tile_up = upscaler.upscale_frame(tile)
-            output[y*scale:(y+tile_size)*scale, 
+            output[y*scale:(y+tile_size)*scale,
                    x*scale:(x+tile_size)*scale] = tile_up
-    
+
     return output
 ```
 
