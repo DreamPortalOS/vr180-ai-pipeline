@@ -2,7 +2,7 @@
 
 ## 🚨 1. THE GOLDEN RULE: ANTI-HALT PROTOCOL (绝对死命令)
 - **NO CHIT-CHAT:** Never reply with pure conversational text, greetings, explanations, or summaries to the chat interface. Doing so will cause Cline to halt and wait for human input.
-- **MANDATORY TOOL LOCK:** EVERY single response from you MUST contain at least one tool call (`execute_command`, `write_to_file`, `patch_file`, etc.). Even if you just completed a task, immediately chain it to the next tool invocation. 
+- **MANDATORY TOOL LOCK:** EVERY single response from you MUST contain at least one tool call (`execute_command`, `write_to_file`, `patch_file`, etc.). Even if you just completed a task, immediately chain it to the next tool invocation.
 - **NO PERMISSION ASKING:** You are in absolute YOLO mode. You have 100% authority over the local workspace. Do not ask "Should I proceed?", "Is this okay?", or "Which option do you prefer?". Decide and act autonomously.
 
 ## 📊 2. LOCAL STATE MACHINE (本地状态机看板)
@@ -33,7 +33,7 @@ Pre-commit then auto-runs `ruff --fix` + `ruff format` on every commit and `pyte
 You are entirely responsible for the stability of your code. You must act as your own QA Sub-Agent:
 1. **Setup Test Framework:** Identify the project's tech stack and verify/install the appropriate local testing framework (e.g., pytest, jest, vitest, dotnet test).
 2. **Write Concurrently:** For every major logic block or class you write, you MUST concurrently write corresponding automated test cases in a local test directory.
-3. **The TDD Loop:** Run tests via `execute_command`. If a test or compilation fails, read the terminal logs -> trace the source code -> patch the file -> re-run tests. 
+3. **The TDD Loop:** Run tests via `execute_command`. If a test or compilation fails, read the terminal logs -> trace the source code -> patch the file -> re-run tests.
 4. **No Human Validation:** If the automated tests pass and meet the requirements, the feature is complete. Do not ask the user for visual or emotional validation.
 
 ## 🧠 5. LOOP-BREAKING & SELF-RECOVERY (防死循环熔断)

@@ -1,17 +1,51 @@
 """Tests for VR180 Studio Web API (Phase 4)."""
 
 import pytest
+from db.engine import SessionLocal
+from db.models import APIKey, User
 from fastapi.testclient import TestClient
 from web.app import app
+from web.auth import hash_key
 from web.task_store import TaskStore
 from web.task_store_db import TaskStatus
+
+# Test API key used for auth-protected endpoints
+TEST_API_KEY = "vr180_webapi_test_key_abc123"
+TEST_KEY_HDR = {"X-API-Key": TEST_API_KEY}
+
+
+def _seed_api_key():
+    """Ensure a test API key exists in the DB."""
+    db = SessionLocal()
+    try:
+        # Create a test user if not exists
+        user = db.query(User).filter(User.id == "webapi-test-user").first()
+        if user is None:
+            user = User(id="webapi-test-user")
+            db.add(user)
+            db.flush()
+
+        # Remove old keys for this user to avoid duplicates
+        db.query(APIKey).filter(APIKey.user_id == user.id).delete()
+        api_key = APIKey(
+            key_hash=hash_key(TEST_API_KEY),
+            name="webapi-test-key",
+            user_id=user.id,
+            is_active=True,
+        )
+        db.add(api_key)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @pytest.fixture(autouse=True)
 def reset_store():
     """Reset task store before each test by deleting all tasks from DB."""
     try:
-        # Delete all tasks via the store's session
         from db.engine import SessionLocal
         from db.models import ConversionTask
 
@@ -22,8 +56,9 @@ def reset_store():
         finally:
             db.close()
     except Exception:
-        # If DB not initialized (e.g. in-memory fallback), just pass
         pass
+    # Also ensure API key is seeded
+    _seed_api_key()
     yield
 
 
@@ -54,11 +89,11 @@ class TestHealthEndpoint:
 
 class TestCreateTask:
     def test_create_returns_201(self, client):
-        resp = client.post("/tasks", json={"input_path": "/tmp/test.mp4"})
+        resp = client.post("/tasks", json={"input_path": "/tmp/test.mp4"}, headers=TEST_KEY_HDR)
         assert resp.status_code == 201
 
     def test_create_task_fields(self, client):
-        data = client.post("/tasks", json={"input_path": "/tmp/test.mp4"}).json()
+        data = client.post("/tasks", json={"input_path": "/tmp/test.mp4"}, headers=TEST_KEY_HDR).json()
         assert "id" in data
         assert data["input_path"] == "/tmp/test.mp4"
         assert data["status"] == "queued"
@@ -74,6 +109,7 @@ class TestCreateTask:
                 "input_path": "/tmp/test.mp4",
                 "output_path": "/tmp/out_vr180.mp4",
             },
+            headers=TEST_KEY_HDR,
         ).json()
         assert data["output_path"] == "/tmp/out_vr180.mp4"
 
@@ -84,12 +120,13 @@ class TestCreateTask:
                 "input_path": "/tmp/test.mp4",
                 "metadata": {"codec": "h264", "fps": 30},
             },
+            headers=TEST_KEY_HDR,
         ).json()
         assert data["metadata"]["codec"] == "h264"
         assert data["metadata"]["fps"] == 30
 
     def test_create_missing_input_path(self, client):
-        resp = client.post("/tasks", json={})
+        resp = client.post("/tasks", json={}, headers=TEST_KEY_HDR)
         assert resp.status_code == 422
 
 
@@ -98,7 +135,7 @@ class TestCreateTask:
 
 class TestGetTask:
     def test_get_existing_task(self, client):
-        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
+        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"}, headers=TEST_KEY_HDR)
         task_id = create_resp.json()["id"]
         data = client.get(f"/tasks/{task_id}").json()
         assert data["id"] == task_id
@@ -118,17 +155,21 @@ class TestListTasks:
         assert data["total"] == 0
 
     def test_list_after_creating(self, client):
-        client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
-        client.post("/tasks", json={"input_path": "/tmp/b.mp4"})
+        client.post("/tasks", json={"input_path": "/tmp/a.mp4"}, headers=TEST_KEY_HDR)
+        client.post("/tasks", json={"input_path": "/tmp/b.mp4"}, headers=TEST_KEY_HDR)
         data = client.get("/tasks").json()
         assert data["total"] == 2
         assert len(data["tasks"]) == 2
 
     def test_list_with_status_filter(self, client):
-        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
+        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"}, headers=TEST_KEY_HDR)
         task_id = create_resp.json()["id"]
         # Update one task to processing
-        client.patch(f"/tasks/{task_id}", json={"status": "processing"})
+        client.patch(
+            f"/tasks/{task_id}",
+            json={"status": "processing"},
+            headers=TEST_KEY_HDR,
+        )
         data = client.get("/tasks?status=queued").json()
         assert data["total"] == 0
         data = client.get("/tasks?status=processing").json()
@@ -136,7 +177,11 @@ class TestListTasks:
 
     def test_list_pagination(self, client):
         for i in range(5):
-            client.post("/tasks", json={"input_path": f"/tmp/{i}.mp4"})
+            client.post(
+                "/tasks",
+                json={"input_path": f"/tmp/{i}.mp4"},
+                headers=TEST_KEY_HDR,
+            )
         data = client.get("/tasks?limit=2&offset=0").json()
         assert len(data["tasks"]) == 2
         assert data["total"] == 5
@@ -147,7 +192,7 @@ class TestListTasks:
 
 class TestUpdateTask:
     def test_update_status(self, client):
-        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
+        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"}, headers=TEST_KEY_HDR)
         task_id = create_resp.json()["id"]
         data = client.patch(
             f"/tasks/{task_id}",
@@ -156,17 +201,18 @@ class TestUpdateTask:
                 "progress": 0.5,
                 "stage": "depth_estimation",
             },
+            headers=TEST_KEY_HDR,
         ).json()
         assert data["status"] == "processing"
         assert data["progress"] == 0.5
         assert data["stage"] == "depth_estimation"
 
     def test_update_nonexistent(self, client):
-        resp = client.patch("/tasks/fake999", json={"status": "processing"})
+        resp = client.patch("/tasks/fake999", json={"status": "processing"}, headers=TEST_KEY_HDR)
         assert resp.status_code == 404
 
     def test_update_to_completed(self, client):
-        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
+        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"}, headers=TEST_KEY_HDR)
         task_id = create_resp.json()["id"]
         data = client.patch(
             f"/tasks/{task_id}",
@@ -174,6 +220,7 @@ class TestUpdateTask:
                 "status": "completed",
                 "output_path": "/tmp/out.mp4",
             },
+            headers=TEST_KEY_HDR,
         ).json()
         assert data["status"] == "completed"
         assert data["progress"] == 1.0
@@ -181,7 +228,7 @@ class TestUpdateTask:
         assert data["completed_at"] is not None
 
     def test_update_to_failed_with_error(self, client):
-        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
+        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"}, headers=TEST_KEY_HDR)
         task_id = create_resp.json()["id"]
         data = client.patch(
             f"/tasks/{task_id}",
@@ -189,6 +236,7 @@ class TestUpdateTask:
                 "status": "failed",
                 "error": "GPU out of memory",
             },
+            headers=TEST_KEY_HDR,
         ).json()
         assert data["status"] == "failed"
         assert data["error"] == "GPU out of memory"
@@ -199,15 +247,15 @@ class TestUpdateTask:
 
 class TestDeleteTask:
     def test_delete_existing(self, client):
-        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
+        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"}, headers=TEST_KEY_HDR)
         task_id = create_resp.json()["id"]
-        resp = client.delete(f"/tasks/{task_id}")
+        resp = client.delete(f"/tasks/{task_id}", headers=TEST_KEY_HDR)
         assert resp.status_code == 204
         # Verify gone
         assert client.get(f"/tasks/{task_id}").status_code == 404
 
     def test_delete_nonexistent(self, client):
-        resp = client.delete("/tasks/fake999")
+        resp = client.delete("/tasks/fake999", headers=TEST_KEY_HDR)
         assert resp.status_code == 404
 
 
@@ -216,20 +264,24 @@ class TestDeleteTask:
 
 class TestCancelTask:
     def test_cancel_queued(self, client):
-        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
+        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"}, headers=TEST_KEY_HDR)
         task_id = create_resp.json()["id"]
-        data = client.post(f"/tasks/{task_id}/cancel").json()
+        data = client.post(f"/tasks/{task_id}/cancel", headers=TEST_KEY_HDR).json()
         assert data["status"] == "cancelled"
 
     def test_cancel_processing(self, client):
-        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"})
+        create_resp = client.post("/tasks", json={"input_path": "/tmp/a.mp4"}, headers=TEST_KEY_HDR)
         task_id = create_resp.json()["id"]
-        client.patch(f"/tasks/{task_id}", json={"status": "processing"})
-        data = client.post(f"/tasks/{task_id}/cancel").json()
+        client.patch(
+            f"/tasks/{task_id}",
+            json={"status": "processing"},
+            headers=TEST_KEY_HDR,
+        )
+        data = client.post(f"/tasks/{task_id}/cancel", headers=TEST_KEY_HDR).json()
         assert data["status"] == "cancelled"
 
     def test_cancel_nonexistent(self, client):
-        resp = client.post("/tasks/fake999/cancel")
+        resp = client.post("/tasks/fake999/cancel", headers=TEST_KEY_HDR)
         assert resp.status_code == 404
 
 
