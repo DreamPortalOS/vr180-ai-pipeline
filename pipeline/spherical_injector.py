@@ -13,6 +13,7 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 
 # ─── ISOBMFF constants ────────────────────────────────────────────────────────
@@ -187,7 +188,7 @@ def _inject_via_spatialmedia_cli(
     try:
         sm_stereo = "left-right" if stereo_mode == "sbs" else "top-bottom"
         cmd = [
-            "python3",
+            sys.executable,
             "-m",
             "spatialmedia",
             "-i",
