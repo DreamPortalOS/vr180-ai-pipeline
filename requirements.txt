@@ -28,6 +28,10 @@ safetensors>=0.4.0,<1.0.0
 celery[redis]>=5.4.0,<6.0.0
 redis>=5.0.7,<6.0.0
 
+# Database ORM
+sqlalchemy>=2.0,<3.0
+alembic>=1.13,<2.0
+
 # Web API
 fastapi>=0.104.0,<1.0.0
 uvicorn>=0.24.0,<1.0.0

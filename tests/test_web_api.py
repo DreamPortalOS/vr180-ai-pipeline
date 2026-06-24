@@ -2,14 +2,28 @@
 
 import pytest
 from fastapi.testclient import TestClient
-from web.app import app, task_store
-from web.task_store import TaskStatus, TaskStore
+from web.app import app
+from web.task_store import TaskStore
+from web.task_store_db import TaskStatus
 
 
 @pytest.fixture(autouse=True)
 def reset_store():
-    """Reset task store before each test."""
-    task_store._tasks.clear()
+    """Reset task store before each test by deleting all tasks from DB."""
+    try:
+        # Delete all tasks via the store's session
+        from db.engine import SessionLocal
+        from db.models import ConversionTask
+
+        db = SessionLocal()
+        try:
+            db.query(ConversionTask).delete()
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        # If DB not initialized (e.g. in-memory fallback), just pass
+        pass
     yield
 
 
