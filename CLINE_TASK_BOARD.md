@@ -134,8 +134,8 @@
 
 ### [x] A1 — Celery 异步任务队列
 
-**状态**: ✅ Completed  
-**优先级**: P0 — 阻塞后续所有阶段  
+**状态**: ✅ Completed
+**优先级**: P0 — 阻塞后续所有阶段
 **预计工作量**: 中等（约 200-300 行新代码 + 测试）
 
 #### 背景
@@ -195,25 +195,25 @@ log = logging.getLogger(__name__)
 def convert_to_vr180(self, input_path: str, output_dir: str, params: dict) -> dict:
     """
     Full VR180 conversion pipeline task.
-    
+
     params keys:
       - depth_model: "small" | "base" | "large"  (default: "small")
       - upscale_factor: 2 | 4  (default: 2)
       - outpainting: bool  (default: False)
-    
+
     Returns: {"output_path": str, "metadata": dict}
     """
     from pipeline.streaming_pipeline import StreamingPipeline
-    
+
     self.update_state(state="STARTED", meta={"stage": "initializing", "progress": 0})
-    
+
     try:
         pipeline = StreamingPipeline(
             depth_model=params.get("depth_model", "small"),
         )
-        
+
         self.update_state(state="PROGRESS", meta={"stage": "depth_estimation", "progress": 10})
-        
+
         output_path = pipeline.process(
             input_path=input_path,
             output_dir=output_dir,
@@ -222,7 +222,7 @@ def convert_to_vr180(self, input_path: str, output_dir: str, params: dict) -> di
                 meta={"stage": stage, "progress": pct}
             ),
         )
-        
+
         return {
             "output_path": str(output_path),
             "metadata": {"input": input_path, "params": params},
@@ -237,15 +237,15 @@ def estimate_depth_only(self, input_path: str, output_dir: str, model_size: str 
     """Standalone depth estimation task (for preview)."""
     from pipeline.depth_estimator import DepthEstimator
     import cv2, numpy as np
-    
+
     self.update_state(state="STARTED", meta={"stage": "loading_model", "progress": 0})
-    
+
     estimator = DepthEstimator(model_size=model_size)
     cap = cv2.VideoCapture(input_path)
-    
+
     depth_frames = []
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
+
     for i in range(min(total, 30)):  # preview: 최대 30프레임
         ret, frame = cap.read()
         if not ret:
@@ -253,13 +253,13 @@ def estimate_depth_only(self, input_path: str, output_dir: str, model_size: str 
         depth = estimator.estimate(frame)
         depth_frames.append(depth)
         self.update_state(state="PROGRESS", meta={"stage": "depth", "progress": int(i / min(total, 30) * 100)})
-    
+
     cap.release()
-    
+
     out_path = Path(output_dir) / "depth_preview.npy"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(str(out_path), np.array(depth_frames))
-    
+
     return {"depth_preview_path": str(out_path), "frames_processed": len(depth_frames)}
 ```
 
@@ -272,7 +272,7 @@ from workers.celery_app import app
 @app.task(bind=True, name="upscale.video", max_retries=1)
 def upscale_video(self, input_path: str, output_path: str, factor: int = 2) -> dict:
     from pipeline.upscaler import Upscaler
-    
+
     self.update_state(state="STARTED", meta={"stage": "upscaling", "progress": 0})
     upscaler = Upscaler(scale_factor=factor)
     upscaler.upscale_video(
@@ -354,12 +354,12 @@ def test_convert_task_calls_pipeline(mock_pipeline_cls):
     mock_instance = MagicMock()
     mock_instance.process.return_value = "/tmp/output.mp4"
     mock_pipeline_cls.return_value = mock_instance
-    
+
     # 用 apply 同步执行（绕过 broker）
     from workers.convert_tasks import convert_to_vr180
     from workers.celery_app import app
     app.conf.task_always_eager = True  # 同步模式
-    
+
     result = convert_to_vr180.apply(
         kwargs={
             "input_path": "/tmp/test.mp4",
@@ -367,7 +367,7 @@ def test_convert_task_calls_pipeline(mock_pipeline_cls):
             "params": {"depth_model": "small"},
         }
     ).get()
-    
+
     assert result["output_path"] == "/tmp/output.mp4"
     mock_instance.process.assert_called_once()
 ```
@@ -487,7 +487,7 @@ Cline 完成后需在本文件写入以下信息：
 
 ### [ ] A2 — 数据库持久化
 
-**状态**: 等待 A1 完成后开始  
+**状态**: 等待 A1 完成后开始
 **依赖**: A1 完成
 
 - 引入 SQLAlchemy 2.0 + Alembic
@@ -499,7 +499,7 @@ Cline 完成后需在本文件写入以下信息：
 
 ### [ ] A3 — API Key 认证
 
-**状态**: 等待 A2 完成后开始  
+**状态**: 等待 A2 完成后开始
 **依赖**: A2 完成
 
 - 实现 `X-API-Key` header 认证
@@ -543,7 +543,7 @@ Cline 完成后需在本文件写入以下信息：
 
 ### [ ] B1 — VideoGen 抽象接口 + Kling API 接入
 
-**状态**: 等待 Phase A 完成  
+**状态**: 等待 Phase A 完成
 
 > ⚠️ 调研结论：Kling/Veo/Seedance **均不支持原生立体输出**，B1 仅生成 2D 源视频，
 > 立体化由 Phase Q 完成。Prompt 需内置广角/低空/FPV 关键词（见 STRATEGY 文档第七节）。
@@ -556,7 +556,7 @@ Cline 完成后需在本文件写入以下信息：
 
 ## 🟢 Phase C — 前端工作流 UI（等待 Phase B 完成）
 
-**状态**: 等待 Phase B 完成  
+**状态**: 等待 Phase B 完成
 详见 `docs/DEV_GUIDE.md` Phase C 章节
 
 ---

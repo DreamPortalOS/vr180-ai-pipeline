@@ -1,7 +1,7 @@
 # VR180 AI Pipeline — 完整会话总结与开发文档
 
 > 本文档总结了从零到可用的全部开发过程，包括需求分析、试错经验、已实现功能和未来开发指南。
-> 
+>
 > 生成时间: 2026-06-23（最后更新: 2026-06-23 Overnight Session）
 
 ---
@@ -92,12 +92,12 @@ def _calc_vertical_fov(self, src_width, src_height):
 2. 发现 `run_pipeline.py` 的批量处理模式会把所有帧加载到内存，对于长视频会出现截断
 3. 24 帧测试时正常，但全量渲染时因为内存管理问题导致中间文件不完整
 
-**修复**: 
+**修复**:
 - 确保 glob pattern 正确排序（`sorted(glob.glob(...))`）
 - 改用 `StreamingPipeline` 避免全量内存加载
 - 手动用 ffmpeg 直接编码 equirect 帧目录
 
-**经验**: 
+**经验**:
 - 对于帧序列编码，**必须**确保 glob 排序正确
 - 大视频**必须**用流式处理，不能全量加载到内存
 - 先用少量帧（如 `--max-frames 24`）验证流程，再跑全量
@@ -125,7 +125,7 @@ cmd = [
 subprocess.run(cmd, check=True)
 ```
 
-**经验**: 
+**经验**:
 - **永远不要手动修改 MP4 二进制结构**，除非你有完整的 ISOBMFF parser
 - Google spatial-media 是唯一可靠的 VR 元数据注入方案
 - ffmpeg 的 `-metadata:s:v` 方式只支持 V1 XML，不支持 sv3d
@@ -136,7 +136,7 @@ subprocess.run(cmd, check=True)
 
 **现象**: `pipeline/upscaler.py` 包含内嵌的 XML 标记和 git diff 冲突标记，Python 无法解析。
 
-**排查过程**: 
+**排查过程**:
 1. 文件中混入了 `<thinking_mode>interleaved</thinking_mode>` 等 XML 标记
 2. 看起来是 AI 编辑过程中产生的 artifact
 
