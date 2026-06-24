@@ -9,22 +9,17 @@ This is the **execution** plan (what to build, in what order, with done-criteria
 
 ## North Star
 Turn a text prompt or a flat 2D clip into a headset-ready, **stereoscopic** VR180 video
-(7680×1920 SBS equirect + `sv3d`/`st3d` metadata), end-to-end, with a usable web UI.
+(square per-eye SBS equirect + `sv3d`/`st3d` metadata), end-to-end, with a usable web UI.
 
 ---
 
-## M0 — Stabilize (this week) · [cline]
-Goal: green test suite + green CI on every open PR, and a VR180 output that headsets actually recognize.
-Sequence is **serial** — each branches from latest `main`.
+## M0 — Stabilize · [cline] ✅ DONE (2026-06-24)
+- ✅ **T-A** PR #8 (T2 auth) — added `passlib[bcrypt]` (+pinned `bcrypt<5`); CI green.
+- ✅ **T-B** test failures — found already-passing on main; only the metadata test remained.
+- ✅ **T-C** PR #10 VR180 metadata — root cause was `inject_via_spatialmedia_cli` calling bare `python3`
+  (resolved to a Python without `spatialmedia`); fixed to `sys.executable`. `sv3d`/`st3d` now injected; CI green.
 
-1. **T-A — PR #8 (T2 auth) green.** Add `passlib[bcrypt]` to `requirements.txt` + `pyproject.toml`.
-2. **T-B — kill the 15 local test failures.** `pytest-asyncio` `asyncio_mode=auto` (13 integration tests);
-   resolve the `streaming_pipeline.py` hw-encoder WIP (finish+retest, or revert) for the 2 phase1 tests.
-3. **T-C — fix VR180 metadata injection.** Declare the Google `spatial-media` dep; make the ffmpeg
-   fallback raise instead of faking success; delete the dead/wrong ISOBMFF builders; add a regression
-   test asserting `sv3d`+`st3d` (Stereo Mode 2) is present.
-
-**M0 done when:** `pytest` green locally, PR #8 + #9 CI green, and a converted clip opens as 3D VR180 in a headset/DeoVR.
+**Merge order to consolidate:** #9 Hermes → #8 auth → #10 metadata (all green; board file overlaps, so merge serially and resolve the board once).
 
 ---
 
@@ -34,21 +29,22 @@ User test feedback (2026-06-24): black borders / FOV not filled, eyes not aligne
 resolution, visible seams. Tackle **geometry & comfort first, then sharpness, then GPU-heavy quality.**
 
 ### M1a — Geometry & comfort (no GPU) · [lead → cline to make default]
-Researched + validated interactively 2026-06-24; needs to become the pipeline DEFAULT, not CLI flags.
+Researched + validated interactively 2026-06-24 (delivered `googlegemini_vr180_v2.mp4`); needs to become
+the pipeline DEFAULT, not ad-hoc CLI flags.
 1. **Per-eye must be SQUARE (1:1).** 180°×180° → square half-equirect. The old `3840×1920` (2:1) vertically
    squished content to half-height — the core "looks wrong / doesn't fill" bug. Use square per-eye
-   (e.g. `--output-width 2880 --output-height 2880` → SBS 5760×2880).
+   (validated `2880×2880` → SBS 5760×2880).
 2. **Fill the FOV.** `--src-hfov 150` fills ~99% of the hemisphere (vs the tiny window at 90°). Tradeoff is
-   spherical stretch at edges — acceptable interim until M1b outpainting. Make a sensible default + document.
-3. **Comfortable stereo.** Drop `max_disparity` 0.05 → ~0.02 so the eyes fuse (fixes "not aligned").
+   spherical stretch at edges — acceptable interim until M1d outpainting. Make a sensible default + document.
+3. **Comfortable stereo.** Dropped `max_disparity` 0.05 → 0.02 so the eyes fuse (fixes "not aligned").
    Tune convergence so the main subject sits at the zero-parallax plane.
 - [ ] [cline] bake these as defaults in `run_pipeline.py` / `EquirectangularMapper` / `StereoRenderer`; add a test.
 
-### M1b — Resolution / sharpness (the "pixel upgrade") · [lead] + [GPU optional]
+### M1b — Resolution / sharpness (the "pixel upgrade") · [lead] + [GPU optional]  ← NEXT
 Target per-eye **2560²–3840²** (research: ~2560²/eye saturates; Quest 3 panel 2064×2208/eye, Quest 2 1832×1920).
 Source here is only 720p, so mapping straight to 2880² is soft. Plan: **upscale the source first** (Real-ESRGAN,
-`pipeline/upscaler.py`) before depth/stereo/equirect, OR DepthCrafter-grade pipeline. Bump bitrate (the 15MB
-h264/CRF20 file was low). Decide canonical output res by target device (Quest vs Vision Pro).
+`pipeline/upscaler.py`) before depth/stereo/equirect. Bump bitrate (the early 15MB h264/CRF20 file was low; v2 is
+h265/CRF18 at 35MB). Decide canonical output res by target device (Quest vs Vision Pro).
 
 ### M1c — Temporal depth + stereo fidelity · [GPU]
 DepthCrafter (temporal-stable depth, stops shimmer) + StereoCrafter (clean disocclusions). Current
@@ -108,5 +104,7 @@ Pricing tiers, API key management + metering (build on T2 auth + quota), billing
 ## Cross-cutting / tech debt (fold into the sprint that touches the area)
 - VR metadata must be identical across CLI, streaming, and API output paths (single source of truth).
 - Decide the canonical target device(s) — Quest (SBS equirect) vs Apple Vision Pro (MV-HEVC via `spatial_converter`). **[user]**
-- CI should install the spatial-media git dep and run the M0 metadata regression test.
+- CI installs the spatial-media git dep and runs the metadata regression test.
+- **Workflow:** cline and lead share one working tree → branch/stash collisions. Run cline and lead orchestration
+  in separate git worktrees (or time-slice) to stop clobbering each other's uncommitted work.
 - Keep `.clinerules` discipline: serial dependent tasks, branch from latest `main`, never `--no-verify`.
