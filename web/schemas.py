@@ -71,3 +71,24 @@ class ErrorResponse(BaseModel):
 
     error: str
     detail: str | None = None
+
+
+class GenerateRequest(BaseModel):
+    """Request to generate a video via an external provider."""
+
+    prompt: str = Field(..., description="User creative prompt (wrapped with VR180 constraints)")
+    scene_type: str = Field("fpv", description="Scene type: fpv / walkthrough / orbit / static")
+    provider: str = Field("kling", description="Video generation provider: kling / seedance / veo")
+    duration_seconds: int = Field(5, ge=1, le=30, description="Target video duration in seconds")
+    resolution: str = Field("1080p", description="Output resolution")
+    fps: int = Field(24, ge=1, le=60, description="Frames per second")
+
+
+class GenerateResponse(BaseModel):
+    """Response from a video generation request."""
+
+    job_id: str = Field(..., description="Job ID from the external provider")
+    provider: str = Field(..., description="Provider used for generation")
+    prompt: str = Field(..., description="The full VR180-wrapped positive prompt")
+    negative_prompt: str = Field(..., description="The VR180 negative prompt")
+    status: str = Field("pending", description="Initial job status")
