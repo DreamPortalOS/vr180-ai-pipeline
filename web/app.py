@@ -24,11 +24,16 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from integrations.base import GenerationParams
+from integrations.factory import get_provider, list_providers
 from workers.celery_app import app as celery_app
 from workers.convert_tasks import convert_to_vr180
 
+from pipeline.prompt_builder import wrap_prompt_for_vr180
 from web.schemas import (
     ErrorResponse,
+    GenerateRequest,
+    GenerateResponse,
     HealthResponse,
     TaskCreateRequest,
     TaskListResponse,
@@ -491,3 +496,113 @@ async def delete_result_v1(task_id: str):
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Result {task_id} not found")
     return None
+
+
+# ─── Video Generation (external providers) ────────────────────────────────────
+
+
+@app.post(
+    "/api/v1/generate",
+    response_model=GenerateResponse,
+    status_code=201,
+    tags=["Video Generation"],
+    responses={
+        400: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
+    },
+)
+async def generate_video(request: GenerateRequest):
+    """Generate a video using an external AI video generation provider.
+
+    Wraps the user prompt with VR180 constraints via ``wrap_prompt_for_vr180``,
+    submits to the chosen provider (kling / seedance / veo), and returns the
+    external job ID for status polling via GET /api/v1/generate/{job_id}.
+    """
+    # 1. Wrap prompt with VR180 constraints
+    try:
+        wrapped = wrap_prompt_for_vr180(
+            user_prompt=request.prompt,
+            scene_type=request.scene_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    # 2. Build generation parameters
+    params = GenerationParams(
+        prompt=wrapped["positive"],
+        negative_prompt=wrapped["negative"],
+        duration_seconds=request.duration_seconds,
+        resolution=request.resolution,
+        fps=request.fps,
+    )
+
+    # 3. Instantiate provider and submit
+    try:
+        provider = get_provider(request.provider)
+        job_id = await provider.submit(params)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except Exception as exc:
+        log.exception("Provider submission failed: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provider submission failed: {exc}",
+        ) from exc
+
+    return GenerateResponse(
+        job_id=job_id,
+        provider=request.provider,
+        prompt=wrapped["positive"],
+        negative_prompt=wrapped["negative"],
+        status="pending",
+    )
+
+
+@app.get(
+    "/api/v1/generate/{job_id}",
+    response_model=dict,
+    tags=["Video Generation"],
+    responses={404: {"model": ErrorResponse}},
+)
+async def poll_generation(
+    job_id: str,
+    provider: str = "kling",
+):
+    """Poll the status of a video generation job.
+
+    Query parameter ``provider`` selects which provider to poll (default: kling).
+    """
+    try:
+        prov = get_provider(provider)
+        status = await prov.poll(job_id)
+    except NotImplementedError:
+        raise HTTPException(
+            status_code=501,
+            detail=f"Polling not yet implemented for provider '{provider}'",
+        ) from None
+    except Exception as exc:
+        log.exception("Poll failed for job %s: %s", job_id, exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Poll failed: {exc}",
+        ) from exc
+
+    return {
+        "job_id": status.job_id,
+        "state": status.state.value,
+        "progress": status.progress,
+        "message": status.message,
+        "output_url": status.output_url,
+    }
+
+
+@app.get(
+    "/api/v1/providers",
+    tags=["Video Generation"],
+)
+async def list_available_providers():
+    """List all registered video generation providers."""
+    return {
+        "providers": list_providers(),
+        "count": len(list_providers()),
+    }

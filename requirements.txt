@@ -41,6 +41,7 @@ python-multipart>=0.0.6,<1.0.0
 # Testing
 pytest>=7.0.0,<9.0.0
 pytest-cov>=4.0.0,<6.0.0
+pytest-asyncio>=0.23,<1.0  # async provider tests (integrations/)
 
 # Linting
 ruff>=0.4.0,<1.0.0
