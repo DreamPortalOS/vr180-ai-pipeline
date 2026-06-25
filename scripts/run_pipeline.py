@@ -149,7 +149,7 @@ def parse_args():
         "--video-upscale",
         choices=["none", "seedvr2"],
         default="none",
-        help="Video upscaling method: none (skip) or seedvr2 (SeedVR2 via ComfyUI, Stage 0) (default: none)",
+        help="Video upscaling method: none (skip) or seedvr2 (SeedVR2, Stage 0) (default: none)",
     )
     parser.add_argument(
         "--video-upscale-factor",
@@ -158,10 +158,36 @@ def parse_args():
         choices=[2, 3, 4],
         help="SeedVR2 upscaling factor (default: 2)",
     )
+    # [Deprecated] ComfyUI URL — use --seedvr2-node-dir for CLI backend
     parser.add_argument(
         "--seedvr2-url",
         default="http://127.0.0.1:8188",
-        help="ComfyUI server URL for SeedVR2 (default: http://127.0.0.1:8188)",
+        help="[Deprecated — use --seedvr2-node-dir] ComfyUI server URL (default: http://127.0.0.1:8188)",
+    )
+
+    # SeedVR2 CLI backend params
+    parser.add_argument(
+        "--seedvr2-node-dir",
+        default=None,
+        help="SeedVR2 custom node directory (contains inference_cli.py). Can also set SEEDVR2_NODE_DIR env var.",
+    )
+    parser.add_argument(
+        "--seedvr2-python",
+        default=None,
+        help="Python executable for inference_cli.py (default: python). Can also set SEEDVR2_PYTHON env var.",
+    )
+    parser.add_argument(
+        "--seedvr2-model-dir",
+        default=None,
+        help="SeedVR2 model .safetensors directory. "
+        "Can also set SEEDVR2_MODEL_DIR env var (default: <node_dir>/../../models/SEEDVR2).",
+    )
+    parser.add_argument(
+        "--seedvr2-resolution",
+        type=int,
+        default=None,
+        help="Output short-side resolution. Auto from source height × factor if 0. "
+        "Can also set SEEDVR2_RESOLUTION env var (default: 1440).",
     )
 
     return parser.parse_args()
@@ -336,9 +362,10 @@ def run_metadata_stage(args, sbs_frames):
 def run_seedvr2_prestage(args) -> str:
     """Stage 0: SeedVR2 video upscaling (runs on the whole video file before frame loading).
 
-    Upscales the input video via ComfyUI SeedVR2, saves the result to a temp path,
-    and returns the path to the upscaled video.  The caller replaces args.input with
-    this path so all downstream stages see the higher-resolution source.
+    Upscales the input video via SeedVR2 inference_cli.py (CLI backend),
+    saves the result to a temp path, and returns the path to the upscaled
+    video.  The caller replaces args.input with this path so all downstream
+    stages see the higher-resolution source.
     """
     log.info("=== Stage 0: SeedVR2 Video Upscaling (%d×) ===", args.video_upscale_factor)
 
@@ -348,7 +375,10 @@ def run_seedvr2_prestage(args) -> str:
 
     upscaler = SeedVR2Upscaler(
         batch_size=5,
-        base_url=args.seedvr2_url,
+        node_dir=args.seedvr2_node_dir,
+        python_exe=args.seedvr2_python,
+        model_dir=args.seedvr2_model_dir,
+        resolution=args.seedvr2_resolution,
     )
 
     log.info("SeedVR2: %s → %s (factor=%d)", args.input, upscaled_path, args.video_upscale_factor)
