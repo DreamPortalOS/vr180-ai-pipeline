@@ -78,6 +78,9 @@ def parse_args():
     parser.add_argument("--temp-dir", default=None, help="Directory for intermediate files")
     parser.add_argument("--no-ffmpeg-v360", action="store_true", help="Disable ffmpeg v360, use OpenCV fallback")
     parser.add_argument(
+        "--no-equirect-batched", action="store_true", help="Disable batched equirect mapping (revert to per-frame)"
+    )
+    parser.add_argument(
         "--no-flip", action="store_true", help="Disable vertical flip (default: flip on for VR headset)"
     )
 
@@ -370,7 +373,12 @@ def run_stereo_stage(args, frames, depths):
 
 
 def run_equirect_stage(args, left_frames, right_frames):
-    """Stage 3: Map stereo views to equirectangular."""
+    """Stage 3: Map stereo views to equirectangular.
+
+    Uses batched ``map_sequence()`` by default (~10× faster than per-frame).
+    Falls back to per-frame ``map_stereo_pair()`` when ``--no-equirect-batched``
+    is set (e.g., for testing or OpenCV fallback).
+    """
     log.info("=== Stage 3: Equirectangular Projection ===")
 
     mapper = EquirectangularMapper(
@@ -381,13 +389,27 @@ def run_equirect_stage(args, left_frames, right_frames):
     )
 
     out_dir = get_temp_dir(args, "equirect")
-    sbs_frames = []
-    for i, (left, right) in enumerate(
-        tqdm(zip(left_frames, right_frames, strict=False), desc="Mapping to equirect", total=len(left_frames))
-    ):
-        sbs = mapper.map_stereo_pair(left, right)
-        sbs_frames.append(sbs)
-        cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
+    temp_dir = get_temp_dir(args)
+
+    if args.no_equirect_batched:
+        # Per-frame path (fallback)
+        sbs_frames = []
+        for i, (left, right) in enumerate(
+            tqdm(
+                zip(left_frames, right_frames, strict=False),
+                desc="Mapping to equirect (per-frame)",
+                total=len(left_frames),
+            )
+        ):
+            sbs = mapper.map_stereo_pair(left, right)
+            sbs_frames.append(sbs)
+            cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
+    else:
+        # Batched path — single ffmpeg v360 call per eye on the whole sequence
+        sbs_frames = mapper.map_sequence(left_frames, right_frames, temp_dir)
+        # Write frames to disk for checkpoint restore
+        for i, sbs in enumerate(sbs_frames):
+            cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
 
     log.info(
         f"Generated {len(sbs_frames)} equirectangular SBS frames ({sbs_frames[0].shape[1]}×{sbs_frames[0].shape[0]})"
