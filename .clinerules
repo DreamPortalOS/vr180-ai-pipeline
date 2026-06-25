@@ -7,10 +7,11 @@
 
 ## 📊 2. LOCAL STATE MACHINE (本地状态机看板)
 To prevent "amnesia" or losing track of the goal during long sessions (60+ minutes), you must maintain your own state in the workspace:
-1. **Initialization:** At the very start, scan the workspace and create a file named `CLINE_TASK_BOARD.md` in the project root.
-2. **Content:** Translate the project requirements into a hyper-granular, step-by-step technical checklist inside `CLINE_TASK_BOARD.md`.
-3. **Execution:** Before editing any code, use a file tool to update `CLINE_TASK_BOARD.md` by marking the current task as `[In Progress]`. Once compiled/tested green, mark it as `[x] Completed` and move to the next item immediately.
+1. **Initialization:** At the very start, scan the workspace and create a file named `.cline-state.md` in the project root — this is YOUR private scratch checklist.
+2. **Content:** Translate the current dispatched task into a hyper-granular, step-by-step technical checklist inside `.cline-state.md`.
+3. **Execution:** Before editing any code, update `.cline-state.md` to mark the current step `[In Progress]`. Once compiled/tested green, mark it `[x] Completed` and move to the next item immediately.
 4. **Never Print Boards to Chat:** All state management must happen inside the markdown file, never in the chat log.
+5. **⚠️ NEVER overwrite `CLINE_TASK_BOARD.md`** — it is the **SHARED lead↔cline dispatch board**, not your scratchpad. Read your dispatched task from it; you MAY tick *your own* task's checkbox, but you must NEVER replace or rewrite the whole file. Your private granular checklist goes in `.cline-state.md` (gitignored).
 
 ## 🛡️ 3. DEFENSIVE EDITING (防模型物理崩溃与截断)
 To avoid `Invalid API Response` caused by Max Output Token exhaustion:
@@ -48,4 +49,4 @@ To prevent triggering Cline's `Too many consecutive mistakes (3)` protection:
 
 ---
 ## 🚀 START MANDATE
-Read the current workspace, immediately create/update `CLINE_TASK_BOARD.md`, and invoke your first tool call to begin development. Move swiftly, silently, and autonomously.
+Read the current workspace and your dispatched task in `CLINE_TASK_BOARD.md` (read-only — do NOT overwrite it), immediately create/update your private `.cline-state.md` scratch checklist, and invoke your first tool call to begin development. Move swiftly, silently, and autonomously.

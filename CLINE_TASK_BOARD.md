@@ -43,7 +43,7 @@ Branch `feat/R3-spatial-converter-tests` from latest `main`. New `tests/test_spa
 SBS / MV-HEVC conversion paths in `pipeline/spatial_converter.py` (coverage lost when `test_phase4` was archived).
 **Tests only** — do NOT change the module under test. ruff + pytest green.
 
-> Status: DISPATCH-1/2/3 delivered by cline → PRs #17 (R-5), #22 (R-2), #23 (R-3), all CI-green.
+> Status (2026-06-25): **merged to main** — R-5 #17 · R-2 #22 · R-3 #23 · P-1 #24 · P-2 #25; lead fixes #19 (CUDA total_memory) + #21 (ffmpeg-stderr deadlock); plan/PRD #20. **NEXT = R-1 (DISPATCH-4)** — cline on `feat/R1-seedvr2-upscaler`.
 
 ### ▶ DISPATCH-4 = R-1 SeedVR2 source upscaler  (parallel-OK — branch from R-5's branch)
 **Branch from `feat/R5-fulldome-mapper` (R-5's branch), NOT `main`.** R-1 and R-5 both edit

@@ -58,3 +58,6 @@ models/
 # Config with local paths
 .env
 *.local.yaml
+
+# Cline private scratch state (NOT the shared CLINE_TASK_BOARD.md)
+.cline-state.md
