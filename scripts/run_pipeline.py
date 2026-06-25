@@ -37,6 +37,7 @@ from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import detect_best_device, resolve_device
 from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.fulldome_mapper import FulldomeMapper
+from pipeline.stereo_crafter import StereoCrafterRenderer
 from pipeline.stereo_renderer import StereoRenderer
 from pipeline.streaming_pipeline import StreamingPipeline
 from pipeline.upscaler import PixelUpscaler
@@ -50,7 +51,8 @@ logging.basicConfig(
 log = logging.getLogger("vr180-pipeline")
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
+    """Parse CLI arguments.  Accept optional *argv* for testing."""
     parser = argparse.ArgumentParser(description="2D AI Video → VR180 Conversion Pipeline")
     parser.add_argument("--input", "-i", required=True, help="Input video file (MP4, MOV, etc.)")
     parser.add_argument("--output", "-o", default=None, help="Output VR180 video path")
@@ -178,6 +180,36 @@ def parse_args():
         help="Max resolution (short side) for DepthCrafter inference (or env DEPTHCRAFTER_MAX_RES)",
     )
 
+    # Stereo model selection
+    parser.add_argument(
+        "--stereo-model",
+        choices=["default", "stereocrafter"],
+        default="default",
+        help="Stereo rendering backend: default (depth-shift + inpaint, default) or "
+        "stereocrafter (Tencent StereoCrafter, CUDA-only, cleaner disocclusion)",
+    )
+    parser.add_argument(
+        "--stereocrafter-repo-dir",
+        default=None,
+        help="StereoCrafter repository directory (or env STEREOCRAFTER_REPO_DIR)",
+    )
+    parser.add_argument(
+        "--stereocrafter-python",
+        default=None,
+        help="Python executable for StereoCrafter inference (or env STEREOCRAFTER_PYTHON)",
+    )
+    parser.add_argument(
+        "--stereocrafter-checkpoint-dir",
+        default=None,
+        help="StereoCrafter checkpoint directory (or env STEREOCRAFTER_CKPT_DIR)",
+    )
+    parser.add_argument(
+        "--stereocrafter-max-res",
+        type=int,
+        default=None,
+        help="Max resolution (short side) for StereoCrafter inference (or env STEREOCRAFTER_MAX_RES)",
+    )
+
     # R-1: SeedVR2 video upscaling pre-stage
     parser.add_argument(
         "--video-upscale",
@@ -224,7 +256,7 @@ def parse_args():
         "Can also set SEEDVR2_RESOLUTION env var (default: 1440).",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def read_frames(video_path: str, max_frames: int | None = None):
@@ -347,6 +379,12 @@ def run_stereo_stage(args, frames, depths):
     """Stage 2: Generate stereo left/right views."""
     log.info("=== Stage 2: Stereo Disparity Rendering ===")
 
+    # StereoCrafter mode — process whole video via external inference
+    if args.stereo_model == "stereocrafter":
+        log.info("Using StereoCrafter for depth-aware stereo with disocclusion inpainting")
+        return _run_stereocrafter_stage(args, frames, depths)
+
+    # Default: per-frame depth-shift renderer
     renderer = StereoRenderer(
         ipd=args.ipd,
         max_disparity=args.max_disparity,
@@ -370,6 +408,76 @@ def run_stereo_stage(args, frames, depths):
 
     log.info(f"Stereo views: {len(left_frames)} frames each")
     return left_frames, right_frames
+
+
+def _run_stereocrafter_stage(args, frames, depths):
+    """Run StereoCrafter inference: frames + depth -> L/R video files -> load frames."""
+
+    # Save frames as a temp video so StereoCrafter can read them
+    temp_dir = get_temp_dir(args)
+    depth_dir = get_temp_dir(args, "depth")
+
+    # Write frames to a temp video file for StereoCrafter input
+    H, W = frames[0].shape[:2]
+    temp_video = os.path.join(temp_dir, "_stereocrafter_input.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(temp_video, fourcc, args.fps or 30, (W, H))
+    for frame in tqdm(frames, desc="Preparing frames for StereoCrafter"):
+        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    writer.release()
+    log.info("StereoCrafter: wrote %d frames to %s", len(frames), temp_video)
+
+    # Save depth maps to depth_dir if not already there
+    # (they should already exist from run_depth_stage, but ensure npy files are present)
+    for i, depth in enumerate(depths):
+        npy_path = os.path.join(depth_dir, f"depth_{i:06d}.npy")
+        if not os.path.exists(npy_path):
+            np.save(npy_path, depth)
+
+    # Output paths
+    left_video = os.path.join(temp_dir, "_stereocrafter_left.mp4")
+    right_video = os.path.join(temp_dir, "_stereocrafter_right.mp4")
+
+    # Run StereoCrafter
+    renderer = StereoCrafterRenderer(
+        repo_dir=args.stereocrafter_repo_dir,
+        python_exe=args.stereocrafter_python,
+        checkpoint_dir=args.stereocrafter_checkpoint_dir,
+        max_resolution=args.stereocrafter_max_res,
+    )
+    result_left, result_right = renderer.render_video(
+        input_path=temp_video,
+        depth_dir=depth_dir,
+        output_left=left_video,
+        output_right=right_video,
+    )
+
+    # Load output videos back as frame arrays
+    left_frames = _load_video_frames(result_left)
+    right_frames = _load_video_frames(result_right)
+
+    # Save individual frames for checkpoint restore
+    left_dir = get_temp_dir(args, "left")
+    right_dir = get_temp_dir(args, "right")
+    for i, (left, right) in enumerate(zip(left_frames, right_frames, strict=False)):
+        cv2.imwrite(os.path.join(left_dir, f"left_{i:06d}.png"), cv2.cvtColor(left, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(right_dir, f"right_{i:06d}.png"), cv2.cvtColor(right, cv2.COLOR_RGB2BGR))
+
+    log.info("StereoCrafter: %d L/R frame pairs loaded", len(left_frames))
+    return left_frames, right_frames
+
+
+def _load_video_frames(video_path: str) -> list[np.ndarray]:
+    """Load all frames from a video file as RGB ndarrays."""
+    cap = cv2.VideoCapture(video_path)
+    frames: list[np.ndarray] = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    return frames
 
 
 def run_equirect_stage(args, left_frames, right_frames):
