@@ -39,6 +39,7 @@ from pipeline.fulldome_mapper import FulldomeMapper
 from pipeline.stereo_renderer import StereoRenderer
 from pipeline.streaming_pipeline import StreamingPipeline
 from pipeline.upscaler import PixelUpscaler
+from pipeline.video_upscaler import SeedVR2Upscaler
 from pipeline.vr_metadata import VRMetadataEmbedder
 
 logging.basicConfig(
@@ -141,6 +142,26 @@ def parse_args():
     )
     parser.add_argument(
         "--dome-size", type=int, default=4096, help="Fulldome output square size in pixels (default 4096)"
+    )
+
+    # R-1: SeedVR2 video upscaling pre-stage
+    parser.add_argument(
+        "--video-upscale",
+        choices=["none", "seedvr2"],
+        default="none",
+        help="Video upscaling method: none (skip) or seedvr2 (SeedVR2 via ComfyUI, Stage 0) (default: none)",
+    )
+    parser.add_argument(
+        "--video-upscale-factor",
+        type=int,
+        default=2,
+        choices=[2, 3, 4],
+        help="SeedVR2 upscaling factor (default: 2)",
+    )
+    parser.add_argument(
+        "--seedvr2-url",
+        default="http://127.0.0.1:8188",
+        help="ComfyUI server URL for SeedVR2 (default: http://127.0.0.1:8188)",
     )
 
     return parser.parse_args()
@@ -309,6 +330,34 @@ def run_metadata_stage(args, sbs_frames):
         width=W,
         height=H,
     )
+    return result
+
+
+def run_seedvr2_prestage(args) -> str:
+    """Stage 0: SeedVR2 video upscaling (runs on the whole video file before frame loading).
+
+    Upscales the input video via ComfyUI SeedVR2, saves the result to a temp path,
+    and returns the path to the upscaled video.  The caller replaces args.input with
+    this path so all downstream stages see the higher-resolution source.
+    """
+    log.info("=== Stage 0: SeedVR2 Video Upscaling (%d×) ===", args.video_upscale_factor)
+
+    temp_dir = get_temp_dir(args)
+    stem = Path(args.input).stem
+    upscaled_path = os.path.join(temp_dir, f"{stem}_seedvr2_{args.video_upscale_factor}x.mp4")
+
+    upscaler = SeedVR2Upscaler(
+        batch_size=5,
+        base_url=args.seedvr2_url,
+    )
+
+    log.info("SeedVR2: %s → %s (factor=%d)", args.input, upscaled_path, args.video_upscale_factor)
+    result = upscaler.upscale(
+        input_path=args.input,
+        output_path=upscaled_path,
+        factor=args.video_upscale_factor,
+    )
+    log.info("SeedVR2 upscale complete → %s", result)
     return result
 
 
@@ -594,6 +643,12 @@ def get_resume_start_stage(temp_dir: str):
 
 def main():
     args = parse_args()
+
+    # R-1: SeedVR2 pre-stage — upscale the input video file before any frame loading
+    if args.video_upscale == "seedvr2":
+        original_input = args.input
+        args.input = run_seedvr2_prestage(args)
+        log.info("SeedVR2 pre-stage: input replaced %s → %s", original_input, args.input)
 
     # Auto-detect device if not specified
     if args.device is None:
