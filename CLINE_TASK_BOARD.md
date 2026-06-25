@@ -26,15 +26,22 @@ Lead is delivering the 4070S deployment (`docs/SEEDVR2_SETUP.md`); cline wraps i
 
 ---
 
-## 🟢 ROUTE 1 — Fulldome / 球幕影院 (mono, no glasses) — recommended next
+## 🟢 ROUTE 1 — Fulldome / 球幕影院 (mono, no glasses) — ▶ ACTIVE (user chose Route-1-first 2026-06-24)
 No stereo → no ghosting, no nausea, max sharpness. Small build, reuses v360 machinery.
+**Approach validated by lead** — single fast v360 pass (~4s for 10s clip, whole video at once, NOT per-frame):
+```
+ffmpeg -i src.mp4 -vf "v360=input=flat:output=fisheye:ih_fov=120:iv_fov=75:h_fov=180:v_fov=180:w=2048:h=2048" out.mp4
+```
+Output is a valid domemaster. `ih_fov/iv_fov` = source coverage → controls how much of the dome the flat clip fills
+(low = a screen-like patch, high = fuller dome but more stretch). Corners outside the 180° circle are black (correct).
 
-### R-5. Fulldome renderer
-- [ ] `pipeline/fulldome_mapper.py` — map upscaled 2D → **domemaster** (circular fisheye, azimuthal-equidistant,
-  square, 180° default / configurable to 200°+) via ffmpeg `v360=input=flat:output=fisheye`. **Mono, no depth.**
-- [ ] `scripts/run_pipeline.py`: `--projection {vr180,fulldome}` (default vr180). Fulldome skips depth/stereo/spherical-metadata.
-- [ ] Output square 4K² (configurable to 8K²); h265. Test: output is square, fisheye, no `sv3d`/`st3d`.
-- [ ] Doc: how to preview (fisheye-aware player) + note dome-software/projector questions are user-pending.
+### R-5. Fulldome renderer (TOP — build now)
+- [ ] `pipeline/fulldome_mapper.py` — wrap the validated v360 recipe. **Mono, no depth.** Params:
+  `dome_fov` (default 180, up to 220), `coverage`/`ih_fov`+`iv_fov` (how much the source fills the dome, default
+  ih_fov=120 iv_fov auto from aspect), output size (default 4096², configurable). **Single ffmpeg pass over the whole video.**
+- [ ] `scripts/run_pipeline.py`: `--projection {vr180,fulldome}` (default vr180). Fulldome skips depth/stereo/spherical-metadata entirely.
+- [ ] Test: output square, fisheye, no `sv3d`/`st3d`. Doc: preview in a fisheye-aware player; dome projector/warp questions user-pending.
+- Note: pairs with SeedVR2 (R-1) for sharpness; the soft look is the 720p source, not the projection.
 
 ---
 
