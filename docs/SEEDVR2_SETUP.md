@@ -49,12 +49,16 @@ The node's auto-downloader **can** fetch models, but it lacks resume — a dropp
 restarts from zero.  For reliable downloads use `curl` with `-C -` (resume):
 
 ```powershell
-# From the node's HF mirror (preferred — matches the node's expected filename)
+# DIFFUSION model (3.16 GB) — required
 curl -L -C - -o ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp8_e4m3fn.safetensors ^
   https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors
 
-# Alternative: official ByteDance repo (but filename differs — you may need a symlink)
-# curl -L -C - -o ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp8_e4m3fn.safetensors ^
+# VAE model (0.47 GB) — required for encode/decode
+curl -L -C - -o ComfyUI/models/SEEDVR2/ema_vae_fp16.safetensors ^
+  https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/ema_vae_fp16.safetensors
+
+# Alternative DIT: official ByteDance repo (filename differs — may need a symlink)
+# curl -L -C - -o ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp16.safetensors ^
 #   https://huggingface.co/ByteDance-Seed/SeedVR2-3B/resolve/main/seedvr2_ema_3b_fp16.safetensors
 ```
 
@@ -63,11 +67,14 @@ curl -L -C - -o ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp8_e4m3fn.safetensors ^
 
 **Model choice for 12 GB:**
 
-| Model file | VRAM | Quality | Recommended |
-|---|---|---|---|
-| `seedvr2_ema_3b_fp8_e4m3fn.safetensors` | ~10 GB | Good | **Default** — fits 12 GB with headroom |
-| `seedvr2_ema_3b_fp16.safetensors` | ~14 GB | Best | OOMs on 12 GB; need 16 GB+ |
-| `seedvr2_ema_3b-Q4_K_M.gguf` | ~8 GB | Fair | Use only if fp8 OOMs |
+**File sizes (lead-verified actuals):**
+
+| Model file | Size | VRAM | Quality | Recommended |
+|---|---|---|---|---|
+| `seedvr2_ema_3b_fp8_e4m3fn.safetensors` | **3.16 GB** | ~10 GB | Good | **Default** — fits 12 GB with headroom |
+| `ema_vae_fp16.safetensors` | **0.47 GB** | ~1 GB | Good | **Required** for VAE decode |
+| `seedvr2_ema_3b_fp16.safetensors` | N/A | ~14 GB | Best | OOMs on 12 GB; need 16 GB+ |
+| `seedvr2_ema_3b-Q4_K_M.gguf` | N/A | ~8 GB | Fair | Use only if fp8 OOMs |
 
 ---
 
@@ -97,11 +104,16 @@ python inference_cli.py "D:\path\to\input.mp4" ^
   --vae_decode_tiled ^
   --vae_decode_tile_size 512 ^
   --vae_decode_tile_overlap 64 ^
+  --vae_encode_tiled ^
+  --vae_encode_tile_size 512 ^
+  --vae_encode_tile_overlap 64 ^
+  --dit_offload_device cpu ^
+  --vae_offload_device cpu ^
   --output_format mp4 ^
   --model_dir "D:\ComfyUI\models\SEEDVR2"
 ```
 
-**12 GB parameters explained:**
+**12 GB parameters (all required — lead-verified config):**
 
 | Flag | Value | Why |
 |---|---|---|
@@ -110,6 +122,10 @@ python inference_cli.py "D:\path\to\input.mp4" ^
 | `--vae_decode_tiled` | *(on)* | **Required** — without it VAE decode OOMs on 12 GB |
 | `--vae_decode_tile_size` | `512` | Smaller tiles = less VRAM, slightly slower |
 | `--vae_decode_tile_overlap` | `64` | Tile overlap to hide seams |
+| `--vae_encode_tiled` | *(on)* | **Required** — without it VAE **encode** OOMs on 12 GB |
+| `--vae_encode_tile_size` | `512` | Same tile size for encode path |
+| `--dit_offload_device` | `cpu` | Offload DIT transformer layers to CPU — saves ~2 GB |
+| `--vae_offload_device` | `cpu` | Offload VAE to CPU — saves ~1 GB |
 
 **Performance:** ~60 s/frame at 1080p → 1440p.  A 100-frame 4-second clip takes ~100 minutes.
 Upscaling to 2160p is proportionally slower (~3×).  This is an **offline tool** — start it and

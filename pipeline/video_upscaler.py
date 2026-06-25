@@ -354,8 +354,11 @@ class CLIBackend(UpscaleBackend):
     ``python_exe``            ``SEEDVR2_PYTHON``        ``python``
     ``model_dir``             ``SEEDVR2_MODEL_DIR``     ``(node_dir)/../../models/SEEDVR2``
     ``vae_decode_tiled``      *(hard-coded True)*       ``True``
+    ``vae_encode_tiled``      *(hard-coded True)*       ``True``
     ``vae_tile_size``         ``SEEDVR2_VAE_TILE_SIZE`` ``512``
-    ``resolution``             ``SEEDVR2_RESOLUTION``   ``1440``
+    ``dit_offload_device``    ``SEEDVR2_DIT_OFFLOAD``   ``cpu``
+    ``vae_offload_device``    ``SEEDVR2_VAE_OFFLOAD``   ``cpu``
+    ``resolution``            ``SEEDVR2_RESOLUTION``    ``1440``
     ========================= ========================= =============================
 
     The *factor* → *resolution* mapping: ffprobe source height, multiply by
@@ -372,7 +375,10 @@ class CLIBackend(UpscaleBackend):
         python_exe: str | None = None,
         model_dir: str | None = None,
         vae_decode_tiled: bool = True,
+        vae_encode_tiled: bool = True,
         vae_tile_size: int | None = None,
+        dit_offload_device: str | None = None,
+        vae_offload_device: str | None = None,
         resolution: int | None = None,
     ) -> None:
         # node_dir: required (env fallback)
@@ -399,19 +405,29 @@ class CLIBackend(UpscaleBackend):
 
         # VAE tiling (must be on for 12 GB)
         self.vae_decode_tiled = vae_decode_tiled
+        self.vae_encode_tiled = vae_encode_tiled
         self.vae_tile_size = vae_tile_size or int(os.environ.get("SEEDVR2_VAE_TILE_SIZE", "512"))
+
+        # Offload devices (12 GB stability — dit + vae offloaded to CPU)
+        defaults = {"dit_offload_device": "cpu", "vae_offload_device": "cpu"}
+        self.dit_offload_device = dit_offload_device or os.environ.get(
+            "SEEDVR2_DIT_OFFLOAD", defaults["dit_offload_device"]
+        )
+        self.vae_offload_device = vae_offload_device or os.environ.get(
+            "SEEDVR2_VAE_OFFLOAD", defaults["vae_offload_device"]
+        )
 
         # Resolution override (0 = auto from factor * source height)
         self.resolution = resolution if resolution is not None else int(os.environ.get("SEEDVR2_RESOLUTION", "1440"))
 
-        # Verify paths exist
+        # Verify paths exist (model_dir NOT required — inference_cli.py handles download)
         self._validate_paths()
 
     # ------------------------------------------------------------------
     # Path validation
     # ------------------------------------------------------------------
     def _validate_paths(self) -> None:
-        """Raise clear errors if critical paths are missing."""
+        """Check critical paths exist. Does NOT require model_dir — inference_cli.py handles download/creation."""
         issues: list[str] = []
 
         node_dir = Path(self.node_dir)
@@ -430,10 +446,6 @@ class CLIBackend(UpscaleBackend):
                 f"  The node directory exists but may be incomplete.  Re-clone or update:\n"
                 f"    cd {self.node_dir} && git pull"
             )
-
-        model_dir = Path(self.model_dir)
-        if not model_dir.is_dir():
-            issues.append(f"SeedVR2 model directory not found: {self.model_dir}\n")
 
         if issues:
             raise RuntimeError("SeedVR2 setup is incomplete:\n" + "\n".join(f"  • {i}" for i in issues))
@@ -486,13 +498,25 @@ class CLIBackend(UpscaleBackend):
             self.model_dir,
         ]
 
-        # Optional flags
+        # 12 GB flags: tiled encode + decode, offload devices
         if self.vae_decode_tiled:
             cmd.append("--vae_decode_tiled")
             cmd.append("--vae_decode_tile_size")
             cmd.append(str(self.vae_tile_size))
             cmd.append("--vae_decode_tile_overlap")
             cmd.append("64")
+        if self.vae_encode_tiled:
+            cmd.append("--vae_encode_tiled")
+            cmd.append("--vae_encode_tile_size")
+            cmd.append(str(self.vae_tile_size))
+            cmd.append("--vae_encode_tile_overlap")
+            cmd.append("64")
+        if self.dit_offload_device:
+            cmd.append("--dit_offload_device")
+            cmd.append(self.dit_offload_device)
+        if self.vae_offload_device:
+            cmd.append("--vae_offload_device")
+            cmd.append(self.vae_offload_device)
 
         log.info("CLIBackend command: %s", " ".join(cmd))
         log.info("CLIBackend cwd: %s", self.node_dir)
@@ -552,7 +576,10 @@ class SeedVR2Upscaler:
         model_dir: str | None = None,
         resolution: int | None = None,
         vae_decode_tiled: bool = True,
+        vae_encode_tiled: bool = True,
         vae_tile_size: int | None = None,
+        dit_offload_device: str | None = None,
+        vae_offload_device: str | None = None,
     ) -> None:
         _assert_cuda()
         _validate_batch_size(batch_size)
@@ -567,7 +594,10 @@ class SeedVR2Upscaler:
                 model_dir=model_dir,
                 resolution=resolution,
                 vae_decode_tiled=vae_decode_tiled,
+                vae_encode_tiled=vae_encode_tiled,
                 vae_tile_size=vae_tile_size,
+                dit_offload_device=dit_offload_device,
+                vae_offload_device=vae_offload_device,
             )
 
     def upscale(

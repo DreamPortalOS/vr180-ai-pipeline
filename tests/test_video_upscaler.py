@@ -305,31 +305,43 @@ class TestCLIBackend:
     @patch("pipeline.video_upscaler.subprocess.run")
     @patch("pipeline.video_upscaler._get_video_height", return_value=1080)
     @patch("pipeline.video_upscaler._assert_cuda", return_value=None)
-    def test_command_contains_vae_decode_tiled(
+    def test_command_contains_12gb_flags(
         self,
         mock_cuda: MagicMock,
         mock_height: MagicMock,
         mock_run: MagicMock,
     ) -> None:
-        """The subprocess command must contain --vae_decode_tiled flag."""
+        """The subprocess command must contain all 12GB stability flags."""
         mock_run.return_value.returncode = 0
         mock_run.return_value.stderr = ""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create fake node dir with inference_cli.py
+            # Create fake node dir with inference_cli.py (model_dir not needed — validation relaxed)
             Path(tmpdir, "inference_cli.py").write_text("# fake")
-            Path(tmpdir, "..", "..", "models", "SEEDVR2").mkdir(parents=True, exist_ok=True)
 
-            backend = CLIBackend(node_dir=tmpdir, vae_decode_tiled=True)
+            backend = CLIBackend(node_dir=tmpdir)
             backend.upscale("input.mp4", "output.mp4", factor=2, batch_size=5)
 
             # Extract the command passed to subprocess.run
             call_args, _kwargs = mock_run.call_args
             cmd = call_args[0]
+
+            # VAE decode tiled (existing)
             assert "--vae_decode_tiled" in cmd, f"Missing --vae_decode_tiled in {cmd}"
             assert "--vae_decode_tile_size" in cmd
             assert "--vae_decode_tile_overlap" in cmd
             assert cmd[cmd.index("--vae_decode_tile_size") + 1] == "512"
             assert cmd[cmd.index("--vae_decode_tile_overlap") + 1] == "64"
+
+            # VAE encode tiled (new — 12GB fix)
+            assert "--vae_encode_tiled" in cmd, f"Missing --vae_encode_tiled in {cmd}"
+            assert "--vae_encode_tile_size" in cmd
+            assert cmd[cmd.index("--vae_encode_tile_size") + 1] == "512"
+
+            # DIT + VAE offload to CPU (new — 12GB fix)
+            assert "--dit_offload_device" in cmd, f"Missing --dit_offload_device in {cmd}"
+            assert cmd[cmd.index("--dit_offload_device") + 1] == "cpu"
+            assert "--vae_offload_device" in cmd, f"Missing --vae_offload_device in {cmd}"
+            assert cmd[cmd.index("--vae_offload_device") + 1] == "cpu"
 
     @patch("pipeline.video_upscaler.subprocess.run")
     @patch("pipeline.video_upscaler._get_video_height", return_value=1080)
@@ -345,7 +357,6 @@ class TestCLIBackend:
         mock_run.return_value.stderr = ""
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "inference_cli.py").write_text("# fake")
-            Path(tmpdir, "..", "..", "models", "SEEDVR2").mkdir(parents=True, exist_ok=True)
 
             backend = CLIBackend(node_dir=tmpdir)
             backend.upscale("input.mp4", "output.mp4", factor=2, batch_size=5)
@@ -367,7 +378,6 @@ class TestCLIBackend:
         mock_run.return_value.stderr = ""
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "inference_cli.py").write_text("# fake")
-            Path(tmpdir, "..", "..", "models", "SEEDVR2").mkdir(parents=True, exist_ok=True)
 
             backend = CLIBackend(node_dir=tmpdir, resolution=0)
             backend.upscale("input.mp4", "output.mp4", factor=2, batch_size=5)
@@ -387,7 +397,6 @@ class TestCLIBackend:
         """CLIBackend.upscale raises if CUDA unavailable."""
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "inference_cli.py").write_text("# fake")
-            Path(tmpdir, "..", "..", "models", "SEEDVR2").mkdir(parents=True, exist_ok=True)
 
             backend = CLIBackend(node_dir=tmpdir)
 
@@ -409,7 +418,6 @@ class TestCLIBackend:
         """CLIBackend.upscale raises for batch_size not 4n+1."""
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "inference_cli.py").write_text("# fake")
-            Path(tmpdir, "..", "..", "models", "SEEDVR2").mkdir(parents=True, exist_ok=True)
 
             backend = CLIBackend(node_dir=tmpdir)
             with pytest.raises(ValueError, match="4n\\+1"):
@@ -429,7 +437,6 @@ class TestCLIBackend:
         mock_run.return_value.stderr = ""
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "inference_cli.py").write_text("# fake")
-            Path(tmpdir, "..", "..", "models", "SEEDVR2").mkdir(parents=True, exist_ok=True)
 
             backend = CLIBackend(node_dir=tmpdir)
             backend.upscale("input.mp4", "output.mp4", factor=2, batch_size=5)

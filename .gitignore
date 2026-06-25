@@ -51,6 +51,10 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints/
 
+# Video experiment artifacts (should not be tracked)
+video/*.md
+video/*.json
+
 # Model weights (too large for git)
 models/
 !models/.gitkeep
