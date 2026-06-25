@@ -10,6 +10,41 @@ Platform layer archived on branch `archive/platform-layer` — do NOT rebuild it
 
 ---
 
+## 📮 ACTIVE DISPATCH — lead → cline (execute IN ORDER, one PR each, serial)
+
+> **Local env is already provisioned by lead — do NOT reinstall torch.** The repo has a working `.venv`
+> (Python 3.12, `torch 2.6.0+cu124` **CUDA** build verified on an RTX 4070 SUPER, `cuda=True`), ffmpeg is on
+> PATH, and `Depth-Anything-V2-Small` is cached. First-run only: `.venv\Scripts\activate` then
+> `pip install pre-commit && pre-commit install`. Branch each task from **latest `main`**. Never `--no-verify`.
+
+### ▶ DISPATCH-1 = R-5 Fulldome renderer  (DO THIS FIRST — Route 1, active)
+Branch `feat/R5-fulldome-mapper` from latest `main`.
+- **New `pipeline/fulldome_mapper.py`** — `class FulldomeMapper`:
+  - `__init__(self, dome_fov=180, coverage_h_fov=120, coverage_v_fov=None, output_size=4096, codec="h264", crf=18)`
+  - `convert(self, input_path, output_path) -> str`: **ONE** ffmpeg pass over the whole video (NOT per-frame):
+    `v360=input=flat:output=fisheye:ih_fov=<coverage_h_fov>:iv_fov=<coverage_v_fov>:h_fov=<dome_fov>:v_fov=<dome_fov>:w=<output_size>:h=<output_size>`
+    When `coverage_v_fov is None`, derive it from the source aspect ratio. subprocess MUST use a list (no `shell=True`).
+  - Validated recipe (lead ran it; produces a valid square-fisheye domemaster):
+    `ffmpeg -i src.mp4 -vf "v360=input=flat:output=fisheye:ih_fov=120:iv_fov=75:h_fov=180:v_fov=180:w=2048:h=2048" out.mp4`
+- **Modify `scripts/run_pipeline.py`**: add `--projection {vr180,fulldome}` (default `vr180`). When `fulldome`,
+  **skip depth/stereo/equirect/metadata entirely** and call `FulldomeMapper`. Use `patch_file` (run_pipeline.py > 150 lines).
+- **New `tests/test_fulldome_mapper.py`**: output square (w==h), fisheye, contains **NO** `sv3d`/`st3d` boxes.
+- Acceptance: `--projection fulldome` → square fisheye domemaster; `--projection vr180` unchanged; `ruff check .` + `ruff format --check .` + `pytest` green.
+- Do **NOT** touch depth/stereo/VR180 logic; do **NOT** add spherical metadata to fulldome.
+
+### ▶ DISPATCH-2 = R-2 Comfort/geometry defaults  (after DISPATCH-1 merges)
+Branch `feat/R2-comfort-defaults` from latest `main`. Bake validated defaults into the pipeline: square per-eye (1:1),
+`max_disparity` default ≈ 0.02, a sensible `src_hfov` default with a docstring tradeoff note. Edit
+`pipeline/equirectangular_mapper.py` + `pipeline/stereo_renderer.py` defaults; add tests asserting square-SBS layout
++ `sv3d`/`st3d` still injected. ruff + pytest green. Don't touch the fulldome branch.
+
+### ▶ DISPATCH-3 = R-3 spatial_converter test coverage  (after DISPATCH-2 merges)
+Branch `feat/R3-spatial-converter-tests` from latest `main`. New `tests/test_spatial_converter.py` covering the core
+SBS / MV-HEVC conversion paths in `pipeline/spatial_converter.py` (coverage lost when `test_phase4` was archived).
+**Tests only** — do NOT change the module under test. ruff + pytest green.
+
+---
+
 ## 🔁 SHARED (benefits both routes)
 
 ### R-1. SeedVR2 source super-resolution pre-stage  ← TOP PRIORITY
