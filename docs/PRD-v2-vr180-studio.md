@@ -7,6 +7,21 @@
 
 ---
 
+## 0. 范围更新（v2.1，2026-06-25）
+
+> 本 PRD v2.0 写于平台层时期，聚焦「VR180 头显」单一输出。现仓库已聚焦 2D→沉浸式**转换管线**，
+> 且输出格式从单一 VR180 扩展为**覆盖维度（180/360）× 立体维度（mono/stereo）**。详见
+> [PLAN_OUTPUT_FORMATS_AND_PROMPT.md](PLAN_OUTPUT_FORMATS_AND_PROMPT.md) 与 [SOLUTION_ARCHITECTURE.md](SOLUTION_ARCHITECTURE.md)。
+
+**关键修正：VR180 ≠ VR360，输出不必是球幕。**
+- **180（前向，飞行影院）** —— 今天可达。同一平面 AIGC 源出两种成片：① 180 鱼眼球幕（mono，投影）② VR180 SBS（stereo，头显）。
+- **360（全向，球幕影厅）** —— 需 360 原生生成 / 多视角拼接 / 大面积外绘，属研究路线（P1–P2）。
+
+**输出格式由素材覆盖决定，素材覆盖由 prompt 决定** —— 故 prompt 工程需 target-aware（按 180/360、mono/stereo 分流），
+见规划文档第 3 节。本 PRD 下文的 Web UI / 引擎集成 / 球面补全等作为**远期平台层参考**（当前已归档于 `archive/platform-layer`）。
+
+---
+
 ## 1. 产品愿景
 
 **一句话**: 一站式 VR180 内容创作平台 —— 从 AI 视频生成到高质量 VR180 成片的全流程工作流。
@@ -641,7 +656,7 @@ def detect_best_device():
 
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
-        vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"🟢 CUDA: {gpu_name} ({vram:.0f} GB)")
         return "cuda"
 

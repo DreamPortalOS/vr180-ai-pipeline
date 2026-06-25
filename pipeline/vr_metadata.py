@@ -141,18 +141,15 @@ class VRMetadataEmbedder:
                 temp_path,
             ]
 
+            # Hand the raw frames to communicate(), which writes stdin and drains
+            # stderr concurrently. Writing frames in a loop while ffmpeg's stderr
+            # PIPE fills unread deadlocks once the OS pipe buffer (~64 KB) is full.
+            raw = b"".join(frame.astype(np.uint8).tobytes() for frame in frames)
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-            try:
-                for frame in frames:
-                    proc.stdin.write(frame.astype(np.uint8).tobytes())
-                proc.stdin.close()
-                proc.wait()
-            except BrokenPipeError:
-                pass
+            _, stderr = proc.communicate(input=raw)
 
             if proc.returncode != 0:
-                stderr = proc.stderr.read().decode() if proc.stderr else ""
-                raise RuntimeError(f"FFmpeg encoding failed:\n{stderr}")
+                raise RuntimeError(f"FFmpeg encoding failed:\n{stderr.decode(errors='replace')}")
 
             # Post-process: inject spherical box via Python ISOBMFF writer
             inject_spherical_metadata(temp_path, output_path, width=out_w, height=out_h, stereo_mode=self.stereo_mode)
@@ -209,18 +206,14 @@ class VRMetadataEmbedder:
             temp_path,
         ]
 
+        # See embed_single_frame_batch: communicate() drains stderr concurrently
+        # to avoid the pipe-buffer deadlock that a manual write loop hits.
+        raw = b"".join(frame.astype(np.uint8).tobytes() for frame in frames)
         proc = subprocess.Popen(cmd1, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            for frame in frames:
-                proc.stdin.write(frame.astype(np.uint8).tobytes())
-            proc.stdin.close()
-            proc.wait()
-        except BrokenPipeError:
-            pass
+        _, stderr = proc.communicate(input=raw)
 
         if proc.returncode != 0:
-            stderr = proc.stderr.read().decode() if proc.stderr else ""
-            raise RuntimeError(f"FFmpeg first-pass failed:\n{stderr}")
+            raise RuntimeError(f"FFmpeg first-pass failed:\n{stderr.decode(errors='replace')}")
 
         # Second pass: inject spherical metadata
         # Read the XML content
