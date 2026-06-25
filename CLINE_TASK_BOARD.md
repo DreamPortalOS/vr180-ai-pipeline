@@ -19,10 +19,10 @@ Lead is delivering the 4070S deployment (`docs/SEEDVR2_SETUP.md`); cline wraps i
 - [ ] `scripts/run_pipeline.py`: `--video-upscale {none,seedvr2}` + `--video-upscale-factor`, Stage 0 before depth. Default `none`.
 - [ ] Mock-based unit test (CI green on Mac, no CUDA/model).
 
-### R-2. Bake geometry/comfort as pipeline DEFAULTS (validated in v2)
-- [ ] Square per-eye (1:1) · `max_disparity` default ~0.02 · sensible `src_hfov` + doc tradeoff · test square-SBS + `sv3d`/`st3d`.
+### R-2. Bake geometry/comfort as pipeline DEFAULTS (validated in v2) ✅ PR #24
+- [x] Square per-eye (1:1) · `max_disparity` default ~0.02 · sensible `src_hfov` + doc tradeoff · test square-SBS + `sv3d`/`st3d`.
 
-### R-3. Re-add `spatial_converter` test coverage (lost with archived test_phase4).
+### R-3. Re-add `spatial_converter` test coverage (lost with archived test_phase4). ✅ PR #23
 
 ---
 

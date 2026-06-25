@@ -32,13 +32,26 @@ class EquirectangularMapper:
 
     def __init__(
         self,
-        output_width: int = 3840,
+        output_width: int = 1920,
         output_height: int = 1920,
-        src_hfov: float = 120.0,  # Source camera horizontal FOV (degrees)
-        # 120° matches typical AI-generated FPV video FOV.
-        # Use 70° for narrow/normal lenses, 90° for action cams.
-        use_ffmpeg: bool = True,  # Prefer ffmpeg v360 when available
+        src_hfov: float = 90.0,
+        use_ffmpeg: bool = True,
     ):
+        """Configure the equirectangular mapper.
+
+        Args:
+            output_width: Per-eye equirectangular width (px).
+                Default 1920 → square 1:1 per eye for comfortable VR180.
+                3840 gives sharper full-resolution output at higher render cost.
+            output_height: Per-eye equirectangular height (px).
+                Default 1920 (square 1:1). Matches output_width for square per-eye.
+            src_hfov: Source camera horizontal field of view (degrees).
+                Default 90° — good tradeoff for most AI-generated and action-cam
+                footage. Higher (e.g. 120°) fills more of the 180° dome but
+                introduces more peripheral stretch. Lower (e.g. 70°) gives a
+                "binoculars" feel with less stretch but worse immersion.
+            use_ffmpeg: Prefer ffmpeg v360 filter when available.
+        """
         self.output_width = output_width
         self.output_height = output_height
         self.src_hfov = src_hfov
