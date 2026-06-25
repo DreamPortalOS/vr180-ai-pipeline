@@ -37,6 +37,7 @@ from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import detect_best_device, resolve_device
 from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.fulldome_mapper import FulldomeMapper
+from pipeline.outpainter import Outpainter
 from pipeline.stereo_crafter import StereoCrafterRenderer
 from pipeline.stereo_renderer import StereoRenderer
 from pipeline.streaming_pipeline import StreamingPipeline
@@ -59,7 +60,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument(
         "--stage",
         "-s",
-        choices=["all", "depth", "stereo", "equirect", "metadata"],
+        choices=["all", "depth", "stereo", "equirect", "outpaint", "metadata"],
         default="all",
         help="Pipeline stage to run (default: all)",
     )
@@ -254,6 +255,33 @@ def parse_args(argv: list[str] | None = None):
         default=None,
         help="Output short-side resolution. Auto from source height × factor if 0. "
         "Can also set SEEDVR2_RESOLUTION env var (default: 1440).",
+    )
+
+    # R-6: 180° Outpaint fill
+    parser.add_argument(
+        "--outpaint",
+        choices=["none", "gradient", "ai"],
+        default="none",
+        help="Outpaint black boundary regions in equirect frames: "
+        "none (skip, default), gradient (OpenCV-based), or ai (SDXL inpaint, requires backend deployment)",
+    )
+    parser.add_argument(
+        "--outpaint-mask-threshold",
+        type=int,
+        default=10,
+        help="Pixel brightness threshold for black boundary detection (default: 10)",
+    )
+    parser.add_argument(
+        "--outpaint-mask-top-ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of height scanned from top for black boundaries (default: 0.25)",
+    )
+    parser.add_argument(
+        "--outpaint-mask-bottom-ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of height scanned from bottom for black boundaries (default: 0.25)",
     )
 
     return parser.parse_args(argv)
@@ -523,6 +551,32 @@ def run_equirect_stage(args, left_frames, right_frames):
         f"Generated {len(sbs_frames)} equirectangular SBS frames ({sbs_frames[0].shape[1]}×{sbs_frames[0].shape[0]})"
     )
     return sbs_frames
+
+
+def run_outpaint_stage(args, sbs_frames):
+    """Stage 3.5: Outpaint black boundary regions in equirect frames."""
+    log.info("=== Stage 3.5: 180° Outpaint Fill (%s) ===", args.outpaint)
+
+    if args.outpaint == "none":
+        log.info("Outpainting disabled (--outpaint none) — skipping")
+        return sbs_frames
+
+    outpainter = Outpainter(
+        mode=args.outpaint,
+        mask_threshold=args.outpaint_mask_threshold,
+        mask_top_ratio=args.outpaint_mask_top_ratio,
+        mask_bottom_ratio=args.outpaint_mask_bottom_ratio,
+    )
+
+    result = outpainter.process(sbs_frames)
+
+    # Overwrite equirect checkpoint files with outpainted versions
+    out_dir = get_temp_dir(args, "equirect")
+    for i, frame in enumerate(result):
+        cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+    log.info("Outpainted %d frames (mode=%s)", len(result), args.outpaint)
+    return result
 
 
 def run_metadata_stage(args, sbs_frames):
@@ -800,8 +854,8 @@ def load_checkpoint(temp_dir: str):
     return None
 
 
-STAGE_ORDER = ["upscale", "depth", "stereo", "equirect", "metadata"]
-STAGE_ORDER_SBS = ["upscale", "equirect", "metadata"]  # Skip depth & stereo for SBS input
+STAGE_ORDER = ["upscale", "depth", "stereo", "equirect", "outpaint", "metadata"]
+STAGE_ORDER_SBS = ["upscale", "equirect", "outpaint", "metadata"]  # Skip depth & stereo for SBS input
 
 
 def detect_sbs_input(video_path: str, force_sbs: bool = False) -> bool:
@@ -1022,6 +1076,17 @@ def main():
                 sbs_frames = run_equirect_stage(args, left_frames, right_frames)
                 save_checkpoint(temp_dir, "equirect", {"num_frames": len(sbs_frames)})
 
+            elif stage == "outpaint":
+                if sbs_frames is None:
+                    import glob
+
+                    eq_dir = get_temp_dir(args, "equirect")
+                    files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
+                    sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
+                    log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint for outpainting")
+                sbs_frames = run_outpaint_stage(args, sbs_frames)
+                save_checkpoint(temp_dir, "outpaint", {"num_frames": len(sbs_frames)})
+
             elif stage == "metadata":
                 if sbs_frames is None:
                     import glob
@@ -1058,6 +1123,14 @@ def main():
         left_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in left_files]
         right_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in right_files]
         run_equirect_stage(args, left_frames, right_frames)
+
+    elif args.stage == "outpaint":
+        eq_dir = get_temp_dir(args, "equirect")
+        import glob
+
+        files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
+        frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
+        run_outpaint_stage(args, frames)
 
     elif args.stage == "metadata":
         eq_dir = get_temp_dir(args, "equirect")
