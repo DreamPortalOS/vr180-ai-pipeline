@@ -23,6 +23,8 @@ Lead is delivering the 4070S deployment (`docs/SEEDVR2_SETUP.md`); cline wraps i
 - [ ] Square per-eye (1:1) · `max_disparity` default ~0.02 · sensible `src_hfov` + doc tradeoff · test square-SBS + `sv3d`/`st3d`.
 
 ### R-3. Re-add `spatial_converter` test coverage (lost with archived test_phase4).
+- [x] `tests/test_spatial_converter.py`: 21 tests (20 pass, 1 skip if no ffmpeg), ruff/pytest green
+- [x] Committed & pushed to `feat/R3-spatial-converter-tests` + PR opened
 
 ---
 
