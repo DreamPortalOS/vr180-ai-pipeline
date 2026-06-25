@@ -8,8 +8,12 @@ This is the **execution** plan (what to build, in what order, with done-criteria
 ---
 
 ## North Star
-Turn a text prompt or a flat 2D clip into a headset-ready, **stereoscopic** VR180 video
-(square per-eye SBS equirect + `sv3d`/`st3d` metadata), end-to-end, with a usable web UI.
+Turn a text prompt or a flat 2D clip into an **immersive** video, end-to-end.
+As of 2026-06-24 this splits into **two delivery routes** off one shared pipeline — see
+**`docs/SOLUTION_ARCHITECTURE.md`**:
+- **Route 1 — Fulldome / 球幕** (mono, no glasses): circular-fisheye domemaster. *Recommended first — sharp & comfortable.*
+- **Route 2 — VR180** (stereo, headset): square-per-eye SBS equirect + `sv3d`/`st3d`. *Differentiator, harder.*
+Shared front-end: ingest/generate → **SeedVR2 upscale** → pluggable renderer → encode.
 
 ---
 
