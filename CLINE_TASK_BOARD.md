@@ -43,6 +43,23 @@ Branch `feat/R3-spatial-converter-tests` from latest `main`. New `tests/test_spa
 SBS / MV-HEVC conversion paths in `pipeline/spatial_converter.py` (coverage lost when `test_phase4` was archived).
 **Tests only** — do NOT change the module under test. ruff + pytest green.
 
+> Status: DISPATCH-1/2/3 delivered by cline → PRs #17 (R-5), #22 (R-2), #23 (R-3), all CI-green.
+
+### ▶ DISPATCH-4 = R-1 SeedVR2 source upscaler  (parallel-OK — branch from R-5's branch)
+**Branch from `feat/R5-fulldome-mapper` (R-5's branch), NOT `main`.** R-1 and R-5 both edit
+`scripts/run_pipeline.py`; per `.clinerules §6` branch the dependent task from the dependency's branch so they
+develop in parallel without conflict (after #17 merges, R-1's PR shows only its own delta).
+**The local SeedVR2 model is NOT deployed yet** (separate ComfyUI install — see `docs/SEEDVR2_SETUP.md`). Build the
+wrapper + CLI + **mock** unit test only; do NOT download/run the real model — CI stays green via mock.
+- **New `pipeline/video_upscaler.py`** — `class SeedVR2Upscaler`: CUDA-only (clear error on Mac/CPU);
+  `batch_size` must be `4n+1` (1,5,9,13…) — validate/raise; `upscale(input_path, output_path, factor)` with an
+  injectable/placeholder backend (real inference wired once the model is deployed).
+- **`scripts/run_pipeline.py`** (patch — file > 150 lines): add `--video-upscale {none,seedvr2}` (default `none`) +
+  `--video-upscale-factor`; when `seedvr2`, run as **Stage 0 before depth**; `none` = zero effect on the current flow.
+- **New `tests/test_video_upscaler.py`** (mock model/subprocess): non-CUDA raises a clear error; `4n+1` validation;
+  `--video-upscale none` leaves the pipeline unchanged.
+- Acceptance: ruff + pytest green on Mac/CPU/CI (no CUDA or model needed). Don't touch other conversion modules.
+
 ---
 
 ## 🔁 SHARED (benefits both routes)
