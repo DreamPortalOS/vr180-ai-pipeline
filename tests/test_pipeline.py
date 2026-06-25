@@ -182,6 +182,34 @@ class TestEquirectangularMapper:
         sbs = mapper.map_stereo_pair(dummy_frame, dummy_frame)
         assert sbs.shape[1] == w_per_eye * 2
 
+    def test_default_square_per_eye(self):
+        """R-2: Default constructor should produce square (1920×1920) per-eye output.
+
+        SBS width should be 2× height (= 3840).
+        """
+        from pipeline.equirectangular_mapper import EquirectangularMapper
+
+        mapper = EquirectangularMapper(use_ffmpeg=False)
+        assert mapper.output_width == 1920
+        assert mapper.output_height == 1920
+        assert mapper.src_hfov == 90.0
+
+    def test_square_sbs_default(self, dummy_frame):
+        """R-2: Default 1920×1920 per-eye → SBS width = 3840, height = 1920."""
+        from pipeline.equirectangular_mapper import EquirectangularMapper
+
+        mapper = EquirectangularMapper(output_width=480, output_height=480, use_ffmpeg=False)
+        sbs = mapper.map_stereo_pair(dummy_frame, dummy_frame)
+        assert sbs.shape[0] == 480
+        assert sbs.shape[1] == 960  # 480 * 2
+
+    def test_default_max_disparity(self):
+        """R-2: Default max_disparity should be ~0.02."""
+        from pipeline.stereo_renderer import StereoRenderer
+
+        renderer = StereoRenderer()
+        assert renderer.max_disparity == pytest.approx(0.02)
+
 
 # ---------------------------------------------------------------------------
 # pipeline.vr_metadata

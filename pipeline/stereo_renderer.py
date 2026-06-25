@@ -28,7 +28,7 @@ class StereoRenderer:
         self,
         ipd: float = 0.064,  # Interpupillary distance in meters
         focal_length_px: float | None = None,
-        max_disparity: float = 0.05,  # Max shift as fraction of image width
+        max_disparity: float = 0.02,  # Max shift as fraction of image width (~0.02 for comfortable VR180)
         temporal_smooth: bool = True,
         convergence: float = 0.3,  # Convergence plane depth (fraction of max depth)
     ):

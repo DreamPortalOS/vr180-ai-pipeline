@@ -35,6 +35,7 @@ from tqdm import tqdm
 from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import detect_best_device, resolve_device
 from pipeline.equirectangular_mapper import EquirectangularMapper
+from pipeline.fulldome_mapper import FulldomeMapper
 from pipeline.stereo_renderer import StereoRenderer
 from pipeline.streaming_pipeline import StreamingPipeline
 from pipeline.upscaler import PixelUpscaler
@@ -120,6 +121,26 @@ def parse_args():
     # Phase 2: Smart SBS detection (Task 1.1)
     parser.add_argument(
         "--force-sbs", action="store_true", help="Force treat input as SBS stereo (skip depth/stereo stages)"
+    )
+
+    # R-5: Fulldome projection
+    parser.add_argument(
+        "--projection",
+        choices=["vr180", "fulldome"],
+        default="vr180",
+        help="Output projection: vr180 (stereo spherical) or fulldome (mono fisheye, default vr180)",
+    )
+    parser.add_argument(
+        "--dome-fov", type=float, default=180.0, help="Fulldome fisheye FOV in degrees (default 180, max ~220)"
+    )
+    parser.add_argument(
+        "--dome-coverage-h", type=float, default=120.0, help="Fulldome source horizontal coverage FOV (default 120)"
+    )
+    parser.add_argument(
+        "--dome-coverage-v", type=float, default=None, help="Fulldome source vertical coverage FOV (auto if omitted)"
+    )
+    parser.add_argument(
+        "--dome-size", type=int, default=4096, help="Fulldome output square size in pixels (default 4096)"
     )
 
     return parser.parse_args()
@@ -612,6 +633,22 @@ def main():
         output = get_output_path(args)
         result = pipeline.process_stream(args.input, output, max_frames=args.max_frames)
         log.info(f"✅ Streaming pipeline complete → {result}")
+        return
+
+    # R-5: Fulldome projection mode — skip all depth/stereo/equirect/metadata
+    if args.projection == "fulldome":
+        log.info("🌐 Fulldome projection mode — bypassing depth/stereo/equirect/metadata stages")
+        mapper = FulldomeMapper(
+            dome_fov=args.dome_fov,
+            coverage_h_fov=args.dome_coverage_h,
+            coverage_v_fov=args.dome_coverage_v,
+            output_size=args.dome_size,
+            codec=args.codec,
+            crf=args.crf,
+        )
+        output = get_output_path(args, suffix="_dome.mp4")
+        result = mapper.convert(args.input, output)
+        log.info(f"✅ Fulldome conversion complete → {result}")
         return
 
     if args.stage == "all":
