@@ -76,3 +76,24 @@ buildvr 只做 video→VR 转换，用户要**自带视频**。
 4. 输出质量（与我们 baseline / StereoCrafter 档对比）
 
 → 建议在我们 baseline 跑通、Phase Q 启动前注册，用作质量基准对标。
+
+---
+
+## 五、技术逆向（2026-06-24 网络调研）
+
+> 关联 `SOLUTION_ARCHITECTURE.md`。来源：buildvr.ai 官网 / docs / blog。
+
+**核心技术 = AI 深度估计 + 相机视点重投影**（和我们同一技术家族）：
+1. **神经网络深度图**：对 2D（及 360）视频做单目深度估计，得到逐帧 depth map。
+2. **虚拟相机重定位**：基于深度在场景内"挪动虚拟视点"，从而扩展视野、模拟视差、生成 180/360。
+   —— 这正是我们 `depth_estimator → stereo_renderer` 在做的事，他们做得更产品化。
+3. **多投影输出**：一个输入 → **6 种投影**（360° 单目、depth map、fisheye、**cubemap**、**fulldome**、half-SBS），
+   并提供 **HEVC 处理 API**（`buildvr.ai/docs`）。有"VR Verse"分享链接，跨 web/头显/沉浸屏播放。
+
+**三个对我们有用的判断：**
+- **他们已经做 fulldome** → 我们的"路线1 球幕"有成熟市场参照，且技术门槛低于真立体。
+- **他们主打单目、depth/stereo 是附加** → 印证"真立体最难、最易致晕"。我们卡住的重影/对不上，正是他们绕开的坑。
+- **"一个源 → 多投影"是他们的产品骨架** → 我们应把"渲染器可插拔（Renderer 接口）"做成一等公民设计
+  （见 `SOLUTION_ARCHITECTURE.md`），同一条 ingest/upscale 链路同时产出 fulldome 与 VR180。
+
+**我们的护城河仍是**：真立体 3D（路线2，配 DepthCrafter/StereoCrafter 解决致晕）× AI 原生生成（prompt→视频→投影）。
