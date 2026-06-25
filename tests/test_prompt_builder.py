@@ -10,7 +10,7 @@ Verifies:
 
 import pytest
 
-from pipeline.prompt_builder import wrap_prompt_for_vr180
+from pipeline.prompt_builder import wrap_prompt, wrap_prompt_for_vr180
 
 # ---------------------------------------------------------------------------
 # Scene-type template tests
@@ -223,3 +223,97 @@ class TestEdgeCases:
         for scene in ("fpv", "walkthrough", "orbit", "static"):
             result = wrap_prompt_for_vr180("Test", scene_type=scene)
             assert len(result["negative"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# New wrap_prompt() target-aware routing tests
+# ---------------------------------------------------------------------------
+
+
+class TestTargetRouting:
+    """Verify wrap_prompt() routes correctly by target."""
+
+    def test_default_target_is_vr180_flight(self):
+        """Default target should produce VR180 flight constraints."""
+        result = wrap_prompt("Fly through canyon", scene_type="fpv")
+        assert result["target"] == "vr180_flight"
+        assert "120°" in result["positive"]
+        assert result["notes"] == ""
+
+    def test_vr180_flight_has_vr180_constraints(self):
+        """Explicit vr180_flight should include narrow FOV and strict negatives."""
+        result = wrap_prompt("Flight", scene_type="fpv", target="vr180_flight")
+        assert result["target"] == "vr180_flight"
+        pos = result["positive"].lower()
+        assert "120°" in pos
+        neg = result["negative"].lower()
+        assert "barrel rolls" in neg
+        assert "rapid turns" in neg
+        assert "rushing past frame edges" in neg
+        assert "extreme close-ups at frame edges" in neg
+
+    def test_fulldome_180_has_wider_fov(self):
+        """fulldome_180 should have ~150-180° FOV in positive prompt."""
+        result = wrap_prompt("Flight", scene_type="fpv", target="fulldome_180")
+        assert result["target"] == "fulldome_180"
+        pos = result["positive"].lower()
+        assert "150-180°" in pos or "150–180°" in pos
+        assert "ultra-wide" in pos
+
+    def test_fulldome_180_relaxed_negative(self):
+        """fulldome_180 should exclude edge-parallax and barrel rolls from negative."""
+        result = wrap_prompt("Flight", scene_type="fpv", target="fulldome_180")
+        neg = result["negative"].lower()
+        assert "extreme close-ups at frame edges" not in neg
+        assert "rushing past frame edges" not in neg
+        assert "barrel rolls" not in neg
+        # Core anti-nausea terms should still be present
+        assert "camera shake" in neg
+        assert "motion blur" in neg
+
+    def test_vr360_dome_has_notes(self):
+        """vr360_dome should return non-empty notes mentioning 360."""
+        result = wrap_prompt("Surrounding scene", scene_type="static", target="vr360_dome")
+        assert result["target"] == "vr360_dome"
+        assert result["notes"] != ""
+        assert "360" in result["notes"]
+
+    def test_vr360_dome_has_equirect_keywords(self):
+        """vr360_dome positive should mention equirectangular / 360° coverage."""
+        result = wrap_prompt("Surrounding scene", scene_type="static", target="vr360_dome")
+        pos = result["positive"].lower()
+        assert "equirectangular" in pos or "360°" in pos or "omni-directional" in pos
+
+    def test_unknown_target_falls_back_to_vr180_flight(self):
+        """Unknown target should fall back to vr180_flight."""
+        result = wrap_prompt("Test", scene_type="fpv", target="unknown_target_xyz")
+        assert result["target"] == "vr180_flight"
+        assert result["notes"] == ""
+        pos = result["positive"].lower()
+        assert "120°" in pos
+
+
+class TestBackwardCompatAlias:
+    """Verify wrap_prompt_for_vr180 still works identically."""
+
+    def test_alias_returns_same_keys(self):
+        result = wrap_prompt_for_vr180("A beautiful landscape", scene_type="fpv")
+        assert isinstance(result, dict)
+        assert "positive" in result
+        assert "negative" in result
+        assert "target" not in result
+        assert "notes" not in result
+
+    def test_alias_contains_vr180_constraints(self):
+        result = wrap_prompt_for_vr180("Flight", scene_type="fpv")
+        pos = result["positive"].lower()
+        assert "120°" in pos
+        neg = result["negative"].lower()
+        assert "barrel rolls" in neg
+        assert "rapid turns" in neg
+
+    def test_alias_matches_default_wrap_prompt(self):
+        legacy = wrap_prompt_for_vr180("Test scene", scene_type="orbit")
+        new = wrap_prompt("Test scene", scene_type="orbit", target="vr180_flight")
+        assert legacy["positive"] == new["positive"]
+        assert legacy["negative"] == new["negative"]
