@@ -1,4 +1,8 @@
-# Core dependencies (locked to major version)
+# 2D → immersive (VR180 + Fulldome) conversion pipeline — dependencies
+# Platform layer (web/db/auth/integrations/notifications/workers) is archived on
+# branch `archive/platform-layer` and intentionally NOT installed here.
+
+# Core
 torch>=2.0.0,<3.0.0
 torchvision>=0.15.0,<1.0.0
 opencv-python>=4.8.0,<5.0.0
@@ -7,47 +11,22 @@ pillow>=10.0.0,<11.0.0
 tqdm>=4.65.0,<5.0.0
 ffmpeg-python>=0.2.0,<1.0.0
 
-# Depth estimation (required for full pipeline)
+# Depth estimation (Depth-Anything-V2) — required for the VR180 stereo route
 transformers>=4.35.0,<5.0.0
 accelerate>=0.24.0,<1.0.0
 safetensors>=0.4.0,<1.0.0
 
-# VR metadata: Google spatial-media is an OPTIONAL CLI tool invoked via
-# `python3 -m spatialmedia` (see pipeline/spherical_injector.py). It is NOT on
-# PyPI — install from source if needed. The pipeline falls back to ffmpeg remux
-# when it is unavailable, so it is intentionally not a hard dependency here.
-#   pip install git+https://github.com/google/spatial-media.git
+# VR180 metadata: Google spatial-media (NOT on PyPI). Required for valid sv3d/st3d.
+#   pip install "git+https://github.com/google/spatial-media.git#egg=spatialmedia"
 
-# Pixel upscaling (optional — install with: pip install realesrgan)
-# realesrgan>=0.3.0
+# Source super-resolution (optional, big quality win — see docs/SEEDVR2_SETUP.md):
+#   SeedVR2 on a CUDA GPU (recommended), or:  pip install realesrgan
 
-# Web UI (optional — install with: pip install gradio)
-# gradio>=4.0.0
-
-# Async task queue
-celery[redis]>=5.4.0,<6.0.0
-redis>=5.0.7,<6.0.0
-
-# Database ORM
-sqlalchemy>=2.0,<3.0
-alembic>=1.13,<2.0
-
-# Web API
-fastapi>=0.104.0,<1.0.0
-uvicorn>=0.24.0,<1.0.0
-httpx>=0.25.0,<1.0.0
-python-multipart>=0.0.6,<1.0.0
-passlib[bcrypt]>=1.7.4,<2.0.0    # auth password hashing (T2 auth)
-bcrypt>=4.0.0,<5.0.0             # pin bcrypt<5 for passlib compatibility
-
-# Testing
+# Dev
 pytest>=7.0.0,<9.0.0
 pytest-cov>=4.0.0,<6.0.0
-pytest-asyncio>=0.23,<1.0  # async provider tests (integrations/)
-
-# Linting
 ruff>=0.4.0,<1.0.0
 
-# Video codec (system dependency)
-# ffmpeg (install via: brew install ffmpeg)
-# spatial-media (install via: pip install spatialmedia)
+# System dependency: ffmpeg
+#   Windows: `choco install ffmpeg` or `scoop install ffmpeg`
+#   macOS:   `brew install ffmpeg`
