@@ -1,58 +1,20 @@
-# CLINE Task Board — VR180 AI Pipeline
+# P-1: Prompt Builder — Target-Aware Routing
 
-**Repo:** `github.com/DreamPortalOS/vr180-ai-pipeline`
-**FOCUS (2026-06-24):** the **2D → immersive video conversion workflow**, optimized for **clarity/resolution**.
-Now **two delivery routes** off one shared pipeline (see `docs/SOLUTION_ARCHITECTURE.md`):
-**Route 1 = 球幕/Fulldome (mono, no glasses)** · **Route 2 = VR180 (stereo, headset)**.
-Platform layer archived on branch `archive/platform-layer` — do NOT rebuild it now.
+## Checklist
 
-**Coordination:** lead (Claude) uses isolated `git worktree`s; cline keeps `.clinerules` (branch from latest `main`, serial, pre-commit green, never `--no-verify`).
-
----
-
-## 🔁 SHARED (benefits both routes)
-
-### R-1. SeedVR2 source super-resolution pre-stage  ← TOP PRIORITY
-Root cause of "completely unclear" = the **720p source**. SeedVR2 (ByteDance, ICLR2026) SOTA temporal video SR.
-Lead is delivering the 4070S deployment (`docs/SEEDVR2_SETUP.md`); cline wraps it into the pipeline:
-- [ ] `pipeline/video_upscaler.py` — `SeedVR2Upscaler`; CUDA-only, clear Mac error; `batch_size`=`4n+1`.
-- [ ] `scripts/run_pipeline.py`: `--video-upscale {none,seedvr2}` + `--video-upscale-factor`, Stage 0 before depth. Default `none`.
-- [ ] Mock-based unit test (CI green on Mac, no CUDA/model).
-
-### R-2. Bake geometry/comfort as pipeline DEFAULTS (validated in v2)
-- [ ] Square per-eye (1:1) · `max_disparity` default ~0.02 · sensible `src_hfov` + doc tradeoff · test square-SBS + `sv3d`/`st3d`.
-
-### R-3. Re-add `spatial_converter` test coverage (lost with archived test_phase4).
-
----
-
-## 🟢 ROUTE 1 — Fulldome / 球幕影院 (mono, no glasses) — ▶ ACTIVE (user chose Route-1-first 2026-06-24)
-No stereo → no ghosting, no nausea, max sharpness. Small build, reuses v360 machinery.
-**Approach validated by lead** — single fast v360 pass (~4s for 10s clip, whole video at once, NOT per-frame):
-```
-ffmpeg -i src.mp4 -vf "v360=input=flat:output=fisheye:ih_fov=120:iv_fov=75:h_fov=180:v_fov=180:w=2048:h=2048" out.mp4
-```
-Output is a valid domemaster. `ih_fov/iv_fov` = source coverage → controls how much of the dome the flat clip fills
-(low = a screen-like patch, high = fuller dome but more stretch). Corners outside the 180° circle are black (correct).
-
-### R-5. Fulldome renderer (TOP — build now)
-- [ ] `pipeline/fulldome_mapper.py` — wrap the validated v360 recipe. **Mono, no depth.** Params:
-  `dome_fov` (default 180, up to 220), `coverage`/`ih_fov`+`iv_fov` (how much the source fills the dome, default
-  ih_fov=120 iv_fov auto from aspect), output size (default 4096², configurable). **Single ffmpeg pass over the whole video.**
-- [ ] `scripts/run_pipeline.py`: `--projection {vr180,fulldome}` (default vr180). Fulldome skips depth/stereo/spherical-metadata entirely.
-- [ ] Test: output square, fisheye, no `sv3d`/`st3d`. Doc: preview in a fisheye-aware player; dome projector/warp questions user-pending.
-- Note: pairs with SeedVR2 (R-1) for sharpness; the soft look is the 720p source, not the projection.
-
----
-
-## 🔵 ROUTE 2 — VR180 stereo (headset) — harder, differentiator (mostly GPU, runs on 4070S)
-Fixes the "重影没对上" + "抬头见边界". Backlog until SeedVR2 + fulldome land.
-- StereoCrafter (clean disocclusion, no smear) · DepthCrafter (temporal depth, no shimmer) · 180° outpainting (fill FOV without stretch).
-
----
-
-## ⚙️ Later
-### R-4. Equirect performance — one batched `v360` pass instead of 2 ffmpeg subprocesses/frame (~10× faster).
-
-## ⏸️ Paused (archived on `archive/platform-layer`)
-Auth, Hermes/Feishu, DB, VideoGen integrations, web API, frontend, quota, commercialization. Revisit after conversion quality is nailed.
+- [x] Analyze requirements & read existing code (prompt_builder.py, test_prompt_builder.py)
+- [x] Git: checkout main → pull → create `feat/P1-prompt-target-aware`
+- [x] Activate .venv, install pre-commit hooks
+- [ ] Modify `pipeline/prompt_builder.py`:
+  - [x] Add `wrap_prompt()` with `target` param (`vr180_flight`, `fulldome_180`, `vr360_dome`)
+  - [x] Create fulldome_180 template with wider FOV, relaxed negative, 3-depth-layers, stable horizon
+  - [x] Create vr360_dome template with equirect/360 coverage, notes field
+  - [x] Add `notes` field to return dict (default `""`)
+  - [x] Refactor `wrap_prompt_for_vr180` as backward-compat alias calling `wrap_prompt(target="vr180_flight")`
+- [ ] Update `tests/test_prompt_builder.py`:
+  - [ ] Test alias backward compat (returns same structure, contains VR180 constraints)
+  - [ ] Test target routing: fulldome_180 positive contains wider FOV
+  - [ ] Test vr360_dome notes non-empty and contains "360"
+  - [ ] Test unknown target falls back to vr180_flight
+- [ ] Run `ruff check . && ruff format --check . && pytest` — all green
+- [ ] Commit, push, open PR (never --no-verify)
