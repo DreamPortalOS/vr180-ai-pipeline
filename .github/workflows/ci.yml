@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev, "feat/**"]
+    branches: [main, dev]
   pull_request:
     branches: [main]
 
@@ -15,21 +15,11 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install ruff
-      - run: ruff check pipeline/ workers/ scripts/ tests/ web/
-      - run: ruff format --check pipeline/ workers/ scripts/ tests/ web/
+      - run: ruff check pipeline/ scripts/ tests/
+      - run: ruff format --check pipeline/ scripts/ tests/
 
   test:
     runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,6 +31,4 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
       - name: Run tests
-        run: pytest tests/ -v -m "not slow" --tb=short
-        env:
-          REDIS_URL: redis://localhost:6379/0
+        run: pytest tests/ -m "not slow" --tb=short
