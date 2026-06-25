@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+from pipeline.depth_crafter import DepthCrafterEstimator
 from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import detect_best_device, resolve_device
 from pipeline.equirectangular_mapper import EquirectangularMapper
@@ -144,6 +145,36 @@ def parse_args():
         "--dome-size", type=int, default=4096, help="Fulldome output square size in pixels (default 4096)"
     )
 
+    # Depth model selection
+    parser.add_argument(
+        "--depth-model",
+        choices=["depth-anything", "depthcrafter"],
+        default="depth-anything",
+        help="Depth estimation backend: depth-anything (per-frame, default) or "
+        "depthcrafter (temporally-consistent video depth, CUDA-only)",
+    )
+    parser.add_argument(
+        "--depthcrafter-repo-dir",
+        default=None,
+        help="DepthCrafter repository directory (or env DEPTHCRAFTER_REPO_DIR)",
+    )
+    parser.add_argument(
+        "--depthcrafter-python",
+        default=None,
+        help="Python executable for DepthCrafter inference (or env DEPTHCRAFTER_PYTHON)",
+    )
+    parser.add_argument(
+        "--depthcrafter-checkpoint-dir",
+        default=None,
+        help="DepthCrafter checkpoint directory (or env DEPTHCRAFTER_CKPT_DIR)",
+    )
+    parser.add_argument(
+        "--depthcrafter-max-res",
+        type=int,
+        default=None,
+        help="Max resolution (short side) for DepthCrafter inference (or env DEPTHCRAFTER_MAX_RES)",
+    )
+
     # R-1: SeedVR2 video upscaling pre-stage
     parser.add_argument(
         "--video-upscale",
@@ -251,6 +282,34 @@ def run_depth_stage(args, frames):
     """Stage 1: Estimate depth for all frames."""
     log.info("=== Stage 1: Depth Estimation ===")
 
+    # DepthCrafter mode — process entire video at once (temporally consistent)
+    if args.depth_model == "depthcrafter":
+        log.info("Using DepthCrafter for temporally-consistent video depth estimation")
+        out_dir = get_temp_dir(args, "depth")
+        estimator = DepthCrafterEstimator(
+            repo_dir=args.depthcrafter_repo_dir,
+            python_exe=args.depthcrafter_python,
+            checkpoint_dir=args.depthcrafter_checkpoint_dir,
+            max_resolution=args.depthcrafter_max_res,
+        )
+        depths = estimator.estimate_video(
+            input_path=args.input,
+            output_dir=out_dir,
+        )
+        # Save individual depth maps for downstream stages
+        for i, depth in enumerate(depths):
+            dmax = float(np.nanmax(depth))
+            depth_vis = (depth / dmax * 255).astype(np.uint8) if dmax > 0 else depth.astype(np.uint8)
+            cv2.imwrite(
+                os.path.join(out_dir, f"depth_{i:06d}.png"),
+                cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO),
+            )
+            np.save(os.path.join(out_dir, f"depth_{i:06d}.npy"), depth)
+
+        log.info(f"Depth maps (DepthCrafter) saved to {out_dir}/")
+        return depths
+
+    # Default: Depth-Anything V2 per-frame
     estimator = DepthEstimator(
         model_size=args.model_size,
         device=args.device,
