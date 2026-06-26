@@ -1,14 +1,17 @@
-"""SeedVR2 video upscaling via ComfyUI backend.
+"""SeedVR2 video upscaling via CLI backend (inference_cli.py).
 
-Provides a SeedVR2Upscaler that wraps ComfyUI HTTP API calls for
-temporal video super-resolution. CUDA-only; raises clear errors on
-CPU/Mac builds. batch_size must be 4n+1 as required by SeedVR2.
+Provides a SeedVR2Upscaler that delegates to the SeedVR2 node's
+inference_cli.py script — no ComfyUI server needed.  CUDA-only;
+raises clear errors on CPU/Mac builds.  batch_size must be 4n+1
+as required by SeedVR2.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import subprocess
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -300,6 +303,256 @@ class ComfyUIBackend(UpscaleBackend):
 
 
 # ---------------------------------------------------------------------------
+# CLI backend (inference_cli.py — recommended)
+# ---------------------------------------------------------------------------
+
+
+def _get_video_height(video_path: str) -> int:
+    """Return the height of *video_path* using ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=height",
+                "-of",
+                "json",
+                video_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        result.check_returncode()
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        if not streams:
+            raise RuntimeError(f"No video stream found in {video_path}")
+        return int(streams[0]["height"])
+    except FileNotFoundError:
+        raise RuntimeError(
+            "ffprobe not found on PATH. Install FFmpeg (www.ffmpeg.org) and ensure ffprobe is available."
+        ) from None
+    except (json.JSONDecodeError, KeyError, ValueError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"Failed to get video height from {video_path}: {exc}") from exc
+
+
+class CLIBackend(UpscaleBackend):
+    """Backend that runs SeedVR2's inference_cli.py directly.
+
+    Spawns the node's ``inference_cli.py`` as a subprocess — no ComfyUI
+    server required.  All paths can be set via environment variables:
+
+    ========================= ========================= =============================
+    Constructor param         Env var                   Default
+    ========================= ========================= =============================
+    ``node_dir``              ``SEEDVR2_NODE_DIR``      ``(none, required)``
+    ``python_exe``            ``SEEDVR2_PYTHON``        ``python``
+    ``model_dir``             ``SEEDVR2_MODEL_DIR``     ``(node_dir)/../../models/SEEDVR2``
+    ``vae_decode_tiled``      *(hard-coded True)*       ``True``
+    ``vae_encode_tiled``      *(hard-coded True)*       ``True``
+    ``vae_tile_size``         ``SEEDVR2_VAE_TILE_SIZE`` ``512``
+    ``dit_offload_device``    ``SEEDVR2_DIT_OFFLOAD``   ``cpu``
+    ``vae_offload_device``    ``SEEDVR2_VAE_OFFLOAD``   ``cpu``
+    ``resolution``            ``SEEDVR2_RESOLUTION``    ``1440``
+    ========================= ========================= =============================
+
+    The *factor* → *resolution* mapping: ffprobe source height, multiply by
+    factor, clamp to the configured *resolution* (or let inference_cli decide
+    if *resolution* is 0).
+    """
+
+    # Default model filename shipped with the node
+    DEFAULT_DIT = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"
+
+    def __init__(
+        self,
+        node_dir: str | None = None,
+        python_exe: str | None = None,
+        model_dir: str | None = None,
+        vae_decode_tiled: bool = True,
+        vae_encode_tiled: bool = True,
+        vae_tile_size: int | None = None,
+        dit_offload_device: str | None = None,
+        vae_offload_device: str | None = None,
+        resolution: int | None = None,
+    ) -> None:
+        # node_dir: required (env fallback)
+        _node_dir = node_dir or os.environ.get("SEEDVR2_NODE_DIR")
+        if not _node_dir:
+            raise RuntimeError(
+                "SeedVR2 node directory not specified. "
+                "Set --seedvr2-node-dir or the SEEDVR2_NODE_DIR environment variable. "
+                "See docs/SEEDVR2_SETUP.md for setup instructions."
+            )
+        self.node_dir: str = str(Path(_node_dir).resolve())
+
+        # python_exe
+        self.python_exe = python_exe or os.environ.get("SEEDVR2_PYTHON", "python")
+
+        # model_dir
+        if model_dir:
+            self.model_dir = str(Path(model_dir).resolve())
+        elif os.environ.get("SEEDVR2_MODEL_DIR"):
+            self.model_dir = str(Path(os.environ["SEEDVR2_MODEL_DIR"]).resolve())
+        else:
+            # default: <node_dir>/../../models/SEEDVR2  (ComfyUI layout)
+            self.model_dir = str(Path(self.node_dir).parent.parent / "models" / "SEEDVR2")
+
+        # VAE tiling (must be on for 12 GB)
+        self.vae_decode_tiled = vae_decode_tiled
+        self.vae_encode_tiled = vae_encode_tiled
+        self.vae_tile_size = vae_tile_size or int(os.environ.get("SEEDVR2_VAE_TILE_SIZE", "512"))
+
+        # Offload devices (12 GB stability — dit + vae offloaded to CPU)
+        defaults = {"dit_offload_device": "cpu", "vae_offload_device": "cpu"}
+        self.dit_offload_device = dit_offload_device or os.environ.get(
+            "SEEDVR2_DIT_OFFLOAD", defaults["dit_offload_device"]
+        )
+        self.vae_offload_device = vae_offload_device or os.environ.get(
+            "SEEDVR2_VAE_OFFLOAD", defaults["vae_offload_device"]
+        )
+
+        # Resolution override (0 = auto from factor * source height)
+        self.resolution = resolution if resolution is not None else int(os.environ.get("SEEDVR2_RESOLUTION", "1440"))
+
+        # Verify paths exist (model_dir NOT required — inference_cli.py handles download)
+        self._validate_paths()
+
+    # ------------------------------------------------------------------
+    # Path validation
+    # ------------------------------------------------------------------
+    def _validate_paths(self) -> None:
+        """Check critical paths exist. Does NOT require model_dir — inference_cli.py handles download/creation."""
+        issues: list[str] = []
+
+        node_dir = Path(self.node_dir)
+        if not node_dir.is_dir():
+            issues.append(
+                f"SeedVR2 node directory not found: {self.node_dir}\n"
+                f"  Clone the node into ComfyUI/custom_nodes/:\n"
+                f"    git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git\n"
+                f"  See docs/SEEDVR2_SETUP.md for details."
+            )
+
+        cli_script = node_dir / "inference_cli.py"
+        if node_dir.is_dir() and not cli_script.is_file():
+            issues.append(
+                f"inference_cli.py not found at {cli_script}\n"
+                f"  The node directory exists but may be incomplete.  Re-clone or update:\n"
+                f"    cd {self.node_dir} && git pull"
+            )
+
+        if issues:
+            raise RuntimeError("SeedVR2 setup is incomplete:\n" + "\n".join(f"  • {i}" for i in issues))
+
+    # ------------------------------------------------------------------
+    # Resolution calculation
+    # ------------------------------------------------------------------
+    def _resolve_resolution(self, input_path: str, factor: int) -> str:
+        """Return ``--resolution <R>`` string or empty if auto."""
+        src_height = _get_video_height(input_path)
+        target = src_height * factor
+        # Use configured resolution if it's larger than the target, or if
+        # explicitly set to something meaningful — inference_cli handles
+        # up/down scaling internally.  We pass the min of target and
+        # self.resolution (when self.resolution > 0) so we don't exceed
+        # the configured cap.
+        if self.resolution > 0 and target > self.resolution:
+            return str(self.resolution)
+        return str(target)
+
+    # ------------------------------------------------------------------
+    # Main upscale method
+    # ------------------------------------------------------------------
+    def upscale(
+        self,
+        input_path: str,
+        output_path: str,
+        factor: int,
+        batch_size: int,
+    ) -> str:
+        _assert_cuda()
+        _validate_batch_size(batch_size)
+
+        resolution_str = self._resolve_resolution(input_path, factor)
+
+        # Build command list (NO shell=True for security)
+        cmd: list[str] = [
+            self.python_exe,
+            "inference_cli.py",
+            input_path,
+            "--output",
+            output_path,
+            "--resolution",
+            resolution_str,
+            "--batch_size",
+            str(batch_size),
+            "--output_format",
+            "mp4",
+            "--model_dir",
+            self.model_dir,
+        ]
+
+        # 12 GB flags: tiled encode + decode, offload devices
+        if self.vae_decode_tiled:
+            cmd.append("--vae_decode_tiled")
+            cmd.append("--vae_decode_tile_size")
+            cmd.append(str(self.vae_tile_size))
+            cmd.append("--vae_decode_tile_overlap")
+            cmd.append("64")
+        if self.vae_encode_tiled:
+            cmd.append("--vae_encode_tiled")
+            cmd.append("--vae_encode_tile_size")
+            cmd.append(str(self.vae_tile_size))
+            cmd.append("--vae_encode_tile_overlap")
+            cmd.append("64")
+        if self.dit_offload_device:
+            cmd.append("--dit_offload_device")
+            cmd.append(self.dit_offload_device)
+        if self.vae_offload_device:
+            cmd.append("--vae_offload_device")
+            cmd.append(self.vae_offload_device)
+
+        log.info("CLIBackend command: %s", " ".join(cmd))
+        log.info("CLIBackend cwd: %s", self.node_dir)
+
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=self.node_dir,
+                capture_output=True,
+                text=True,
+                timeout=3600,  # 1 hour max
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Python executable not found: {self.python_exe}. "
+                f"Set SEEDVR2_PYTHON or --seedvr2-python to the correct path."
+            ) from exc
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                "SeedVR2 inference_cli.py timed out after 1 hour. The video may be too long or the GPU too slow."
+            ) from None
+
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            raise RuntimeError(
+                f"SeedVR2 inference_cli.py failed (exit code {result.returncode}):\n"
+                f"  {stderr}\n"
+                f"  Command: {' '.join(cmd)}\n"
+                f"  See docs/SEEDVR2_SETUP.md for troubleshooting."
+            )
+
+        log.info("SeedVR2 CLI upscale complete → %s", output_path)
+        return output_path
+
+
+# ---------------------------------------------------------------------------
 # SeedVR2 Upscaler (front-facing class)
 # ---------------------------------------------------------------------------
 
@@ -311,20 +564,41 @@ class SeedVR2Upscaler:
 
     The *backend* argument allows injecting a different backend (e.g.
     for testing or future Path-B headless integration).  Defaults to
-    :class:`ComfyUIBackend`.
+    :class:`CLIBackend`.
     """
 
     def __init__(
         self,
         batch_size: int = 5,
         backend: UpscaleBackend | None = None,
-        base_url: str = "http://127.0.0.1:8188",
+        node_dir: str | None = None,
+        python_exe: str | None = None,
+        model_dir: str | None = None,
+        resolution: int | None = None,
+        vae_decode_tiled: bool = True,
+        vae_encode_tiled: bool = True,
+        vae_tile_size: int | None = None,
+        dit_offload_device: str | None = None,
+        vae_offload_device: str | None = None,
     ) -> None:
         _assert_cuda()
         _validate_batch_size(batch_size)
 
         self.batch_size = batch_size
-        self.backend = backend or ComfyUIBackend(base_url=base_url)
+        if backend is not None:
+            self.backend = backend
+        else:
+            self.backend = CLIBackend(
+                node_dir=node_dir,
+                python_exe=python_exe,
+                model_dir=model_dir,
+                resolution=resolution,
+                vae_decode_tiled=vae_decode_tiled,
+                vae_encode_tiled=vae_encode_tiled,
+                vae_tile_size=vae_tile_size,
+                dit_offload_device=dit_offload_device,
+                vae_offload_device=vae_offload_device,
+            )
 
     def upscale(
         self,

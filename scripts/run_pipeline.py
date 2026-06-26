@@ -32,10 +32,13 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+from pipeline.depth_crafter import DepthCrafterEstimator
 from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import detect_best_device, resolve_device
 from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.fulldome_mapper import FulldomeMapper
+from pipeline.outpainter import Outpainter
+from pipeline.stereo_crafter import StereoCrafterRenderer
 from pipeline.stereo_renderer import StereoRenderer
 from pipeline.streaming_pipeline import StreamingPipeline
 from pipeline.upscaler import PixelUpscaler
@@ -49,14 +52,15 @@ logging.basicConfig(
 log = logging.getLogger("vr180-pipeline")
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
+    """Parse CLI arguments.  Accept optional *argv* for testing."""
     parser = argparse.ArgumentParser(description="2D AI Video → VR180 Conversion Pipeline")
     parser.add_argument("--input", "-i", required=True, help="Input video file (MP4, MOV, etc.)")
     parser.add_argument("--output", "-o", default=None, help="Output VR180 video path")
     parser.add_argument(
         "--stage",
         "-s",
-        choices=["all", "depth", "stereo", "equirect", "metadata"],
+        choices=["all", "depth", "stereo", "equirect", "outpaint", "metadata"],
         default="all",
         help="Pipeline stage to run (default: all)",
     )
@@ -76,6 +80,9 @@ def parse_args():
     parser.add_argument("--no-temporal", action="store_true", help="Disable temporal smoothing")
     parser.add_argument("--temp-dir", default=None, help="Directory for intermediate files")
     parser.add_argument("--no-ffmpeg-v360", action="store_true", help="Disable ffmpeg v360, use OpenCV fallback")
+    parser.add_argument(
+        "--no-equirect-batched", action="store_true", help="Disable batched equirect mapping (revert to per-frame)"
+    )
     parser.add_argument(
         "--no-flip", action="store_true", help="Disable vertical flip (default: flip on for VR headset)"
     )
@@ -144,12 +151,72 @@ def parse_args():
         "--dome-size", type=int, default=4096, help="Fulldome output square size in pixels (default 4096)"
     )
 
+    # Depth model selection
+    parser.add_argument(
+        "--depth-model",
+        choices=["depth-anything", "depthcrafter"],
+        default="depth-anything",
+        help="Depth estimation backend: depth-anything (per-frame, default) or "
+        "depthcrafter (temporally-consistent video depth, CUDA-only)",
+    )
+    parser.add_argument(
+        "--depthcrafter-repo-dir",
+        default=None,
+        help="DepthCrafter repository directory (or env DEPTHCRAFTER_REPO_DIR)",
+    )
+    parser.add_argument(
+        "--depthcrafter-python",
+        default=None,
+        help="Python executable for DepthCrafter inference (or env DEPTHCRAFTER_PYTHON)",
+    )
+    parser.add_argument(
+        "--depthcrafter-checkpoint-dir",
+        default=None,
+        help="DepthCrafter checkpoint directory (or env DEPTHCRAFTER_CKPT_DIR)",
+    )
+    parser.add_argument(
+        "--depthcrafter-max-res",
+        type=int,
+        default=None,
+        help="Max resolution (short side) for DepthCrafter inference (or env DEPTHCRAFTER_MAX_RES)",
+    )
+
+    # Stereo model selection
+    parser.add_argument(
+        "--stereo-model",
+        choices=["default", "stereocrafter"],
+        default="default",
+        help="Stereo rendering backend: default (depth-shift + inpaint, default) or "
+        "stereocrafter (Tencent StereoCrafter, CUDA-only, cleaner disocclusion)",
+    )
+    parser.add_argument(
+        "--stereocrafter-repo-dir",
+        default=None,
+        help="StereoCrafter repository directory (or env STEREOCRAFTER_REPO_DIR)",
+    )
+    parser.add_argument(
+        "--stereocrafter-python",
+        default=None,
+        help="Python executable for StereoCrafter inference (or env STEREOCRAFTER_PYTHON)",
+    )
+    parser.add_argument(
+        "--stereocrafter-checkpoint-dir",
+        default=None,
+        help="StereoCrafter checkpoint directory (or env STEREOCRAFTER_CKPT_DIR)",
+    )
+    parser.add_argument(
+        "--stereocrafter-max-res",
+        type=int,
+        default=None,
+        help="Max resolution (short side) for StereoCrafter inference (or env STEREOCRAFTER_MAX_RES)",
+    )
+
     # R-1: SeedVR2 video upscaling pre-stage
     parser.add_argument(
         "--video-upscale",
         choices=["none", "seedvr2"],
         default="none",
-        help="Video upscaling method: none (skip) or seedvr2 (SeedVR2 via ComfyUI, Stage 0) (default: none)",
+        help="Video upscaling method: none (skip) or seedvr2 (SeedVR2, Stage 0) (default: none)",
     )
     parser.add_argument(
         "--video-upscale-factor",
@@ -158,13 +225,66 @@ def parse_args():
         choices=[2, 3, 4],
         help="SeedVR2 upscaling factor (default: 2)",
     )
+    # [Deprecated] ComfyUI URL — use --seedvr2-node-dir for CLI backend
     parser.add_argument(
         "--seedvr2-url",
         default="http://127.0.0.1:8188",
-        help="ComfyUI server URL for SeedVR2 (default: http://127.0.0.1:8188)",
+        help="[Deprecated — use --seedvr2-node-dir] ComfyUI server URL (default: http://127.0.0.1:8188)",
     )
 
-    return parser.parse_args()
+    # SeedVR2 CLI backend params
+    parser.add_argument(
+        "--seedvr2-node-dir",
+        default=None,
+        help="SeedVR2 custom node directory (contains inference_cli.py). Can also set SEEDVR2_NODE_DIR env var.",
+    )
+    parser.add_argument(
+        "--seedvr2-python",
+        default=None,
+        help="Python executable for inference_cli.py (default: python). Can also set SEEDVR2_PYTHON env var.",
+    )
+    parser.add_argument(
+        "--seedvr2-model-dir",
+        default=None,
+        help="SeedVR2 model .safetensors directory. "
+        "Can also set SEEDVR2_MODEL_DIR env var (default: <node_dir>/../../models/SEEDVR2).",
+    )
+    parser.add_argument(
+        "--seedvr2-resolution",
+        type=int,
+        default=None,
+        help="Output short-side resolution. Auto from source height × factor if 0. "
+        "Can also set SEEDVR2_RESOLUTION env var (default: 1440).",
+    )
+
+    # R-6: 180° Outpaint fill
+    parser.add_argument(
+        "--outpaint",
+        choices=["none", "gradient", "ai"],
+        default="none",
+        help="Outpaint black boundary regions in equirect frames: "
+        "none (skip, default), gradient (OpenCV-based), or ai (SDXL inpaint, requires backend deployment)",
+    )
+    parser.add_argument(
+        "--outpaint-mask-threshold",
+        type=int,
+        default=10,
+        help="Pixel brightness threshold for black boundary detection (default: 10)",
+    )
+    parser.add_argument(
+        "--outpaint-mask-top-ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of height scanned from top for black boundaries (default: 0.25)",
+    )
+    parser.add_argument(
+        "--outpaint-mask-bottom-ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of height scanned from bottom for black boundaries (default: 0.25)",
+    )
+
+    return parser.parse_args(argv)
 
 
 def read_frames(video_path: str, max_frames: int | None = None):
@@ -225,6 +345,34 @@ def run_depth_stage(args, frames):
     """Stage 1: Estimate depth for all frames."""
     log.info("=== Stage 1: Depth Estimation ===")
 
+    # DepthCrafter mode — process entire video at once (temporally consistent)
+    if args.depth_model == "depthcrafter":
+        log.info("Using DepthCrafter for temporally-consistent video depth estimation")
+        out_dir = get_temp_dir(args, "depth")
+        estimator = DepthCrafterEstimator(
+            repo_dir=args.depthcrafter_repo_dir,
+            python_exe=args.depthcrafter_python,
+            checkpoint_dir=args.depthcrafter_checkpoint_dir,
+            max_resolution=args.depthcrafter_max_res,
+        )
+        depths = estimator.estimate_video(
+            input_path=args.input,
+            output_dir=out_dir,
+        )
+        # Save individual depth maps for downstream stages
+        for i, depth in enumerate(depths):
+            dmax = float(np.nanmax(depth))
+            depth_vis = (depth / dmax * 255).astype(np.uint8) if dmax > 0 else depth.astype(np.uint8)
+            cv2.imwrite(
+                os.path.join(out_dir, f"depth_{i:06d}.png"),
+                cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO),
+            )
+            np.save(os.path.join(out_dir, f"depth_{i:06d}.npy"), depth)
+
+        log.info(f"Depth maps (DepthCrafter) saved to {out_dir}/")
+        return depths
+
+    # Default: Depth-Anything V2 per-frame
     estimator = DepthEstimator(
         model_size=args.model_size,
         device=args.device,
@@ -259,6 +407,12 @@ def run_stereo_stage(args, frames, depths):
     """Stage 2: Generate stereo left/right views."""
     log.info("=== Stage 2: Stereo Disparity Rendering ===")
 
+    # StereoCrafter mode — process whole video via external inference
+    if args.stereo_model == "stereocrafter":
+        log.info("Using StereoCrafter for depth-aware stereo with disocclusion inpainting")
+        return _run_stereocrafter_stage(args, frames, depths)
+
+    # Default: per-frame depth-shift renderer
     renderer = StereoRenderer(
         ipd=args.ipd,
         max_disparity=args.max_disparity,
@@ -284,8 +438,83 @@ def run_stereo_stage(args, frames, depths):
     return left_frames, right_frames
 
 
+def _run_stereocrafter_stage(args, frames, depths):
+    """Run StereoCrafter inference: frames + depth -> L/R video files -> load frames."""
+
+    # Save frames as a temp video so StereoCrafter can read them
+    temp_dir = get_temp_dir(args)
+    depth_dir = get_temp_dir(args, "depth")
+
+    # Write frames to a temp video file for StereoCrafter input
+    H, W = frames[0].shape[:2]
+    temp_video = os.path.join(temp_dir, "_stereocrafter_input.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(temp_video, fourcc, args.fps or 30, (W, H))
+    for frame in tqdm(frames, desc="Preparing frames for StereoCrafter"):
+        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    writer.release()
+    log.info("StereoCrafter: wrote %d frames to %s", len(frames), temp_video)
+
+    # Save depth maps to depth_dir if not already there
+    # (they should already exist from run_depth_stage, but ensure npy files are present)
+    for i, depth in enumerate(depths):
+        npy_path = os.path.join(depth_dir, f"depth_{i:06d}.npy")
+        if not os.path.exists(npy_path):
+            np.save(npy_path, depth)
+
+    # Output paths
+    left_video = os.path.join(temp_dir, "_stereocrafter_left.mp4")
+    right_video = os.path.join(temp_dir, "_stereocrafter_right.mp4")
+
+    # Run StereoCrafter
+    renderer = StereoCrafterRenderer(
+        repo_dir=args.stereocrafter_repo_dir,
+        python_exe=args.stereocrafter_python,
+        checkpoint_dir=args.stereocrafter_checkpoint_dir,
+        max_resolution=args.stereocrafter_max_res,
+    )
+    result_left, result_right = renderer.render_video(
+        input_path=temp_video,
+        depth_dir=depth_dir,
+        output_left=left_video,
+        output_right=right_video,
+    )
+
+    # Load output videos back as frame arrays
+    left_frames = _load_video_frames(result_left)
+    right_frames = _load_video_frames(result_right)
+
+    # Save individual frames for checkpoint restore
+    left_dir = get_temp_dir(args, "left")
+    right_dir = get_temp_dir(args, "right")
+    for i, (left, right) in enumerate(zip(left_frames, right_frames, strict=False)):
+        cv2.imwrite(os.path.join(left_dir, f"left_{i:06d}.png"), cv2.cvtColor(left, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(right_dir, f"right_{i:06d}.png"), cv2.cvtColor(right, cv2.COLOR_RGB2BGR))
+
+    log.info("StereoCrafter: %d L/R frame pairs loaded", len(left_frames))
+    return left_frames, right_frames
+
+
+def _load_video_frames(video_path: str) -> list[np.ndarray]:
+    """Load all frames from a video file as RGB ndarrays."""
+    cap = cv2.VideoCapture(video_path)
+    frames: list[np.ndarray] = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    return frames
+
+
 def run_equirect_stage(args, left_frames, right_frames):
-    """Stage 3: Map stereo views to equirectangular."""
+    """Stage 3: Map stereo views to equirectangular.
+
+    Uses batched ``map_sequence()`` by default (~10× faster than per-frame).
+    Falls back to per-frame ``map_stereo_pair()`` when ``--no-equirect-batched``
+    is set (e.g., for testing or OpenCV fallback).
+    """
     log.info("=== Stage 3: Equirectangular Projection ===")
 
     mapper = EquirectangularMapper(
@@ -296,18 +525,58 @@ def run_equirect_stage(args, left_frames, right_frames):
     )
 
     out_dir = get_temp_dir(args, "equirect")
-    sbs_frames = []
-    for i, (left, right) in enumerate(
-        tqdm(zip(left_frames, right_frames, strict=False), desc="Mapping to equirect", total=len(left_frames))
-    ):
-        sbs = mapper.map_stereo_pair(left, right)
-        sbs_frames.append(sbs)
-        cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
+    temp_dir = get_temp_dir(args)
+
+    if args.no_equirect_batched:
+        # Per-frame path (fallback)
+        sbs_frames = []
+        for i, (left, right) in enumerate(
+            tqdm(
+                zip(left_frames, right_frames, strict=False),
+                desc="Mapping to equirect (per-frame)",
+                total=len(left_frames),
+            )
+        ):
+            sbs = mapper.map_stereo_pair(left, right)
+            sbs_frames.append(sbs)
+            cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
+    else:
+        # Batched path — single ffmpeg v360 call per eye on the whole sequence
+        sbs_frames = mapper.map_sequence(left_frames, right_frames, temp_dir)
+        # Write frames to disk for checkpoint restore
+        for i, sbs in enumerate(sbs_frames):
+            cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
 
     log.info(
         f"Generated {len(sbs_frames)} equirectangular SBS frames ({sbs_frames[0].shape[1]}×{sbs_frames[0].shape[0]})"
     )
     return sbs_frames
+
+
+def run_outpaint_stage(args, sbs_frames):
+    """Stage 3.5: Outpaint black boundary regions in equirect frames."""
+    log.info("=== Stage 3.5: 180° Outpaint Fill (%s) ===", args.outpaint)
+
+    if args.outpaint == "none":
+        log.info("Outpainting disabled (--outpaint none) — skipping")
+        return sbs_frames
+
+    outpainter = Outpainter(
+        mode=args.outpaint,
+        mask_threshold=args.outpaint_mask_threshold,
+        mask_top_ratio=args.outpaint_mask_top_ratio,
+        mask_bottom_ratio=args.outpaint_mask_bottom_ratio,
+    )
+
+    result = outpainter.process(sbs_frames)
+
+    # Overwrite equirect checkpoint files with outpainted versions
+    out_dir = get_temp_dir(args, "equirect")
+    for i, frame in enumerate(result):
+        cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+    log.info("Outpainted %d frames (mode=%s)", len(result), args.outpaint)
+    return result
 
 
 def run_metadata_stage(args, sbs_frames):
@@ -336,9 +605,10 @@ def run_metadata_stage(args, sbs_frames):
 def run_seedvr2_prestage(args) -> str:
     """Stage 0: SeedVR2 video upscaling (runs on the whole video file before frame loading).
 
-    Upscales the input video via ComfyUI SeedVR2, saves the result to a temp path,
-    and returns the path to the upscaled video.  The caller replaces args.input with
-    this path so all downstream stages see the higher-resolution source.
+    Upscales the input video via SeedVR2 inference_cli.py (CLI backend),
+    saves the result to a temp path, and returns the path to the upscaled
+    video.  The caller replaces args.input with this path so all downstream
+    stages see the higher-resolution source.
     """
     log.info("=== Stage 0: SeedVR2 Video Upscaling (%d×) ===", args.video_upscale_factor)
 
@@ -348,7 +618,10 @@ def run_seedvr2_prestage(args) -> str:
 
     upscaler = SeedVR2Upscaler(
         batch_size=5,
-        base_url=args.seedvr2_url,
+        node_dir=args.seedvr2_node_dir,
+        python_exe=args.seedvr2_python,
+        model_dir=args.seedvr2_model_dir,
+        resolution=args.seedvr2_resolution,
     )
 
     log.info("SeedVR2: %s → %s (factor=%d)", args.input, upscaled_path, args.video_upscale_factor)
@@ -581,8 +854,8 @@ def load_checkpoint(temp_dir: str):
     return None
 
 
-STAGE_ORDER = ["upscale", "depth", "stereo", "equirect", "metadata"]
-STAGE_ORDER_SBS = ["upscale", "equirect", "metadata"]  # Skip depth & stereo for SBS input
+STAGE_ORDER = ["upscale", "depth", "stereo", "equirect", "outpaint", "metadata"]
+STAGE_ORDER_SBS = ["upscale", "equirect", "outpaint", "metadata"]  # Skip depth & stereo for SBS input
 
 
 def detect_sbs_input(video_path: str, force_sbs: bool = False) -> bool:
@@ -803,6 +1076,17 @@ def main():
                 sbs_frames = run_equirect_stage(args, left_frames, right_frames)
                 save_checkpoint(temp_dir, "equirect", {"num_frames": len(sbs_frames)})
 
+            elif stage == "outpaint":
+                if sbs_frames is None:
+                    import glob
+
+                    eq_dir = get_temp_dir(args, "equirect")
+                    files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
+                    sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
+                    log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint for outpainting")
+                sbs_frames = run_outpaint_stage(args, sbs_frames)
+                save_checkpoint(temp_dir, "outpaint", {"num_frames": len(sbs_frames)})
+
             elif stage == "metadata":
                 if sbs_frames is None:
                     import glob
@@ -839,6 +1123,14 @@ def main():
         left_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in left_files]
         right_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in right_files]
         run_equirect_stage(args, left_frames, right_frames)
+
+    elif args.stage == "outpaint":
+        eq_dir = get_temp_dir(args, "equirect")
+        import glob
+
+        files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
+        frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
+        run_outpaint_stage(args, frames)
 
     elif args.stage == "metadata":
         eq_dir = get_temp_dir(args, "equirect")

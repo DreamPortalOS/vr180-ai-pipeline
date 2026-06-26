@@ -93,3 +93,55 @@ design (the Renderer interface above), and fulldome is proven-shippable. Our edg
 2. **Route 1 Fulldome renderer** — small, high-quality, shippable. *(recommended next)*
 3. **Route 2 stereo quality** — DepthCrafter + StereoCrafter on 4070S. *(parallel, harder)*
 4. Refactor render stage behind the **Renderer interface** so both routes share ingest/upscale/encode.
+5. **Outpainter (Stage 3.5)** — optional outpainting after equirectangular projection, before stereo rendering.
+   Fills black zenith/nadir boundaries caused by limited source vertical FOV.
+   Gradient mode (OpenCV, no model) ships first; AI mode (SDXL inpaint backend) is pluggable for later.
+
+---
+
+## Stage 3.5 — 180° Outpaint Fill (optional)
+
+_Route 2 (VR180) only; no-op on Route 1 (fulldome)._
+
+When a 2D source is projected to equirectangular (VR180 hemisphere), the top (zenith ≈ 20–30°) and bottom
+(nadir) have **no source content** → pure black.  The outpainter fills these regions so the viewer sees a
+continuous sky/ground instead of a hard black edge.
+
+### Three modes & trade-offs
+
+| Mode | Backend | Quality | Performance | Dependency |
+|---|---|---|---|---|
+| `none` | — | No fill | Zero cost | None |
+| `gradient` | OpenCV (blur + edge extension) | Decent for uniform sky/ground; may show blur on complex textures | Real-time (2 ms/frame) | `opencv-python` |
+| `ai` | Pluggable `AIOutpaintBackend` (SDXL inpaint / Seedance / custom) | Best — semantically fills with sky, clouds, terrain | Slow (1–5 s/frame on GPU) | `diffusers` + `torch` + deployed model |
+
+### How it works (gradient mode)
+
+1. `detect_black_boundary_mask()` scans top N% and bottom N% of the frame row-by-row, stopping at the
+   first non-black row (threshold: mean pixel < `mask_threshold`).
+2. `_gradient_outpaint_single()` copies the nearest valid row's content outward with a decreasing alpha,
+   then applies a vertical Gaussian blur to blend the seam.
+3. The original non-masked pixels are restored after blurring, so middle content is untouched.
+
+### AI backend contract
+
+```python
+class AIOutpaintBackend(abc.ABC):
+    def outpaint(self, frames: list[np.ndarray], mask: np.ndarray) -> list[np.ndarray]: ...
+```
+
+Implementations must handle the batch (multiple frames with the same mask).  A `MockAIOutpaintBackend` is
+provided for testing.  For real deployment see `docs/OUTPAINT_SETUP.md` (placeholder — lead fills actual
+model path + commands).
+
+### Pipeline integration
+
+```
+equirectangular_mapper → [outpainter] → stereo_renderer → encode
+                         ↑ optional
+                   --outpaint {none,gradient,ai}
+```
+
+- `--outpaint gradient` is safe to use on **every** run — it detects black and only fills where needed.
+- `--outpaint ai` requires a deployed backend; the CLI will error with a clear message if unavailable.
+- Default is `none` so existing behavior is preserved.

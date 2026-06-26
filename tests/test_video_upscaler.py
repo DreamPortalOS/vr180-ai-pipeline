@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pipeline.video_upscaler import (
+    CLIBackend,
     ComfyUIBackend,
     SeedVR2Upscaler,
     UpscaleBackend,
@@ -260,6 +261,10 @@ class TestPipelineIntegration:
         parser.add_argument("--video-upscale", choices=["none", "seedvr2"], default="none")
         parser.add_argument("--video-upscale-factor", type=int, default=2)
         parser.add_argument("--seedvr2-url", default="http://127.0.0.1:8188")
+        parser.add_argument("--seedvr2-node-dir", default=None)
+        parser.add_argument("--seedvr2-python", default=None)
+        parser.add_argument("--seedvr2-model-dir", default=None)
+        parser.add_argument("--seedvr2-resolution", type=int, default=None)
         parser.add_argument("--input", default="dummy.mp4")
         args = parser.parse_args(["--input", "dummy.mp4"])
 
@@ -272,3 +277,171 @@ class TestPipelineIntegration:
         if args.video_upscale == "seedvr2":
             args.input = "upscaled.mp4"
         assert args.input == original_input, "none should NOT change input"
+
+
+# ---------------------------------------------------------------------------
+# CLIBackend tests (mock subprocess.run)
+# ---------------------------------------------------------------------------
+
+
+class TestCLIBackend:
+    """Mock-based tests for CLIBackend — requires no CUDA or SeedVR2 node."""
+
+    def test_node_dir_missing_raises(self) -> None:
+        """CLIBackend raises RuntimeError if node_dir doesn't exist."""
+        with (
+            patch("os.environ", {}),
+            tempfile.TemporaryDirectory() as tmpdir,
+        ):
+            fake_node = os.path.join(tmpdir, "nonexistent")
+            with pytest.raises(RuntimeError, match="SeedVR2 setup is incomplete"):
+                CLIBackend(node_dir=fake_node)
+
+    def test_missing_inference_cli_raises(self) -> None:
+        """Raise if node_dir exists but inference_cli.py is absent."""
+        with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(RuntimeError, match=r"inference_cli.py not found"):
+            CLIBackend(node_dir=tmpdir)
+
+    @patch("pipeline.video_upscaler.subprocess.run")
+    @patch("pipeline.video_upscaler._get_video_height", return_value=1080)
+    @patch("pipeline.video_upscaler._assert_cuda", return_value=None)
+    def test_command_contains_12gb_flags(
+        self,
+        mock_cuda: MagicMock,
+        mock_height: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        """The subprocess command must contain all 12GB stability flags."""
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stderr = ""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create fake node dir with inference_cli.py (model_dir not needed — validation relaxed)
+            Path(tmpdir, "inference_cli.py").write_text("# fake")
+
+            backend = CLIBackend(node_dir=tmpdir)
+            backend.upscale("input.mp4", "output.mp4", factor=2, batch_size=5)
+
+            # Extract the command passed to subprocess.run
+            call_args, _kwargs = mock_run.call_args
+            cmd = call_args[0]
+
+            # VAE decode tiled (existing)
+            assert "--vae_decode_tiled" in cmd, f"Missing --vae_decode_tiled in {cmd}"
+            assert "--vae_decode_tile_size" in cmd
+            assert "--vae_decode_tile_overlap" in cmd
+            assert cmd[cmd.index("--vae_decode_tile_size") + 1] == "512"
+            assert cmd[cmd.index("--vae_decode_tile_overlap") + 1] == "64"
+
+            # VAE encode tiled (new — 12GB fix)
+            assert "--vae_encode_tiled" in cmd, f"Missing --vae_encode_tiled in {cmd}"
+            assert "--vae_encode_tile_size" in cmd
+            assert cmd[cmd.index("--vae_encode_tile_size") + 1] == "512"
+
+            # DIT + VAE offload to CPU (new — 12GB fix)
+            assert "--dit_offload_device" in cmd, f"Missing --dit_offload_device in {cmd}"
+            assert cmd[cmd.index("--dit_offload_device") + 1] == "cpu"
+            assert "--vae_offload_device" in cmd, f"Missing --vae_offload_device in {cmd}"
+            assert cmd[cmd.index("--vae_offload_device") + 1] == "cpu"
+
+    @patch("pipeline.video_upscaler.subprocess.run")
+    @patch("pipeline.video_upscaler._get_video_height", return_value=1080)
+    @patch("pipeline.video_upscaler._assert_cuda", return_value=None)
+    def test_cwd_is_node_dir(
+        self,
+        mock_cuda: MagicMock,
+        mock_height: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        """subprocess.run must be called with cwd=node_dir."""
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stderr = ""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "inference_cli.py").write_text("# fake")
+
+            backend = CLIBackend(node_dir=tmpdir)
+            backend.upscale("input.mp4", "output.mp4", factor=2, batch_size=5)
+
+            _args, kwargs_cwd = mock_run.call_args
+            assert kwargs_cwd["cwd"] == tmpdir, f"Expected cwd={tmpdir}, got {kwargs_cwd['cwd']}"
+
+    @patch("pipeline.video_upscaler.subprocess.run")
+    @patch("pipeline.video_upscaler._get_video_height", return_value=1080)
+    @patch("pipeline.video_upscaler._assert_cuda", return_value=None)
+    def test_resolution_from_factor(
+        self,
+        mock_cuda: MagicMock,
+        mock_height: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        """2× factor on 1080p source → resolution == 2160."""
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stderr = ""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "inference_cli.py").write_text("# fake")
+
+            backend = CLIBackend(node_dir=tmpdir, resolution=0)
+            backend.upscale("input.mp4", "output.mp4", factor=2, batch_size=5)
+
+            call_args_res, _kwargs_res = mock_run.call_args
+            cmd = call_args_res[0]
+            res_idx = cmd.index("--resolution") + 1
+            assert cmd[res_idx] == "2160", f"Expected resolution 2160, got {cmd[res_idx]}"
+
+    @patch("pipeline.video_upscaler.subprocess.run")
+    @patch("pipeline.video_upscaler._get_video_height", return_value=1080)
+    def test_cuda_error(
+        self,
+        mock_height: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        """CLIBackend.upscale raises if CUDA unavailable."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "inference_cli.py").write_text("# fake")
+
+            backend = CLIBackend(node_dir=tmpdir)
+
+            with (
+                patch.dict("sys.modules", {"torch": None}),
+                pytest.raises(RuntimeError, match="PyTorch is not installed"),
+            ):
+                backend.upscale("input.mp4", "output.mp4", factor=2, batch_size=5)
+
+    @patch("pipeline.video_upscaler.subprocess.run")
+    @patch("pipeline.video_upscaler._get_video_height", return_value=1080)
+    @patch("pipeline.video_upscaler._assert_cuda", return_value=None)
+    def test_4n_plus_1_validation(
+        self,
+        mock_cuda: MagicMock,
+        mock_height: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        """CLIBackend.upscale raises for batch_size not 4n+1."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "inference_cli.py").write_text("# fake")
+
+            backend = CLIBackend(node_dir=tmpdir)
+            with pytest.raises(ValueError, match="4n\\+1"):
+                backend.upscale("input.mp4", "output.mp4", factor=2, batch_size=2)
+
+    @patch("pipeline.video_upscaler.subprocess.run")
+    @patch("pipeline.video_upscaler._get_video_height", return_value=1080)
+    @patch("pipeline.video_upscaler._assert_cuda", return_value=None)
+    def test_output_format_mp4(
+        self,
+        mock_cuda: MagicMock,
+        mock_height: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        """The command must contain --output_format mp4."""
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stderr = ""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "inference_cli.py").write_text("# fake")
+
+            backend = CLIBackend(node_dir=tmpdir)
+            backend.upscale("input.mp4", "output.mp4", factor=2, batch_size=5)
+
+            call_args_fmt, _kwargs_fmt = mock_run.call_args
+            cmd = call_args_fmt[0]
+            assert "--output_format" in cmd
+            assert cmd[cmd.index("--output_format") + 1] == "mp4"

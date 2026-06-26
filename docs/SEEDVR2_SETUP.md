@@ -1,72 +1,214 @@
-# SeedVR2 Source Upscaling — Deployment on RTX 4070S (Windows)
+# SeedVR2 Video Upscaling — Deployment Guide
 
-_Goal: upscale the **720p source clip** to ~2880p **before** VR180/fulldome conversion. The 720p source is the
-dominant cause of "completely unclear". SeedVR2 (ByteDance, ICLR2026) is the 2026 SOTA temporal video super-res —
-best-in-class on short, AI-generated, compressed clips (exactly our input)._
+_Goal: upscale the 720p/1080p source clip to 1440p+ **before** VR180/fulldome conversion.
+SeedVR2 (ByteDance, ICLR2026) is the 2026 SOTA temporal video super-res — best-in-class on
+short, AI-generated, compressed clips (exactly our input)._
 
-> **Platform note:** the official `ByteDance-Seed/SeedVR` repo targets Linux/H100 and depends on `flash_attn` +
-> NVIDIA `apex`, which are painful to build on Windows. **On Windows, use Path A (ComfyUI).** Use Path B only on
-> Linux/WSL2 for headless automation.
+This guide documents the **CLI backend** (the only path verified on a 12 GB RTX 4070S).
+It uses the ComfyUI node's `inference_cli.py` — no ComfyUI server required.
 
----
-
-## Path A — ComfyUI-SeedVR2 (recommended on Windows/4070S)
-
-The ComfyUI node is built for consumer GPUs (block-swap, GGUF quant, tiling). SeedVR2 v2.5 runs even the 7B model
-on 8GB; the **3B** model is comfortable on the 4070S's 12GB.
-
-1. **Install ComfyUI** (portable Windows build) — https://github.com/comfyanonymous/ComfyUI
-2. **Install the node** (ComfyUI-Manager → search "SeedVR2", or git clone into `ComfyUI/custom_nodes/`):
-   `https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler`
-3. **Download the 3B model** into the node's models folder:
-   - `seedvr2_ema_3b_fp16.safetensors` (best quality, fits 12GB), or
-   - `seedvr2_ema_3b-Q4_K_M.gguf` (lower VRAM / faster) — from HF `ByteDance-Seed/SeedVR2-3B` (or the node's HF mirror `numz/SeedVR2_comfyUI`).
-4. **Workflow:** Load Video → SeedVR2 Upscaler → Save Video. Key settings for 12GB:
-   - **Model:** 3B fp16 (or GGUF if VRAM-tight)
-   - **Target resolution:** short side **1440** (→ 1280×720 becomes ~2560×1440) or push to **2160** if VRAM allows
-   - **`batch_size` MUST be `4n+1`** (1, 5, 9, 13, 17 …) — this is how SeedVR2 keeps frames temporally consistent.
-     Start at **5**; raise until VRAM is ~80% full, lower if OOM.
-   - **Block swap:** raise it if you OOM (trades speed for VRAM); 0 if you have headroom.
-5. **Run on our clip:** drop `video/googlegemini.mp4` in, export → `googlegemini_2560.mp4`.
+> **Compatibility:** Windows 11 + 12 GB VRAM verified.  Python 3.10–3.12.
 
 ---
 
-## Path B — Headless (Linux / WSL2 only, for automation)
+## 1. Clone ComfyUI + SeedVR2 Node
 
-```bash
-git clone https://github.com/bytedance-seed/SeedVR.git && cd SeedVR
-conda create -n seedvr python=3.10 -y && conda activate seedvr
-pip install -r requirements.txt
-pip install flash_attn==2.5.9.post1 --no-build-isolation   # needs CUDA toolchain
-# apex from a prebuilt wheel matching your CUDA/torch
+The node ships `inference_cli.py` which does everything: automatic model download (with resume),
+OOM-retry, tiled VAE decode, and direct MP4 output.
 
-python - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id="ByteDance-Seed/SeedVR2-3B", local_dir="ckpts/")
-PY
+```powershell
+# 1. ComfyUI base (optional but provides model dir structure)
+git clone https://github.com/comfyanonymous/ComfyUI.git
+# or just create the model dir manually:
+# mkdir -p ComfyUI/models/SEEDVR2
 
-# inference takes a FOLDER OF FRAMES, not an mp4:
-ffmpeg -i input.mp4 frames_in/%06d.png
-python projects/inference_seedvr2_3b.py \
-  --video_path frames_in --output_dir frames_out \
-  --res_h 1440 --res_w 2560 --sp_size 1 --seed 0
-ffmpeg -framerate 24 -i frames_out/%06d.png -c:v libx265 -crf 16 -pix_fmt yuv420p googlegemini_2560.mp4
-```
-VRAM: a single 12GB card handles short clips at ~1440p; reduce `res_*` / clip length if OOM (the repo's reference
-"1×H100-80G = 100×720×1280" is far above 12GB, so keep sequences short and resolution modest).
-
----
-
-## Then convert (unchanged pipeline)
-
-The upscaled clip is just a higher-res input — feed it straight into the existing converter:
-```bash
-PYTHONPATH=. python scripts/run_pipeline.py \
-  --input video/googlegemini_2560.mp4 \
-  --output video/googlegemini_vr180_v3.mp4 \
-  --src-hfov 150 --max-disparity 0.02 --codec h265 --crf 16
-# fulldome variant arrives with pipeline/fulldome_mapper.py (Route 1, board)
+# 2. SeedVR2 custom node (the CLI script lives here)
+cd ComfyUI/custom_nodes
+git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git
+cd ComfyUI-SeedVR2_VideoUpscaler
 ```
 
-**Acceptance:** the `_v3` output should be visibly sharper than v2 — that confirms source resolution was the bottleneck.
-Send it back for a headset test. (cline task R-1 will wrap this as a `--video-upscale` flag once the manual path is proven.)
+**Directory layout after cloning:**
+```
+ComfyUI/
+├── custom_nodes/
+│   └── ComfyUI-SeedVR2_VideoUpscaler/
+│       ├── inference_cli.py          ← the CLI entry point
+│       ├── src/                      ← internal modules (imported via cwd)
+│       └── ...
+└── models/
+    └── SEEDVR2/                      ← model files go here
+        └── seedvr2_ema_3b_fp8_e4m3fn.safetensors
+```
+
+---
+
+## 2. Download the Model
+
+The node's auto-downloader **can** fetch models, but it lacks resume — a dropped connection
+restarts from zero.  For reliable downloads use `curl` with `-C -` (resume):
+
+```powershell
+# DIFFUSION model (3.16 GB) — required
+curl -L -C - -o ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp8_e4m3fn.safetensors ^
+  https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors
+
+# VAE model (0.47 GB) — required for encode/decode
+curl -L -C - -o ComfyUI/models/SEEDVR2/ema_vae_fp16.safetensors ^
+  https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/ema_vae_fp16.safetensors
+
+# Alternative DIT: official ByteDance repo (filename differs — may need a symlink)
+# curl -L -C - -o ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp16.safetensors ^
+#   https://huggingface.co/ByteDance-Seed/SeedVR2-3B/resolve/main/seedvr2_ema_3b_fp16.safetensors
+```
+
+> **Filenames matter.** `inference_cli.py` defaults to `DEFAULT_DIT = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"`.
+> If you use a different file, pass `--dit <filename>` to the CLI.
+
+**Model choice for 12 GB:**
+
+**File sizes (lead-verified actuals):**
+
+| Model file | Size | VRAM | Quality | Recommended |
+|---|---|---|---|---|
+| `seedvr2_ema_3b_fp8_e4m3fn.safetensors` | **3.16 GB** | ~10 GB | Good | **Default** — fits 12 GB with headroom |
+| `ema_vae_fp16.safetensors` | **0.47 GB** | ~1 GB | Good | **Required** for VAE decode |
+| `seedvr2_ema_3b_fp16.safetensors` | N/A | ~14 GB | Best | OOMs on 12 GB; need 16 GB+ |
+| `seedvr2_ema_3b-Q4_K_M.gguf` | N/A | ~8 GB | Fair | Use only if fp8 OOMs |
+
+---
+
+## 3. Verify the CLI Works
+
+From the **node directory** (`ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler`):
+
+```powershell
+python inference_cli.py --help
+```
+
+You should see flags like `--vae_decode_tiled`, `--batch_size`, `--resolution`, etc.
+If you get `ModuleNotFoundError: No module named 'src'`, you're running from the wrong
+directory — `cwd` must be the node directory.
+
+---
+
+## 4. Run Upscaling (Manual Test)
+
+```powershell
+cd ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler
+
+python inference_cli.py "D:\path\to\input.mp4" ^
+  --output "D:\path\to\output.mp4" ^
+  --resolution 1440 ^
+  --batch_size 5 ^
+  --vae_decode_tiled ^
+  --vae_decode_tile_size 512 ^
+  --vae_decode_tile_overlap 64 ^
+  --vae_encode_tiled ^
+  --vae_encode_tile_size 512 ^
+  --vae_encode_tile_overlap 64 ^
+  --dit_offload_device cpu ^
+  --vae_offload_device cpu ^
+  --output_format mp4 ^
+  --model_dir "D:\ComfyUI\models\SEEDVR2"
+```
+
+**12 GB parameters (all required — lead-verified config):**
+
+| Flag | Value | Why |
+|---|---|---|
+| `--resolution` | `1440` | Short-side target. 1080p × 2 = 2160 (too big), 1440 is the sweet spot |
+| `--batch_size` | `5` | Must be `4n+1`.  5 fits in 12 GB; 9 OOMs on long clips |
+| `--vae_decode_tiled` | *(on)* | **Required** — without it VAE decode OOMs on 12 GB |
+| `--vae_decode_tile_size` | `512` | Smaller tiles = less VRAM, slightly slower |
+| `--vae_decode_tile_overlap` | `64` | Tile overlap to hide seams |
+| `--vae_encode_tiled` | *(on)* | **Required** — without it VAE **encode** OOMs on 12 GB |
+| `--vae_encode_tile_size` | `512` | Same tile size for encode path |
+| `--dit_offload_device` | `cpu` | Offload DIT transformer layers to CPU — saves ~2 GB |
+| `--vae_offload_device` | `cpu` | Offload VAE to CPU — saves ~1 GB |
+
+**Performance:** ~60 s/frame at 1080p → 1440p.  A 100-frame 4-second clip takes ~100 minutes.
+Upscaling to 2160p is proportionally slower (~3×).  This is an **offline tool** — start it and
+walk away.
+
+---
+
+## 5. Integrate with Pipeline
+
+Set environment variables (or pass CLI flags):
+
+```powershell
+$env:SEEDVR2_NODE_DIR = "D:\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler"
+$env:SEEDVR2_MODEL_DIR = "D:\ComfyUI\models\SEEDVR2"
+$env:SEEDVR2_RESOLUTION = "1440"
+```
+
+Then run:
+
+```powershell
+python scripts/run_pipeline.py ^
+  --input video\googlegemini.mp4 ^
+  --output video\googlegemini_vr180.mp4 ^
+  --video-upscale seedvr2 ^
+  --seedvr2-node-dir "%SEEDVR2_NODE_DIR%" ^
+  --seedvr2-model-dir "%SEEDVR2_MODEL_DIR%" ^
+  --seedvr2-resolution 1440 ^
+  --src-hfov 150 --codec h265 --crf 16
+```
+
+If env vars are set, you can omit the `--seedvr2-*` flags entirely:
+
+```powershell
+python scripts/run_pipeline.py --input video.mp4 --output vr180.mp4 --video-upscale seedvr2
+```
+
+---
+
+## 6. Troubleshooting
+
+### "inference_cli.py not found"
+→ You cloned the wrong repo or the node directory is incomplete.
+```powershell
+dir /b D:\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\*.py
+```
+Should show `inference_cli.py`.  If not, re-clone:
+```powershell
+git -C D:\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler pull
+```
+
+### "No module named 'src'"
+→ You are not running from the node directory.  `cwd` **must** be the node directory.
+The pipeline's `CLIBackend` sets this automatically.
+
+### "CUDA out of memory"
+→ Reduce `--batch_size` to 1 or use `--vae_decode_tiled` (which is on by default).
+If still OOM, switch to the GGUF quant model and add `--dit seedvr2_ema_3b-Q4_K_M.gguf`.
+
+### Model download fails / slow
+→ The auto-downloader in `inference_cli.py` uses `requests` without resume.
+**Pre-download the model** manually with `curl -C -` (see Step 2 above) and place it in
+`models/SEEDVR2/`.  The CLI will find it there and skip download.
+
+### Very slow (~10 min per frame)
+→ You might be CPU-bound (not using CUDA).  Verify with `nvidia-smi` that the GPU is utilised.
+→ If piped through WSL2, GPU passthrough may not work.  Run natively on Windows.
+
+---
+
+## Environment Variable Reference
+
+| Variable | Corresponding `--seedvr2-*` flag | Default |
+|---|---|---|
+| `SEEDVR2_NODE_DIR` | `--seedvr2-node-dir` | *(required)* |
+| `SEEDVR2_PYTHON` | `--seedvr2-python` | `python` |
+| `SEEDVR2_MODEL_DIR` | `--seedvr2-model-dir` | `<node_dir>/../../models/SEEDVR2` |
+| `SEEDVR2_VAE_TILE_SIZE` | *(constructor param)* | `512` |
+| `SEEDVR2_RESOLUTION` | `--seedvr2-resolution` | `1440` |
+
+---
+
+## Deprecated: ComfyUI Server Path
+
+The old ComfyUIBackend (HTTP API) is preserved in `pipeline/video_upscaler.py` but is
+**not recommended**.  The CLI backend (`CLIBackend`) is simpler, faster to set up, and
+matches the exact command that was verified on the 12 GB test machine.
