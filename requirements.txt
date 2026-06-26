@@ -22,6 +22,9 @@ safetensors>=0.4.0,<1.0.0
 # Source super-resolution (optional, big quality win — see docs/SEEDVR2_SETUP.md):
 #   SeedVR2 on a CUDA GPU (recommended), or:  pip install realesrgan
 
+# Video generation providers (Kling / Seedance / Veo) — HTTP client (see docs/VIDEOGEN_SETUP.md)
+httpx>=0.25.0,<1.0.0
+
 # Dev
 pytest>=7.0.0,<9.0.0
 pytest-cov>=4.0.0,<6.0.0
