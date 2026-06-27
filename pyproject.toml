@@ -41,7 +41,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["pipeline*"]
+include = ["pipeline*", "integrations*"]
 
 [project.scripts]
 vr180-pipeline = "scripts.run_pipeline:main"
