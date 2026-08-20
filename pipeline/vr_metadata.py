@@ -56,12 +56,14 @@ class VRMetadataEmbedder:
         preset: str = "medium",
         fps: int = 30,
         stereo_mode: str = "sbs",
+        bitrate: str | None = None,
     ):
         self.codec = codec
         self.crf = crf
         self.preset = preset
         self.fps = fps
         self.stereo_mode = stereo_mode
+        self.bitrate = bitrate
 
     def _codec_name(self) -> str:
         return "libx265" if self.codec == "h265" else "libx264"
@@ -132,8 +134,13 @@ class VRMetadataEmbedder:
                 self._codec_name(),
                 "-preset",
                 self.preset,
-                "-crf",
-                str(self.crf),
+            ]
+            if self.bitrate:
+                # Explicit target bitrate (e.g. "80M") overrides CRF.
+                cmd += ["-b:v", self.bitrate]
+            else:
+                cmd += ["-crf", str(self.crf)]
+            cmd += [
                 "-pix_fmt",
                 "yuv420p",
                 "-movflags",

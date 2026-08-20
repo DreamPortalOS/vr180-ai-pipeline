@@ -17,6 +17,78 @@ from pipeline.stereo_renderer import StereoRenderer
 
 log = logging.getLogger("vr180-streaming")
 
+# Reference eye resolution for bitrate scaling (the legacy default).
+REFERENCE_EYE_SIZE = 1920
+# Baseline bitrate (Mbps) that produced acceptable quality at 1920²/eye.
+BASELINE_BITRATE_MBPS = 20.0
+
+# --quality presets: name -> per-eye square size (px).
+# preview  : 1920²/eye — fast iteration, legacy resolution.
+# standard : 2880²/eye — streaming, default quality path.
+# high     : 3840²/eye — streaming, max sharpness for Quest-class HMDs.
+QUALITY_PRESETS: dict[str, int] = {
+    "preview": 1920,
+    "standard": 2880,
+    "high": 3840,
+}
+DEFAULT_QUALITY = "standard"
+
+
+def resolve_quality(
+    quality: str,
+    explicit_eye_size: int | None = None,
+) -> tuple[int, bool]:
+    """Map a --quality preset to (eye_size, streaming).
+
+    Args:
+        quality: One of QUALITY_PRESETS keys.
+        explicit_eye_size: Explicit per-eye size override (e.g. from
+            --output-width). When given, it wins over the preset.
+
+    Returns:
+        (eye_size, streaming) — per-eye square resolution and whether the
+        streaming (O(1) memory) pipeline should be used. All presets except
+        ``preview`` imply streaming.
+
+    Raises:
+        ValueError: On unknown quality preset.
+    """
+    if quality not in QUALITY_PRESETS:
+        raise ValueError(f"Unknown quality preset: {quality!r} (choose from {sorted(QUALITY_PRESETS)})")
+    eye_size = explicit_eye_size if explicit_eye_size is not None else QUALITY_PRESETS[quality]
+    streaming = quality != "preview"
+    return eye_size, streaming
+
+
+def scaled_bitrate_mbps(
+    eye_size: int,
+    base_mbps: float = BASELINE_BITRATE_MBPS,
+    reference_eye_size: int = REFERENCE_EYE_SIZE,
+    max_mbps: float | None = None,
+) -> float:
+    """Scale output bitrate linearly with total pixel area.
+
+    Bitrate scales with (eye_size / reference)² so that bits-per-pixel stay
+    constant relative to the 1920²/eye reference tier:
+      - 1920² → base (1×)
+      - 2880² → 2.25× base
+      - 3840² → 4× base
+
+    Args:
+        eye_size: Per-eye square resolution (px).
+        base_mbps: Bitrate at the reference resolution (Mbps).
+        reference_eye_size: Resolution the base bitrate was tuned for.
+        max_mbps: Optional upper clamp (Mbps). ``None`` = no cap.
+
+    Returns:
+        Scaled bitrate in Mbps, clamped to ``max_mbps`` if given.
+    """
+    scale = (eye_size / reference_eye_size) ** 2
+    bitrate = base_mbps * scale
+    if max_mbps is not None:
+        bitrate = min(bitrate, max_mbps)
+    return bitrate
+
 
 class StreamingPipeline:
     """Stream-based VR180 conversion with O(1) memory footprint.
@@ -44,6 +116,7 @@ class StreamingPipeline:
         codec: str = "h264",
         crf: int = 23,
         fps: int = 30,
+        bitrate: str | None = None,
     ):
         self.model_size = model_size
         self.device = resolve_device(device)
@@ -55,6 +128,7 @@ class StreamingPipeline:
         self.codec = codec
         self.crf = crf
         self.fps = fps
+        self.bitrate = bitrate
 
         # Initialise pipeline stages
         self.depth_estimator = DepthEstimator(
@@ -99,8 +173,13 @@ class StreamingPipeline:
             "pipe:0",
             "-c:v",
             enc_codec,
-            "-crf",
-            str(self.crf),
+        ]
+        if self.bitrate:
+            # Explicit target bitrate (e.g. "80M") overrides CRF.
+            cmd += ["-b:v", self.bitrate]
+        else:
+            cmd += ["-crf", str(self.crf)]
+        cmd += [
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -206,6 +285,7 @@ def run_streaming_pipeline(
     fps: int = 30,
     flip_vertical: bool = True,
     max_frames: int | None = None,
+    bitrate: str | None = None,
 ) -> str:
     """Convenience function to run the streaming pipeline in one call.
 
@@ -240,5 +320,6 @@ def run_streaming_pipeline(
         crf=crf,
         fps=fps,
         flip_vertical=flip_vertical,
+        bitrate=bitrate,
     )
     return pipeline.process_stream(input_path, output_path, max_frames=max_frames)

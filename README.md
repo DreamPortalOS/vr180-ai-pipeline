@@ -93,6 +93,7 @@ python scripts/run_pipeline.py \
   --src-hfov 150 --max-disparity 0.02 --model-size small --codec h265 --crf 18
 ```
 输出为方形每眼 SBS（如 5760×2880），传 Quest 用 Skybox/DeoVR 选「180° 3D (SBS)」。
+质量档位 `--quality {preview,standard,high}`（默认 `standard` = 2880²/眼流式，`high` = 3840²/眼流式，`preview` = 1920²/眼快速迭代）；码率随像素面积自适应缩放。
 
 ### 提升清晰度（强烈推荐）
 先用 SeedVR2 把源片升采样到 ~2K–4K，再跑上面的转换。部署见 **[docs/SEEDVR2_SETUP.md](docs/SEEDVR2_SETUP.md)**（Windows/4070S 走 ComfyUI）。

@@ -40,7 +40,12 @@ from pipeline.fulldome_mapper import FulldomeMapper
 from pipeline.outpainter import Outpainter
 from pipeline.stereo_crafter import StereoCrafterRenderer
 from pipeline.stereo_renderer import StereoRenderer
-from pipeline.streaming_pipeline import StreamingPipeline
+from pipeline.streaming_pipeline import (
+    DEFAULT_QUALITY,
+    StreamingPipeline,
+    resolve_quality,
+    scaled_bitrate_mbps,
+)
 from pipeline.upscaler import PixelUpscaler
 from pipeline.video_upscaler import SeedVR2Upscaler
 from pipeline.vr_metadata import VRMetadataEmbedder
@@ -73,8 +78,25 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--codec", choices=["h264", "h265"], default="h264", help="Output video codec")
     parser.add_argument("--crf", type=int, default=23, help="Constant rate factor")
     parser.add_argument("--fps", type=int, default=None, help="Output frame rate (default: inherit from source video)")
-    parser.add_argument("--output-width", type=int, default=3840, help="Equirectangular output width per eye")
-    parser.add_argument("--output-height", type=int, default=1920, help="Equirectangular output height per eye")
+    parser.add_argument(
+        "--quality",
+        choices=["preview", "standard", "high"],
+        default=DEFAULT_QUALITY,
+        help="Quality preset for per-eye output resolution and memory path: "
+        "preview = 1920²/eye, legacy fast path (lowest RAM, for iteration); "
+        "standard = 2880²/eye, streaming (O(1) RAM) — default; "
+        "high = 3840²/eye, streaming (O(1) RAM, sharpest on Quest-class HMDs). "
+        "Explicit --output-width/--output-height override the preset resolution. "
+        "Output bitrate scales with pixel area (capped by --max-bitrate).",
+    )
+    parser.add_argument(
+        "--max-bitrate",
+        type=float,
+        default=200.0,
+        help="Cap for the pixel-area-scaled output bitrate in Mbps (default: 200)",
+    )
+    parser.add_argument("--output-width", type=int, default=None, help="Equirectangular output width per eye")
+    parser.add_argument("--output-height", type=int, default=None, help="Equirectangular output height per eye")
     parser.add_argument("--src-hfov", type=float, default=70.0, help="Source camera horizontal FOV (degrees)")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of frames (for testing)")
     parser.add_argument("--no-temporal", action="store_true", help="Disable temporal smoothing")
@@ -588,6 +610,7 @@ def run_metadata_stage(args, sbs_frames):
         codec=args.codec,
         crf=args.crf,
         fps=args.fps,
+        bitrate=args.bitrate,
     )
 
     output_path = get_output_path(args)
@@ -915,8 +938,30 @@ def get_resume_start_stage(temp_dir: str):
     return 0
 
 
+def apply_quality_preset(args):
+    """Resolve --quality into concrete resolution / streaming / bitrate defaults.
+
+    Explicit --output-width/--output-height/--bitrate/--streaming always win;
+    the preset only fills in values the user did not specify.
+    """
+    eye_size, streaming = resolve_quality(args.quality, args.output_width)
+    args.output_width = eye_size
+    if args.output_height is None:
+        args.output_height = eye_size
+    if streaming and not args.streaming and args.projection == "vr180":
+        args.streaming = True
+        log.info("🎚️  --quality %s → %d²/eye, streaming mode (O(1) memory)", args.quality, eye_size)
+    else:
+        log.info("🎚️  --quality %s → %d²/eye", args.quality, eye_size)
+    if args.bitrate is None:
+        mbps = scaled_bitrate_mbps(eye_size, max_mbps=args.max_bitrate)
+        args.bitrate = f"{mbps:g}M"
+        log.info("📶 Adaptive bitrate: %.1f Mbps (scaled from 1920² baseline)", mbps)
+
+
 def main():
     args = parse_args()
+    apply_quality_preset(args)
 
     # R-1: SeedVR2 pre-stage — upscale the input video file before any frame loading
     if args.video_upscale == "seedvr2":
@@ -958,6 +1003,7 @@ def main():
             codec=args.codec,
             crf=args.crf,
             fps=args.fps,
+            bitrate=args.bitrate,
         )
         output = get_output_path(args)
         result = pipeline.process_stream(args.input, output, max_frames=args.max_frames)
