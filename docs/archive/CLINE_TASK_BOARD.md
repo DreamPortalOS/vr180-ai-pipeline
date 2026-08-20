@@ -1,3 +1,6 @@
+> **[已归档 2026-08-21]** cline 派单机制已退役，任务派发改为 GitHub Issues（`stage:ready` 标签）
+> 由本地 cockpit lane 轮询执行。worker 行为规范见仓根 `CLAUDE.md`。本文件仅作历史记录。
+
 # CLINE Task Board — VR180 AI Pipeline
 
 **Repo:** `github.com/DreamPortalOS/vr180-ai-pipeline`

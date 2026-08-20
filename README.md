@@ -2,7 +2,7 @@
 
 > 把普通 2D 视频（含 AI 生成的 FPV 素材）转换成**沉浸式视频**。当前聚焦**转换工作流与画面清晰度**。
 
-本文件是项目总入口。详细规划见 [docs/SOLUTION_ARCHITECTURE.md](docs/SOLUTION_ARCHITECTURE.md) 与 [docs/ROADMAP.md](docs/ROADMAP.md)；当前任务见 [CLINE_TASK_BOARD.md](CLINE_TASK_BOARD.md)。
+本文件是项目总入口。详细规划见 [docs/SOLUTION_ARCHITECTURE.md](docs/SOLUTION_ARCHITECTURE.md) 与 [docs/ROADMAP.md](docs/ROADMAP.md)；当前任务见 [GitHub Issues](https://github.com/DreamPortalOS/vr180-ai-pipeline/issues)（`stage:ready` = 待开发队列）。
 
 ---
 
@@ -37,16 +37,20 @@
 
 ```
 vr180-ai-pipeline/
-├── CLINE_TASK_BOARD.md          # ★ 任务看板（lead 派活、cline 执行）
-├── .clinerules                  # ★ cline 自主开发协议
+├── CLAUDE.md                    # ★ 自主 worker 行为规范（cockpit 派单执行）
 ├── pipeline/                    # 核心转换管线
-│   ├── depth_estimator.py       #   深度估计（路线2）
+│   ├── depth_estimator.py       #   深度估计（Depth-Anything-V2，路线2）
+│   ├── depth_crafter.py         #   DepthCrafter 时序深度（可插拔后端）
 │   ├── stereo_renderer.py       #   立体视差渲染（路线2）
-│   ├── equirectangular_mapper.py#   等距投影（路线2）
+│   ├── stereo_crafter.py        #   StereoCrafter 补遮挡（可插拔后端）
+│   ├── equirectangular_mapper.py#   等距投影（含 map_sequence 批处理）
+│   ├── fulldome_mapper.py       #   路线1 球幕渲染器（v360 鱼眼）
+│   ├── outpainter.py            #   180° 边界外绘
+│   ├── video_upscaler.py        #   SeedVR2 源片超分（CUDA）
 │   ├── spherical_injector.py    #   sv3d/st3d 注入（spatialmedia）
 │   ├── vr_metadata.py / spatial_converter.py / streaming_pipeline.py / upscaler.py
-│   ├── prompt_builder.py        #   VR180 友好 prompt 包装
-│   └── (待建) fulldome_mapper.py #   路线1 球幕渲染器（看板 R-5）
+│   └── prompt_builder.py        #   VR180 友好 prompt 包装
+├── integrations/                # 生成层（Kling / Seedance / Veo）
 ├── scripts/run_pipeline.py      #   CLI 跑完整管线
 ├── tests/                       # pytest（CI 把关）
 ├── docs/                        # 文档（见下方索引）
@@ -101,25 +105,29 @@ pytest -q
 
 ---
 
-## 协作模式
-**lead（Claude Code）** 分析/规划/审查/QA + 写任务规格到 `CLINE_TASK_BOARD.md`；**cline** 按看板自主编码、自测、开 PR；**项目所有者** 实测效果、定方向、合并 PR。lead 的 git 操作走独立 `git worktree`，避免与 cline 抢工作区。详见 [.clinerules](.clinerules)。
+## 协作模式（2026-08 起：cockpit 派单）
+**lead（Claude）** 作为 PM/架构师写详细任务卡到 **GitHub Issues**（打 `stage:ready` + `model:cheap` 标签）；
+本地 **cockpit lane** 轮询领卡，派 worker（当前引擎 **kimi-k3**，网关探活失败自动回落 deepseek）在隔离
+worktree 里实现、自测、开 PR；自动评审（CI 绿 + AI 评审）squash 合并；**项目所有者** 通过仓根
+`WORKLOG.md`（本地异步工作台）实测打分、定方向。worker 行为规范见 [CLAUDE.md](CLAUDE.md)。
 
-## 当前进展
-- ✅ 转换管线（深度/立体/等距/VR 元数据）跑通；VR180 输出格式正确（方形每眼 + `sv3d`/`st3d`）。
-- ✅ 仓库精简：平台层归档，主线聚焦转换。
-- ▶ **路线1 球幕渲染器（R-5）** 进行中；**SeedVR2 源片超分** 部署中（清晰度关键）。
-- 🔜 路线2 立体画质：DepthCrafter + StereoCrafter（治重影/致晕，需 GPU）。
+## 当前进展（2026-08-21）
+- ✅ 转换管线全链路跑通：SeedVR2 超分 → 深度/立体 → 等距/鱼眼投影 → `sv3d`/`st3d` 注入（PR #1–#32 全部合并）。
+- ✅ 路线1 球幕渲染器（fulldome）、180° 外绘、批处理等距投影（~10×）、生成层（Kling/Seedance/Veo）落地。
+- ▶ **画质冲刺**：Quest 实测暴露两大主因 —— 每眼 1920px 太低（→ 流式 3840/眼）+ 视差 0.02 太弱且深度噪声大
+  （→ 参数扫描 + Mac 上 DepthCrafter/StereoCrafter）。当前任务队列见 GitHub Issues。
+- 🔜 跨机工作流：Windows（SeedVR2/CUDA）↔ Mac M2 Max（重深度/立体模型，MPS）分段接力。
 
 ## 文档索引
 | 文档 | 内容 |
 |------|------|
-| [CLINE_TASK_BOARD.md](CLINE_TASK_BOARD.md) | ★ 当前任务看板 |
+| [CLAUDE.md](CLAUDE.md) | ★ 自主 worker 行为规范 |
 | [docs/SOLUTION_ARCHITECTURE.md](docs/SOLUTION_ARCHITECTURE.md) | ★ 两路线系统方案 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 执行路线图（里程碑） |
 | [docs/SEEDVR2_SETUP.md](docs/SEEDVR2_SETUP.md) | SeedVR2 在 4070S 上的部署 |
 | [docs/COMPETITOR_AND_BUSINESS.md](docs/COMPETITOR_AND_BUSINESS.md) | buildvr.ai 竞品逆向（技术+商业） |
 | [docs/STRATEGY_AI_VR180.md](docs/STRATEGY_AI_VR180.md) · [docs/PROMPT_GUIDE_VR180.md](docs/PROMPT_GUIDE_VR180.md) | 技术路线 / Prompt 指南 |
-| [.clinerules](.clinerules) | cline 自主开发协议 |
+| [docs/archive/](docs/archive/) | 历史过程文件（cline 看板/协议等） |
 
 ## License
 MIT — 见 [LICENSE](LICENSE)。

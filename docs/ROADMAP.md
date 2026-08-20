@@ -3,7 +3,23 @@
 _Last updated: 2026-06-24. Owner tags: **[cline]** local autonomous dev · **[GPU]** needs remote GPU · **[lead]** orchestration/integration/review · **[user]** decision/credentials needed._
 
 This is the **execution** plan (what to build, in what order, with done-criteria).
-`docs/PRD-v2-vr180-studio.md` is the product vision; `CLINE_TASK_BOARD.md` is the live tactical queue cline pulls from.
+`docs/PRD-v2-vr180-studio.md` is the product vision; the live tactical queue is now
+**GitHub Issues** (`stage:ready` label) executed by cockpit workers — see `CLAUDE.md`.
+
+---
+
+## 2026-08-21 状态快照与新冲刺（Quality Sprint v3）
+
+**已落地**（PR #1–#32 全部合并）：M0 稳定化 ✅ · M1a 几何/舒适默认值 ✅（#22）· SeedVR2 集成 ✅（#26/#27，4070S 已部署）·
+fulldome 渲染器 ✅（#17）· DepthCrafter/StereoCrafter 可插拔封装 ✅（#28，真实推理待 Mac 部署）· 批处理等距 ~10× ✅（#29）·
+180° 外绘 ✅（#31）· 生成层 Kling/Seedance/Veo ✅（#32）。Prompt 工程已砍掉（实测 Veo 对提示词不敏感）。
+
+**Quest 实测结论（2026-06-27，全维度 1 分）→ 两个根因**：
+1. **清晰度**：每眼仅 1920px（为省内存压的），180° 铺开像素密度极低。管线自带流式 O(1) 内存模式可出 3840–7680/眼 → **做成默认高清路径**。
+2. **重影/立体弱**：视差 0.02 太保守 + 单帧深度噪声大 → 短期做**参数扫描 A/B 工具**（视差/汇聚面），长期靠 Mac (M2 Max) 跑 DepthCrafter/StereoCrafter 出干净深度与补遮挡。
+
+**新冲刺任务卡（GitHub Issues，V-1 … V-6）**：V-1 高清流式默认路径（P0）· V-2 立体参数扫描工具（P0）·
+V-3 跨机分段管线 + job manifest（P1）· V-4 长片分块内存管理（P1）· V-5 VR180 输出 QA 校验器（P2）· V-6 fulldome 定位文档（P2）。
 
 ---
 
