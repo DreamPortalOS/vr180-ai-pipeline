@@ -127,6 +127,7 @@ worktree 里实现、自测、开 PR；自动评审（CI 绿 + AI 评审）squas
 | [docs/SEEDVR2_SETUP.md](docs/SEEDVR2_SETUP.md) | SeedVR2 在 4070S 上的部署 |
 | [docs/COMPETITOR_AND_BUSINESS.md](docs/COMPETITOR_AND_BUSINESS.md) | buildvr.ai 竞品逆向（技术+商业） |
 | [docs/STRATEGY_AI_VR180.md](docs/STRATEGY_AI_VR180.md) · [docs/PROMPT_GUIDE_VR180.md](docs/PROMPT_GUIDE_VR180.md) | 技术路线 / Prompt 指南 |
+| [docs/FULLDOME_USAGE.md](docs/FULLDOME_USAGE.md) | fulldome 输出定位与预览（⚠️ 非头显格式） |
 | [docs/archive/](docs/archive/) | 历史过程文件（cline 看板/协议等） |
 
 ## License
