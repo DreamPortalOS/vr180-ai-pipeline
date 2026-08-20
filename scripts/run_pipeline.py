@@ -136,7 +136,8 @@ def parse_args(argv: list[str] | None = None):
         "--projection",
         choices=["vr180", "fulldome"],
         default="vr180",
-        help="Output projection: vr180 (stereo spherical) or fulldome (mono fisheye, default vr180)",
+        help="Output projection: vr180 (stereo spherical) or fulldome (mono fisheye, default vr180). "
+        "⚠️ fulldome 球幕/桌面用，不适用于 VR 头显——头显请用 vr180",
     )
     parser.add_argument(
         "--dome-fov", type=float, default=180.0, help="Fulldome fisheye FOV in degrees (default 180, max ~220)"
