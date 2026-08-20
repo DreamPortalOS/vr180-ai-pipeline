@@ -3,8 +3,9 @@
 #   pre-commit install --hook-type pre-commit --hook-type pre-push
 # Run all: pre-commit run --all-files
 #
-# IMPORTANT: ruff rev MUST match CI (.github/workflows/ci.yml installs latest ruff)
+# IMPORTANT: ruff rev MUST match CI (.github/workflows/ci.yml pins ruff==0.15.18)
 # and the local venv. A version mismatch is why lint can pass locally but fail in CI.
+# Bump both places together.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.18

@@ -1,3 +1,6 @@
+> **[已归档 2026-08-21]** 原仓根 `.clinerules`（cline 自主开发协议）。cline 机制已退役，
+> 现行 worker 规范见仓根 `CLAUDE.md`。本文件仅作历史记录。
+
 # 🤖 Universal Ultimate Autonomy Protocol (YOLO Long-Cycle Edition)
 
 ## 🚨 1. THE GOLDEN RULE: ANTI-HALT PROTOCOL (绝对死命令)

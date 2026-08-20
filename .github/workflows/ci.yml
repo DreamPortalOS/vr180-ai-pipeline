@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# 同一分支的旧跑批直接取消，省 runner 时间，也避免评审门看到过期的 pending。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -14,7 +19,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install ruff
+          cache: pip
+      # 版本必须与 .pre-commit-config.yaml 的 ruff rev 一致，否则本地绿 CI 红。
+      - run: pip install ruff==0.15.18
       - run: ruff check pipeline/ scripts/ tests/
       - run: ruff format --check pipeline/ scripts/ tests/
 
