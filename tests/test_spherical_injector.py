@@ -150,3 +150,98 @@ class TestBoxFinding:
         buf = bytearray(outer)
         pos = _find_box_recursive(buf, b"stsd", 0, len(buf))
         assert pos == 8  # moov header size
+
+
+class TestSpecLayoutScanning:
+    """Regression tests for issue #46: sv3d/st3d live inside stsd sample entries.
+
+    Per Google Spherical Video V2, sv3d/st3d hang inside the visual sample
+    entry (avc1/hvc1/...) of the stsd box — not directly under stbl. The old
+    scanner only descended moov/trak/mdia/minf/stbl, so real injected files
+    were false-negatives. Structures here are hand-built from raw bytes, no
+    ffmpeg or real media needed.
+    """
+
+    def _make_box(self, type_: bytes, body: bytes = b"") -> bytes:
+        size = 8 + len(body)
+        return struct.pack(">I", size) + type_ + body
+
+    def _make_stsd(self, entries: bytes) -> bytes:
+        """stsd FullBox: header(8) + version/flags(4) + entry_count(4) + entries."""
+        return self._make_box(b"stsd", b"\x00\x00\x00\x00" + struct.pack(">I", 1) + entries)
+
+    def _make_visual_sample_entry(self, codec: bytes, children: bytes) -> bytes:
+        """VisualSampleEntry: header(8) + 78 bytes fixed fields + child boxes."""
+        fixed = b"\x00" * 78
+        return self._make_box(codec, fixed + children)
+
+    def _make_spec_tree(self, leaf: bytes) -> bytes:
+        """moov > trak > mdia > minf > stbl > stsd > hvc1 > leaf."""
+        stsd = self._make_stsd(self._make_visual_sample_entry(b"hvc1", leaf))
+        stbl = self._make_box(b"stbl", stsd)
+        minf = self._make_box(b"minf", stbl)
+        mdia = self._make_box(b"mdia", minf)
+        trak = self._make_box(b"trak", mdia)
+        return self._make_box(b"moov", trak)
+
+    def test_finds_st3d_and_sv3d_in_sample_entry(self):
+        st3d = self._make_box(b"st3d", b"\x00\x00\x00\x00\x02")
+        sv3d = self._make_box(b"sv3d", b"payload")
+        buf = bytearray(self._make_spec_tree(st3d + sv3d))
+
+        st3d_pos = _find_box_recursive(buf, b"st3d", 0, len(buf))
+        sv3d_pos = _find_box_recursive(buf, b"sv3d", 0, len(buf))
+
+        assert st3d_pos != -1
+        assert sv3d_pos != -1
+        assert bytes(buf[st3d_pos + 4 : st3d_pos + 8]) == b"st3d"
+        assert bytes(buf[sv3d_pos + 4 : sv3d_pos + 8]) == b"sv3d"
+        # sv3d immediately follows st3d in the sample entry
+        st3d_size = struct.unpack(">I", buf[st3d_pos : st3d_pos + 4])[0]
+        assert sv3d_pos == st3d_pos + st3d_size
+
+    def test_offset_is_absolute(self):
+        """Found offset must be absolute from buffer start, verifiable by re-parse."""
+        st3d = self._make_box(b"st3d", b"\x00\x00\x00\x00\x02")
+        buf = bytearray(self._make_spec_tree(st3d))
+        pos = _find_box_recursive(buf, b"st3d", 0, len(buf))
+        # Re-read size/type at the returned offset to prove it points at the box
+        size = struct.unpack(">I", buf[pos : pos + 4])[0]
+        assert size == len(st3d)
+        assert bytes(buf[pos + 4 : pos + 8]) == b"st3d"
+
+    def test_each_visual_sample_entry_codec(self):
+        """All supported visual sample entry types must be descended into."""
+        for codec in (b"avc1", b"avc3", b"hvc1", b"hev1", b"av01", b"vp09", b"mp4v"):
+            st3d = self._make_box(b"st3d", b"\x00\x00\x00\x00\x02")
+            stsd = self._make_stsd(self._make_visual_sample_entry(codec, st3d))
+            buf = bytearray(self._make_box(b"stbl", stsd))
+            assert _find_box_recursive(buf, b"st3d", 0, len(buf)) != -1, codec
+
+    def test_returns_minus_one_when_absent(self):
+        """Same tree shape but no spherical boxes → -1, no false positive."""
+        other = self._make_box(b"avcC", b"\x01\x02\x03")
+        buf = bytearray(self._make_spec_tree(other))
+        assert _find_box_recursive(buf, b"st3d", 0, len(buf)) == -1
+        assert _find_box_recursive(buf, b"sv3d", 0, len(buf)) == -1
+
+    def test_truncated_sample_entry_does_not_raise(self):
+        """A sample entry whose declared size is smaller than its fixed header
+        must be skipped (bounds check), not crash with a bare exception."""
+        # hvc1 claims size 20 — far less than 8+78 header; children unreachable
+        bad_entry = struct.pack(">I", 20) + b"hvc1" + b"\x00" * 12
+        stsd = self._make_stsd(bad_entry)
+        buf = bytearray(self._make_box(b"stbl", stsd))
+        assert _find_box_recursive(buf, b"st3d", 0, len(buf)) == -1
+
+    def test_truncated_stsd_does_not_raise(self):
+        """stsd claiming fewer bytes than its 16-byte FullBox header is skipped."""
+        bad_stsd = struct.pack(">I", 12) + b"stsd" + b"\x00" * 4
+        buf = bytearray(self._make_box(b"stbl", bad_stsd))
+        assert _find_box_recursive(buf, b"st3d", 0, len(buf)) == -1
+
+    def test_stbl_direct_children_still_found(self):
+        """Boxes directly under stbl (old behavior) must keep working."""
+        st3d = self._make_box(b"st3d", b"\x00\x00\x00\x00\x02")
+        buf = bytearray(self._make_box(b"stbl", st3d))
+        assert _find_box_recursive(buf, b"st3d", 0, len(buf)) == 8
