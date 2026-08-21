@@ -166,7 +166,9 @@ class TestStreamingPipeline(unittest.TestCase):
         """_build_ffmpeg_cmd uses libx265 for h265 codec."""
         from pipeline.streaming_pipeline import StreamingPipeline
 
-        p = StreamingPipeline(codec="h265")
+        # hw_encoder=False pins the software path (issue #49: on CUDA machines
+        # auto mode may select hevc_nvenc, making this assertion machine-dependent).
+        p = StreamingPipeline(codec="h265", hw_encoder=False)
         cmd = p._build_ffmpeg_cmd("/tmp/out.mp4", 7680, 1920)
         self.assertIn("libx265", cmd)
 
