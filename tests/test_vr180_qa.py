@@ -1,13 +1,16 @@
 """Tests for scripts/vr180_qa.py — VR180 output QA validator.
 
 ffprobe is mocked; mp4 box layer uses real spherical_injector primitives to
-build tiny synthetic ISOBMFF files (ftyp + moov/trak/mdia/minf/stbl) so the
-box scanning runs against real bytes, not mocks.
+build tiny synthetic ISOBMFF files so the box scanning runs against real
+bytes, not mocks. The synthetic layout follows the Google Spherical V2 spec:
+sv3d/st3d live inside stsd's visual sample entry (hvc1), i.e.
+moov > trak > mdia > minf > stbl > stsd(entry_count=1) > hvc1 > sv3d + st3d.
 """
 
 from __future__ import annotations
 
 import json
+import struct
 
 import pytest
 from scripts import vr180_qa
@@ -20,9 +23,17 @@ from scripts.vr180_qa import (
 from pipeline.spherical_injector import _box4, _build_st3d, _build_sv3d
 
 
+def _stsd_with_hvc1(children: bytes) -> bytes:
+    """stsd FullBox (version/flags + entry_count=1) wrapping one hvc1 visual
+    sample entry (78-byte fixed header) that carries *children* boxes."""
+    hvc1 = _box4(b"hvc1", b"\x00" * 78 + children)
+    return _box4(b"stsd", b"\x00\x00\x00\x00" + struct.pack(">I", 1) + hvc1)
+
+
 def _make_mp4(tmp_path, name: str, boxes: bytes = b"") -> str:
-    """Build a minimal synthetic mp4 with the given boxes inside stbl."""
-    stbl = _box4(b"stbl", boxes)
+    """Build a minimal synthetic mp4 with the given boxes inside the hvc1
+    sample entry of stsd (the spec location for sv3d/st3d)."""
+    stbl = _box4(b"stbl", _stsd_with_hvc1(boxes))
     minf = _box4(b"minf", stbl)
     mdia = _box4(b"mdia", minf)
     trak = _box4(b"trak", mdia)

@@ -119,13 +119,26 @@ def _find_box_at(buf: bytearray, box_type: bytes, start: int, end: int) -> int:
     return -1
 
 
+# Plain container boxes: child boxes start right after the 8-byte header.
+_PLAIN_CONTAINERS = frozenset({b"moov", b"trak", b"mdia", b"minf", b"stbl"})
+
+# stsd is a FullBox: version/flags(4) + entry_count(4) precede the sample entries.
+_STSD_HEADER_SIZE = 16
+
+# Visual sample entries (avc1/hvc1/...) carry 78 bytes of fixed fields after the
+# 8-byte box header before any child boxes (sv3d/st3d live here per Spherical V2).
+_VISUAL_SAMPLE_ENTRIES = frozenset({b"avc1", b"avc3", b"hvc1", b"hev1", b"av01", b"vp09", b"mp4v"})
+_SAMPLE_ENTRY_HEADER_SIZE = 8 + 78
+
+
 def _find_box_recursive(buf: bytearray, box_type: bytes, start: int, end: int) -> int:
     """Recursively search for an ISOBMFF box inside containers.
 
-    Searches top-level boxes, and recurses into containers (moov, trak, mdia, minf, stbl).
+    Searches top-level boxes, and recurses into containers (moov, trak, mdia,
+    minf, stbl), into stsd (FullBox + entry_count), and into visual sample
+    entries (avc1/hvc1/... — where Spherical V2 sv3d/st3d actually live).
     Returns byte offset of the found box, or -1.
     """
-    containers = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
     pos = start
     while pos + 8 <= end:
         size = struct.unpack(">I", buf[pos : pos + 4])[0]
@@ -134,10 +147,19 @@ def _find_box_recursive(buf: bytearray, box_type: bytes, start: int, end: int) -
         btype = bytes(buf[pos + 4 : pos + 8])
         if btype == box_type:
             return pos
-        if btype in containers:
+        if btype in _PLAIN_CONTAINERS:
             inner_start = pos + 8
-            inner_end = pos + size
-            found = _find_box_recursive(buf, box_type, inner_start, inner_end)
+        elif btype == b"stsd":
+            inner_start = pos + _STSD_HEADER_SIZE
+        elif btype in _VISUAL_SAMPLE_ENTRIES:
+            inner_start = pos + _SAMPLE_ENTRY_HEADER_SIZE
+        else:
+            pos += size
+            continue
+        # Bounds check: skip boxes whose declared header overruns the buffer
+        # instead of raising on a truncated/corrupt file.
+        if inner_start <= pos + size:
+            found = _find_box_recursive(buf, box_type, inner_start, pos + size)
             if found != -1:
                 return found
         pos += size
