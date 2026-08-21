@@ -231,3 +231,25 @@ class TestCLI:
         rc = main(["--input", "a.mp4", "--outdir", str(tmp_path), "--convergences", "bogus"])
         assert rc == 1
         assert "unknown convergence" in capsys.readouterr().err
+
+
+class TestPreparePipelineArgs:
+    """The sweep must hand stage functions *fully resolved* pipeline args.
+
+    Regression for the V-1/V-2 integration seam: --quality presets (#34)
+    leave output_width/height/bitrate as None until apply_quality_preset
+    runs. The sweep calls stage functions directly (bypassing
+    run_pipeline.main), so it must resolve the presets itself — otherwise
+    the equirect stage crashes on None dimensions at real render time
+    (unit tests with a fake runner never see it).
+    """
+
+    def test_resolves_quality_preset_defaults(self) -> None:
+        from scripts.stereo_sweep import prepare_pipeline_args
+
+        variant = {"max_disparity": 0.06, "convergence_name": "mid", "convergence": 0.30}
+        args = prepare_pipeline_args("in.mp4", "out.mp4", variant)
+        assert args.output_width is not None and args.output_width > 0
+        assert args.output_height is not None and args.output_height > 0
+        assert args.bitrate is not None
+        assert args.max_disparity == 0.06
