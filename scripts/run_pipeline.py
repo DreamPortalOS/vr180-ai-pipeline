@@ -1007,7 +1007,25 @@ def main():
         )
         output = get_output_path(args)
         result = pipeline.process_stream(args.input, output, max_frames=args.max_frames)
-        log.info(f"✅ Streaming pipeline complete → {result}")
+        # Inject sv3d/st3d VR metadata so HMDs recognise the stream as 180° 3D
+        # (issue #45 defect 2: streaming path previously skipped this entirely).
+        # SBS frame is (2×output_width) × output_height (horizontal concat).
+        from pipeline.spherical_injector import inject_spherical_metadata
+
+        injected = result + ".vr.mp4"
+        try:
+            inject_spherical_metadata(
+                result,
+                injected,
+                width=args.output_width * 2,
+                height=args.output_height,
+                stereo_mode="sbs",
+            )
+        except Exception as e:
+            log.error(f"❌ VR metadata injection failed for {result}: {e}")
+            raise
+        os.replace(injected, result)
+        log.info(f"✅ Streaming pipeline complete (sv3d/st3d injected) → {result}")
         return
 
     # R-5: Fulldome projection mode — skip all depth/stereo/equirect/metadata

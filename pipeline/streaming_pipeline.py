@@ -5,6 +5,7 @@ processes depth → stereo → equirect, and writes directly to an ffmpeg output
 No frame buffers accumulate in RAM.
 """
 
+import contextlib
 import logging
 import subprocess
 
@@ -32,6 +33,46 @@ QUALITY_PRESETS: dict[str, int] = {
     "high": 3840,
 }
 DEFAULT_QUALITY = "standard"
+
+# H.264 NVENC hardware width cap: frames wider than this need HEVC (issue #45).
+NVENC_MAX_WIDTH = 4096
+
+
+def select_encoder(codec: str, sbs_width: int, hw: bool = False) -> list[str]:
+    """Pick the ffmpeg encoder args for an SBS frame of the given width.
+
+    Large-frame safety (issue #45 defect 3): libx264 on an 8K-class SBS frame
+    (7680×3840) exhausts process RAM during encoder init, and H.264 NVENC
+    hard-caps at 4096 px wide — so wide frames must use HEVC.
+
+    Args:
+        codec: Requested codec ('h264' or 'h265').
+        sbs_width: Full side-by-side frame width in pixels (2× per-eye width).
+        hw: Whether NVENC hardware encoding is available.
+
+    Returns:
+        ffmpeg encoder args, e.g. ``["-c:v", "hevc_nvenc"]`` or
+        ``["-c:v", "libx265", "-preset", "fast"]``.
+
+    Raises:
+        ValueError: If libx264 would be used on a frame wider than
+            NVENC_MAX_WIDTH (the known OOM configuration).
+    """
+    if hw:
+        if sbs_width > NVENC_MAX_WIDTH:
+            return ["-c:v", "hevc_nvenc"]
+        return ["-c:v", "h264_nvenc" if codec == "h264" else "hevc_nvenc"]
+
+    # Software encoding.
+    if codec == "h265" or sbs_width > NVENC_MAX_WIDTH:
+        if codec == "h264" and sbs_width > NVENC_MAX_WIDTH:
+            log.warning(
+                f"⚠️  SBS width {sbs_width} > {NVENC_MAX_WIDTH}: libx264 would OOM on "
+                "frames this large — forcing libx265 (-preset fast). Expect high RAM "
+                "usage; use a CUDA machine for hardware encoding if possible."
+            )
+        return ["-c:v", "libx265", "-preset", "fast"]
+    return ["-c:v", "libx264"]
 
 
 def resolve_quality(
@@ -117,6 +158,7 @@ class StreamingPipeline:
         crf: int = 23,
         fps: int = 30,
         bitrate: str | None = None,
+        hw_encoder: bool | None = None,
     ):
         self.model_size = model_size
         self.device = resolve_device(device)
@@ -129,6 +171,9 @@ class StreamingPipeline:
         self.crf = crf
         self.fps = fps
         self.bitrate = bitrate
+        # Hardware (NVENC) encoding: auto-enabled on CUDA machines unless
+        # explicitly overridden (injectable for tests — issue #45 defect 3).
+        self.hw_encoder = self.device.startswith("cuda") if hw_encoder is None else hw_encoder
 
         # Initialise pipeline stages
         self.depth_estimator = DepthEstimator(
@@ -153,9 +198,6 @@ class StreamingPipeline:
         Returns:
             List of command-line arguments for subprocess.
         """
-        codec_map = {"h264": "libx264", "h265": "libx265"}
-        enc_codec = codec_map.get(self.codec, "libx264")
-
         cmd = [
             "ffmpeg",
             "-y",
@@ -171,9 +213,11 @@ class StreamingPipeline:
             str(self.fps),
             "-i",
             "pipe:0",
-            "-c:v",
-            enc_codec,
         ]
+        # Encoder chosen by frame size + hardware availability (issue #45
+        # defect 3): libx264 OOMs on >4096-wide SBS frames; NVENC H.264 caps
+        # at 4096 wide so 8K-class output must go through HEVC.
+        cmd += select_encoder(self.codec, width, hw=self.hw_encoder)
         if self.bitrate:
             # Explicit target bitrate (e.g. "80M") overrides CRF.
             cmd += ["-b:v", self.bitrate]
@@ -189,10 +233,14 @@ class StreamingPipeline:
         return cmd
 
     def _open_ffmpeg_writer(self, output_path: str, width: int, height: int) -> subprocess.Popen:
-        """Open an ffmpeg subprocess that accepts raw RGB frames on stdin."""
+        """Open an ffmpeg subprocess that accepts raw RGB frames on stdin.
+
+        stderr is discarded (DEVNULL): an undrained PIPE fills its 64 KB
+        buffer and deadlocks the whole pipeline (same class of bug as #21).
+        """
         cmd = self._build_ffmpeg_cmd(output_path, width, height)
         log.info(f"ffmpeg cmd: {' '.join(cmd)}")
-        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def process_stream(
         self,
@@ -225,11 +273,14 @@ class StreamingPipeline:
             total = min(total, max_frames)
 
         log.info(f"Input: {in_w}×{in_h}, {fps:.2f} fps, {total} frames")
-        log.info(f"Target output: {self.output_width}×{self.output_height} (SBS)")
 
-        # SBS output = side-by-side stereo: 2× the equirect width
-        out_w = self.output_width
-        out_h = self.output_height * 2
+        # SBS output = side-by-side stereo: map_stereo_pair concatenates
+        # left|right horizontally (axis=1), so the frame is (H, 2W, 3) —
+        # the declared ffmpeg size must be 2W×H, not W×2H (issue #45 defect 1:
+        # the old W×2H declaration produced row-interleaved garbage video).
+        out_w = self.output_width * 2
+        out_h = self.output_height
+        log.info(f"Target output: {out_w}×{out_h} (SBS, {self.output_width}² per eye)")
 
         proc = self._open_ffmpeg_writer(output_path, out_w, out_h)
 
@@ -252,7 +303,14 @@ class StreamingPipeline:
                 sbs = self.eq_mapper.map_stereo_pair(left, right)
 
                 # Write raw RGB to ffmpeg pipe
-                proc.stdin.write(sbs.tobytes())
+                try:
+                    proc.stdin.write(sbs.tobytes())
+                except BrokenPipeError:
+                    raise RuntimeError(
+                        f"ffmpeg encoder died after {frame_idx} frames — "
+                        "check encoder availability/limits for this resolution "
+                        f"({out_w}×{out_h})"
+                    ) from None
 
                 # Release intermediates to keep memory O(1)
                 del depth, left, right, sbs, rgb, bgr
@@ -263,8 +321,19 @@ class StreamingPipeline:
 
         finally:
             cap.release()
-            proc.stdin.close()
+            # encoder may already be dead; returncode check below reports it
+            with contextlib.suppress(BrokenPipeError, OSError):
+                proc.stdin.close()
             proc.wait()
+
+        # Reached only when the loop finished without an exception — a non-zero
+        # exit here means ffmpeg failed silently (would previously return
+        # "success" with a corrupt/empty file).
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg encoding failed (exit code {proc.returncode}) after "
+                f"{frame_idx} frames — rerun with stderr visible to see the ffmpeg error"
+            )
 
         log.info(f"✅ Streaming complete: {frame_idx} frames → {output_path}")
         return output_path
@@ -286,6 +355,7 @@ def run_streaming_pipeline(
     flip_vertical: bool = True,
     max_frames: int | None = None,
     bitrate: str | None = None,
+    hw_encoder: bool | None = None,
 ) -> str:
     """Convenience function to run the streaming pipeline in one call.
 
@@ -321,5 +391,6 @@ def run_streaming_pipeline(
         fps=fps,
         flip_vertical=flip_vertical,
         bitrate=bitrate,
+        hw_encoder=hw_encoder,
     )
     return pipeline.process_stream(input_path, output_path, max_frames=max_frames)

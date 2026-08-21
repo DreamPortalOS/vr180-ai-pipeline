@@ -153,12 +153,14 @@ class TestStreamingPipeline(unittest.TestCase):
         """_build_ffmpeg_cmd generates valid ffmpeg command."""
         from pipeline.streaming_pipeline import StreamingPipeline
 
-        p = StreamingPipeline(codec="h264", crf=23, fps=30)
-        cmd = p._build_ffmpeg_cmd("/tmp/out.mp4", 7680, 1920)
+        # hw_encoder=False pins the software path (issue #45: encoder is now
+        # hardware-aware; CI/dev machines with CUDA would otherwise pick NVENC).
+        p = StreamingPipeline(codec="h264", crf=23, fps=30, hw_encoder=False)
+        cmd = p._build_ffmpeg_cmd("/tmp/out.mp4", 3840, 1920)
         self.assertIn("ffmpeg", cmd)
         self.assertIn("libx264", cmd)
         self.assertIn("pipe:0", cmd)
-        self.assertIn("7680x1920", cmd)
+        self.assertIn("3840x1920", cmd)
 
     def test_build_ffmpeg_cmd_h265(self):
         """_build_ffmpeg_cmd uses libx265 for h265 codec."""
