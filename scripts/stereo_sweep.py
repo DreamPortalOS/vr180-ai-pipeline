@@ -149,6 +149,23 @@ def render_variants_md(
 # ---------------------------------------------------------------------------
 
 
+def prepare_pipeline_args(input_path: str, output_path: str, variant: dict):
+    """Build fully-resolved run_pipeline args for one sweep variant.
+
+    ``parse_args`` alone is not a complete contract: the --quality presets
+    (#34) leave ``output_width``/``output_height``/``bitrate`` as ``None``
+    for ``apply_quality_preset`` to fill in (``run_pipeline.main`` does this
+    before any stage runs). Calling the stage functions with the unresolved
+    ``None`` values crashes in the equirect stage, so resolve here too.
+    """
+    from scripts import run_pipeline as rp
+
+    args = rp.parse_args(["--input", input_path, "--output", output_path])
+    rp.apply_quality_preset(args)
+    args.max_disparity = variant["max_disparity"]
+    return args
+
+
 def run_pipeline_variant(
     input_path: str,
     output_path: str,
@@ -168,8 +185,7 @@ def run_pipeline_variant(
     import cv2
     from scripts import run_pipeline as rp
 
-    args = rp.parse_args(["--input", input_path, "--output", output_path])
-    args.max_disparity = variant["max_disparity"]
+    args = prepare_pipeline_args(input_path, output_path, variant)
     if args.device is None:
         from pipeline.device_utils import detect_best_device
 
