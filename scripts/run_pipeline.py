@@ -130,6 +130,15 @@ def parse_args(argv: list[str] | None = None):
     # New: output encoding options
     parser.add_argument("--bitrate", default=None, help="Target bitrate (e.g., 50M). Overrides CRF if set.")
     parser.add_argument("--hardware-encoder", action="store_true", help="Use hardware encoder (VideoToolbox)")
+    parser.add_argument(
+        "--hw-encoder",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="NVENC hardware encoding for the streaming pipeline: "
+        "auto (default) = probe NVENC with a tiny test encode, fall back to software if unavailable; "
+        "on = force NVENC without probing (user takes the risk); "
+        "off = software encoding only (libx264/libx265).",
+    )
 
     # New: input validation
     parser.add_argument(
@@ -1004,6 +1013,7 @@ def main():
             crf=args.crf,
             fps=args.fps,
             bitrate=args.bitrate,
+            hw_encoder=args.hw_encoder,
         )
         output = get_output_path(args)
         result = pipeline.process_stream(args.input, output, max_frames=args.max_frames)

@@ -8,6 +8,7 @@ No frame buffers accumulate in RAM.
 import contextlib
 import logging
 import subprocess
+import tempfile
 
 import cv2
 
@@ -36,6 +37,112 @@ DEFAULT_QUALITY = "standard"
 
 # H.264 NVENC hardware width cap: frames wider than this need HEVC (issue #45).
 NVENC_MAX_WIDTH = 4096
+
+# Process-local NVENC probe cache: encoder name -> (available, stderr_summary).
+# A probe runs ffmpeg once per encoder per process (issue #49).
+_NVENC_PROBE_CACHE: dict[str, tuple[bool, str]] = {}
+
+# How many bytes of stderr tail to keep for diagnostics.
+STDERR_TAIL_BYTES = 4096
+
+
+def _probe_nvenc_detail(encoder: str, ffmpeg: str = "ffmpeg") -> tuple[bool, str]:
+    """Run a minimal ffmpeg job with *encoder* and report availability.
+
+    Returns:
+        (available, stderr_summary) — ``available`` is True only when ffmpeg
+        exits 0; ``stderr_summary`` is the tail of ffmpeg's stderr for logging.
+    """
+    cmd = [
+        ffmpeg,
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=256x256:d=0.1",
+        "-frames:v",
+        "1",
+        "-c:v",
+        encoder,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        # ffmpeg binary missing / failed to launch / timed out.
+        return False, str(e)
+    stderr_tail = (result.stderr or "")[-STDERR_TAIL_BYTES:].strip()
+    return result.returncode == 0, stderr_tail
+
+
+def probe_nvenc(encoder: str, ffmpeg: str = "ffmpeg") -> bool:
+    """Probe whether an NVENC encoder actually works on this machine.
+
+    CUDA being available does NOT imply NVENC works — e.g. driver 580.88 with
+    a newer ffmpeg nightly reports "Driver does not support the required nvenc
+    API version" and the encoder fails to open (issue #49). This runs a tiny
+    synthetic one-frame encode with the target encoder and checks the exit
+    code. The result is cached per encoder for the lifetime of the process.
+
+    Args:
+        encoder: ffmpeg encoder name, e.g. ``hevc_nvenc`` / ``h264_nvenc``.
+        ffmpeg: ffmpeg executable (default ``ffmpeg`` from PATH).
+
+    Returns:
+        True if the encoder successfully encoded one synthetic frame.
+    """
+    if encoder not in _NVENC_PROBE_CACHE:
+        _NVENC_PROBE_CACHE[encoder] = _probe_nvenc_detail(encoder, ffmpeg)
+    return _NVENC_PROBE_CACHE[encoder][0]
+
+
+def _resolve_hw_encoder(
+    device: str,
+    codec: str,
+    sbs_width: int,
+    hw_encoder: bool | str | None,
+) -> bool:
+    """Resolve the effective hardware-encoding flag (issue #49).
+
+    Args:
+        device: Resolved compute device string ("cuda", "mps", "cpu").
+        codec: Requested codec ('h264' or 'h265').
+        sbs_width: Full SBS frame width — determines which NVENC encoder the
+            pipeline would actually use (H.264 NVENC caps at NVENC_MAX_WIDTH).
+        hw_encoder: ``None``/``"auto"`` = probe; ``True``/``"on"`` = force
+            NVENC (skip probe, user takes the risk); ``False``/``"off"`` =
+            software encoding.
+
+    Returns:
+        True to use NVENC, False for software encoding.
+    """
+    if hw_encoder in (True, "on"):
+        return True
+    if hw_encoder in (False, "off"):
+        return False
+    # auto: only CUDA machines can have NVENC at all.
+    if not device.startswith("cuda"):
+        return False
+    # Probe the encoder the pipeline would actually select for this frame size.
+    encoder = select_encoder(codec, sbs_width, hw=True)[1]
+    if probe_nvenc(encoder):
+        return True
+    stderr_summary = _NVENC_PROBE_CACHE.get(encoder, (False, ""))[1]
+    log.warning(
+        "⚠️  NVENC encoder %s unavailable — falling back to software encoding. "
+        "ffmpeg says: %s — 升级 NVIDIA 驱动 ≥610 可启用硬编 (upgrade NVIDIA driver to ≥610 to enable NVENC)",
+        encoder,
+        stderr_summary or "(no stderr)",
+    )
+    return False
 
 
 def select_encoder(codec: str, sbs_width: int, hw: bool = False) -> list[str]:
@@ -158,7 +265,7 @@ class StreamingPipeline:
         crf: int = 23,
         fps: int = 30,
         bitrate: str | None = None,
-        hw_encoder: bool | None = None,
+        hw_encoder: bool | str | None = None,
     ):
         self.model_size = model_size
         self.device = resolve_device(device)
@@ -171,9 +278,17 @@ class StreamingPipeline:
         self.crf = crf
         self.fps = fps
         self.bitrate = bitrate
-        # Hardware (NVENC) encoding: auto-enabled on CUDA machines unless
-        # explicitly overridden (injectable for tests — issue #45 defect 3).
-        self.hw_encoder = self.device.startswith("cuda") if hw_encoder is None else hw_encoder
+        # Hardware (NVENC) encoding — issue #49: CUDA availability does NOT
+        # imply NVENC works (driver/ffmpeg ABI mismatch). "auto" (None) probes
+        # the actual encoder with a tiny synthetic encode and falls back to
+        # software on failure; "on" forces NVENC without probing; "off" forces
+        # software. Booleans kept for backward compatibility (True=on, False=off).
+        self.hw_encoder = _resolve_hw_encoder(
+            self.device,
+            codec,
+            output_width * 2,
+            hw_encoder,
+        )
 
         # Initialise pipeline stages
         self.depth_estimator = DepthEstimator(
@@ -235,12 +350,47 @@ class StreamingPipeline:
     def _open_ffmpeg_writer(self, output_path: str, width: int, height: int) -> subprocess.Popen:
         """Open an ffmpeg subprocess that accepts raw RGB frames on stdin.
 
-        stderr is discarded (DEVNULL): an undrained PIPE fills its 64 KB
-        buffer and deadlocks the whole pipeline (same class of bug as #21).
+        stderr goes to a temp file (issue #49): DEVNULL hid fatal encoder
+        errors (e.g. NVENC driver mismatch), while an undrained PIPE fills its
+        64 KB buffer and deadlocks the pipeline (#21/#45). A file is drained
+        by the OS at no cost, and on failure we read back only the tail for
+        the error message. The file is deleted once the process finishes.
         """
         cmd = self._build_ffmpeg_cmd(output_path, width, height)
         log.info(f"ffmpeg cmd: {' '.join(cmd)}")
-        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Closed later in process_stream's finally (after ffmpeg exits and the
+        # tail has been read), not at this scope's exit — hence no `with`.
+        stderr_file = tempfile.TemporaryFile(prefix="vr180-ffmpeg-stderr-")  # noqa: SIM115
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=stderr_file)
+        # Stash the file object on the process so process_stream can read the
+        # tail on failure and close it afterwards.
+        proc._stderr_file = stderr_file  # type: ignore[attr-defined]
+        return proc
+
+    @staticmethod
+    def _ffmpeg_stderr_summary(proc: subprocess.Popen) -> str:
+        """Read the tail of ffmpeg's captured stderr for error messages."""
+        # vars() not getattr(): mock objects auto-create attributes on access.
+        stderr_file = vars(proc).get("_stderr_file")
+        if stderr_file is None:
+            return "(stderr not captured)"
+        try:
+            stderr_file.flush()
+            stderr_file.seek(0, 2)
+            size = stderr_file.tell()
+            stderr_file.seek(max(0, size - STDERR_TAIL_BYTES))
+            tail = stderr_file.read()
+            text = tail.decode("utf-8", errors="replace").strip()
+            return text or "(ffmpeg produced no stderr output)"
+        except (OSError, ValueError):
+            return "(stderr unreadable)"
+
+    @staticmethod
+    def _close_ffmpeg_stderr(proc: subprocess.Popen) -> None:
+        stderr_file = vars(proc).get("_stderr_file")
+        if stderr_file is not None:
+            with contextlib.suppress(OSError):
+                stderr_file.close()
 
     def process_stream(
         self,
@@ -284,56 +434,70 @@ class StreamingPipeline:
 
         proc = self._open_ffmpeg_writer(output_path, out_w, out_h)
 
-        frame_idx = 0
         try:
-            while frame_idx < total:
-                ret, bgr = cap.read()
-                if not ret:
-                    break
+            frame_idx = 0
+            try:
+                while frame_idx < total:
+                    ret, bgr = cap.read()
+                    if not ret:
+                        break
 
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-                # --- Stage 1: Depth estimation ---
-                depth = self.depth_estimator.estimate(rgb)
+                    # --- Stage 1: Depth estimation ---
+                    depth = self.depth_estimator.estimate(rgb)
 
-                # --- Stage 2: Stereo rendering ---
-                left, right = self.stereo_renderer.render(rgb, depth)
+                    # --- Stage 2: Stereo rendering ---
+                    left, right = self.stereo_renderer.render(rgb, depth)
 
-                # --- Stage 3: Equirectangular mapping ---
-                sbs = self.eq_mapper.map_stereo_pair(left, right)
+                    # --- Stage 3: Equirectangular mapping ---
+                    sbs = self.eq_mapper.map_stereo_pair(left, right)
 
-                # Write raw RGB to ffmpeg pipe
-                try:
-                    proc.stdin.write(sbs.tobytes())
-                except BrokenPipeError:
-                    raise RuntimeError(
-                        f"ffmpeg encoder died after {frame_idx} frames — "
-                        "check encoder availability/limits for this resolution "
-                        f"({out_w}×{out_h})"
-                    ) from None
+                    # Write raw RGB to ffmpeg pipe. Issue #49: on Windows a dead
+                    # ffmpeg (e.g. NVENC failed to open) surfaces as
+                    # OSError(errno=22) from stdin.write, not BrokenPipeError —
+                    # catch both, and report ffmpeg's stderr tail + exit code.
+                    try:
+                        proc.stdin.write(sbs.tobytes())
+                    except BrokenPipeError:
+                        raise RuntimeError(
+                            f"ffmpeg encoder died after {frame_idx} frames — "
+                            "check encoder availability/limits for this resolution "
+                            f"({out_w}×{out_h}). ffmpeg stderr: {self._ffmpeg_stderr_summary(proc)}"
+                        ) from None
+                    except OSError as e:
+                        if e.errno in (22, 32):  # EINVAL (Windows broken pipe) / EPIPE
+                            raise RuntimeError(
+                                f"ffmpeg encoder died after {frame_idx} frames "
+                                f"(pipe write failed, errno={e.errno}; exit code "
+                                f"{proc.poll()}). ffmpeg stderr: {self._ffmpeg_stderr_summary(proc)}"
+                            ) from None
+                        raise
 
-                # Release intermediates to keep memory O(1)
-                del depth, left, right, sbs, rgb, bgr
+                    # Release intermediates to keep memory O(1)
+                    del depth, left, right, sbs, rgb, bgr
 
-                frame_idx += 1
-                if frame_idx % 10 == 0:
-                    log.info(f"  [{frame_idx}/{total}] frames processed")
+                    frame_idx += 1
+                    if frame_idx % 10 == 0:
+                        log.info(f"  [{frame_idx}/{total}] frames processed")
 
+            finally:
+                cap.release()
+                # encoder may already be dead; returncode check below reports it
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    proc.stdin.close()
+                proc.wait()
+
+            # Reached only when the loop finished without an exception — a
+            # non-zero exit here means ffmpeg failed (issue #49: include the
+            # captured stderr tail so the actual ffmpeg error is visible).
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg encoding failed (exit code {proc.returncode}) after "
+                    f"{frame_idx} frames. ffmpeg stderr: {self._ffmpeg_stderr_summary(proc)}"
+                )
         finally:
-            cap.release()
-            # encoder may already be dead; returncode check below reports it
-            with contextlib.suppress(BrokenPipeError, OSError):
-                proc.stdin.close()
-            proc.wait()
-
-        # Reached only when the loop finished without an exception — a non-zero
-        # exit here means ffmpeg failed silently (would previously return
-        # "success" with a corrupt/empty file).
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"ffmpeg encoding failed (exit code {proc.returncode}) after "
-                f"{frame_idx} frames — rerun with stderr visible to see the ffmpeg error"
-            )
+            self._close_ffmpeg_stderr(proc)
 
         log.info(f"✅ Streaming complete: {frame_idx} frames → {output_path}")
         return output_path
@@ -355,7 +519,7 @@ def run_streaming_pipeline(
     flip_vertical: bool = True,
     max_frames: int | None = None,
     bitrate: str | None = None,
-    hw_encoder: bool | None = None,
+    hw_encoder: bool | str | None = None,
 ) -> str:
     """Convenience function to run the streaming pipeline in one call.
 

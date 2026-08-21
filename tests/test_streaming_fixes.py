@@ -119,14 +119,21 @@ class TestSbsLayout(unittest.TestCase):
         self.assertEqual(cmd[s_idx + 1], "200x50")  # 2*100 x 50 — horizontal SBS
 
     def test_stderr_is_devnull_not_pipe(self):
-        """Defect 3: undrained stderr PIPE deadlocks — must be DEVNULL."""
+        """Defect 3 / issue #49: stderr must be drained — a file, not PIPE/DEVNULL.
+
+        DEVNULL hid fatal encoder errors (NVENC driver mismatch was invisible);
+        an undrained PIPE deadlocks. The writer now sends stderr to a temp file
+        so failures can report the ffmpeg error tail.
+        """
         import subprocess
 
         p = _make_pipeline(output_width=100, output_height=50)
         with patch("pipeline.streaming_pipeline.subprocess.Popen") as popen_mock:
             p._open_ffmpeg_writer("out.mp4", 200, 50)
         kwargs = popen_mock.call_args[1]
-        self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertNotEqual(kwargs["stderr"], subprocess.PIPE)
+        self.assertNotEqual(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertTrue(hasattr(kwargs["stderr"], "write"))  # a real file object
 
 
 class TestFfmpegFailureHandling(unittest.TestCase):
