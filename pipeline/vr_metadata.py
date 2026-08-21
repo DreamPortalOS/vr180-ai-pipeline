@@ -14,16 +14,21 @@ Usage:
     from pipeline.vr_metadata import VRMetadataEmbedder
     embedder = VRMetadataEmbedder()
     embedder.embed_single_frame_batch(frames, "output.mp4")
+    embedder.embed_frame_stream(iter(frames), "output.mp4")  # O(chunk) RAM
 """
 
 import contextlib
+import logging
 import os
 import subprocess
 import tempfile
+from collections.abc import Iterable
 
 import numpy as np
 
 from pipeline.spherical_injector import inject_spherical_metadata
+
+log = logging.getLogger(__name__)
 
 # Google Spherical Video V2 XML template (for VR180)
 SPHERICAL_XML_TEMPLATE = """<?xml version="1.0"?>
@@ -44,6 +49,23 @@ SPHERICAL_XML_TEMPLATE = """<?xml version="1.0"?>
   <GSpherical:CroppedAreaImageWidthPixels>{pano_width}</GSpherical:CroppedAreaImageWidthPixels>
   <GSpherical:CroppedAreaImageHeightPixels>{pano_height}</GSpherical:CroppedAreaImageHeightPixels>
 </rdf:SphericalVideo>"""
+
+# How many bytes of ffmpeg stderr tail to keep for error messages.
+STDERR_TAIL_BYTES = 4096
+
+
+def _read_stderr_tail(stderr_file) -> str:
+    """Read the tail of ffmpeg's captured stderr temp file for error messages."""
+    try:
+        stderr_file.flush()
+        stderr_file.seek(0, 2)
+        size = stderr_file.tell()
+        stderr_file.seek(max(0, size - STDERR_TAIL_BYTES))
+        tail = stderr_file.read()
+        text = tail.decode("utf-8", errors="replace").strip()
+        return text or "(ffmpeg produced no stderr output)"
+    except (OSError, ValueError):
+        return "(stderr unreadable)"
 
 
 class VRMetadataEmbedder:
@@ -77,6 +99,103 @@ class VRMetadataEmbedder:
             pano_width=width,
             pano_height=height,
         )
+
+    def _build_encode_cmd(self, width: int, height: int, temp_path: str) -> list[str]:
+        """Build the ffmpeg rawvideo-pipe encode command."""
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-s",
+            f"{width}x{height}",
+            "-pix_fmt",
+            "rgb24",
+            "-r",
+            str(self.fps),
+            "-i",
+            "-",
+            "-c:v",
+            self._codec_name(),
+            "-preset",
+            self.preset,
+        ]
+        if self.bitrate:
+            # Explicit target bitrate (e.g. "80M") overrides CRF.
+            cmd += ["-b:v", self.bitrate]
+        else:
+            cmd += ["-crf", str(self.crf)]
+        cmd += [
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            temp_path,
+        ]
+        return cmd
+
+    def _encode_and_inject(
+        self,
+        frames: Iterable[np.ndarray],
+        output_path: str,
+        width: int,
+        height: int,
+        xml_path: str,
+        stream: bool,
+    ) -> str:
+        """Encode frames to temp MP4 via ffmpeg pipe, then inject sv3d/st3d."""
+        temp_path = output_path + ".tmp.mp4"
+        cmd = self._build_encode_cmd(width, height, temp_path)
+
+        if stream:
+            # Chunked path (V-4): write frames one at a time and drain stderr
+            # from a temp file — peak RAM is one frame, never the joined bytes.
+            stderr_file = tempfile.TemporaryFile(prefix="vr180-meta-stderr-")  # noqa: SIM115
+            try:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=stderr_file)
+                frame_count = 0
+                try:
+                    for frame in frames:
+                        proc.stdin.write(np.asarray(frame, dtype=np.uint8).tobytes())
+                        frame_count += 1
+                except (BrokenPipeError, OSError) as e:
+                    raise RuntimeError(
+                        f"ffmpeg encoder died after {frame_count} frames ({e}). "
+                        f"stderr: {_read_stderr_tail(stderr_file)}"
+                    ) from None
+                finally:
+                    with contextlib.suppress(BrokenPipeError, OSError):
+                        proc.stdin.close()
+                    proc.wait()
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"FFmpeg encoding failed (exit code {proc.returncode}) after {frame_count} frames:\n"
+                        f"{_read_stderr_tail(stderr_file)}"
+                    )
+                if frame_count == 0:
+                    raise ValueError("No frames to encode")
+            finally:
+                with contextlib.suppress(OSError):
+                    stderr_file.close()
+        else:
+            # Legacy whole-batch path: hand all frames to communicate(), which
+            # writes stdin and drains stderr concurrently. Writing frames in a
+            # loop while ffmpeg's stderr PIPE fills unread deadlocks once the
+            # OS pipe buffer (~64 KB) is full.
+            raw = b"".join(frame.astype(np.uint8).tobytes() for frame in frames)
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            _, stderr = proc.communicate(input=raw)
+
+            if proc.returncode != 0:
+                raise RuntimeError(f"FFmpeg encoding failed:\n{stderr.decode(errors='replace')}")
+
+        # Post-process: inject spherical box via Python ISOBMFF writer
+        inject_spherical_metadata(temp_path, output_path, width=width, height=height, stereo_mode=self.stereo_mode)
+        with contextlib.suppress(OSError):
+            os.unlink(temp_path)
+        return output_path
 
     def embed_single_frame_batch(
         self,
@@ -113,56 +232,48 @@ class VRMetadataEmbedder:
             xml_path = f.name
 
         try:
-            # Encode with ffmpeg (no spherical metadata in encoding pass)
-            temp_path = output_path + ".tmp.mp4"
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "rawvideo",
-                "-vcodec",
-                "rawvideo",
-                "-s",
-                f"{W}x{H}",
-                "-pix_fmt",
-                "rgb24",
-                "-r",
-                str(self.fps),
-                "-i",
-                "-",
-                "-c:v",
-                self._codec_name(),
-                "-preset",
-                self.preset,
-            ]
-            if self.bitrate:
-                # Explicit target bitrate (e.g. "80M") overrides CRF.
-                cmd += ["-b:v", self.bitrate]
-            else:
-                cmd += ["-crf", str(self.crf)]
-            cmd += [
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                temp_path,
-            ]
-
-            # Hand the raw frames to communicate(), which writes stdin and drains
-            # stderr concurrently. Writing frames in a loop while ffmpeg's stderr
-            # PIPE fills unread deadlocks once the OS pipe buffer (~64 KB) is full.
-            raw = b"".join(frame.astype(np.uint8).tobytes() for frame in frames)
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-            _, stderr = proc.communicate(input=raw)
-
-            if proc.returncode != 0:
-                raise RuntimeError(f"FFmpeg encoding failed:\n{stderr.decode(errors='replace')}")
-
-            # Post-process: inject spherical box via Python ISOBMFF writer
-            inject_spherical_metadata(temp_path, output_path, width=out_w, height=out_h, stereo_mode=self.stereo_mode)
+            self._encode_and_inject(frames, output_path, out_w, out_h, xml_path, stream=False)
+        except FileNotFoundError:
+            print("[Metadata] ffmpeg not found!")
+            raise
+        finally:
             with contextlib.suppress(OSError):
-                os.unlink(temp_path)
+                os.unlink(xml_path)
 
+        print(f"[Metadata] ✅ VR180 video saved to {output_path}")
+        return output_path
+
+    def embed_frame_stream(
+        self,
+        frames: Iterable[np.ndarray],
+        output_path: str,
+        width: int,
+        height: int,
+    ) -> str:
+        """Encode frames from an iterable with O(1)-per-frame RAM (V-4).
+
+        Identical output to :meth:`embed_single_frame_batch`, but frames are
+        consumed lazily and written to ffmpeg's stdin one at a time — the
+        caller may pass a generator that reads checkpoint PNGs from disk, so
+        peak memory is a single frame instead of the whole sequence plus its
+        joined byte buffer.
+
+        Args:
+            frames: Iterable of (H, W, 3) uint8 SBS equirect frames.
+            output_path: Output MP4 path.
+            width, height: Frame dimensions (required — no auto-detect).
+
+        Returns:
+            Path to output file.
+        """
+        xml_content = self._spherical_xml(width, height)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".xml", delete=False) as f:
+            f.write(xml_content)
+            xml_path = f.name
+
+        try:
+            self._encode_and_inject(frames, output_path, width, height, xml_path, stream=True)
         except FileNotFoundError:
             print("[Metadata] ffmpeg not found!")
             raise

@@ -628,6 +628,38 @@ pytest tests/integration/test_task_queue.py -v
 - **决策**：默认用高斯模糊渐变（方案 B），高质量模式用 AI Outpainting（方案 A）
 - **理由**：高斯模糊速度快，效果可接受；AI Outpainting 质量更好但慢 10x；让用户选择
 
+### ADR-006：长片内存管理（V-4, issue #37）
+
+- **决策**：非流式路径统一分块处理（`pipeline/chunked_processing.py`），
+  `--chunk-size N`（默认 64 帧）+ `--chunk-overlap K`（默认 0）；每个 stage
+  产出即写 checkpoint（PNG/NPY），下游 stage 从 checkpoint 按需重读，
+  不在 stage 之间保留整段帧列表。
+- **理由**：旧路径 `list(read_frames(...))` + 各 stage 结果列表全部驻留
+  RAM，峰值 ≈ 4×N×H×W×3 字节（输入帧 + 深度 + L/R + SBS），长 8K 片
+  ~98 GB。分块后峰值 ≈ 1×N（输入帧，depth→stereo 期间）+ chunk_size ×
+  单帧，与片长解耦。`--chunk-size 0` 恢复旧行为（调试用）。
+- **内存模型**（非流式、分块开启时）：
+  - depth 阶段：输入帧列表（N×H×W×3）+ 每帧深度即写盘，不驻留；
+  - stereo 阶段后：输入帧与深度列表立即释放，L/R 帧即写盘；
+  - equirect / outpaint / metadata 阶段：从 checkpoint 分块重读，
+    metadata 用 `VRMetadataEmbedder.embed_frame_stream()` 逐帧喂 ffmpeg
+    stdin（峰值 1 帧），不再 `b"".join(所有帧)`。
+- **逐帧一致性**：所有分块 stage 都是**逐帧函数**，分块结果与整段处理
+  逐帧 bit 一致（tests/test_chunked_processing.py 用 20 帧 64×64 合成
+  序列对 chunk_size=1/4/6/20/100 验证，含 chunk_size>总帧数 极端）。
+  时序 EMA（`--temporal-smoothing`）状态跨 chunk 传递，同样 bit 一致；
+  需要有限时序窗口的环节用 `chunked_windows()` 的 overlap 上下文，
+  overlap ≥ 窗口-1 时边界一致。
+
+#### 不可分块环节（全局上下文，显式上限）
+
+| 环节 | 为什么不可分块 | 内存上限估算 |
+|---|---|---|
+| `depthcrafter` | 时序扩散需要整段视频；外部 CLI 进程自读视频文件 | 外部进程自身 VRAM/RAM（1024px 短边约 10–16 GB）；wrapper 侧只持有返回的深度列表 N×H×W×4 B（float32） |
+| `stereocrafter` | 视频扩散 inpainting 需要全局时序上下文；外部 CLI 整段处理 | wrapper 侧：输入帧 N×H×W×3 B + 回读 L/R 输出 2×N×H×W×3 B；长片请用 `--max-frames` 或流式路径 |
+
+（与 `pipeline/chunked_processing.UNCHUNKABLE_STAGES` 保持同步。）
+
 ---
 
 ## 附录：常用命令速查

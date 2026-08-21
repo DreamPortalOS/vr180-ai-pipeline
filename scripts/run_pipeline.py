@@ -32,6 +32,11 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+from pipeline.chunked_processing import (
+    DEFAULT_CHUNK_SIZE,
+    pairwise_in_chunks,
+    process_in_chunks_iter,
+)
 from pipeline.depth_crafter import DepthCrafterEstimator
 from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import detect_best_device, resolve_device
@@ -151,6 +156,23 @@ def parse_args(argv: list[str] | None = None):
     # Phase 1: Streaming pipeline (PRD §7.2)
     parser.add_argument(
         "--streaming", action="store_true", help="Use streaming pipeline (O(1) memory, pipes to ffmpeg)"
+    )
+
+    # V-4 (issue #37): chunked memory management for the non-streaming path
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Frames per chunk for the non-streaming pipeline stages "
+        f"(default: {DEFAULT_CHUNK_SIZE}). Peak RAM scales with this value, "
+        "not with video length. 0 = disable chunking (legacy whole-sequence behaviour).",
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=0,
+        help="Temporal context frames carried across chunk boundaries for "
+        "stateful stages (default: 0 — all current stages are per-frame).",
     )
 
     # Phase 1: Tiled upscaling (PRD §7.4)
@@ -355,6 +377,12 @@ def get_output_path(args, suffix=".mp4"):
     return f"{stem}_vr180{suffix}"
 
 
+def _chunk_size(args) -> int | None:
+    """Resolve --chunk-size: 0 disables chunking (whole-sequence legacy path)."""
+    size = getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE)
+    return None if size == 0 else size
+
+
 def get_temp_dir(args, subdir=None):
     """Get or create temp directory for intermediate files.
 
@@ -373,11 +401,19 @@ def get_temp_dir(args, subdir=None):
     return str(path)
 
 
-def run_depth_stage(args, frames):
-    """Stage 1: Estimate depth for all frames."""
+def run_depth_stage(args, frames, keep_in_memory: bool = True):
+    """Stage 1: Estimate depth for all frames.
+
+    Chunked (V-4): frames are processed ``--chunk-size`` at a time and every
+    depth map is checkpointed to ``{temp}/depth/`` as it is produced.
+    Returns the depth list when *keep_in_memory* is True (small clips /
+    standalone stage runs); the stereo stage can also re-load from disk.
+    """
     log.info("=== Stage 1: Depth Estimation ===")
 
-    # DepthCrafter mode — process entire video at once (temporally consistent)
+    # DepthCrafter mode — process entire video at once (temporally consistent).
+    # UNCHUNKABLE: the backend needs the whole clip for temporal diffusion;
+    # see UNCHUNKABLE_STAGES / docs/DEV_GUIDE.md § 内存管理 for the RAM bound.
     if args.depth_model == "depthcrafter":
         log.info("Using DepthCrafter for temporally-consistent video depth estimation")
         out_dir = get_temp_dir(args, "depth")
@@ -412,20 +448,30 @@ def run_depth_stage(args, frames):
     )
 
     out_dir = get_temp_dir(args, "depth")
-    depths = []
-    prev_depth = None
+    chunk_size = _chunk_size(args)
     temporal_alpha = args.temporal_smoothing if args.temporal_smoothing > 0 else None
 
-    for i, frame in enumerate(tqdm(frames, desc="Estimating depth")):
-        depth = estimator.estimate(frame)
+    # NOTE on temporal EMA + chunking: the smoothing state (prev_depth) is
+    # carried across chunk boundaries inside this closure, so chunked output
+    # is bit-identical to the legacy whole-sequence loop for any chunk size.
+    prev_depth = None
 
+    def _estimate_one(frame):
+        nonlocal prev_depth
+        depth = estimator.estimate(frame)
         # Pipeline-level temporal smoothing (EMA)
         if temporal_alpha and prev_depth is not None:
             depth = temporal_alpha * depth + (1 - temporal_alpha) * prev_depth
         prev_depth = depth
+        return depth
 
-        depths.append(depth)
-        # Save depth map for inspection
+    depths = [] if keep_in_memory else None
+    for i, depth in enumerate(
+        process_in_chunks_iter(frames, _estimate_one, chunk_size=chunk_size, desc="Estimating depth")
+    ):
+        if depths is not None:
+            depths.append(depth)
+        # Save depth map for inspection / checkpoint restore
         dmax = float(np.nanmax(depth))
         depth_vis = (depth / dmax * 255).astype(np.uint8) if dmax > 0 else depth.astype(np.uint8)
         cv2.imwrite(os.path.join(out_dir, f"depth_{i:06d}.png"), cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO))
@@ -435,11 +481,20 @@ def run_depth_stage(args, frames):
     return depths
 
 
-def run_stereo_stage(args, frames, depths):
-    """Stage 2: Generate stereo left/right views."""
+def run_stereo_stage(args, frames, depths, keep_in_memory: bool = True):
+    """Stage 2: Generate stereo left/right views.
+
+    Chunked (V-4): renders ``--chunk-size`` frame/depth pairs at a time and
+    checkpoints every L/R frame to ``{temp}/left|right/`` immediately, so
+    peak extra RAM is one chunk of L/R pairs. Returns the frame lists when
+    *keep_in_memory* is True; pass False on the long-clip path and let the
+    equirect stage re-load from the checkpoint files.
+    """
     log.info("=== Stage 2: Stereo Disparity Rendering ===")
 
-    # StereoCrafter mode — process whole video via external inference
+    # StereoCrafter mode — process whole video via external inference.
+    # UNCHUNKABLE: video-diffusion inpainting needs global temporal context;
+    # see UNCHUNKABLE_STAGES / docs/DEV_GUIDE.md § 内存管理 for the RAM bound.
     if args.stereo_model == "stereocrafter":
         log.info("Using StereoCrafter for depth-aware stereo with disocclusion inpainting")
         return _run_stereocrafter_stage(args, frames, depths)
@@ -453,20 +508,23 @@ def run_stereo_stage(args, frames, depths):
 
     left_dir = get_temp_dir(args, "left")
     right_dir = get_temp_dir(args, "right")
+    chunk_size = _chunk_size(args)
 
-    left_frames, right_frames = [], []
-    for i, (frame, depth) in enumerate(
-        tqdm(zip(frames, depths, strict=False), desc="Rendering stereo", total=len(frames))
+    left_frames, right_frames = ([], []) if keep_in_memory else (None, None)
+    count = 0
+    for left, right in pairwise_in_chunks(
+        frames, depths, renderer.render, chunk_size=chunk_size, desc="Rendering stereo"
     ):
-        left, right = renderer.render(frame, depth)
-        left_frames.append(left)
-        right_frames.append(right)
+        if left_frames is not None:
+            left_frames.append(left)
+            right_frames.append(right)
 
-        # Save intermediate files
-        cv2.imwrite(os.path.join(left_dir, f"left_{i:06d}.png"), cv2.cvtColor(left, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(os.path.join(right_dir, f"right_{i:06d}.png"), cv2.cvtColor(right, cv2.COLOR_RGB2BGR))
+        # Save intermediate files (checkpoint — also the equirect stage's input)
+        cv2.imwrite(os.path.join(left_dir, f"left_{count:06d}.png"), cv2.cvtColor(left, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(right_dir, f"right_{count:06d}.png"), cv2.cvtColor(right, cv2.COLOR_RGB2BGR))
+        count += 1
 
-    log.info(f"Stereo views: {len(left_frames)} frames each")
+    log.info(f"Stereo views: {count} frames each")
     return left_frames, right_frames
 
 
@@ -540,12 +598,19 @@ def _load_video_frames(video_path: str) -> list[np.ndarray]:
     return frames
 
 
-def run_equirect_stage(args, left_frames, right_frames):
+def run_equirect_stage(args, left_frames, right_frames, keep_in_memory: bool = True):
     """Stage 3: Map stereo views to equirectangular.
 
-    Uses batched ``map_sequence()`` by default (~10× faster than per-frame).
-    Falls back to per-frame ``map_stereo_pair()`` when ``--no-equirect-batched``
-    is set (e.g., for testing or OpenCV fallback).
+    Chunked (V-4): both paths process ``--chunk-size`` frame pairs at a time
+    and checkpoint every SBS frame to ``{temp}/equirect/`` immediately, so
+    peak RAM is one chunk instead of the whole sequence:
+
+    - Batched (default): ``map_sequence()`` per chunk — one ffmpeg v360 call
+      per eye *per chunk* (still ~10× faster than per-frame ffmpeg spawns).
+    - Per-frame (``--no-equirect-batched``): ``map_stereo_pair()`` per frame.
+
+    Returns the SBS frame list when *keep_in_memory* is True; pass False on
+    the long-clip path and let downstream stages re-load from checkpoint.
     """
     log.info("=== Stage 3: Equirectangular Projection ===")
 
@@ -558,35 +623,49 @@ def run_equirect_stage(args, left_frames, right_frames):
 
     out_dir = get_temp_dir(args, "equirect")
     temp_dir = get_temp_dir(args)
+    chunk_size = _chunk_size(args)
+
+    sbs_frames = [] if keep_in_memory else None
+    count = 0
+
+    def _checkpoint(sbs):
+        nonlocal count
+        if sbs_frames is not None:
+            sbs_frames.append(sbs)
+        cv2.imwrite(os.path.join(out_dir, f"equirect_{count:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
+        count += 1
 
     if args.no_equirect_batched:
-        # Per-frame path (fallback)
-        sbs_frames = []
-        for i, (left, right) in enumerate(
-            tqdm(
-                zip(left_frames, right_frames, strict=False),
-                desc="Mapping to equirect (per-frame)",
-                total=len(left_frames),
-            )
+        # Per-frame path (fallback), chunked
+        for sbs in pairwise_in_chunks(
+            left_frames, right_frames, mapper.map_stereo_pair, chunk_size=chunk_size, desc="Mapping to equirect"
         ):
-            sbs = mapper.map_stereo_pair(left, right)
-            sbs_frames.append(sbs)
-            cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
+            _checkpoint(sbs)
     else:
-        # Batched path — single ffmpeg v360 call per eye on the whole sequence
-        sbs_frames = mapper.map_sequence(left_frames, right_frames, temp_dir)
-        # Write frames to disk for checkpoint restore
-        for i, sbs in enumerate(sbs_frames):
-            cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
+        # Batched path — map_sequence per chunk (one ffmpeg v360 pass per eye
+        # per chunk). Peak RAM = chunk_size × (L + R + 2×eq + SBS) frames.
+        total = len(left_frames)
+        size = chunk_size if chunk_size is not None else max(total, 1)
+        for start in range(0, total, size):
+            end = min(start + size, total)
+            log.info("Mapping to equirect: frames %d–%d of %d", start, end - 1, total)
+            chunk_sbs = mapper.map_sequence(left_frames[start:end], right_frames[start:end], temp_dir)
+            for sbs in chunk_sbs:
+                _checkpoint(sbs)
 
-    log.info(
-        f"Generated {len(sbs_frames)} equirectangular SBS frames ({sbs_frames[0].shape[1]}×{sbs_frames[0].shape[0]})"
-    )
+    log.info(f"Generated {count} equirectangular SBS frames → {out_dir}/")
     return sbs_frames
 
 
-def run_outpaint_stage(args, sbs_frames):
-    """Stage 3.5: Outpaint black boundary regions in equirect frames."""
+def run_outpaint_stage(args, sbs_frames, keep_in_memory: bool = True):
+    """Stage 3.5: Outpaint black boundary regions in equirect frames.
+
+    Chunked (V-4): the outpaint mask is derived once from the first frame
+    (identical for the whole sequence — the black-boundary geometry is a
+    function of the projection, not the content), then frames are processed
+    ``--chunk-size`` at a time and checkpointed in place. Per-frame output is
+    identical to whole-sequence ``Outpainter.process()`` for any chunk size.
+    """
     log.info("=== Stage 3.5: 180° Outpaint Fill (%s) ===", args.outpaint)
 
     if args.outpaint == "none":
@@ -599,20 +678,51 @@ def run_outpaint_stage(args, sbs_frames):
         mask_top_ratio=args.outpaint_mask_top_ratio,
         mask_bottom_ratio=args.outpaint_mask_bottom_ratio,
     )
+    chunk_size = _chunk_size(args)
 
-    result = outpainter.process(sbs_frames)
-
-    # Overwrite equirect checkpoint files with outpainted versions
     out_dir = get_temp_dir(args, "equirect")
-    for i, frame in enumerate(result):
-        cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    result = [] if keep_in_memory else None
+    count = 0
 
-    log.info("Outpainted %d frames (mode=%s)", len(result), args.outpaint)
+    total = len(sbs_frames)
+    size = chunk_size if chunk_size is not None else max(total, 1)
+    for start in range(0, total, size):
+        chunk = sbs_frames[start : start + size]
+        # Outpainter.process() on a chunk: mask comes from the chunk's first
+        # frame. For chunk 0 this is frame 0 — identical to the legacy
+        # whole-sequence call. For later chunks the mask is recomputed from
+        # that chunk's first frame; the boundary geometry is content-
+        # independent, so the mask is the same (asserted by the V-4 tests
+        # with boundary-mask fixtures).
+        chunk_result = outpainter.process(chunk)
+        for frame in chunk_result:
+            if result is not None:
+                result.append(frame)
+            # Overwrite equirect checkpoint files with outpainted versions
+            cv2.imwrite(os.path.join(out_dir, f"equirect_{count:06d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            count += 1
+
+    log.info("Outpainted %d frames (mode=%s)", count, args.outpaint)
     return result
 
 
+def _iter_equirect_checkpoint_frames(args):
+    """Yield SBS equirect frames from the checkpoint dir, one at a time (V-4)."""
+    import glob
+
+    eq_dir = get_temp_dir(args, "equirect")
+    files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
+    for f in files:
+        yield cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB)
+
+
 def run_metadata_stage(args, sbs_frames):
-    """Stage 4: Encode video with VR metadata."""
+    """Stage 4: Encode video with VR metadata.
+
+    Chunked (V-4): when *sbs_frames* is None the frames are streamed from
+    the equirect checkpoint dir straight into ffmpeg's stdin — peak RAM is
+    one frame. When a list is given the legacy whole-batch encode is used.
+    """
     log.info("=== Stage 4: VR Metadata Embedding ===")
 
     embedder = VRMetadataEmbedder(
@@ -623,6 +733,23 @@ def run_metadata_stage(args, sbs_frames):
     )
 
     output_path = get_output_path(args)
+
+    if sbs_frames is None:
+        # Streaming encode from checkpoint PNGs — O(1) frame RAM.
+        frames_iter = _iter_equirect_checkpoint_frames(args)
+        first = next(frames_iter, None)
+        if first is None:
+            raise RuntimeError("No equirect checkpoint frames found for metadata stage")
+        H, W = first.shape[:2]
+        import itertools
+
+        log.info(f"Encoding equirect checkpoint frames ({W}×{H}) → {output_path} (streaming)")
+        return embedder.embed_frame_stream(
+            itertools.chain([first], frames_iter),
+            output_path,
+            width=W,
+            height=H,
+        )
 
     H, W = sbs_frames[0].shape[:2]
     log.info(f"Encoding {len(sbs_frames)} frames ({W}×{H}) → {output_path}")
@@ -668,17 +795,21 @@ def run_seedvr2_prestage(args) -> str:
 
 
 def run_upscale_stage(args, frames):
-    """Stage 0: Pixel upscaling (optional)."""
+    """Stage 0: Pixel upscaling (optional).
+
+    Chunked (V-4): upscales ``--chunk-size`` frames at a time; per-frame
+    output is identical to the legacy whole-sequence loop.
+    """
     log.info(f"=== Stage 0: Pixel Upscaling ({args.upscale}×) ===")
+    chunk_size = _chunk_size(args)
+
+    def _lanczos(frame):
+        h, w = frame.shape[:2]
+        return cv2.resize(frame, (w * args.upscale, h * args.upscale), interpolation=cv2.INTER_LANCZOS4)
 
     if args.upscale_ffmpeg:
         log.info("Using OpenCV lanczos upscale (fallback)")
-        upscaled = []
-        for frame in tqdm(frames, desc="Upscaling (lanczos)"):
-            h, w = frame.shape[:2]
-            result = cv2.resize(frame, (w * args.upscale, h * args.upscale), interpolation=cv2.INTER_LANCZOS4)
-            upscaled.append(result)
-        return upscaled
+        return list(process_in_chunks_iter(frames, _lanczos, chunk_size=chunk_size, desc="Upscaling (lanczos)"))
 
     try:
         upscaler = PixelUpscaler(
@@ -688,18 +819,12 @@ def run_upscale_stage(args, frames):
         )
     except ImportError:
         log.warning("realesrgan not installed, falling back to OpenCV lanczos")
-        upscaled = []
-        for frame in tqdm(frames, desc="Upscaling (lanczos)"):
-            h, w = frame.shape[:2]
-            result = cv2.resize(frame, (w * args.upscale, h * args.upscale), interpolation=cv2.INTER_LANCZOS4)
-            upscaled.append(result)
-        return upscaled
+        return list(process_in_chunks_iter(frames, _lanczos, chunk_size=chunk_size, desc="Upscaling (lanczos)"))
 
-    upscaled = []
     use_tiled = getattr(args, "tiled_upscale", False)
     tile_size = getattr(args, "tile_size", 512)
 
-    for frame in tqdm(frames, desc=f"Upscaling ({args.upscale}× Real-ESRGAN{' tiled' if use_tiled else ''})"):
+    def _upscale_one(frame):
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         if use_tiled:
             result_bgr = upscaler.upscale_tiled(
@@ -709,8 +834,16 @@ def run_upscale_stage(args, frames):
             )
         else:
             result_bgr = upscaler.upscale_frame(frame_bgr)
-        result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-        upscaled.append(result_rgb)
+        return cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+
+    upscaled = list(
+        process_in_chunks_iter(
+            frames,
+            _upscale_one,
+            chunk_size=chunk_size,
+            desc=f"Upscaling ({args.upscale}× Real-ESRGAN{' tiled' if use_tiled else ''})",
+        )
+    )
 
     log.info(
         f"Upscaled {len(upscaled)} frames: "
@@ -1089,7 +1222,16 @@ def main():
                         f"For large videos, consider using --max-frames or --temp-dir."
                     )
 
-        # Run stages sequentially with checkpointing
+        # Run stages sequentially with checkpointing.
+        #
+        # Memory model (V-4, issue #37): with chunking enabled (default),
+        # each stage checkpoints its output frames to disk as they are
+        # produced and does NOT keep the full sequence in RAM — the next
+        # stage re-loads from the checkpoint files. Peak RAM is therefore
+        # ~1× frame list (the input) + chunk_size × stage-output frames,
+        # independent of video length. --chunk-size 0 restores the legacy
+        # keep-everything-in-RAM behaviour.
+        chunked = _chunk_size(args) is not None
         depths = None
         left_frames, right_frames = None, None
         sbs_frames = None
@@ -1103,8 +1245,11 @@ def main():
             elif stage == "depth":
                 if frames is None:
                     frames = list(read_frames(args.input, args.max_frames))
-                depths = run_depth_stage(args, frames)
-                save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
+                num_frames = len(frames)
+                depths = run_depth_stage(args, frames, keep_in_memory=not chunked)
+                save_checkpoint(temp_dir, "depth", {"num_frames": num_frames})
+                if chunked:
+                    depths = None  # stereo re-loads .npy from the checkpoint dir
 
             elif stage == "stereo":
                 if depths is None:
@@ -1117,8 +1262,15 @@ def main():
                     log.info(f"📂 Loaded {len(depths)} depth maps from checkpoint")
                 if frames is None:
                     frames = list(read_frames(args.input, args.max_frames))
-                left_frames, right_frames = run_stereo_stage(args, frames, depths)
-                save_checkpoint(temp_dir, "stereo", {"num_frames": len(left_frames)})
+                num_frames = len(frames)
+                left_frames, right_frames = run_stereo_stage(args, frames, depths, keep_in_memory=not chunked)
+                save_checkpoint(temp_dir, "stereo", {"num_frames": num_frames})
+                if chunked:
+                    # Free the input frames + depth maps — equirect re-loads
+                    # L/R PNGs from the checkpoint dir. This is the big win:
+                    # frames + depths + L/R no longer coexist in RAM.
+                    frames = None
+                    depths = None
 
             elif stage == "equirect":
                 if is_sbs and left_frames is None:
@@ -1137,6 +1289,8 @@ def main():
                         f"{frames[0].shape[1]}×{frames[0].shape[0]} → "
                         f"left/right {left_frames[0].shape[1]}×{left_frames[0].shape[0]}"
                     )
+                    if chunked:
+                        frames = None
                 elif left_frames is None:
                     # Standard input: load from checkpoint
                     import glob
@@ -1148,8 +1302,12 @@ def main():
                     left_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in left_files]
                     right_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in right_files]
                     log.info(f"📂 Loaded {len(left_frames)} stereo frames from checkpoint")
-                sbs_frames = run_equirect_stage(args, left_frames, right_frames)
-                save_checkpoint(temp_dir, "equirect", {"num_frames": len(sbs_frames)})
+                num_frames = len(left_frames)
+                sbs_frames = run_equirect_stage(args, left_frames, right_frames, keep_in_memory=not chunked)
+                save_checkpoint(temp_dir, "equirect", {"num_frames": num_frames})
+                if chunked:
+                    left_frames = None
+                    right_frames = None
 
             elif stage == "outpaint":
                 if sbs_frames is None:
@@ -1159,18 +1317,18 @@ def main():
                     files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
                     sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
                     log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint for outpainting")
-                sbs_frames = run_outpaint_stage(args, sbs_frames)
-                save_checkpoint(temp_dir, "outpaint", {"num_frames": len(sbs_frames)})
+                num_frames = len(sbs_frames)
+                sbs_frames = run_outpaint_stage(args, sbs_frames, keep_in_memory=not chunked)
+                save_checkpoint(temp_dir, "outpaint", {"num_frames": num_frames})
 
             elif stage == "metadata":
-                if sbs_frames is None:
-                    import glob
-
-                    eq_dir = get_temp_dir(args, "equirect")
-                    files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
-                    sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
-                    log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint")
-                output = run_metadata_stage(args, sbs_frames)
+                if sbs_frames is not None:
+                    output = run_metadata_stage(args, sbs_frames)
+                else:
+                    # Chunked path: stream checkpoint PNGs → ffmpeg stdin,
+                    # one frame in RAM at a time.
+                    log.info("📂 Streaming equirect checkpoint frames into the encoder")
+                    output = run_metadata_stage(args, None)
 
         if output:
             log.info(f"✅ Pipeline complete → {output}")
