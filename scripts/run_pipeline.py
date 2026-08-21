@@ -26,6 +26,8 @@ import argparse
 import json
 import logging
 import os
+import platform
+import sys
 from pathlib import Path
 
 import cv2
@@ -147,6 +149,30 @@ def parse_args(argv: list[str] | None = None):
 
     # New: checkpoint/resume
     parser.add_argument("--resume", action="store_true", help="Resume from last completed checkpoint stage")
+
+    # V-3: cross-machine staged pipeline + job manifest (issue #36)
+    parser.add_argument(
+        "--stages",
+        default=None,
+        help="Comma-separated stage subset to run: upscale,depth,stereo,project,encode "
+        "(default: all — behaviour identical to running without this flag)",
+    )
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help="Write/update a job manifest JSON at this path after the run (cross-machine relay)",
+    )
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        metavar="MANIFEST",
+        help="Resume from a job manifest: completed stages are hash-validated, then skipped",
+    )
+    parser.add_argument(
+        "--machine",
+        default=None,
+        help="Machine label recorded into the manifest (e.g. win-cuda, mac-mps)",
+    )
 
     # Phase 1: Streaming pipeline (PRD §7.2)
     parser.add_argument(
@@ -968,21 +994,197 @@ def apply_quality_preset(args):
         log.info("📶 Adaptive bitrate: %.1f Mbps (scaled from 1920² baseline)", mbps)
 
 
+# ---------------------------------------------------------------------------
+# V-3: job manifest / cross-machine relay helpers (issue #36)
+# ---------------------------------------------------------------------------
+
+# Canonical --stages names → internal stage names used by the stage loop.
+# "project" covers the equirect projection + optional outpaint fill;
+# "encode" is the metadata/encode stage.
+_MANIFEST_TO_INTERNAL = {
+    "upscale": ["upscale"],
+    "depth": ["depth"],
+    "stereo": ["stereo"],
+    "project": ["equirect", "outpaint"],
+    "encode": ["metadata"],
+}
+_INTERNAL_TO_MANIFEST = {
+    "upscale": "upscale",
+    "depth": "depth",
+    "stereo": "stereo",
+    "equirect": "project",
+    "outpaint": "project",
+    "metadata": "encode",
+}
+MANIFEST_STAGE_NAMES = list(_MANIFEST_TO_INTERNAL)
+
+
+def parse_stages_arg(value):
+    """Parse --stages 'a,b,c' into canonical manifest stage names (ordered)."""
+    if value is None:
+        return list(MANIFEST_STAGE_NAMES)
+    names = [s.strip() for s in str(value).split(",") if s.strip()]
+    unknown = [n for n in names if n not in _MANIFEST_TO_INTERNAL]
+    if unknown:
+        raise ValueError(
+            f"Unknown stage(s) in --stages: {', '.join(unknown)} (valid: {', '.join(MANIFEST_STAGE_NAMES)})"
+        )
+    # De-duplicate, preserve canonical order
+    return [n for n in MANIFEST_STAGE_NAMES if n in names]
+
+
+def _machine_label(args):
+    """Machine label for manifest entries: explicit --machine, else auto."""
+    if getattr(args, "machine", None):
+        return args.machine
+    return f"{platform.system().lower()}-{args.device or 'cpu'}"
+
+
+def _stage_artifacts(args, manifest_name):
+    """(inputs, outputs, params) recorded for a completed manifest stage."""
+    params = {}
+    if manifest_name == "upscale":
+        outputs = [args.input] if args.video_upscale == "seedvr2" else []
+        params = {
+            "video_upscale": args.video_upscale,
+            "video_upscale_factor": args.video_upscale_factor,
+            "upscale": args.upscale,
+        }
+    elif manifest_name == "depth":
+        outputs = [get_temp_dir(args, "depth")]
+        params = {"depth_model": args.depth_model, "model_size": args.model_size}
+    elif manifest_name == "stereo":
+        outputs = [get_temp_dir(args, "left"), get_temp_dir(args, "right")]
+        params = {"stereo_model": args.stereo_model, "ipd": args.ipd}
+    elif manifest_name == "project":
+        outputs = [get_temp_dir(args, "equirect")]
+        params = {
+            "output_width": args.output_width,
+            "output_height": args.output_height,
+            "src_hfov": args.src_hfov,
+            "outpaint": args.outpaint,
+        }
+    elif manifest_name == "encode":
+        outputs = [get_output_path(args)] if args.stage == "all" else []
+        params = {"codec": args.codec, "crf": args.crf, "bitrate": args.bitrate, "fps": args.fps}
+    else:  # pragma: no cover - guarded by parse_stages_arg
+        outputs, params = [], {}
+    return [], outputs, params
+
+
+def _manifest_record_stage(manifest, args, manifest_name):
+    """Record one completed stage into the manifest (hashes file outputs)."""
+    from pipeline.job_manifest import mark_stage_done
+
+    inputs, outputs, params = _stage_artifacts(args, manifest_name)
+    mark_stage_done(
+        manifest,
+        manifest_name,
+        machine=_machine_label(args),
+        inputs=inputs,
+        outputs=outputs,
+        params=params,
+    )
+
+
+def _manifest_prepare(args):
+    """Load/create the job manifest and compute which stages to skip.
+
+    Returns (manifest, skip_internal, stages_to_run_internal) — all None
+    when no manifest/stages flags are in play (zero behaviour change).
+    """
+    from pipeline.job_manifest import (
+        STATUS_DONE,
+        ManifestError,
+        completed_stages,
+        get_stage,
+        load_manifest,
+        new_manifest,
+        validate_source,
+        validate_stage_outputs,
+    )
+
+    stages_arg = args.stages if isinstance(args.stages, str) else None
+    manifest_arg = args.manifest if isinstance(args.manifest, str) else None
+    resume_arg = args.resume_from if isinstance(args.resume_from, str) else None
+
+    if stages_arg is None and manifest_arg is None and resume_arg is None:
+        return None, None, None
+
+    try:
+        wanted = parse_stages_arg(stages_arg)
+    except ValueError as e:
+        log.error("❌ %s", e)
+        sys.exit(2)
+
+    manifest = None
+    done = []
+    if resume_arg:
+        try:
+            manifest = load_manifest(resume_arg)
+            validate_source(manifest, args.input)
+            for name in completed_stages(manifest):
+                validate_stage_outputs(manifest, name)
+        except ManifestError as e:
+            log.error("❌ Cannot resume from %s:\n%s", resume_arg, e)
+            sys.exit(1)
+        done = completed_stages(manifest)
+        log.info("📂 Resuming from manifest %s — completed stages: %s", resume_arg, done or "[]")
+    elif manifest_arg:
+        if os.path.exists(manifest_arg):
+            try:
+                manifest = load_manifest(manifest_arg)
+            except ManifestError as e:
+                log.error("❌ %s", e)
+                sys.exit(1)
+        else:
+            # job id: input stem + short source hash prefix
+            from pipeline.job_manifest import sha256_file
+
+            src_hash = sha256_file(args.input) if os.path.isfile(args.input) else "nohash"
+            job_id = f"{Path(args.input).stem}-{src_hash[:8]}"
+            manifest = new_manifest(job_id, args.input, machine=_machine_label(args))
+
+    # Map to internal stage names, skipping manifest-done stages.
+    skip_internal = []
+    stages_internal = []
+    for name in wanted:
+        stage_entry = get_stage(manifest, name) if manifest else None
+        if resume_arg and stage_entry and stage_entry.get("status") == STATUS_DONE:
+            skip_internal.extend(_MANIFEST_TO_INTERNAL[name])
+            continue
+        stages_internal.extend(_MANIFEST_TO_INTERNAL[name])
+
+    return manifest, skip_internal, stages_internal
+
+
 def main():
     args = parse_args()
     apply_quality_preset(args)
 
-    # R-1: SeedVR2 pre-stage — upscale the input video file before any frame loading
-    if args.video_upscale == "seedvr2":
-        original_input = args.input
-        args.input = run_seedvr2_prestage(args)
-        log.info("SeedVR2 pre-stage: input replaced %s → %s", original_input, args.input)
+    # V-3: job manifest — load/create, hash-validate completed stages,
+    # compute which stages to skip.  None when no manifest flags are given
+    # (behaviour then identical to before issue #36).
+    manifest, manifest_skip, manifest_stages = _manifest_prepare(args)
+    manifest_touched: set[str] = set()
 
     # Auto-detect device if not specified
     if args.device is None:
         args.device = detect_best_device()
     else:
         args.device = resolve_device(args.device)
+
+    # R-1: SeedVR2 pre-stage — upscale the input video file before any frame loading
+    if args.video_upscale == "seedvr2":
+        if manifest_skip and "upscale" in manifest_skip:
+            log.info("⏭️  Skipping SeedVR2 pre-stage (upscale already done in manifest)")
+        else:
+            original_input = args.input
+            args.input = run_seedvr2_prestage(args)
+            log.info("SeedVR2 pre-stage: input replaced %s → %s", original_input, args.input)
+            if manifest is not None:
+                _manifest_record_stage(manifest, args, "upscale")
+                manifest_touched.add("upscale")
 
     # Handle --validate-input mode
     if args.validate_input:
@@ -998,8 +1200,10 @@ def main():
         args.fps = round(src_fps) if src_fps and src_fps > 0 else 30
         log.info(f"📹 Output fps inherited from source: {args.fps}")
 
-    # Streaming pipeline mode (PRD §7.2)
-    if args.streaming and args.stage == "all":
+    # Streaming pipeline mode (PRD §7.2).  V-3: the streaming path is a
+    # single fused run — it cannot be split across machines, so --stages /
+    # --resume-from force the batch path.
+    if args.streaming and args.stage == "all" and manifest_stages is None:
         log.info("🚀 Streaming pipeline mode (O(1) memory)")
         pipeline = StreamingPipeline(
             model_size=args.model_size,
@@ -1038,8 +1242,13 @@ def main():
         log.info(f"✅ Streaming pipeline complete (sv3d/st3d injected) → {result}")
         return
 
-    # R-5: Fulldome projection mode — skip all depth/stereo/equirect/metadata
+    # R-5: Fulldome projection mode — skip all depth/stereo/equirect/metadata.
+    # Fulldome is a single fused conversion with no VR180 stage loop, so the
+    # V-3 manifest/stage-subset flags do not apply to it.
     if args.projection == "fulldome":
+        if manifest_stages is not None:
+            log.error("❌ --stages/--manifest/--resume-from do not apply to --projection fulldome")
+            sys.exit(2)
         log.info("🌐 Fulldome projection mode — bypassing depth/stereo/equirect/metadata stages")
         mapper = FulldomeMapper(
             dome_fov=args.dome_fov,
@@ -1074,6 +1283,24 @@ def main():
         if "upscale" in stages_to_run and args.upscale == 0:
             stages_to_run = [s for s in stages_to_run if s != "upscale"]
 
+        # V-3: apply --stages subset + manifest-resume skip list.
+        if manifest_stages is not None:
+            stages_to_run = [s for s in stages_to_run if s in manifest_stages]
+            if manifest_skip:
+                skipped = [s for s in base_order if s in manifest_skip and s in manifest_stages]
+                if skipped:
+                    log.info("⏭️  Manifest-resume: skipping completed stage(s): %s", skipped)
+            log.info("🧩 Stage subset (--stages): running %s", stages_to_run or "[]")
+
+        def _record(internal_stage):
+            """Record a completed internal stage into the job manifest."""
+            if manifest is None:
+                return
+            mname = _INTERNAL_TO_MANIFEST.get(internal_stage)
+            if mname and mname not in manifest_touched:
+                _manifest_record_stage(manifest, args, mname)
+                manifest_touched.add(mname)
+
         # Load frames if needed
         frames = None
         if need_frames or "depth" in stages_to_run:
@@ -1099,12 +1326,14 @@ def main():
             if stage == "upscale":
                 frames = run_upscale_stage(args, frames)
                 save_checkpoint(temp_dir, "upscale")
+                _record("upscale")
 
             elif stage == "depth":
                 if frames is None:
                     frames = list(read_frames(args.input, args.max_frames))
                 depths = run_depth_stage(args, frames)
                 save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
+                _record("depth")
 
             elif stage == "stereo":
                 if depths is None:
@@ -1119,6 +1348,7 @@ def main():
                     frames = list(read_frames(args.input, args.max_frames))
                 left_frames, right_frames = run_stereo_stage(args, frames, depths)
                 save_checkpoint(temp_dir, "stereo", {"num_frames": len(left_frames)})
+                _record("stereo")
 
             elif stage == "equirect":
                 if is_sbs and left_frames is None:
@@ -1150,6 +1380,7 @@ def main():
                     log.info(f"📂 Loaded {len(left_frames)} stereo frames from checkpoint")
                 sbs_frames = run_equirect_stage(args, left_frames, right_frames)
                 save_checkpoint(temp_dir, "equirect", {"num_frames": len(sbs_frames)})
+                _record("equirect")
 
             elif stage == "outpaint":
                 if sbs_frames is None:
@@ -1161,6 +1392,7 @@ def main():
                     log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint for outpainting")
                 sbs_frames = run_outpaint_stage(args, sbs_frames)
                 save_checkpoint(temp_dir, "outpaint", {"num_frames": len(sbs_frames)})
+                _record("outpaint")
 
             elif stage == "metadata":
                 if sbs_frames is None:
@@ -1171,9 +1403,17 @@ def main():
                     sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
                     log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint")
                 output = run_metadata_stage(args, sbs_frames)
+                _record("metadata")
 
         if output:
             log.info(f"✅ Pipeline complete → {output}")
+
+        # V-3: persist the job manifest (write new / update resumed one).
+        manifest_out = args.manifest if isinstance(args.manifest, str) else None
+        if manifest is not None and manifest_out:
+            from pipeline.job_manifest import save_manifest
+
+            save_manifest(manifest, manifest_out)
 
     elif args.stage == "depth":
         frames = list(read_frames(args.input, args.max_frames))
