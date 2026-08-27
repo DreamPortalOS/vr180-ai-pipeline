@@ -127,6 +127,41 @@ class DepthEstimator:
         """Estimate depth for a list of frames."""
         return [self.estimate(f) for f in frames]
 
+    def estimate_sequence_chunked(
+        self,
+        frames: list[np.ndarray],
+        *,
+        chunk_size: int | None = None,
+        overlap: int = 0,
+    ) -> list[np.ndarray]:
+        """Estimate depth for a sequence in memory-bounded chunks (V-4, #37).
+
+        Depth-Anything V2 is a **per-frame** estimator with no temporal
+        state, so chunking is bit-exact with ``overlap=0``: each frame's depth
+        depends only on that frame.  Peak memory is proportional to
+        ``chunk_size``, not clip length — only one chunk of frames (and the
+        one loaded model) is resident at a time.
+
+        ``overlap`` is accepted (and ignored — there is no temporal state to
+        rebuild) so callers can pass a uniform value alongside the
+        :class:`pipeline.stereo_renderer.StereoRenderer` chunked path.
+
+        Args:
+            frames: Input frames.
+            chunk_size: Frames per chunk (default :func:`default_chunk_size`).
+            overlap: Warmup frames per chunk (default 0 — sufficient here).
+
+        Returns:
+            Depth maps, same length/order as input.
+        """
+        from pipeline.chunked_processor import process_in_chunks
+
+        def _process_chunk(chunk_frames, warm_offset, emit_offset):
+            outs = [self.estimate(f) for f in chunk_frames]
+            return iter(outs[warm_offset:])
+
+        return list(process_in_chunks(frames, _process_chunk, chunk_size=chunk_size, overlap=overlap))
+
     @staticmethod
     def _calibrate_metric(relative_depth: np.ndarray) -> np.ndarray:
         """Convert relative depth to approximate metric depth.

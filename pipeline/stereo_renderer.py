@@ -146,6 +146,46 @@ class StereoRenderer:
         """Process a batch of frame/depth pairs."""
         return [self.render(f, d) for f, d in zip(frames, depths, strict=False)]
 
+    def render_sequence_chunked(
+        self,
+        frames: list,
+        depths: list,
+        *,
+        chunk_size: int | None = None,
+        overlap: int = 0,
+    ) -> list:
+        """Render a frame/depth sequence in memory-bounded chunks (V-4, #37).
+
+        Identical output to ``[self.render(f, d) for f, d in zip(frames,
+        depths)]`` — chunking is a memory optimisation only.  Because the same
+        ``StereoRenderer`` instance drives every chunk, the temporal state
+        (``_prev_disparity``) is **continuous** across chunk boundaries, so the
+        result is bit-exact with ``overlap=0``.  ``overlap`` is accepted (and
+        ignored for correctness — it only costs recompute) so callers that
+        also feed other finite-memory stages can pass one uniform value.
+
+        Peak memory is proportional to ``chunk_size``, not to the clip length:
+        only one chunk's frames/depths are in RAM at a time.
+
+        Args:
+            frames: Left/mono source frames.
+            depths: Matching depth maps (same length).
+            chunk_size: Frames per chunk (default :func:`default_chunk_size`).
+            overlap: Warmup frames per chunk (default 0 — sufficient here).
+
+        Returns:
+            List of ``(left, right)`` pairs, same length/order as input.
+        """
+        from pipeline.chunked_processor import process_in_chunks
+
+        pairs = list(zip(frames, depths, strict=True))
+
+        def _process_chunk(chunk_pairs, warm_offset, emit_offset):
+            outs = [self.render(f, d) for f, d in chunk_pairs]
+            return iter(outs[warm_offset:])
+
+        return list(process_in_chunks(pairs, _process_chunk, chunk_size=chunk_size, overlap=overlap))
+
     def reset_temporal_state(self):
         """Clear temporal smoothing state for a new video sequence."""
         self._prev_disparity = None
