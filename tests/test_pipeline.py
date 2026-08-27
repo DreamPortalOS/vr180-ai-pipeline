@@ -3,6 +3,8 @@
 Run with: pytest tests/ -v
 """
 
+import contextlib
+import glob
 import os
 import subprocess
 
@@ -114,6 +116,33 @@ class TestDepthEstimator:
         depth = estimator.estimate(dummy_frame)
         assert np.all(depth >= 0)
 
+    def test_estimate_sequence_chunked_matches_whole(self, monkeypatch):
+        """V-4 (#37): chunked depth == whole-sequence, all chunk sizes.
+
+        Depth-Anything is per-frame (no temporal state) → bit-exact with
+        overlap=0.  ``estimate`` is stubbed so no model/transformers load.
+        """
+        from pipeline.depth_estimator import DepthEstimator
+
+        rng = np.random.default_rng(3)
+        frames = [rng.integers(0, 256, (48, 48, 3), dtype=np.uint8) for _ in range(20)]
+
+        def _fake_estimate(self, frame):
+            # Deterministic per-frame transform (frame-dependent, stateless).
+            return frame.mean(axis=2).astype(np.float32) / 255.0
+
+        monkeypatch.setattr(DepthEstimator, "estimate", _fake_estimate)
+
+        est = DepthEstimator(model_size="small", device="cpu")
+        whole = [est.estimate(f) for f in frames]
+
+        for cs in (1, 6, 100, None):
+            est2 = DepthEstimator(model_size="small", device="cpu")
+            got = est2.estimate_sequence_chunked(frames, chunk_size=cs, overlap=0)
+            assert len(got) == 20
+            for i, (g, w) in enumerate(zip(got, whole, strict=True)):
+                assert np.array_equal(g, w), f"cs={cs} frame {i} differs"
+
 
 # ---------------------------------------------------------------------------
 # pipeline.stereo_renderer
@@ -142,6 +171,31 @@ class TestStereoRenderer:
         left, right = renderer.render(dummy_frame, dummy_depth)
         diff = np.mean(np.abs(left.astype(float) - right.astype(float)))
         assert diff > 0, "Left and right frames should have some disparity"
+
+    def test_render_sequence_chunked_matches_whole(self):
+        """V-4 (#37): chunked stereo render == whole-sequence render, all chunk sizes.
+
+        The StereoRenderer reuses one instance across chunks so ``_prev_disparity``
+        is continuous → bit-exact with overlap=0.  Covers the chunk_size=1 and
+        chunk_size>total extremes plus a typical multi-chunk size.
+        """
+        from pipeline.stereo_renderer import StereoRenderer
+
+        rng = np.random.default_rng(7)
+        frames = [rng.integers(0, 256, (64, 64, 3), dtype=np.uint8) for _ in range(20)]
+        depths = [rng.random((64, 64)).astype(np.float32) for _ in range(20)]
+
+        # Whole-sequence reference
+        ref = StereoRenderer()
+        whole = [ref.render(f, d) for f, d in zip(frames, depths, strict=True)]
+
+        for cs in (1, 7, 100, None):
+            r = StereoRenderer()
+            got = r.render_sequence_chunked(frames, depths, chunk_size=cs, overlap=0)
+            assert len(got) == 20, f"count wrong for cs={cs}"
+            for i, (gl, wl) in enumerate(zip(got, whole, strict=True)):
+                assert np.array_equal(gl[0], wl[0]), f"cs={cs} left frame {i} differs"
+                assert np.array_equal(gl[1], wl[1]), f"cs={cs} right frame {i} differs"
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +374,117 @@ class TestRunPipelineCLI:
         importlib.util.module_from_spec(spec)
         # Don't execute main, just verify it loads
         assert spec is not None
+
+
+# ---------------------------------------------------------------------------
+# V-4 (#37): chunked batch stages — chunked == whole-sequence end-to-end
+# ---------------------------------------------------------------------------
+
+
+class TestRunPipelineChunked:
+    """The batch depth/stereo stages under --chunk-size must match whole-run.
+
+    DepthEstimator.estimate is stubbed (no transformers/model) so this is a
+    pure CPU test of the chunking wiring + temporal-state continuity.
+    """
+
+    @staticmethod
+    def _import_run_pipeline():
+        import importlib.util
+        import sys
+
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "run_pipeline_v4",
+                os.path.join(os.path.dirname(__file__), "..", "scripts", "run_pipeline.py"),
+            )
+            mod = importlib.util.module_from_spec(spec)
+            assert spec is not None
+            spec.loader.exec_module(mod)
+            return mod
+        finally:
+            with contextlib.suppress(ValueError):
+                sys.path.remove(os.path.join(os.path.dirname(__file__), "..", "scripts"))
+
+    def _args(self, run_pipeline, tmp_path, chunk_size, overlap=0):
+        from unittest.mock import MagicMock
+
+        args = MagicMock()
+        args.depth_model = "depth-anything"
+        args.stereo_model = "default"
+        args.model_size = "small"
+        args.device = "cpu"
+        args.temporal_smoothing = 0.3
+        args.ipd = 0.064
+        args.max_disparity = 0.02
+        args.no_temporal = False
+        args.chunk_size = chunk_size
+        args.overlap = overlap
+        args.temp_dir = str(tmp_path)
+        args.input = str(tmp_path / "fake_input.mp4")
+        return args
+
+    def test_depth_stage_chunked_matches_whole(self, tmp_path, monkeypatch):
+        """--chunk-size depth (with EMA) == whole-sequence depth, all chunk sizes."""
+        run_pipeline = self._import_run_pipeline()
+
+        rng = np.random.default_rng(11)
+        frames = [rng.integers(0, 256, (48, 48, 3), dtype=np.uint8) for _ in range(20)]
+
+        def fake_estimate(self, frame):
+            return frame.mean(axis=2).astype(np.float32) / 255.0
+
+        monkeypatch.setattr(run_pipeline.DepthEstimator, "estimate", fake_estimate)
+
+        # Whole-sequence reference
+        ref_args = self._args(run_pipeline, tmp_path / "ref", chunk_size=None)
+        ref = run_pipeline.run_depth_stage(ref_args, frames)
+
+        for cs in (1, 7, 100):
+            cargs = self._args(run_pipeline, tmp_path / f"cs{cs}", chunk_size=cs)
+            got = run_pipeline.run_depth_stage(cargs, frames)
+            assert len(got) == 20
+            for i, (g, w) in enumerate(zip(got, ref, strict=True)):
+                assert np.array_equal(g, w), f"cs={cs} frame {i} differs"
+
+    def test_stereo_stage_chunked_matches_whole(self, tmp_path):
+        """--chunk-size stereo == whole-sequence stereo, all chunk sizes."""
+        run_pipeline = self._import_run_pipeline()
+
+        rng = np.random.default_rng(23)
+        frames = [rng.integers(0, 256, (48, 48, 3), dtype=np.uint8) for _ in range(20)]
+        depths = [rng.random((48, 48)).astype(np.float32) for _ in range(20)]
+
+        ref_args = self._args(run_pipeline, tmp_path / "ref", chunk_size=None)
+        ref_l, ref_r = run_pipeline.run_stereo_stage(ref_args, frames, depths)
+
+        for cs in (1, 7, 100):
+            cargs = self._args(run_pipeline, tmp_path / f"cs{cs}", chunk_size=cs)
+            got_l, got_r = run_pipeline.run_stereo_stage(cargs, frames, depths)
+            assert len(got_l) == 20 and len(got_r) == 20
+            for i in range(20):
+                assert np.array_equal(got_l[i], ref_l[i]), f"cs={cs} left frame {i} differs"
+                assert np.array_equal(got_r[i], ref_r[i]), f"cs={cs} right frame {i} differs"
+
+    def test_depth_stage_writes_checkpoints_per_frame(self, tmp_path, monkeypatch):
+        """Chunked depth must still write every depth_{i}.npy + .png checkpoint."""
+        run_pipeline = self._import_run_pipeline()
+        rng = np.random.default_rng(5)
+        frames = [rng.integers(0, 256, (32, 32, 3), dtype=np.uint8) for _ in range(10)]
+
+        def fake_estimate(self, frame):
+            return frame.mean(axis=2).astype(np.float32) / 255.0
+
+        monkeypatch.setattr(run_pipeline.DepthEstimator, "estimate", fake_estimate)
+        cargs = self._args(run_pipeline, tmp_path, chunk_size=4, overlap=0)
+        run_pipeline.run_depth_stage(cargs, frames)
+        depth_dir = run_pipeline.get_temp_dir(cargs, "depth")
+        npy = sorted(glob.glob(os.path.join(depth_dir, "depth_*.npy")))
+        png = sorted(glob.glob(os.path.join(depth_dir, "depth_*.png")))
+        assert len(npy) == 10 and len(png) == 10
+        # Indices 0..9 present.
+        assert {os.path.basename(p) for p in npy} == {f"depth_{i:06d}.npy" for i in range(10)}
 
 
 # ---------------------------------------------------------------------------

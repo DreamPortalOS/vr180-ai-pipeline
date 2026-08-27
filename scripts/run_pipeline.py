@@ -101,6 +101,25 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--output-height", type=int, default=None, help="Equirectangular output height per eye")
     parser.add_argument("--src-hfov", type=float, default=70.0, help="Source camera horizontal FOV (degrees)")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of frames (for testing)")
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=None,
+        help="V-4: batch depth/stereo stage chunk size in frames. When set, the "
+        "non-streaming depth and stereo stages process frames in memory-bounded "
+        "chunks (peak RAM ∝ chunk_size, not clip length) instead of buffering the "
+        "whole sequence. Default None = legacy whole-sequence buffering. The "
+        "streaming pipeline (O(1) memory) is unaffected.",
+    )
+    parser.add_argument(
+        "--overlap",
+        type=int,
+        default=0,
+        help="V-4: warmup frames replayed at each chunk boundary to rebuild "
+        "temporal state. 0 (default) is exact for stateless stages and for "
+        "stages whose state persists across chunks (depth estimator, stereo "
+        "renderer). Use >=1 only for finite-window temporal filters.",
+    )
     parser.add_argument("--no-temporal", action="store_true", help="Disable temporal smoothing")
     parser.add_argument("--temp-dir", default=None, help="Directory for intermediate files")
     parser.add_argument("--no-ffmpeg-v360", action="store_true", help="Disable ffmpeg v360, use OpenCV fallback")
@@ -442,20 +461,57 @@ def run_depth_stage(args, frames):
     prev_depth = None
     temporal_alpha = args.temporal_smoothing if args.temporal_smoothing > 0 else None
 
-    for i, frame in enumerate(tqdm(frames, desc="Estimating depth")):
-        depth = estimator.estimate(frame)
+    # V-4 (#37): optional chunked processing.  When --chunk-size is set, frames
+    # are processed in memory-bounded chunks via process_in_chunks.  Depth-Anything
+    # is stateless so chunking is bit-exact with overlap=0; the pipeline-level
+    # EMA (prev_depth) is carried across chunks by processing the chunk stream
+    # sequentially below, so its state is continuous and the output matches the
+    # whole-sequence run exactly.
+    chunk_size = getattr(args, "chunk_size", None)
 
-        # Pipeline-level temporal smoothing (EMA)
+    def _emit_depth(i, frame):
+        nonlocal prev_depth
+        depth = estimator.estimate(frame)
         if temporal_alpha and prev_depth is not None:
             depth = temporal_alpha * depth + (1 - temporal_alpha) * prev_depth
         prev_depth = depth
-
         depths.append(depth)
-        # Save depth map for inspection
         dmax = float(np.nanmax(depth))
         depth_vis = (depth / dmax * 255).astype(np.uint8) if dmax > 0 else depth.astype(np.uint8)
         cv2.imwrite(os.path.join(out_dir, f"depth_{i:06d}.png"), cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO))
         np.save(os.path.join(out_dir, f"depth_{i:06d}.npy"), depth)
+
+    if chunk_size:
+        from pipeline.chunked_processor import process_in_chunks
+
+        overlap = getattr(args, "overlap", 0)
+        # Drive the per-frame emit over chunks.  Depth-Anything is stateless,
+        # so the warmup prefix is a no-op (nothing to rebuild); the EMA
+        # ``prev_depth`` is carried across chunks by the sequential emit below,
+        # making the output bit-exact vs the whole-sequence run.  Peak RAM is
+        # ∝ chunk_size rather than clip length.
+        gi = 0
+
+        def _depth_process_fn(chunk_frames, warm_offset, emit_offset):
+            nonlocal gi
+            # Warmup: no temporal state to rebuild for a stateless estimator.
+            outs = []
+            for f in chunk_frames[warm_offset:]:
+                _emit_depth(gi, f)
+                outs.append(depths[-1])
+                gi += 1
+            return iter(outs)
+
+        list(
+            tqdm(
+                process_in_chunks(frames, _depth_process_fn, chunk_size=chunk_size, overlap=overlap),
+                desc="Estimating depth (chunked)",
+                total=len(frames),
+            )
+        )
+    else:
+        for i, frame in enumerate(tqdm(frames, desc="Estimating depth")):
+            _emit_depth(i, frame)
 
     log.info(f"Depth maps saved to {out_dir}/")
     return depths
@@ -480,17 +536,31 @@ def run_stereo_stage(args, frames, depths):
     left_dir = get_temp_dir(args, "left")
     right_dir = get_temp_dir(args, "right")
 
-    left_frames, right_frames = [], []
-    for i, (frame, depth) in enumerate(
-        tqdm(zip(frames, depths, strict=False), desc="Rendering stereo", total=len(frames))
-    ):
-        left, right = renderer.render(frame, depth)
-        left_frames.append(left)
-        right_frames.append(right)
+    pairs: list[tuple] = list(zip(frames, depths, strict=False))
+    chunk_size = getattr(args, "chunk_size", None)
+    overlap = getattr(args, "overlap", 0)
 
-        # Save intermediate files
-        cv2.imwrite(os.path.join(left_dir, f"left_{i:06d}.png"), cv2.cvtColor(left, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(os.path.join(right_dir, f"right_{i:06d}.png"), cv2.cvtColor(right, cv2.COLOR_RGB2BGR))
+    left_frames, right_frames = [], []
+    if chunk_size:
+        # V-4 (#37): memory-bounded chunked render.  One StereoRenderer
+        # instance drives every chunk so ``_prev_disparity`` is continuous →
+        # bit-exact vs whole-sequence with overlap=0.  Peak RAM ∝ chunk_size.
+        chunked = renderer.render_sequence_chunked(frames, depths, chunk_size=chunk_size, overlap=overlap)
+        iterator = tqdm(chunked, desc="Rendering stereo (chunked)", total=len(pairs))
+        for i, (left, right) in enumerate(iterator):
+            left_frames.append(left)
+            right_frames.append(right)
+            cv2.imwrite(os.path.join(left_dir, f"left_{i:06d}.png"), cv2.cvtColor(left, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(right_dir, f"right_{i:06d}.png"), cv2.cvtColor(right, cv2.COLOR_RGB2BGR))
+    else:
+        for i, (frame, depth) in enumerate(tqdm(pairs, desc="Rendering stereo", total=len(pairs))):
+            left, right = renderer.render(frame, depth)
+            left_frames.append(left)
+            right_frames.append(right)
+
+            # Save intermediate files
+            cv2.imwrite(os.path.join(left_dir, f"left_{i:06d}.png"), cv2.cvtColor(left, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(right_dir, f"right_{i:06d}.png"), cv2.cvtColor(right, cv2.COLOR_RGB2BGR))
 
     log.info(f"Stereo views: {len(left_frames)} frames each")
     return left_frames, right_frames
