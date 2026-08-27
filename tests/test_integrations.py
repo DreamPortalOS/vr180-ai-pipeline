@@ -246,16 +246,15 @@ class TestSeedanceProvider:
         provider = SeedanceProvider()
 
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"task": {"task_id": "ark-task-001"}}
+        submit_resp.json.return_value = {"id": "cgt-20260828004522-rxht8"}
         submit_resp.raise_for_status.return_value = None
 
         poll_resp = MagicMock(spec=httpx.Response)
         poll_resp.json.return_value = {
-            "task": {
-                "task_id": "ark-task-001",
-                "status": "succeeded",
-                "outputs": [{"video_url": "https://ark-cdn.volces.com/video.mp4"}],
-            }
+            "id": "cgt-20260828004522-rxht8",
+            "status": "succeeded",
+            "content": {"video_url": "https://ark-cdn.volces.com/video.mp4"},
+            "usage": {"completion_tokens": 512},
         }
         poll_resp.raise_for_status.return_value = None
 
@@ -268,7 +267,7 @@ class TestSeedanceProvider:
             result = provider.generate("flying")
 
         assert result.video_url == "https://ark-cdn.volces.com/video.mp4"
-        assert result.job_id == "ark-task-001"
+        assert result.job_id == "cgt-20260828004522-rxht8"
         assert result.provider == "seedance"
 
         # Verify the request body used the Ark content-list contract.
@@ -278,24 +277,35 @@ class TestSeedanceProvider:
         assert body["resolution"] == "480p"
         assert body["ratio"] == "adaptive"
         assert body["duration"] == 5
-        assert mock_client.get.call_args[0][0] == "/contents/generations/tasks/ark-task-001"
+        assert mock_client.get.call_args[0][0] == "/contents/generations/tasks/cgt-20260828004522-rxht8"
 
     def test_generate_custom_kwargs_override_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ARK_API_KEY", "test-key")
         provider = SeedanceProvider()
 
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"task_id": "ark-task-002"}
+        submit_resp.json.return_value = {"id": "cgt-20260828010000-abcde"}
         submit_resp.raise_for_status.return_value = None
 
         poll_resp = MagicMock(spec=httpx.Response)
-        poll_resp.json.return_value = {"task": {"status": "succeeded", "outputs": [{"video_url": "https://x/v.mp4"}]}}
+        poll_resp.json.return_value = {
+            "id": "cgt-20260828010000-abcde",
+            "status": "running",
+        }
         poll_resp.raise_for_status.return_value = None
+
+        poll_resp2 = MagicMock(spec=httpx.Response)
+        poll_resp2.json.return_value = {
+            "id": "cgt-20260828010000-abcde",
+            "status": "succeeded",
+            "content": {"video_url": "https://x/v.mp4"},
+        }
+        poll_resp2.raise_for_status.return_value = None
 
         mock_client = MagicMock(spec=httpx.Client)
         mock_client.__enter__.return_value = mock_client
         mock_client.post.return_value = submit_resp
-        mock_client.get.return_value = poll_resp
+        mock_client.get.side_effect = [poll_resp, poll_resp2]
 
         with patch("integrations.seedance.httpx.Client", return_value=mock_client):
             provider.generate("test", model=SeedanceProvider.MODEL_STD, resolution="720p", ratio="16:9", duration=8)
@@ -350,20 +360,28 @@ class TestSeedanceProvider:
         provider = SeedanceProvider()
 
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"task_id": "ark-task-003"}
+        submit_resp.json.return_value = {"id": "cgt-20260828020000-fail01"}
         submit_resp.raise_for_status.return_value = None
 
         poll_resp = MagicMock(spec=httpx.Response)
         poll_resp.json.return_value = {
-            "task": {"status": "failed"},
-            "error": {"code": "ModelNotOpen", "message": "model not enabled", "model": "doubao-seedance-2-0-260128"},
+            "id": "cgt-20260828020000-fail01",
+            "status": "running",
         }
         poll_resp.raise_for_status.return_value = None
+
+        poll_resp2 = MagicMock(spec=httpx.Response)
+        poll_resp2.json.return_value = {
+            "id": "cgt-20260828020000-fail01",
+            "status": "failed",
+            "error": {"code": "ModelNotOpen", "message": "model not enabled", "model": "doubao-seedance-2-0-260128"},
+        }
+        poll_resp2.raise_for_status.return_value = None
 
         mock_client = MagicMock(spec=httpx.Client)
         mock_client.__enter__.return_value = mock_client
         mock_client.post.return_value = submit_resp
-        mock_client.get.return_value = poll_resp
+        mock_client.get.side_effect = [poll_resp, poll_resp2]
 
         with (
             patch("integrations.seedance.httpx.Client", return_value=mock_client),
@@ -377,11 +395,11 @@ class TestSeedanceProvider:
         provider = SeedanceProvider()
 
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"task_id": "ark-task-004"}
+        submit_resp.json.return_value = {"id": "cgt-20260828030000-timeout1"}
         submit_resp.raise_for_status.return_value = None
 
         poll_resp = MagicMock(spec=httpx.Response)
-        poll_resp.json.return_value = {"task": {"status": "processing"}}
+        poll_resp.json.return_value = {"id": "cgt-20260828030000-timeout1", "status": "running"}
         poll_resp.raise_for_status.return_value = None
 
         mock_client = MagicMock(spec=httpx.Client)
@@ -691,13 +709,15 @@ class TestKlingImageToVideo:
 
 
 class TestSeedanceImageToVideo:
-    def _submit_poll(self, task_id="ark-i2v-001", status="succeeded"):
+    def _submit_poll(self, task_id="cgt-20260828040000-i2v01", status="succeeded"):
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"task": {"task_id": task_id}}
+        submit_resp.json.return_value = {"id": task_id}
         submit_resp.raise_for_status.return_value = None
         poll_resp = MagicMock(spec=httpx.Response)
         poll_resp.json.return_value = {
-            "task": {"status": status, "outputs": [{"video_url": "https://ark-cdn.volces.com/i2v.mp4"}]}
+            "id": task_id,
+            "status": status,
+            "content": {"video_url": "https://ark-cdn.volces.com/i2v.mp4"},
         }
         poll_resp.raise_for_status.return_value = None
         return submit_resp, poll_resp
@@ -709,17 +729,25 @@ class TestSeedanceImageToVideo:
         provider = SeedanceProvider()
 
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"task_id": "ark-i2v-001"}
+        submit_resp.json.return_value = {"id": "cgt-20260828050000-http01"}
         submit_resp.raise_for_status.return_value = None
         poll_resp = MagicMock(spec=httpx.Response)
         poll_resp.json.return_value = {
-            "task": {"status": "succeeded", "outputs": [{"video_url": "https://ark-cdn.volces.com/i2v.mp4"}]}
+            "id": "cgt-20260828050000-http01",
+            "status": "running",
         }
         poll_resp.raise_for_status.return_value = None
+        poll_resp2 = MagicMock(spec=httpx.Response)
+        poll_resp2.json.return_value = {
+            "id": "cgt-20260828050000-http01",
+            "status": "succeeded",
+            "content": {"video_url": "https://ark-cdn.volces.com/i2v.mp4"},
+        }
+        poll_resp2.raise_for_status.return_value = None
 
         mock_client = _mock_httpx_client()
         mock_client.post.return_value = submit_resp
-        mock_client.get.return_value = poll_resp
+        mock_client.get.side_effect = [poll_resp, poll_resp2]
 
         with (
             patch("integrations.seedance.httpx.Client", return_value=mock_client),
@@ -728,14 +756,14 @@ class TestSeedanceImageToVideo:
             result = provider.generate_from_image("https://example.com/p.png", duration=5, prompt="pan left")
 
         assert result.video_url == "https://ark-cdn.volces.com/i2v.mp4"
-        assert result.job_id == "ark-i2v-001"
+        assert result.job_id == "cgt-20260828050000-http01"
         assert result.provider == "seedance"
 
         body = mock_client.post.call_args[1]["json"]
         content = body["content"]
         assert content[0] == {"type": "text", "text": "pan left"}
         assert content[1] == {"type": "image_url", "image_url": {"url": "https://example.com/p.png"}}
-        mock_client.get.assert_called_once()
+        assert mock_client.get.call_count == 2
 
     def test_i2v_local_image_encoded_as_base64_data_url(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
         """A local image is validated and base64-encoded as a data URL."""
@@ -748,17 +776,25 @@ class TestSeedanceImageToVideo:
         _cv2.imwrite(str(img), _cv2.resize(np.zeros((400, 600, 3), dtype=np.uint8), (600, 400)))
 
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"task_id": "ark-i2v-002"}
+        submit_resp.json.return_value = {"id": "cgt-20260828060000-base01"}
         submit_resp.raise_for_status.return_value = None
         poll_resp = MagicMock(spec=httpx.Response)
         poll_resp.json.return_value = {
-            "task": {"status": "succeeded", "outputs": [{"video_url": "https://ark-cdn.volces.com/i2v.mp4"}]}
+            "id": "cgt-20260828060000-base01",
+            "status": "running",
         }
         poll_resp.raise_for_status.return_value = None
+        poll_resp2 = MagicMock(spec=httpx.Response)
+        poll_resp2.json.return_value = {
+            "id": "cgt-20260828060000-base01",
+            "status": "succeeded",
+            "content": {"video_url": "https://ark-cdn.volces.com/i2v.mp4"},
+        }
+        poll_resp2.raise_for_status.return_value = None
 
         mock_client = _mock_httpx_client()
         mock_client.post.return_value = submit_resp
-        mock_client.get.return_value = poll_resp
+        mock_client.get.side_effect = [poll_resp, poll_resp2]
 
         with (
             patch("integrations.seedance.httpx.Client", return_value=mock_client),
@@ -780,18 +816,25 @@ class TestSeedanceImageToVideo:
         provider = SeedanceProvider()
 
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"task_id": "ark-i2v-003"}
+        submit_resp.json.return_value = {"id": "cgt-20260828070000-err01"}
         submit_resp.raise_for_status.return_value = None
         poll_resp = MagicMock(spec=httpx.Response)
         poll_resp.json.return_value = {
-            "task": {"status": "expired"},
-            "error": {"code": "ResourceNotFound", "message": "task expired"},
+            "id": "cgt-20260828070000-err01",
+            "status": "running",
         }
         poll_resp.raise_for_status.return_value = None
+        poll_resp2 = MagicMock(spec=httpx.Response)
+        poll_resp2.json.return_value = {
+            "id": "cgt-20260828070000-err01",
+            "status": "expired",
+            "error": {"code": "ResourceNotFound", "message": "task expired"},
+        }
+        poll_resp2.raise_for_status.return_value = None
 
         mock_client = _mock_httpx_client()
         mock_client.post.return_value = submit_resp
-        mock_client.get.return_value = poll_resp
+        mock_client.get.side_effect = [poll_resp, poll_resp2]
 
         with (
             patch("integrations.seedance.httpx.Client", return_value=mock_client),
@@ -824,11 +867,13 @@ class TestSeedanceImageToVideo:
         _cv2.imwrite(str(img), _cv2.resize(np.zeros((400, 600, 3), dtype=np.uint8), (600, 400)))
 
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"task_id": "ark-i2v-004"}
+        submit_resp.json.return_value = {"id": "cgt-20260828080000-empty01"}
         submit_resp.raise_for_status.return_value = None
         poll_resp = MagicMock(spec=httpx.Response)
         poll_resp.json.return_value = {
-            "task": {"status": "succeeded", "outputs": [{"video_url": "https://ark-cdn.volces.com/i2v.mp4"}]}
+            "id": "cgt-20260828080000-empty01",
+            "status": "succeeded",
+            "content": {"video_url": "https://ark-cdn.volces.com/i2v.mp4"},
         }
         poll_resp.raise_for_status.return_value = None
 
