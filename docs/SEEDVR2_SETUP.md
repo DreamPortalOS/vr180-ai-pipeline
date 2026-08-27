@@ -1,214 +1,201 @@
-# SeedVR2 Video Upscaling — Deployment Guide
+# SeedVR2 Video Upscaling — In-Repo Deployment
 
 _Goal: upscale the 720p/1080p source clip to 1440p+ **before** VR180/fulldome conversion.
 SeedVR2 (ByteDance, ICLR2026) is the 2026 SOTA temporal video super-res — best-in-class on
 short, AI-generated, compressed clips (exactly our input)._
 
-This guide documents the **CLI backend** (the only path verified on a 12 GB RTX 4070S).
-It uses the ComfyUI node's `inference_cli.py` — no ComfyUI server required.
+As of 2026-08-28 the legacy `D:/ComfyUI` install was removed. SeedVR2 now lives
+**inside this repo** (everything gitignored) and is picked up automatically by
+`pipeline/video_upscaler.CLIBackend` via in-repo default paths. One command deploys it.
 
-> **Compatibility:** Windows 11 + 12 GB VRAM verified.  Python 3.10–3.12.
-
----
-
-## 1. Clone ComfyUI + SeedVR2 Node
-
-The node ships `inference_cli.py` which does everything: automatic model download (with resume),
-OOM-retry, tiled VAE decode, and direct MP4 output.
-
-```powershell
-# 1. ComfyUI base (optional but provides model dir structure)
-git clone https://github.com/comfyanonymous/ComfyUI.git
-# or just create the model dir manually:
-# mkdir -p ComfyUI/models/SEEDVR2
-
-# 2. SeedVR2 custom node (the CLI script lives here)
-cd ComfyUI/custom_nodes
-git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git
-cd ComfyUI-SeedVR2_VideoUpscaler
-```
-
-**Directory layout after cloning:**
-```
-ComfyUI/
-├── custom_nodes/
-│   └── ComfyUI-SeedVR2_VideoUpscaler/
-│       ├── inference_cli.py          ← the CLI entry point
-│       ├── src/                      ← internal modules (imported via cwd)
-│       └── ...
-└── models/
-    └── SEEDVR2/                      ← model files go here
-        └── seedvr2_ema_3b_fp8_e4m3fn.safetensors
-```
+> **Compatibility:** Windows 11 + RTX 4070 SUPER (12 GB) verified. Python 3.10–3.12. CUDA-only.
 
 ---
 
-## 2. Download the Model
+## 1. One-Command Bootstrap
 
-The node's auto-downloader **can** fetch models, but it lacks resume — a dropped connection
-restarts from zero.  For reliable downloads use `curl` with `-C -` (resume):
+From the repo root, on the Windows host with the GPU:
 
 ```powershell
-# DIFFUSION model (3.16 GB) — required
-curl -L -C - -o ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp8_e4m3fn.safetensors ^
-  https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors
-
-# VAE model (0.47 GB) — required for encode/decode
-curl -L -C - -o ComfyUI/models/SEEDVR2/ema_vae_fp16.safetensors ^
-  https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/ema_vae_fp16.safetensors
-
-# Alternative DIT: official ByteDance repo (filename differs — may need a symlink)
-# curl -L -C - -o ComfyUI/models/SEEDVR2/seedvr2_ema_3b_fp16.safetensors ^
-#   https://huggingface.co/ByteDance-Seed/SeedVR2-3B/resolve/main/seedvr2_ema_3b_fp16.safetensors
+python scripts/setup_seedvr2.py
 ```
 
-> **Filenames matter.** `inference_cli.py` defaults to `DEFAULT_DIT = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"`.
-> If you use a different file, pass `--dit <filename>` to the CLI.
+That's it. The script does everything, idempotently (re-running only fills missing pieces):
+
+| Step | What | Time |
+|---|---|---|
+| 1 | `git clone` the SeedVR2 node repo into `third_party/seedvr2_videoupscaler/` (or `git pull` if present) | ~30 s |
+| 2 | Build a **dedicated** venv *inside* the node dir (never the project-root venv), install `torch==2.6.0` on cu124 + the node's requirements | ~5 min |
+| 3 | Download the two model weights to `models/SEEDVR2/` | ~15 min (4 GB) |
+| 4 | Self-check: `inference_cli.py --help` | ~5 s |
+| 5 | Print the env-var values (optional — in-repo defaults are used automatically) | |
+
+**Options:**
+
+```powershell
+python scripts/setup_seedvr2.py --skip-model       # weights already on disk (>1 GB)
+python scripts/setup_seedvr2.py --skip-deps        # venv + pip install already done
+python scripts/setup_seedvr2.py --dry-run          # print planned steps, zero I/O
+python scripts/setup_seedvr2.py --pip-mirror https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+The `--pip-mirror` flag forwards `-i <url>` to pip (useful from mainland China:
+[Tsinghua](https://pypi.tuna.tsinghua.edu.cn/simple) / [Aliyun](https://mirrors.aliyun.com/pypi/simple/)).
+`torch` is **always** installed from the official PyTorch cu124 index (never mirrored),
+because the PyTorch wheels are index-specific.
+
+---
+
+## 2. In-Repo Layout
+
+Everything below is gitignored (`models/`, `third_party/`, `.venv/`):
+
+```
+<repo>/
+├── third_party/
+│   └── seedvr2_videoupscaler/     ← git clone of numz/ComfyUI-SeedVR2_VideoUpscaler
+│       ├── inference_cli.py       ← the CLI entry point
+│       ├── src/                   ← internal modules
+│       └── .venv/                 ← dedicated venv (torch + node deps)
+├── models/
+│   └── SEEDVR2/                   ← model weights
+│       ├── seedvr2_ema_3b_fp8_e4m3fn.safetensors   (≈3.2 GB)
+│       └── ema_vae_fp16.safetensors                (≈0.5 GB)
+└── pipeline/video_upscaler.py     ← CLIBackend uses these paths by default
+```
+
+The pipeline's `CLIBackend` resolves paths in this order (each layer only when the
+previous is unset AND the path actually exists on disk):
+
+1. Explicit `--seedvr2-*` flag / constructor argument
+2. `SEEDVR2_NODE_DIR` / `SEEDVR2_PYTHON` / `SEEDVR2_MODEL_DIR` env vars
+3. In-repo defaults: `third_party/seedvr2_videoupscaler`, its `.venv/python`, `models/SEEDVR2`
+4. *(only for `model_dir`)* legacy ComfyUI layout `<node_dir>/../../models/SEEDVR2`
+
+If none of the three layers resolve for `node_dir`, the constructor raises and points you
+at `scripts/setup_seedvr2.py`.
+
+---
+
+## 3. Disk + VRAM Requirements
+
+| Resource | Requirement | Notes |
+|---|---|---|
+| **Disk** | ~8 GB free | 4 GB models + ~3 GB venv + git clone |
+| **VRAM** | 12 GB (RTX 4070 SUPER) | 16 GB+ recommended for faster throughput |
+| **Python** | 3.10–3.12 | The host's python; a separate venv is created inside the node dir |
+| **CUDA** | 12.4 drivers | torch 2.6.0 cu124 wheels |
+| **ffmpeg** | on PATH | required by `inference_cli.py` + ffprobe |
 
 **Model choice for 12 GB:**
 
-**File sizes (lead-verified actuals):**
-
 | Model file | Size | VRAM | Quality | Recommended |
 |---|---|---|---|---|
-| `seedvr2_ema_3b_fp8_e4m3fn.safetensors` | **3.16 GB** | ~10 GB | Good | **Default** — fits 12 GB with headroom |
-| `ema_vae_fp16.safetensors` | **0.47 GB** | ~1 GB | Good | **Required** for VAE decode |
-| `seedvr2_ema_3b_fp16.safetensors` | N/A | ~14 GB | Best | OOMs on 12 GB; need 16 GB+ |
-| `seedvr2_ema_3b-Q4_K_M.gguf` | N/A | ~8 GB | Fair | Use only if fp8 OOMs |
+| `seedvr2_ema_3b_fp8_e4m3fn.safetensors` | **3.2 GB** | ~10 GB | Good | **Default** — fits 12 GB with headroom |
+| `ema_vae_fp16.safetensors` | **0.5 GB** | ~1 GB | Good | **Required** for VAE encode/decode |
+| `seedvr2_ema_3b_fp16.safetensors` | ~6 GB | ~14 GB | Best | OOMs on 12 GB; need 16 GB+ |
 
 ---
 
-## 3. Verify the CLI Works
+## 4. Run Upscaling
 
-From the **node directory** (`ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler`):
-
-```powershell
-python inference_cli.py --help
-```
-
-You should see flags like `--vae_decode_tiled`, `--batch_size`, `--resolution`, etc.
-If you get `ModuleNotFoundError: No module named 'src'`, you're running from the wrong
-directory — `cwd` must be the node directory.
-
----
-
-## 4. Run Upscaling (Manual Test)
-
-```powershell
-cd ComfyUI/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler
-
-python inference_cli.py "D:\path\to\input.mp4" ^
-  --output "D:\path\to\output.mp4" ^
-  --resolution 1440 ^
-  --batch_size 5 ^
-  --vae_decode_tiled ^
-  --vae_decode_tile_size 512 ^
-  --vae_decode_tile_overlap 64 ^
-  --vae_encode_tiled ^
-  --vae_encode_tile_size 512 ^
-  --vae_encode_tile_overlap 64 ^
-  --dit_offload_device cpu ^
-  --vae_offload_device cpu ^
-  --output_format mp4 ^
-  --model_dir "D:\ComfyUI\models\SEEDVR2"
-```
-
-**12 GB parameters (all required — lead-verified config):**
-
-| Flag | Value | Why |
-|---|---|---|
-| `--resolution` | `1440` | Short-side target. 1080p × 2 = 2160 (too big), 1440 is the sweet spot |
-| `--batch_size` | `5` | Must be `4n+1`.  5 fits in 12 GB; 9 OOMs on long clips |
-| `--vae_decode_tiled` | *(on)* | **Required** — without it VAE decode OOMs on 12 GB |
-| `--vae_decode_tile_size` | `512` | Smaller tiles = less VRAM, slightly slower |
-| `--vae_decode_tile_overlap` | `64` | Tile overlap to hide seams |
-| `--vae_encode_tiled` | *(on)* | **Required** — without it VAE **encode** OOMs on 12 GB |
-| `--vae_encode_tile_size` | `512` | Same tile size for encode path |
-| `--dit_offload_device` | `cpu` | Offload DIT transformer layers to CPU — saves ~2 GB |
-| `--vae_offload_device` | `cpu` | Offload VAE to CPU — saves ~1 GB |
-
-**Performance:** ~60 s/frame at 1080p → 1440p.  A 100-frame 4-second clip takes ~100 minutes.
-Upscaling to 2160p is proportionally slower (~3×).  This is an **offline tool** — start it and
-walk away.
-
----
-
-## 5. Integrate with Pipeline
-
-Set environment variables (or pass CLI flags):
-
-```powershell
-$env:SEEDVR2_NODE_DIR = "D:\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler"
-$env:SEEDVR2_MODEL_DIR = "D:\ComfyUI\models\SEEDVR2"
-$env:SEEDVR2_RESOLUTION = "1440"
-```
-
-Then run:
+**You don't need to set any env vars** — the pipeline uses the in-repo defaults. Just:
 
 ```powershell
 python scripts/run_pipeline.py ^
-  --input video\googlegemini.mp4 ^
-  --output video\googlegemini_vr180.mp4 ^
+  --input video\source.mp4 ^
+  --output video\upscaled_then_vr180.mp4 ^
   --video-upscale seedvr2 ^
-  --seedvr2-node-dir "%SEEDVR2_NODE_DIR%" ^
-  --seedvr2-model-dir "%SEEDVR2_MODEL_DIR%" ^
   --seedvr2-resolution 1440 ^
   --src-hfov 150 --codec h265 --crf 16
 ```
 
-If env vars are set, you can omit the `--seedvr2-*` flags entirely:
+To override the in-repo paths (e.g. weights on a faster NVMe), export the env vars the
+bootstrap prints, or pass `--seedvr2-node-dir` / `--seedvr2-python` / `--seedvr2-model-dir`
+to `run_pipeline.py`.
 
-```powershell
-python scripts/run_pipeline.py --input video.mp4 --output vr180.mp4 --video-upscale seedvr2
-```
+**12 GB parameters** (all set by `CLIBackend` automatically — verified on the RTX 4070S):
+
+| Flag | Value | Why |
+|---|---|---|
+| `--resolution` | `1440` | Short-side target; 1080p×2=2160 is too big, 1440 is the sweet spot |
+| `--batch_size` | `5` | Must be `4n+1`. 5 fits 12 GB; 9 OOMs on long clips |
+| `--vae_decode_tiled` / `_encode_tiled` | on | **Required** — without it VAE encode/decode OOMs on 12 GB |
+| `--vae_*_tile_size` | `512` | Smaller tiles = less VRAM, slightly slower |
+| `--dit_offload_device` | `cpu` | Offload DIT transformer layers — saves ~2 GB |
+| `--vae_offload_device` | `cpu` | Offload VAE — saves ~1 GB |
+
+**Performance:** ~60 s/frame at 1080p → 1440p. A 100-frame 4-second clip takes ~100 minutes.
+This is an **offline tool** — start it and walk away.
 
 ---
 
-## 6. Troubleshooting
+## 5. Troubleshooting
 
-### "inference_cli.py not found"
-→ You cloned the wrong repo or the node directory is incomplete.
+### `git clone` / `git pull` fails
+Likely a network/proxy issue (common from mainland China). Set a proxy and re-run:
+
 ```powershell
-dir /b D:\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler\*.py
+git config --global http.proxy http://your-proxy:port
+git config --global https.proxy http://your-proxy:port
+python scripts/setup_seedvr2.py
 ```
-Should show `inference_cli.py`.  If not, re-clone:
+
+### `pip install` fails / slow
+Use a PyPI mirror for the CPU-side packages (torch still comes from the official cu124 index):
+
 ```powershell
-git -C D:\ComfyUI\custom_nodes\ComfyUI-SeedVR2_VideoUpscaler pull
+python scripts/setup_seedvr2.py --pip-mirror https://pypi.tuna.tsinghua.edu.cn/simple
 ```
-
-### "No module named 'src'"
-→ You are not running from the node directory.  `cwd` **must** be the node directory.
-The pipeline's `CLIBackend` sets this automatically.
-
-### "CUDA out of memory"
-→ Reduce `--batch_size` to 1 or use `--vae_decode_tiled` (which is on by default).
-If still OOM, switch to the GGUF quant model and add `--dit seedvr2_ema_3b-Q4_K_M.gguf`.
 
 ### Model download fails / slow
-→ The auto-downloader in `inference_cli.py` uses `requests` without resume.
-**Pre-download the model** manually with `curl -C -` (see Step 2 above) and place it in
-`models/SEEDVR2/`.  The CLI will find it there and skip download.
+The bootstrap uses `hf_hub_download` first (with resume) and falls back to `curl -C -`
+(resume-capable). If both fail, download manually and drop the files into `models/SEEDVR2/`:
 
-### Very slow (~10 min per frame)
-→ You might be CPU-bound (not using CUDA).  Verify with `nvidia-smi` that the GPU is utilised.
-→ If piped through WSL2, GPU passthrough may not work.  Run natively on Windows.
+```powershell
+curl -L -C - -o models/SEEDVR2/seedvr2_ema_3b_fp8_e4m3fn.safetensors ^
+  https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/seedvr2_ema_3b_fp8_e4m3fn.safetensors
+curl -L -C - -o models/SEEDVR2/ema_vae_fp16.safetensors ^
+  https://huggingface.co/numz/SeedVR2_comfyUI/resolve/main/ema_vae_fp16.safetensors
+```
+
+Re-running `python scripts/setup_seedvr2.py` will **skip** any file >1 GB.
+
+### `CUDA out of memory`
+Reduce `--batch_size` to 1, or pass `--seedvr2-resolution 1080`. The default config
+(tiled VAE + CPU offload) already targets 12 GB.
+
+### `CUDA is not available`
+The upscaler is CUDA-only. Verify `nvidia-smi` shows the GPU and that the pytorch
+installed in the **dedicated venv** (`third_party/seedvr2_videoupscaler/.venv/`) is the
+CUDA build:
+
+```powershell
+third_party\seedvr2_videoupscaler\.venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"
+```
+
+### `No module named 'src'` / `inference_cli.py` errors
+You (or a script) is running `inference_cli.py` from the wrong directory. The pipeline's
+`CLIBackend` sets `cwd` to the node dir automatically — you should never run the CLI by hand.
+If the node dir is missing `inference_cli.py`, re-run the bootstrap.
 
 ---
 
-## Environment Variable Reference
+## 6. Environment Variable Reference
 
-| Variable | Corresponding `--seedvr2-*` flag | Default |
+| Variable | Corresponding `--seedvr2-*` flag | Default (in-repo) |
 |---|---|---|
-| `SEEDVR2_NODE_DIR` | `--seedvr2-node-dir` | *(required)* |
-| `SEEDVR2_PYTHON` | `--seedvr2-python` | `python` |
-| `SEEDVR2_MODEL_DIR` | `--seedvr2-model-dir` | `<node_dir>/../../models/SEEDVR2` |
+| `SEEDVR2_NODE_DIR` | `--seedvr2-node-dir` | `<repo>/third_party/seedvr2_videoupscaler` |
+| `SEEDVR2_PYTHON` | `--seedvr2-python` | `<repo>/third_party/seedvr2_videoupscaler/.venv/python` |
+| `SEEDVR2_MODEL_DIR` | `--seedvr2-model-dir` | `<repo>/models/SEEDVR2` |
 | `SEEDVR2_VAE_TILE_SIZE` | *(constructor param)* | `512` |
 | `SEEDVR2_RESOLUTION` | `--seedvr2-resolution` | `1440` |
 
 ---
 
-## Deprecated: ComfyUI Server Path
+## 7. CI Note
 
-The old ComfyUIBackend (HTTP API) is preserved in `pipeline/video_upscaler.py` but is
-**not recommended**.  The CLI backend (`CLIBackend`) is simpler, faster to set up, and
-matches the exact command that was verified on the 12 GB test machine.
+CI is Ubuntu + CPU-only + no GPU + no downloads. The bootstrap script is **never run**
+in CI — it is tested with `--dry-run`, which asserts the planned step sequence with zero
+I/O. The pipeline's `CLIBackend` is tested with mocked subprocess calls and fake node dirs
+built with `tmp_path`.

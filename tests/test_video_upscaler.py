@@ -445,3 +445,174 @@ class TestCLIBackend:
             cmd = call_args_fmt[0]
             assert "--output_format" in cmd
             assert cmd[cmd.index("--output_format") + 1] == "mp4"
+
+
+# ---------------------------------------------------------------------------
+# In-repo default path fallback (managed by scripts/setup_seedvr2.py)
+# ---------------------------------------------------------------------------
+
+
+class TestCLIBackendInRepoFallback:
+    """Verify CLIBackend resolves to in-repo defaults only when paths exist."""
+
+    def test_node_dir_falls_back_to_inrepo_when_env_unset(self, tmp_path) -> None:
+        """With no env / no explicit arg, node_dir resolves to INREPO_NODE_DIR if it exists."""
+        import pipeline.video_upscaler as vu
+
+        fake_node = tmp_path / "third_party" / "seedvr2_videoupscaler"
+        fake_node.mkdir(parents=True)
+        (fake_node / "inference_cli.py").write_text("# fake")
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(vu, "INREPO_NODE_DIR", fake_node),
+            patch.object(vu, "INREPO_PYTHON_EXE", tmp_path / "nope"),
+            patch.object(vu, "INREPO_MODEL_DIR", tmp_path / "nope-model"),
+        ):
+            os.environ.pop("SEEDVR2_NODE_DIR", None)
+            os.environ.pop("SEEDVR2_PYTHON", None)
+            os.environ.pop("SEEDVR2_MODEL_DIR", None)
+
+            backend = CLIBackend()
+            assert Path(backend.node_dir) == fake_node.resolve()
+
+    def test_node_dir_env_takes_precedence_over_inrepo(self, tmp_path) -> None:
+        """An explicit env var beats the in-repo default even when both exist."""
+        import pipeline.video_upscaler as vu
+
+        inrepo_node = tmp_path / "inrepo_node"
+        inrepo_node.mkdir()
+        (inrepo_node / "inference_cli.py").write_text("# fake")
+
+        env_node = tmp_path / "env_node"
+        env_node.mkdir()
+        (env_node / "inference_cli.py").write_text("# fake")
+
+        with (
+            patch.object(vu, "INREPO_NODE_DIR", inrepo_node),
+            patch.object(vu, "INREPO_PYTHON_EXE", tmp_path / "nope"),
+            patch.object(vu, "INREPO_MODEL_DIR", tmp_path / "nope-model"),
+            patch.dict(os.environ, {"SEEDVR2_NODE_DIR": str(env_node)}, clear=False),
+        ):
+            backend = CLIBackend()
+            assert Path(backend.node_dir) == env_node.resolve()
+
+    def test_explicit_node_dir_beats_env_and_inrepo(self, tmp_path) -> None:
+        """Explicit constructor arg wins over both env and in-repo default."""
+        import pipeline.video_upscaler as vu
+
+        inrepo_node = tmp_path / "inrepo_node"
+        inrepo_node.mkdir()
+        env_node = tmp_path / "env_node"
+        env_node.mkdir()
+        explicit_node = tmp_path / "explicit_node"
+        explicit_node.mkdir()
+        (explicit_node / "inference_cli.py").write_text("# fake")
+
+        with (
+            patch.object(vu, "INREPO_NODE_DIR", inrepo_node),
+            patch.object(vu, "INREPO_PYTHON_EXE", tmp_path / "nope"),
+            patch.object(vu, "INREPO_MODEL_DIR", tmp_path / "nope-model"),
+            patch.dict(os.environ, {"SEEDVR2_NODE_DIR": str(env_node)}, clear=False),
+        ):
+            backend = CLIBackend(node_dir=str(explicit_node))
+            assert Path(backend.node_dir) == explicit_node.resolve()
+
+    def test_no_paths_raises_with_bootstrap_hint(self, tmp_path) -> None:
+        """When nothing is configured and in-repo dirs don't exist, raise a bootstrap hint."""
+        import pipeline.video_upscaler as vu
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(vu, "INREPO_NODE_DIR", tmp_path / "does-not-exist"),
+            patch.object(vu, "INREPO_PYTHON_EXE", tmp_path / "nope"),
+            patch.object(vu, "INREPO_MODEL_DIR", tmp_path / "nope-model"),
+        ):
+            os.environ.pop("SEEDVR2_NODE_DIR", None)
+            with pytest.raises(RuntimeError, match=r"setup_seedvr2\.py"):
+                CLIBackend()
+
+    def test_python_falls_back_to_inrepo_venv(self, tmp_path) -> None:
+        """python_exe resolves to the in-repo venv python when it exists on disk."""
+        import pipeline.video_upscaler as vu
+
+        fake_node = tmp_path / "third_party" / "seedvr2_videoupscaler"
+        fake_node.mkdir(parents=True)
+        (fake_node / "inference_cli.py").write_text("# fake")
+
+        fake_python = tmp_path / "fakepython.exe"
+        fake_python.write_text("# fake")
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(vu, "INREPO_NODE_DIR", fake_node),
+            patch.object(vu, "INREPO_PYTHON_EXE", fake_python),
+            patch.object(vu, "INREPO_MODEL_DIR", tmp_path / "nope-model"),
+        ):
+            os.environ.pop("SEEDVR2_PYTHON", None)
+            os.environ.pop("SEEDVR2_NODE_DIR", None)
+            os.environ.pop("SEEDVR2_MODEL_DIR", None)
+            backend = CLIBackend()
+            assert backend.python_exe == str(fake_python)
+
+    def test_python_defaults_to_python_when_nothing_exists(self, tmp_path) -> None:
+        """With no venv python, python_exe falls back to the bare 'python' string."""
+        import pipeline.video_upscaler as vu
+
+        fake_node = tmp_path / "third_party" / "seedvr2_videoupscaler"
+        fake_node.mkdir(parents=True)
+        (fake_node / "inference_cli.py").write_text("# fake")
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(vu, "INREPO_NODE_DIR", fake_node),
+            patch.object(vu, "INREPO_PYTHON_EXE", tmp_path / "missingpython"),
+            patch.object(vu, "INREPO_MODEL_DIR", tmp_path / "nope-model"),
+        ):
+            os.environ.pop("SEEDVR2_PYTHON", None)
+            os.environ.pop("SEEDVR2_NODE_DIR", None)
+            os.environ.pop("SEEDVR2_MODEL_DIR", None)
+            backend = CLIBackend()
+            assert backend.python_exe == "python"
+
+    def test_model_dir_falls_back_to_inrepo(self, tmp_path) -> None:
+        """model_dir resolves to INREPO_MODEL_DIR when it exists and env is unset."""
+        import pipeline.video_upscaler as vu
+
+        fake_node = tmp_path / "third_party" / "seedvr2_videoupscaler"
+        fake_node.mkdir(parents=True)
+        (fake_node / "inference_cli.py").write_text("# fake")
+        fake_model = tmp_path / "models" / "SEEDVR2"
+        fake_model.mkdir(parents=True)
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(vu, "INREPO_NODE_DIR", fake_node),
+            patch.object(vu, "INREPO_PYTHON_EXE", tmp_path / "nope"),
+            patch.object(vu, "INREPO_MODEL_DIR", fake_model),
+        ):
+            os.environ.pop("SEEDVR2_MODEL_DIR", None)
+            os.environ.pop("SEEDVR2_NODE_DIR", None)
+            os.environ.pop("SEEDVR2_PYTHON", None)
+            backend = CLIBackend()
+            assert Path(backend.model_dir) == fake_model.resolve()
+
+    def test_model_dir_legacy_comfyui_layout_when_inrepo_missing(self, tmp_path) -> None:
+        """If in-repo model dir doesn't exist, fall back to <node_dir>/../../models/SEEDVR2."""
+        import pipeline.video_upscaler as vu
+
+        # node_dir at <tmp>/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler
+        node_dir = tmp_path / "custom_nodes" / "ComfyUI-SeedVR2_VideoUpscaler"
+        node_dir.mkdir(parents=True)
+        (node_dir / "inference_cli.py").write_text("# fake")
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(vu, "INREPO_NODE_DIR", tmp_path / "nope-node"),
+            patch.object(vu, "INREPO_PYTHON_EXE", tmp_path / "nope"),
+            patch.object(vu, "INREPO_MODEL_DIR", tmp_path / "nope-model"),
+        ):
+            os.environ.pop("SEEDVR2_MODEL_DIR", None)
+            backend = CLIBackend(node_dir=str(node_dir))
+            # legacy layout: parent.parent/models/SEEDVR2 == tmp/models/SEEDVR2
+            assert Path(backend.model_dir) == (tmp_path / "models" / "SEEDVR2").resolve()

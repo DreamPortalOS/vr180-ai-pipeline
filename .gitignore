@@ -59,6 +59,9 @@ video/*.json
 models/
 !models/.gitkeep
 
+# In-repo third-party deps (SeedVR2 node + its dedicated venv — gitignored, never committed)
+third_party/
+
 # Config with local paths
 .env
 *.local.yaml

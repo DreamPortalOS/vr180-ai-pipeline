@@ -26,6 +26,31 @@ log = logging.getLogger(__name__)
 
 _BATCH_SIZE_HELP = "batch_size must be 4n+1 (1, 5, 9, 13, 17, ...)"
 
+# ---------------------------------------------------------------------------
+# In-repo default paths (managed by scripts/setup_seedvr2.py)
+# ---------------------------------------------------------------------------
+# The repo root is two parents up from this file (pipeline/video_upscaler.py).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Node repo lives under third_party/ (gitignored) — see scripts/setup_seedvr2.py.
+INREPO_NODE_DIR = _REPO_ROOT / "third_party" / "seedvr2_videoupscaler"
+# Dedicated venv created *inside* the node dir (never the project-root venv).
+INREPO_PYTHON_EXE = (
+    INREPO_NODE_DIR / ".venv" / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
+)
+# Model weights under models/SEEDVR2 (models/ is gitignored).
+INREPO_MODEL_DIR = _REPO_ROOT / "models" / "SEEDVR2"
+
+
+def _inrepo_env_hint() -> str:
+    """The text appended to errors when no SeedVR2 paths were configured/found."""
+    return (
+        "No SeedVR2 node/python/model paths were configured or found in-repo.\n"
+        "  Run the one-command bootstrap to deploy SeedVR2 inside the repo:\n"
+        "    python scripts/setup_seedvr2.py\n"
+        "  See docs/SEEDVR2_SETUP.md for disk/VRAM requirements and troubleshooting."
+    )
+
 
 def _validate_batch_size(batch_size: int) -> None:
     if batch_size < 1:
@@ -44,7 +69,7 @@ def _assert_cuda() -> None:
         raise RuntimeError(
             "CUDA is not available — cannot run SeedVR2Upscaler. "
             "This upscaler requires an NVIDIA GPU with CUDA support. "
-            "On Windows, install ComfyUI + SeedVR2 node (see docs/SEEDVR2_SETUP.md)."
+            "Run scripts/setup_seedvr2.py to deploy SeedVR2 in-repo (see docs/SEEDVR2_SETUP.md)."
         )
 
 
@@ -348,11 +373,11 @@ class CLIBackend(UpscaleBackend):
     server required.  All paths can be set via environment variables:
 
     ========================= ========================= =============================
-    Constructor param         Env var                   Default
+    Constructor param         Env var                   Default (if env unset)
     ========================= ========================= =============================
-    ``node_dir``              ``SEEDVR2_NODE_DIR``      ``(none, required)``
-    ``python_exe``            ``SEEDVR2_PYTHON``        ``python``
-    ``model_dir``             ``SEEDVR2_MODEL_DIR``     ``(node_dir)/../../models/SEEDVR2``
+    ``node_dir``              ``SEEDVR2_NODE_DIR``      in-repo ``third_party/seedvr2_videoupscaler`` *(if exists)*
+    ``python_exe``            ``SEEDVR2_PYTHON``        in-repo venv python *(if exists)*, else ``python``
+    ``model_dir``             ``SEEDVR2_MODEL_DIR``     in-repo ``models/SEEDVR2`` *(if exists)*, else ``<node_dir>/../../models/SEEDVR2``
     ``vae_decode_tiled``      *(hard-coded True)*       ``True``
     ``vae_encode_tiled``      *(hard-coded True)*       ``True``
     ``vae_tile_size``         ``SEEDVR2_VAE_TILE_SIZE`` ``512``
@@ -360,6 +385,10 @@ class CLIBackend(UpscaleBackend):
     ``vae_offload_device``    ``SEEDVR2_VAE_OFFLOAD``   ``cpu``
     ``resolution``            ``SEEDVR2_RESOLUTION``    ``1440``
     ========================= ========================= =============================
+
+    The in-repo defaults are only adopted when the corresponding path actually
+    exists on disk; if none of node_dir / env / in-repo resolve, the constructor
+    raises and points to ``scripts/setup_seedvr2.py``.
 
     The *factor* → *resolution* mapping: ffprobe source height, multiply by
     factor, clamp to the configured *resolution* (or let inference_cli decide
@@ -381,26 +410,33 @@ class CLIBackend(UpscaleBackend):
         vae_offload_device: str | None = None,
         resolution: int | None = None,
     ) -> None:
-        # node_dir: required (env fallback)
+        # node_dir: explicit > env > in-repo default (only if it exists on disk)
         _node_dir = node_dir or os.environ.get("SEEDVR2_NODE_DIR")
+        if not _node_dir and INREPO_NODE_DIR.is_dir():
+            _node_dir = str(INREPO_NODE_DIR)
         if not _node_dir:
-            raise RuntimeError(
-                "SeedVR2 node directory not specified. "
-                "Set --seedvr2-node-dir or the SEEDVR2_NODE_DIR environment variable. "
-                "See docs/SEEDVR2_SETUP.md for setup instructions."
-            )
+            raise RuntimeError(_inrepo_env_hint())
         self.node_dir: str = str(Path(_node_dir).resolve())
 
-        # python_exe
-        self.python_exe = python_exe or os.environ.get("SEEDVR2_PYTHON", "python")
+        # python_exe: explicit > env > in-repo venv python (only if exists) > "python"
+        if python_exe:
+            self.python_exe = python_exe
+        elif os.environ.get("SEEDVR2_PYTHON"):
+            self.python_exe = os.environ["SEEDVR2_PYTHON"]
+        elif INREPO_PYTHON_EXE.is_file():
+            self.python_exe = str(INREPO_PYTHON_EXE)
+        else:
+            self.python_exe = "python"
 
-        # model_dir
+        # model_dir: explicit > env > in-repo default > ComfyUI layout fallback
         if model_dir:
             self.model_dir = str(Path(model_dir).resolve())
         elif os.environ.get("SEEDVR2_MODEL_DIR"):
             self.model_dir = str(Path(os.environ["SEEDVR2_MODEL_DIR"]).resolve())
+        elif INREPO_MODEL_DIR.is_dir():
+            self.model_dir = str(INREPO_MODEL_DIR)
         else:
-            # default: <node_dir>/../../models/SEEDVR2  (ComfyUI layout)
+            # default: <node_dir>/../../models/SEEDVR2  (legacy ComfyUI layout)
             self.model_dir = str(Path(self.node_dir).parent.parent / "models" / "SEEDVR2")
 
         # VAE tiling (must be on for 12 GB)
@@ -434,8 +470,8 @@ class CLIBackend(UpscaleBackend):
         if not node_dir.is_dir():
             issues.append(
                 f"SeedVR2 node directory not found: {self.node_dir}\n"
-                f"  Clone the node into ComfyUI/custom_nodes/:\n"
-                f"    git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git\n"
+                f"  Run the one-command bootstrap to deploy it in-repo:\n"
+                f"    python scripts/setup_seedvr2.py\n"
                 f"  See docs/SEEDVR2_SETUP.md for details."
             )
 
@@ -443,8 +479,8 @@ class CLIBackend(UpscaleBackend):
         if node_dir.is_dir() and not cli_script.is_file():
             issues.append(
                 f"inference_cli.py not found at {cli_script}\n"
-                f"  The node directory exists but may be incomplete.  Re-clone or update:\n"
-                f"    cd {self.node_dir} && git pull"
+                f"  The node directory exists but may be incomplete.  Re-run the bootstrap:\n"
+                f"    python scripts/setup_seedvr2.py"
             )
 
         if issues:
