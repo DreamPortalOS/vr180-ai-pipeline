@@ -2,7 +2,7 @@
 
 Provides a unified interface over external video generation APIs:
 - Kling (Kuaishou / 可灵)
-- Seedance (Google-backed)
+- Seedance (Volcengine Ark / 火山方舟)
 - Veo (Google DeepMind / Vertex AI)
 
 Each provider implements the :class:`VideoGenProvider` ABC defined in

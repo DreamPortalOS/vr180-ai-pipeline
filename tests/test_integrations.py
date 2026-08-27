@@ -9,6 +9,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import httpx
+import numpy as np
 import pytest
 from integrations.base import GenerationResult, VideoGenProvider
 from integrations.factory import get_provider, list_providers
@@ -58,7 +59,7 @@ class TestVideoGenProviderABC:
 
     def test_provider_name_property(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("KLING_API_KEY", "key")
-        monkeypatch.setenv("SEEDANCE_API_KEY", "key")
+        monkeypatch.setenv("ARK_API_KEY", "key")
         assert KlingProvider().provider_name == "kling"
         assert SeedanceProvider().provider_name == "seedance"
 
@@ -91,7 +92,7 @@ class TestFactory:
         assert isinstance(instance, KlingProvider)
 
     def test_get_provider_seedance(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SEEDANCE_API_KEY", "key")
+        monkeypatch.setenv("ARK_API_KEY", "key")
         instance = get_provider("seedance")
         assert isinstance(instance, SeedanceProvider)
 
@@ -219,27 +220,42 @@ class TestKlingProvider:
 
 
 class TestSeedanceProvider:
+    """Seedance now runs on Volcengine Ark (ARK_API_KEY)."""
+
     def test_load_api_key_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SEEDANCE_API_KEY", "env-key")
+        monkeypatch.setenv("ARK_API_KEY", "env-key")
         provider = SeedanceProvider()
         assert provider._api_key == "env-key"
 
     def test_load_api_key_missing_raises(self) -> None:
-        with pytest.raises(ValueError, match="SEEDANCE_API_KEY"):
+        with pytest.raises(ValueError, match="ARK_API_KEY"):
+            SeedanceProvider()
+        # Old key name must NOT be accepted — it referred to a fake endpoint.
+        with pytest.raises(ValueError, match="ARK_API_KEY"), pytest.MonkeyPatch().context() as mp:
+            mp.setenv("SEEDANCE_API_KEY", "legacy-key")
             SeedanceProvider()
 
+    def test_model_constants(self) -> None:
+        from integrations.seedance import MODEL_FAST, MODEL_STD
+
+        assert MODEL_FAST == "doubao-seedance-2-0-fast-260128"
+        assert MODEL_STD == "doubao-seedance-2-0-260128"
+
     def test_generate_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SEEDANCE_API_KEY", "test-key")
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
         provider = SeedanceProvider()
 
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"id": "seedance-job-001"}
+        submit_resp.json.return_value = {"task": {"task_id": "ark-task-001"}}
         submit_resp.raise_for_status.return_value = None
 
         poll_resp = MagicMock(spec=httpx.Response)
         poll_resp.json.return_value = {
-            "status": "completed",
-            "output": {"video_url": "https://cdn.seedance.ai/video.mp4"},
+            "task": {
+                "task_id": "ark-task-001",
+                "status": "succeeded",
+                "outputs": [{"video_url": "https://ark-cdn.volces.com/video.mp4"}],
+            }
         }
         poll_resp.raise_for_status.return_value = None
 
@@ -251,12 +267,47 @@ class TestSeedanceProvider:
         with patch("integrations.seedance.httpx.Client", return_value=mock_client):
             result = provider.generate("flying")
 
-        assert result.video_url == "https://cdn.seedance.ai/video.mp4"
-        assert result.job_id == "seedance-job-001"
+        assert result.video_url == "https://ark-cdn.volces.com/video.mp4"
+        assert result.job_id == "ark-task-001"
         assert result.provider == "seedance"
 
-    def test_generate_submit_missing_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SEEDANCE_API_KEY", "test-key")
+        # Verify the request body used the Ark content-list contract.
+        body = mock_client.post.call_args[1]["json"]
+        assert body["model"] == "doubao-seedance-2-0-fast-260128"
+        assert body["content"] == [{"type": "text", "text": "flying"}]
+        assert body["resolution"] == "480p"
+        assert body["ratio"] == "adaptive"
+        assert body["duration"] == 5
+        assert mock_client.get.call_args[0][0] == "/contents/generations/tasks/ark-task-001"
+
+    def test_generate_custom_kwargs_override_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        provider = SeedanceProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"task_id": "ark-task-002"}
+        submit_resp.raise_for_status.return_value = None
+
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {"task": {"status": "succeeded", "outputs": [{"video_url": "https://x/v.mp4"}]}}
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = MagicMock(spec=httpx.Client)
+        mock_client.__enter__.return_value = mock_client
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with patch("integrations.seedance.httpx.Client", return_value=mock_client):
+            provider.generate("test", model=SeedanceProvider.MODEL_STD, resolution="720p", ratio="16:9", duration=8)
+
+        body = mock_client.post.call_args[1]["json"]
+        assert body["model"] == SeedanceProvider.MODEL_STD
+        assert body["resolution"] == "720p"
+        assert body["ratio"] == "16:9"
+        assert body["duration"] == 8
+
+    def test_generate_submit_missing_task_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
         provider = SeedanceProvider()
 
         submit_resp = MagicMock(spec=httpx.Response)
@@ -269,20 +320,44 @@ class TestSeedanceProvider:
 
         with (
             patch("integrations.seedance.httpx.Client", return_value=mock_client),
-            pytest.raises(RuntimeError, match="missing id"),
+            pytest.raises(RuntimeError, match="missing task_id"),
         ):
             provider.generate("test")
 
-    def test_generate_poll_cancelled(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SEEDANCE_API_KEY", "test-key")
+    def test_generate_submit_http_error_with_error_block(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        provider = SeedanceProvider()
+
+        err_body = {"error": {"code": "InvalidEndpointOrModel.NotFound", "message": "model not found"}}
+        err_resp = MagicMock(spec=httpx.Response)
+        err_resp.json.return_value = err_body
+        err_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "not found", request=MagicMock(), response=err_resp
+        )
+
+        mock_client = MagicMock(spec=httpx.Client)
+        mock_client.__enter__.return_value = mock_client
+        mock_client.post.return_value = err_resp
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            pytest.raises(RuntimeError, match=r"InvalidEndpointOrModel\.NotFound"),
+        ):
+            provider.generate("test")
+
+    def test_generate_poll_failed_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
         provider = SeedanceProvider()
 
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"id": "seedance-job-003"}
+        submit_resp.json.return_value = {"task_id": "ark-task-003"}
         submit_resp.raise_for_status.return_value = None
 
         poll_resp = MagicMock(spec=httpx.Response)
-        poll_resp.json.return_value = {"status": "failed", "message": "credit exhausted"}
+        poll_resp.json.return_value = {
+            "task": {"status": "failed"},
+            "error": {"code": "ModelNotOpen", "message": "model not enabled", "model": "doubao-seedance-2-0-260128"},
+        }
         poll_resp.raise_for_status.return_value = None
 
         mock_client = MagicMock(spec=httpx.Client)
@@ -292,7 +367,33 @@ class TestSeedanceProvider:
 
         with (
             patch("integrations.seedance.httpx.Client", return_value=mock_client),
-            pytest.raises(RuntimeError, match="credit exhausted"),
+            patch("integrations.seedance.time.sleep", return_value=None),
+            pytest.raises(RuntimeError, match="ModelNotOpen"),
+        ):
+            provider.generate("test")
+
+    def test_generate_poll_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        provider = SeedanceProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"task_id": "ark-task-004"}
+        submit_resp.raise_for_status.return_value = None
+
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {"task": {"status": "processing"}}
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = MagicMock(spec=httpx.Client)
+        mock_client.__enter__.return_value = mock_client
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+            patch("integrations.seedance.time.time", side_effect=[1.0, 1e9]),
+            pytest.raises(RuntimeError, match="did not complete"),
         ):
             provider.generate("test")
 
@@ -590,17 +691,29 @@ class TestKlingImageToVideo:
 
 
 class TestSeedanceImageToVideo:
-    def test_i2v_sends_image_payload_and_polls(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SEEDANCE_API_KEY", "test-key")
-        provider = SeedanceProvider()
-
+    def _submit_poll(self, task_id="ark-i2v-001", status="succeeded"):
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"id": "seedance-i2v-001"}
+        submit_resp.json.return_value = {"task": {"task_id": task_id}}
         submit_resp.raise_for_status.return_value = None
         poll_resp = MagicMock(spec=httpx.Response)
         poll_resp.json.return_value = {
-            "status": "completed",
-            "output": {"video_url": "https://cdn.seedance.ai/i2v.mp4"},
+            "task": {"status": status, "outputs": [{"video_url": "https://ark-cdn.volces.com/i2v.mp4"}]}
+        }
+        poll_resp.raise_for_status.return_value = None
+        return submit_resp, poll_resp
+
+    def test_i2v_http_url_passed_through_in_content(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An http(s) image URL is treated as pass-through and placed in the
+        content list's image_url item."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        provider = SeedanceProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"task_id": "ark-i2v-001"}
+        submit_resp.raise_for_status.return_value = None
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {
+            "task": {"status": "succeeded", "outputs": [{"video_url": "https://ark-cdn.volces.com/i2v.mp4"}]}
         }
         poll_resp.raise_for_status.return_value = None
 
@@ -612,26 +725,35 @@ class TestSeedanceImageToVideo:
             patch("integrations.seedance.httpx.Client", return_value=mock_client),
             patch("integrations.seedance.time.sleep", return_value=None),
         ):
-            result = provider.generate_from_image("https://example.com/p.png", duration=5, aspect_ratio="16:9")
+            result = provider.generate_from_image("https://example.com/p.png", duration=5, prompt="pan left")
 
-        assert result.video_url == "https://cdn.seedance.ai/i2v.mp4"
-        assert result.job_id == "seedance-i2v-001"
+        assert result.video_url == "https://ark-cdn.volces.com/i2v.mp4"
+        assert result.job_id == "ark-i2v-001"
         assert result.provider == "seedance"
+
         body = mock_client.post.call_args[1]["json"]
-        assert body["image"] == "https://example.com/p.png"
-        assert body["image_format"] == SeedanceProvider.I2V_IMAGE_FORMAT
-        assert body["model"] == SeedanceProvider.I2V_MODEL
+        content = body["content"]
+        assert content[0] == {"type": "text", "text": "pan left"}
+        assert content[1] == {"type": "image_url", "image_url": {"url": "https://example.com/p.png"}}
         mock_client.get.assert_called_once()
 
-    def test_i2v_poll_cancelled(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("SEEDANCE_API_KEY", "test-key")
+    def test_i2v_local_image_encoded_as_base64_data_url(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        """A local image is validated and base64-encoded as a data URL."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
         provider = SeedanceProvider()
 
+        import cv2 as _cv2
+
+        img = tmp_path / "p.png"
+        _cv2.imwrite(str(img), _cv2.resize(np.zeros((400, 600, 3), dtype=np.uint8), (600, 400)))
+
         submit_resp = MagicMock(spec=httpx.Response)
-        submit_resp.json.return_value = {"id": "seedance-i2v-002"}
+        submit_resp.json.return_value = {"task_id": "ark-i2v-002"}
         submit_resp.raise_for_status.return_value = None
         poll_resp = MagicMock(spec=httpx.Response)
-        poll_resp.json.return_value = {"status": "failed", "message": "quota exceeded"}
+        poll_resp.json.return_value = {
+            "task": {"status": "succeeded", "outputs": [{"video_url": "https://ark-cdn.volces.com/i2v.mp4"}]}
+        }
         poll_resp.raise_for_status.return_value = None
 
         mock_client = _mock_httpx_client()
@@ -641,9 +763,86 @@ class TestSeedanceImageToVideo:
         with (
             patch("integrations.seedance.httpx.Client", return_value=mock_client),
             patch("integrations.seedance.time.sleep", return_value=None),
-            pytest.raises(RuntimeError, match="quota exceeded"),
+        ):
+            provider.generate_from_image(str(img), prompt="")
+
+        import base64
+
+        body = mock_client.post.call_args[1]["json"]
+        url = body["content"][1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        raw = base64.b64decode(url.split(",", 1)[1])
+        assert raw == img.read_bytes()
+
+    def test_i2v_poll_error_resource_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The ResourceNotFound code surfaces as a readable error message."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        provider = SeedanceProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"task_id": "ark-i2v-003"}
+        submit_resp.raise_for_status.return_value = None
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {
+            "task": {"status": "expired"},
+            "error": {"code": "ResourceNotFound", "message": "task expired"},
+        }
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+            pytest.raises(RuntimeError, match="ResourceNotFound"),
         ):
             provider.generate_from_image("https://x.com/p.png")
+
+    def test_i2v_rejects_invalid_format(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        provider = SeedanceProvider()
+        bad = tmp_path / "x.tif"
+        bad.write_bytes(b"not-an-image")
+        with pytest.raises(ValueError, match="unsupported format"):
+            provider.generate_from_image(str(bad))
+
+    def test_i2v_rejects_file_not_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        provider = SeedanceProvider()
+        with pytest.raises(ValueError, match="Image file not found"):
+            provider.generate_from_image("/nonexistent/photo.png")
+
+    def test_i2v_empty_prompt_allows_image_only(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        """Seedance allows an empty prompt — image-only motion."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        provider = SeedanceProvider()
+        img = tmp_path / "p.png"
+        import cv2 as _cv2
+
+        _cv2.imwrite(str(img), _cv2.resize(np.zeros((400, 600, 3), dtype=np.uint8), (600, 400)))
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"task_id": "ark-i2v-004"}
+        submit_resp.raise_for_status.return_value = None
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {
+            "task": {"status": "succeeded", "outputs": [{"video_url": "https://ark-cdn.volces.com/i2v.mp4"}]}
+        }
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+        ):
+            result = provider.generate_from_image(str(img), prompt="")
+        assert result.provider == "seedance"
+        assert mock_client.post.call_args[1]["json"]["content"][0] == {"type": "text", "text": ""}
 
 
 class TestVeoImageToVideo:
