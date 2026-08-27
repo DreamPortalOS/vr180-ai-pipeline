@@ -1,15 +1,15 @@
 # Video Generation Providers — Setup Guide
 
 This document describes how to configure and use the three supported external
-video generation providers: **Kling** (Kuaishou), **Seedance** (Google-backed),
-and **Veo** (Google DeepMind / Vertex AI).
+video generation providers: **Kling** (Kuaishou), **Seedance** (Volcengine
+Ark / 火山方舟), and **Veo** (Google DeepMind / Vertex AI).
 
 ## Quick Start
 
 ```bash
 # Set your API key(s) — only the one(s) you need
 export KLING_API_KEY="your-kling-api-key"
-# export SEEDANCE_API_KEY="your-seedance-api-key"
+# export ARK_API_KEY="your-ark-api-key"  # Seedance on Volcengine Ark
 # export VEO_API_KEY="your-veo-api-key"
 # export GCP_PROJECT_ID="your-gcp-project"  # only for Veo
 
@@ -30,9 +30,9 @@ python -m scripts.generate --list-providers
 
 | Provider   | Env Variable        | Default Model          | Notes                        |
 |------------|---------------------|------------------------|------------------------------|
-| Kling      | `KLING_API_KEY`     | `kling-v1`             | Submit + poll lifecycle      |
-| Seedance   | `SEEDANCE_API_KEY`  | (API default)          | Submit + poll lifecycle      |
-| Veo        | `VEO_API_KEY`       | `veo-001`              | Synchronous predict, GCP     |
+| Kling      | `KLING_API_KEY`    | `kling-v1`                           | Submit + poll lifecycle        |
+| Seedance   | `ARK_API_KEY`      | `doubao-seedance-2-0-fast-260128`    | Ark submit + poll lifecycle    |
+| Veo        | `VEO_API_KEY`      | `veo-001`                            | Synchronous predict, GCP       |
 
 All three implement the same `VideoGenProvider` ABC with a synchronous
 `generate()` call that blocks until the video URL is available.
@@ -79,17 +79,23 @@ print(result.video_url)
 
 ---
 
-## 2. Seedance (Google-backed)
+## 2. Seedance (Volcengine Ark / 火山方舟)
+
+The Seedance video model (豆包·Seedance) is served on the **Volcengine Ark**
+platform.  It uses the standard Ark
+``POST /contents/generations/tasks`` submit + poll lifecycle.
 
 ### Obtaining an API Key
 
-1. Go to https://docs.seedance.ai/
-2. Register for an account
-3. Generate an API key from the dashboard
+1. Go to the Volcengine Ark console: https://console.volcengine.com/ark/
+2. Create an API key for your project.
+3. Ensure the model is enabled (开通) for your project — by default
+   ``doubao-seedance-2-0-fast-260128`` (the ``MODEL_FAST`` preset). If you get a
+   ``ModelNotOpen`` error, enable the model in the console.
 4. Set the environment variable:
 
 ```bash
-export SEEDANCE_API_KEY="your-seedance-api-key"
+export ARK_API_KEY="your-ark-api-key"
 ```
 
 ### Usage
@@ -102,17 +108,38 @@ result = provider.generate(
     prompt="slow cinematic pan across a misty forest",
     duration=5,
     aspect_ratio="16:9",
-    fps=24,
 )
 print(result.video_url)
+
+# Image-to-video: local file (validated + base64) or http(s) URL (passed through)
+result = provider.generate_from_image(
+    image_path="hero.png",
+    prompt="slow zoom in",
+    duration=5,
+)
 ```
 
 ### Supported Parameters
 
-| Parameter        | Type  | Description                             |
-|------------------|-------|-----------------------------------------|
-| `model`          | str   | Model ID (optional, uses default)       |
-| `negative_prompt`| str   | Things to avoid in the generated video  |
+| Parameter     | Type | Description                                    |
+|---------------|------|------------------------------------------------|
+| `model`       | str  | Model ID (default ``MODEL_FAST``; ``MODEL_STD`` reserved) |
+| `resolution`  | str  | e.g. ``"480p"`` (default)                     |
+| `ratio`       | str  | e.g. ``"adaptive"`` (default)                 |
+| `duration`    | int  | Target duration in seconds (default 5)        |
+
+All extra fields are passed as ``**kwargs`` and override the defaults.
+`aspect_ratio` / `fps` are accepted for API compatibility but the Ark endpoint
+uses `resolution` / `ratio` instead.
+
+### Image input constraints
+
+A local starting image is validated before upload:
+
+- format: jpeg / png / webp;
+- size: under 30 MB;
+- edge length: 300–6000 px;
+- aspect ratio (width / height): 0.4–2.5.
 
 ---
 

@@ -34,6 +34,87 @@ _MIN_WIDTH_WARN = 1024
 _VALID_MODES = ("letterbox", "crop")
 _ASPECT_RE = re.compile(r"^\d+(?:\.\d+)?[:/]\d+(?:\.\d+)?$")
 
+# Image-to-video input constraints (shared by providers that accept a starting
+# image). Validated before upload so providers fail fast with a clear message.
+_VALID_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+_MIN_ASPECT = 0.4
+_MAX_ASPECT = 2.5
+_MIN_EDGE_PX = 300
+_MAX_EDGE_PX = 6000
+_MAX_IMAGE_BYTES = 30 * 1024 * 1024  # 30 MB
+
+
+def validate_image_for_i2v(image_path: str, file_bytes: bytes | None = None) -> None:
+    """Validate a local image for image-to-video upload.
+
+    Checks (all required by the image-to-video backends):
+
+    * file exists and is readable;
+    * extension is one of jpeg / png / webp;
+    * byte size is under 30 MB;
+    * the decoded frame is an actual image (not corrupt / not a text file);
+    * pixel width and height are each within ``(300, 6000)``;
+    * aspect ratio (width / height) is within ``(0.4, 2.5)``.
+
+    Parameters
+    ----------
+    image_path:
+        Local filesystem path to the image.
+    file_bytes:
+        Optional pre-read bytes (used by callers that have already read the
+        file, e.g. to base64-encode). When provided this is used instead of
+        re-reading the file.
+
+    Raises
+    ------
+    ValueError
+        If any constraint is violated, with a message naming the offending path.
+    """
+    if image_path.lower().startswith("http://") or image_path.lower().startswith("https://"):
+        return  # URL pass-through — the backend validates it.
+
+    path = Path(image_path)
+    if not path.exists():
+        raise ValueError(f"Image file not found: {image_path}")
+
+    suffix = path.suffix.lower()
+    if suffix not in _VALID_IMAGE_EXTENSIONS:
+        raise ValueError(
+            f"Image {image_path!r}: unsupported format {suffix!r}. Allowed: {list(_VALID_IMAGE_EXTENSIONS)}"
+        )
+
+    size = path.stat().st_size if file_bytes is None else len(file_bytes)
+    if size >= _MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"Image {image_path!r}: size {size} bytes exceeds the {_MAX_IMAGE_BYTES // (1024 * 1024)} MB limit"
+        )
+
+    # Decode to confirm it's a valid image and to read the dimensions.
+    try:
+        img = cv2.imread(image_path)
+    except Exception as exc:
+        raise ValueError(f"Failed to decode image at {image_path!r}: {exc}") from None
+    if img is None or img.size == 0:
+        raise ValueError(f"Could not decode image at {image_path!r} (not a valid image).")
+
+    height, width = img.shape[:2]
+
+    if not (_MIN_EDGE_PX <= width <= _MAX_EDGE_PX):
+        raise ValueError(
+            f"Image {image_path!r}: width {width} is outside the allowed range ({_MIN_EDGE_PX}, {_MAX_EDGE_PX}) px"
+        )
+    if not (_MIN_EDGE_PX <= height <= _MAX_EDGE_PX):
+        raise ValueError(
+            f"Image {image_path!r}: height {height} is outside the allowed range ({_MIN_EDGE_PX}, {_MAX_EDGE_PX}) px"
+        )
+
+    aspect = width / height
+    if not (_MIN_ASPECT <= aspect <= _MAX_ASPECT):
+        raise ValueError(
+            f"Image {image_path!r}: aspect ratio {aspect:.3f} is outside the "
+            f"allowed range ({_MIN_ASPECT}, {_MAX_ASPECT})"
+        )
+
 
 @dataclass
 class PreparedImage:

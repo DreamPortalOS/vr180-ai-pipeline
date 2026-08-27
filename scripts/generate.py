@@ -68,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Available providers: " + ", ".join(list_providers()) + "\n\n"
             "Environment variables:\n"
             "  KLING_API_KEY      API key for Kling\n"
-            "  SEEDANCE_API_KEY   API key for Seedance\n"
+            "  ARK_API_KEY        API key for Seedance (Volcengine Ark)\n"
             "  VEO_API_KEY        API key for Veo (Vertex AI)\n"
             "  GCP_PROJECT_ID     GCP project (Veo, defaults to 'my-project')\n"
         ),
