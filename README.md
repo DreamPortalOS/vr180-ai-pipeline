@@ -95,6 +95,20 @@ python scripts/run_pipeline.py \
 输出为方形每眼 SBS（如 5760×2880），传 Quest 用 Skybox/DeoVR 选「180° 3D (SBS)」。
 质量档位 `--quality {preview,standard,high}`（默认 `standard` = 2880²/眼流式，`high` = 3840²/眼流式，`preview` = 1920²/眼快速迭代）；码率随像素面积自适应缩放。
 
+### 单图 → VR180（一张图直接生成 VR180）
+
+用 `scripts/image_to_vr180.py` 一条命令把单图变成 Quest 可播的 VR180（I2V 生成 → [超分] → 转换 → QA）：
+
+```bash
+# Windows PowerShell:  $env:PYTHONPATH="."   |  macOS/Linux:  export PYTHONPATH=.
+python scripts/image_to_vr180.py --image cat.png --provider mock --quality preview --workdir build/cat_vr180
+pytest tests/test_image_to_vr180.py -q          # 干净仓库（无模型/key）验证 mock 全链路
+```
+
+> `--provider mock` 用 ffmpeg 合成视频，不联网不要 key。配真实生成用 `--provider seedance|kling|veo`
+> （见 [docs/IMAGE_TO_VR180.md](docs/IMAGE_TO_VR180.md)）。`convert` 阶段依赖 Depth-Anything-V2
+> 深度模型（`transformers`），干净环境未装时用上面的 `pytest` 验证编排器接线。
+
 ### 提升清晰度（强烈推荐）
 先用 SeedVR2 把源片升采样到 ~2K–4K，再跑上面的转换。部署见 **[docs/SEEDVR2_SETUP.md](docs/SEEDVR2_SETUP.md)**（Windows/4070S 走 ComfyUI）。
 
@@ -131,6 +145,7 @@ worktree 里实现、自测、开 PR；自动评审（CI 绿 + AI 评审）squas
 | [docs/SEEDVR2_SETUP.md](docs/SEEDVR2_SETUP.md) | SeedVR2 在 4070S 上的部署 |
 | [docs/COMPETITOR_AND_BUSINESS.md](docs/COMPETITOR_AND_BUSINESS.md) | buildvr.ai 竞品逆向（技术+商业） |
 | [docs/STRATEGY_AI_VR180.md](docs/STRATEGY_AI_VR180.md) · [docs/PROMPT_GUIDE_VR180.md](docs/PROMPT_GUIDE_VR180.md) | 技术路线 / Prompt 指南 |
+| [docs/IMAGE_TO_VR180.md](docs/IMAGE_TO_VR180.md) | ★ 单图 → VR180 使用指南（mock 试跑 / 真实 key / 断点续跑 / 排查） |
 | [docs/FULLDOME_USAGE.md](docs/FULLDOME_USAGE.md) | fulldome 输出定位与预览（⚠️ 非头显格式） |
 | [docs/archive/](docs/archive/) | 历史过程文件（cline 看板/协议等） |
 
