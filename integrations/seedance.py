@@ -142,9 +142,13 @@ class SeedanceProvider(VideoGenProvider):
                 poll_resp = client.get(_QUERY_PATH.format(task_id=task_id), headers=headers)
                 poll_resp.raise_for_status()
                 poll_data = poll_resp.json()
-                status = poll_data.get("task", {}).get("status")
-                if status is None:
-                    status = poll_data.get("status", "unknown")
+
+                # Real Ark shape: top-level ``status`` (running/succeeded/failed).
+                # A ``usage.completion_tokens`` block may ride along — logged for observability.
+                usage = poll_data.get("usage") or {}
+                if usage:
+                    log.info("Seedance: task %s usage=%s", task_id, usage)
+                status = poll_data.get("status") or poll_data.get("task", {}).get("status") or "unknown"
 
                 if status in ("succeeded", "completed"):
                     video_url = self._extract_video_url(poll_data)
@@ -166,7 +170,12 @@ class SeedanceProvider(VideoGenProvider):
 
     @staticmethod
     def _handle_submit(resp: httpx.Response) -> str:
-        """Return the ``task_id`` from a submit response, handling errors."""
+        """Return the task id from a submit response, handling errors.
+
+        Real Ark response shape: ``{"id": "cgt-...", ...}`` — the field is
+        ``id``, **not** ``task_id``.  The legacy ``task_id`` lookups are kept as
+        a defensive fallback only.
+        """
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -176,7 +185,7 @@ class SeedanceProvider(VideoGenProvider):
             raise RuntimeError(f"Seedance submit failed: {exc.response.status_code} {exc}") from None
 
         data = resp.json()
-        task_id: str | None = (data.get("task") or {}).get("task_id") or data.get("task_id")
+        task_id: str | None = data.get("id") or (data.get("task") or {}).get("task_id") or data.get("task_id")
         if not task_id:
             error = data.get("error") or {}
             if error.get("code"):
@@ -188,10 +197,14 @@ class SeedanceProvider(VideoGenProvider):
     def _extract_video_url(data: dict) -> str | None:
         """Locate the video URL in an Ark task response.
 
-        The measured shape nests the result under ``task.outputs[].video_url``
-        or flat ``content[].outputs[].video_url``; fall back to a top-level
-        ``video_url`` to stay tolerant of shape drift.
+        Real shape on success: a signed TOS download link at
+        ``content.video_url``.  The older ``task.outputs[].video_url`` /
+        ``content[].outputs[].video_url`` nesting is kept as a defensive
+        fallback, plus a flat top-level ``video_url`` for shape drift.
         """
+        content = data.get("content")
+        if isinstance(content, dict) and content.get("video_url"):
+            return str(content["video_url"])
         for bucket in (data.get("task") or {}, data):
             if not isinstance(bucket, dict):
                 continue
