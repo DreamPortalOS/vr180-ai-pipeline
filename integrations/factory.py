@@ -29,12 +29,14 @@ def _ensure_registry() -> None:
 
     # Lazy imports to keep factory import lightweight
     from integrations.kling import KlingProvider
+    from integrations.mock_provider import MockProvider
     from integrations.seedance import SeedanceProvider
     from integrations.veo import VeoProvider
 
     _PROVIDER_REGISTRY["kling"] = KlingProvider
     _PROVIDER_REGISTRY["seedance"] = SeedanceProvider
     _PROVIDER_REGISTRY["veo"] = VeoProvider
+    _PROVIDER_REGISTRY["mock"] = MockProvider
 
     log.debug("Provider registry: %s", list(_PROVIDER_REGISTRY))
 
@@ -45,7 +47,7 @@ def get_provider(name: str, **kwargs: Any) -> VideoGenProvider:
     Parameters
     ----------
     name : str
-        One of ``"kling"``, ``"seedance"``, ``"veo"``.
+        One of ``"kling"``, ``"seedance"``, ``"veo"``, ``"mock"``.
     **kwargs
         Passed through to the provider constructor (e.g. ``api_key``).
 
