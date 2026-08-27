@@ -29,7 +29,22 @@ def _ensure_output_dir() -> str:
 
 
 def _download_video(url: str, out_path: str) -> str:
-    """Download a video from *url* to *out_path* and return the path."""
+    """Copy the video at *url* to *out_path* and return the path.
+
+    *url* is normally an ``http(s)`` URL, in which case the bytes are
+    fetched over the network.  Some providers (notably the local mock
+    provider) return a local file path as ``video_url``; in that case the
+    file is copied rather than fetched.  This keeps the full chain runnable
+    on CI without keys or network access.
+    """
+    if _is_local_path(url):
+        log.info("Copying local video %s -> %s", url, out_path)
+        if not os.path.exists(url):
+            raise RuntimeError(f"Video file not found: {url}")
+        with open(url, "rb") as src, open(out_path, "wb") as dst:
+            dst.write(src.read())
+        log.info("Copied %d bytes", os.path.getsize(out_path))
+        return out_path
     log.info("Downloading video from %s -> %s", url, out_path)
     with httpx.Client(timeout=300, follow_redirects=True) as client:
         resp = client.get(url)
@@ -38,6 +53,11 @@ def _download_video(url: str, out_path: str) -> str:
             f.write(resp.content)
     log.info("Downloaded %d bytes", len(resp.content))
     return out_path
+
+
+def _is_local_path(value: str) -> bool:
+    """Return True if *value* looks like a local filesystem path."""
+    return not (value.startswith("http://") or value.startswith("https://"))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,14 +73,25 @@ def build_parser() -> argparse.ArgumentParser:
             "  GCP_PROJECT_ID     GCP project (Veo, defaults to 'my-project')\n"
         ),
     )
-    parser.add_argument("prompt", type=str, help="Text description of the desired video.")
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        default="",
+        help="Text description of the desired video. Optional when --image is given.",
+    )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=None,
+        help="Path or URL to a starting image; switches to image-to-video (generate_from_image).",
+    )
     parser.add_argument(
         "--provider",
         "-p",
         type=str,
         default="kling",
         choices=list_providers(),
-        help="Video generation provider (default: kling).",
+        help="Video generation provider (default: kling). Use 'mock' to run fully offline.",
     )
     parser.add_argument(
         "--duration",
@@ -150,29 +181,59 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Provider error: %s", exc)
         return 1
 
-    # Generate
-    log.info(
-        "Generating with provider=%s, duration=%d, aspect_ratio=%s, fps=%d",
-        args.provider,
-        args.duration,
-        args.aspect_ratio,
-        args.fps,
-    )
     kwargs: dict[str, str | int | float] = {}
     if negative_prompt:
         kwargs["negative_prompt"] = negative_prompt
 
-    try:
-        result = provider.generate(
-            prompt=prompt,
-            duration=args.duration,
-            aspect_ratio=args.aspect_ratio,
-            fps=args.fps,
-            **kwargs,
+    # Generate — text-to-video or image-to-video
+    if args.image:
+        if not prompt:
+            log.warning("--image given without a prompt; using empty prompt")
+        log.info(
+            "Image-to-video with provider=%s, image=%s, duration=%d, aspect_ratio=%s, fps=%d",
+            args.provider,
+            args.image,
+            args.duration,
+            args.aspect_ratio,
+            args.fps,
         )
-    except RuntimeError as exc:
-        log.error("Generation failed: %s", exc)
-        return 1
+        try:
+            result = provider.generate_from_image(
+                image_path=args.image,
+                prompt=prompt,
+                duration=args.duration,
+                aspect_ratio=args.aspect_ratio,
+                fps=args.fps,
+                **kwargs,
+            )
+        except NotImplementedError as exc:
+            log.error("Provider %s does not support image-to-video: %s", args.provider, exc)
+            return 1
+        except RuntimeError as exc:
+            log.error("Generation failed: %s", exc)
+            return 1
+    else:
+        if not prompt:
+            log.error("A prompt (or --image) is required.")
+            return 2
+        log.info(
+            "Generating with provider=%s, duration=%d, aspect_ratio=%s, fps=%d",
+            args.provider,
+            args.duration,
+            args.aspect_ratio,
+            args.fps,
+        )
+        try:
+            result = provider.generate(
+                prompt=prompt,
+                duration=args.duration,
+                aspect_ratio=args.aspect_ratio,
+                fps=args.fps,
+                **kwargs,
+            )
+        except RuntimeError as exc:
+            log.error("Generation failed: %s", exc)
+            return 1
 
     # Determine output path
     if args.output:

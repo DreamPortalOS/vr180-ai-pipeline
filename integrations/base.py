@@ -90,8 +90,56 @@ class VideoGenProvider(ABC):
         """
 
     # ------------------------------------------------------------------
+    # Image-to-video
+    # ------------------------------------------------------------------
+
+    def generate_from_image(
+        self,
+        image_path: str,
+        prompt: str = "",
+        duration: int = 5,
+        aspect_ratio: str = "16:9",
+        **kwargs: Any,
+    ) -> GenerationResult:
+        """Generate a video using a starting image.
+
+        Subclasses opt into this by overriding it. Providers that only
+        support text-to-video may leave the default, which raises
+        :class:`NotImplementedError`.
+
+        Parameters
+        ----------
+        image_path : str
+            Local path to the image, or an ``http(s)`` URL. Providers
+            encode local images as base64 and pass URLs through verbatim.
+        prompt : str
+            Optional text prompt describing the desired motion.
+        duration : int
+            Target duration in seconds.
+        aspect_ratio : str
+            Aspect ratio string, e.g. ``"16:9"``.
+        **kwargs
+            Provider-specific extra parameters.
+
+        Returns
+        -------
+        GenerationResult
+
+        Raises
+        ------
+        NotImplementedError
+            If this provider does not support image-to-video.
+        """
+        raise NotImplementedError(f"{self.name} does not support image-to-video")
+
+    # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        """Human-readable provider name, e.g. ``"kling"``."""
+        return self.provider_name
 
     @property
     def provider_name(self) -> str:

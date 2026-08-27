@@ -82,7 +82,8 @@ class TestFactory:
         assert "kling" in providers
         assert "seedance" in providers
         assert "veo" in providers
-        assert len(providers) == 3
+        assert "mock" in providers
+        assert len(providers) == 4
 
     def test_get_provider_kling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("KLING_API_KEY", "key")
@@ -411,3 +412,381 @@ class TestPromptToGenerationFlow:
         assert "rapid turns" in negative
 
         # The prompt is a plain string — compatible with generate
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Image-to-video (G-1): base default + per-provider i2v + MockProvider
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestBaseGenerateFromImage:
+    def test_default_raises_not_implemented(self) -> None:
+        """A provider that does not override i2v must raise NotImplementedError."""
+
+        class StubProvider(VideoGenProvider):
+            def _load_api_key(self) -> str:
+                return "test-key"
+
+            def generate(
+                self,
+                prompt: str,
+                duration: int = 5,
+                aspect_ratio: str = "16:9",
+                fps: int = 24,
+                **kwargs,
+            ) -> GenerationResult:
+                return GenerationResult(video_url="https://x.com/v.mp4", provider=self.provider_name)
+
+        p = StubProvider()
+        with pytest.raises(NotImplementedError, match="does not support image-to-video"):
+            p.generate_from_image("photo.png")
+
+    def test_not_implemented_mentions_provider_name(self) -> None:
+        class StubProvider(VideoGenProvider):
+            def _load_api_key(self) -> str:
+                return "test-key"
+
+            def generate(
+                self,
+                prompt: str,
+                duration: int = 5,
+                aspect_ratio: str = "16:9",
+                fps: int = 24,
+                **kwargs,
+            ) -> GenerationResult:
+                return GenerationResult(video_url="https://x.com/v.mp4", provider=self.provider_name)
+
+        p = StubProvider()
+        with pytest.raises(NotImplementedError, match=type(p).__name__.lower().replace("provider", "")):
+            p.generate_from_image("photo.png")
+
+
+def _mock_httpx_client():
+    """Return a MagicMock httpx.Client usable as both value and context manager."""
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.__enter__.return_value = mock_client
+    return mock_client
+
+
+class TestKlingImageToVideo:
+    def test_i2v_sends_image_payload_and_polls(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLING_API_KEY", "test-key")
+        provider = KlingProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"data": {"job_id": "kling-i2v-001"}}
+        submit_resp.raise_for_status.return_value = None
+
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {"data": {"status": "succeed", "video_url": "https://cdn.kling.com/i2v.mp4"}}
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with (
+            patch.object(provider, "_sign", return_value=("sig", "1", "nonce")),
+            patch("integrations.kling.httpx.Client", return_value=mock_client),
+            patch("integrations.kling.time.sleep", return_value=None),
+        ):
+            result = provider.generate_from_image("https://example.com/photo.png", duration=5, aspect_ratio="16:9")
+
+        assert result.video_url == "https://cdn.kling.com/i2v.mp4"
+        assert result.job_id == "kling-i2v-001"
+        assert result.provider == "kling"
+
+        # The image URL was passed through verbatim into the request body
+        body = mock_client.post.call_args[1]["json"]
+        assert body["image"] == "https://example.com/photo.png"
+        mock_client.get.assert_called_once()
+
+    def test_i2v_encodes_local_image_as_base64(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        monkeypatch.setenv("KLING_API_KEY", "test-key")
+        provider = KlingProvider()
+        img = tmp_path / "img.png"
+        img.write_bytes(b"\x89PNGfake-image-bytes")
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"data": {"job_id": "kling-i2v-002"}}
+        submit_resp.raise_for_status.return_value = None
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {"data": {"status": "succeed", "video_url": "https://cdn.kling.com/i2v.mp4"}}
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with (
+            patch.object(provider, "_sign", return_value=("sig", "1", "nonce")),
+            patch("integrations.kling.httpx.Client", return_value=mock_client),
+            patch("integrations.kling.time.sleep", return_value=None),
+        ):
+            provider.generate_from_image(str(img))
+
+        body = mock_client.post.call_args[1]["json"]
+        import base64
+
+        assert base64.b64decode(body["image"]) == b"\x89PNGfake-image-bytes"
+        assert body["image_type"] == KlingProvider.I2V_IMAGE_TYPE
+
+    def test_i2v_poll_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLING_API_KEY", "test-key")
+        provider = KlingProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"data": {"job_id": "kling-i2v-003"}}
+        submit_resp.raise_for_status.return_value = None
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {"data": {"status": "failed", "message": "unsafe content"}}
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with (
+            patch.object(provider, "_sign", return_value=("sig", "1", "nonce")),
+            patch("integrations.kling.httpx.Client", return_value=mock_client),
+            patch("integrations.kling.time.sleep", return_value=None),
+            pytest.raises(RuntimeError, match="unsafe content"),
+        ):
+            provider.generate_from_image("https://x.com/p.png")
+
+    def test_i2v_poll_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLING_API_KEY", "test-key")
+        provider = KlingProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"data": {"job_id": "kling-i2v-004"}}
+        submit_resp.raise_for_status.return_value = None
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {"data": {"status": "processing"}}
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        # Freeze the clock so the deadline is reached immediately.
+        with (
+            patch.object(provider, "_sign", return_value=("sig", "1", "nonce")),
+            patch("integrations.kling.httpx.Client", return_value=mock_client),
+            patch("integrations.kling.time.sleep", return_value=None),
+            patch(
+                "integrations.kling.time.time",
+                side_effect=[1.0, 1e9],
+            ),
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            provider.generate_from_image("https://x.com/p.png")
+
+    def test_i2v_missing_image_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KLING_API_KEY", "test-key")
+        provider = KlingProvider()
+        with pytest.raises(RuntimeError, match="Image file not found"):
+            provider.generate_from_image("/nonexistent/photo.png")
+
+
+class TestSeedanceImageToVideo:
+    def test_i2v_sends_image_payload_and_polls(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SEEDANCE_API_KEY", "test-key")
+        provider = SeedanceProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"id": "seedance-i2v-001"}
+        submit_resp.raise_for_status.return_value = None
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {
+            "status": "completed",
+            "output": {"video_url": "https://cdn.seedance.ai/i2v.mp4"},
+        }
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+        ):
+            result = provider.generate_from_image("https://example.com/p.png", duration=5, aspect_ratio="16:9")
+
+        assert result.video_url == "https://cdn.seedance.ai/i2v.mp4"
+        assert result.job_id == "seedance-i2v-001"
+        assert result.provider == "seedance"
+        body = mock_client.post.call_args[1]["json"]
+        assert body["image"] == "https://example.com/p.png"
+        assert body["image_format"] == SeedanceProvider.I2V_IMAGE_FORMAT
+        assert body["model"] == SeedanceProvider.I2V_MODEL
+        mock_client.get.assert_called_once()
+
+    def test_i2v_poll_cancelled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SEEDANCE_API_KEY", "test-key")
+        provider = SeedanceProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"id": "seedance-i2v-002"}
+        submit_resp.raise_for_status.return_value = None
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {"status": "failed", "message": "quota exceeded"}
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+            pytest.raises(RuntimeError, match="quota exceeded"),
+        ):
+            provider.generate_from_image("https://x.com/p.png")
+
+
+class TestVeoImageToVideo:
+    def test_i2v_sends_image_payload(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VEO_API_KEY", "test-key")
+        monkeypatch.setenv("GCP_PROJECT_ID", "my-project")
+        provider = VeoProvider()
+
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.json.return_value = {
+            "predictions": [{"id": "veo-i2v-001", "video_url": "https://storage.googleapis.com/veo/i2v.mp4"}]
+        }
+        mock_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = mock_resp
+
+        with patch("integrations.veo.httpx.Client", return_value=mock_client):
+            result = provider.generate_from_image("https://example.com/p.png", duration=5, aspect_ratio="16:9")
+
+        assert result.video_url == "https://storage.googleapis.com/veo/i2v.mp4"
+        assert result.job_id == "veo-i2v-001"
+        assert result.provider == "veo"
+
+        body = mock_client.post.call_args[1]["json"]
+        inst = body["instances"][0]
+        assert inst["image"][VeoProvider.I2V_IMAGE_BYTES_FIELD] == "https://example.com/p.png"
+
+    def test_i2v_missing_predictions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VEO_API_KEY", "test-key")
+        monkeypatch.setenv("GCP_PROJECT_ID", "my-project")
+        provider = VeoProvider()
+
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.json.return_value = {}
+        mock_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = mock_resp
+
+        with (
+            patch("integrations.veo.httpx.Client", return_value=mock_client),
+            pytest.raises(RuntimeError, match="missing predictions"),
+        ):
+            provider.generate_from_image("https://x.com/p.png")
+
+    def test_i2v_missing_video_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VEO_API_KEY", "test-key")
+        monkeypatch.setenv("GCP_PROJECT_ID", "my-project")
+        provider = VeoProvider()
+
+        mock_resp = MagicMock(spec=httpx.Response)
+        mock_resp.json.return_value = {"predictions": [{"id": "veo-i2v-002"}]}
+        mock_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = mock_resp
+
+        with (
+            patch("integrations.veo.httpx.Client", return_value=mock_client),
+            pytest.raises(RuntimeError, match="missing video URL"),
+        ):
+            provider.generate_from_image("https://x.com/p.png")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MockProvider: real ffmpeg lavfi render, verified with ffprobe
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _probe(out_path):
+    """Run ffprobe against *out_path*; return the parsed JSON stream info."""
+    import json as _json
+    import subprocess
+
+    cmd = [
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        out_path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+    assert r.returncode == 0, f"ffprobe failed: {r.stderr}"
+    return _json.loads(r.stdout)
+
+
+class TestMockProvider:
+    def test_factory_registers_mock(self) -> None:
+        assert "mock" in list_providers()
+        instance = get_provider("mock")
+        from integrations.mock_provider import MockProvider
+
+        assert isinstance(instance, MockProvider)
+
+    def test_mock_provider_no_env_needed(self) -> None:
+        from integrations.mock_provider import MockProvider
+
+        # Should not raise even with no environment keys set.
+        p = MockProvider()
+        assert p._api_key == "mock"
+
+    def test_mock_generate_produces_readable_video(self, tmp_path) -> None:
+        from integrations.mock_provider import MockProvider
+
+        provider = MockProvider()
+        out = tmp_path / "mock_gen.mp4"
+        out_path = provider._render(str(out), duration=1, fps=24, width=128, height=72)
+        assert out_path == str(out)
+
+        info = _probe(out_path)
+        assert info.get("format") and info["format"].get("duration")
+        assert any(s.get("codec_type") == "video" for s in info.get("streams", []))
+
+    def test_mock_generate_returns_result(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        from integrations.mock_provider import MockProvider
+
+        monkeypatch.setenv("MOCK_PROVIDER_OUTPUT_DIR", str(tmp_path))
+        provider = MockProvider()
+
+        result = provider.generate("mock flyover", duration=1)
+
+        assert result.provider == "mock"
+        assert result.job_id.startswith("mock-")
+        assert result.video_url.endswith(".mp4")
+        info = _probe(result.video_url)
+        assert info.get("format")
+        assert any(s.get("codec_type") == "video" for s in info.get("streams", []))
+
+    def test_mock_generate_from_image_returns_result(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        from integrations.mock_provider import MockProvider
+
+        monkeypatch.setenv("MOCK_PROVIDER_OUTPUT_DIR", str(tmp_path))
+        provider = MockProvider()
+
+        result = provider.generate_from_image("https://example.com/cat.png", duration=1)
+
+        assert result.provider == "mock"
+        assert result.job_id.startswith("mock-i2v-")
+        assert result.metadata["image_path"] == "https://example.com/cat.png"
+        info = _probe(result.video_url)
+        assert info.get("format")
+        assert any(s.get("codec_type") == "video" for s in info.get("streams", []))
