@@ -112,17 +112,20 @@ pytest -q
 worktree 里实现、自测、开 PR；自动评审（CI 绿 + AI 评审）squash 合并；**项目所有者** 通过仓根
 `WORKLOG.md`（本地异步工作台）实测打分、定方向。worker 行为规范见 [CLAUDE.md](CLAUDE.md)。
 
-## 当前进展（2026-08-21）
-- ✅ 转换管线全链路跑通：SeedVR2 超分 → 深度/立体 → 等距/鱼眼投影 → `sv3d`/`st3d` 注入（PR #1–#32 全部合并）。
-- ✅ 路线1 球幕渲染器（fulldome）、180° 外绘、批处理等距投影（~10×）、生成层（Kling/Seedance/Veo）落地。
-- ▶ **画质冲刺**：Quest 实测暴露两大主因 —— 每眼 1920px 太低（→ 流式 3840/眼）+ 视差 0.02 太弱且深度噪声大
-  （→ 参数扫描 + Mac 上 DepthCrafter/StereoCrafter）。当前任务队列见 GitHub Issues。
-- 🔜 跨机工作流：Windows（SeedVR2/CUDA）↔ Mac M2 Max（重深度/立体模型，MPS）分段接力。
+## 当前进展（2026-08-21 晚）
+- ✅ **画质冲刺 V-1…V-9 全部交付**（kimi-k3 编码 + lead 实机验收）：质量预设（3840²/眼流式默认路径）、
+  流式 SBS 布局/元数据注入/编码器回退三连修、立体参数扫描工具、VR180 QA 校验器、跨机 job manifest。
+- ✅ 3840²/眼 · 视差 0.06 · hfov150 样片已交付 Quest 真机（等 owner 打分）。
+- ▶ **阶段 G：单图 → 视频 → VR180 工作流**（见 [docs/PRD-image-to-vr180.md](docs/PRD-image-to-vr180.md)）：
+  provider 层加 image-to-video 入口 → 图片预处理 → 一键编排 `image_to_vr180`。真实生成待 owner 提供 API key。
+- 🔜 Mac M2 Max 上 DepthCrafter/StereoCrafter（治重影的根治路径，owner 部署中）。
 
 ## 文档索引
 | 文档 | 内容 |
 |------|------|
 | [CLAUDE.md](CLAUDE.md) | ★ 自主 worker 行为规范 |
+| [docs/DEV_PROCESS.md](docs/DEV_PROCESS.md) | ★ 开发协作机制（owner/lead/kimi-k3 分工与验收流程） |
+| [docs/PRD-image-to-vr180.md](docs/PRD-image-to-vr180.md) | ★ 阶段 G PRD：单图→视频→VR180 |
 | [docs/SOLUTION_ARCHITECTURE.md](docs/SOLUTION_ARCHITECTURE.md) | ★ 两路线系统方案 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 执行路线图（里程碑） |
 | [docs/SEEDVR2_SETUP.md](docs/SEEDVR2_SETUP.md) | SeedVR2 在 4070S 上的部署 |
