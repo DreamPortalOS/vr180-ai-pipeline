@@ -6,6 +6,7 @@ method.  No live API calls are made — all HTTP responses are mocked.
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -81,10 +82,11 @@ class TestFactory:
     def test_list_providers(self) -> None:
         providers = list_providers()
         assert "kling" in providers
+        assert "local-svd" in providers
         assert "seedance" in providers
         assert "veo" in providers
         assert "mock" in providers
-        assert len(providers) == 4
+        assert len(providers) == 5
 
     def test_get_provider_kling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("KLING_API_KEY", "key")
@@ -1034,3 +1036,305 @@ class TestMockProvider:
         info = _probe(result.video_url)
         assert info.get("format")
         assert any(s.get("codec_type") == "video" for s in info.get("streams", []))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LocalSVDProvider (G-4): local diffusers/SVD image-to-video, pluggable backend
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestLocalSVDFactory:
+    def test_factory_registers_local_svd(self) -> None:
+        assert "local-svd" in list_providers()
+        from integrations.local_svd import LocalSVDProvider
+
+        instance = get_provider("local-svd")
+        assert isinstance(instance, LocalSVDProvider)
+
+    def test_provider_name(self) -> None:
+        from integrations.local_svd import LocalSVDProvider
+
+        # No env var / key required — local generation needs none.
+        provider = LocalSVDProvider()
+        assert provider.provider_name == "localsvd"
+
+    def test_api_key_is_local_no_env_needed(self) -> None:
+        from integrations.local_svd import LocalSVDProvider
+
+        provider = LocalSVDProvider()
+        assert provider._api_key == "local"
+
+    def test_generate_raises_not_implemented(self) -> None:
+        from integrations.local_svd import LocalSVDProvider
+
+        provider = LocalSVDProvider()
+        with pytest.raises(NotImplementedError, match="image-to-video"):
+            provider.generate("a flying scene")
+
+
+class TestLocalSVDParameterSelection:
+    """12GB/MPS parameter selection logic (acceptance: inject fake device info).
+
+    The provider picks resolution / CPU-offload from the device.  We monkey-patch
+    ``detect_best_device`` and set ``_device`` / ``vram_gb`` directly to exercise
+    each branch without touching any real GPU.
+    """
+
+    def _make_provider(self, device: str):
+        from integrations.local_svd import LocalSVDProvider
+
+        provider = LocalSVDProvider()
+        provider._device = device
+        return provider
+
+    def test_cuda_low_vram_12gb_low_res_and_offload(self) -> None:
+
+        provider = self._make_provider("cuda")
+        params = provider._select_params()
+        assert params["width"] == 576
+        assert params["height"] == 320
+        assert params["enable_cpu_offload"] is True
+        assert params["motion_amplitude"] == 6.0
+        assert params["fps"] == 7
+
+    def test_cuda_low_vram_injected_8gb_stays_low_res(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Explicit vram_gb below the 12GB threshold stays low-res + offload."""
+
+        provider = self._make_provider("cuda")
+        params = provider._select_params(vram_gb=8)
+        assert params["width"] == 576
+        assert params["height"] == 320
+        assert params["enable_cpu_offload"] is True
+        assert params["fps"] == 7
+
+    def test_cuda_high_vram_24gb_full_res_no_offload(self) -> None:
+
+        provider = self._make_provider("cuda")
+        params = provider._select_params(vram_gb=24)
+        assert params["width"] == 1024
+        assert params["height"] == 576
+        assert params["enable_cpu_offload"] is False
+
+    def test_mps_full_res_no_offload(self) -> None:
+        """MPS (M2 Max 96GB unified memory) → full resolution, no offload."""
+
+        provider = self._make_provider("mps")
+        params = provider._select_params()
+        assert params["width"] == 1024
+        assert params["height"] == 576
+        assert params["enable_cpu_offload"] is False
+
+    def test_cpu_fallback_low_res(self) -> None:
+
+        provider = self._make_provider("cpu")
+        params = provider._select_params()
+        assert params["width"] == 576
+        assert params["height"] == 320
+        assert params["enable_cpu_offload"] is False
+
+    def test_explicit_kwargs_override_device_defaults(self) -> None:
+
+        provider = self._make_provider("mps")
+        params = provider._select_params(width=384, height=256, fps=6, motion_amplitude=4.5, enable_cpu_offload=True)
+        assert params["width"] == 384
+        assert params["height"] == 256
+        assert params["fps"] == 6
+        assert params["motion_amplitude"] == 4.5
+        assert params["enable_cpu_offload"] is True
+
+
+class TestLocalSVDMockBackend:
+    """Full-path test with the fake backend — no model, no network."""
+
+    def test_generate_from_image_full_path_with_mock(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        import cv2
+        import numpy as np
+        from integrations.local_svd import LocalSVDProvider, MockSVDBackend
+
+        monkeypatch.setenv("SVD_PROVIDER_OUTPUT_DIR", str(tmp_path))
+
+        img = tmp_path / "input.png"
+        cv2.imwrite(str(img), np.zeros((400, 600, 3), dtype=np.uint8))
+
+        provider = LocalSVDProvider(backend=MockSVDBackend(), device="cuda")
+        result = provider.generate_from_image(str(img), duration=1, aspect_ratio="16:9")
+
+        assert result.provider == "localsvd"
+        assert result.job_id.startswith("local-svd-")
+        assert result.video_url.endswith(".mp4")
+        assert os.path.exists(result.video_url)
+        info = _probe(result.video_url)
+        assert info.get("format")
+        assert any(s.get("codec_type") == "video" for s in info.get("streams", []))
+
+        meta = result.metadata
+        assert meta["device"] == "cuda"
+        assert meta["backend"] == "MockSVDBackend"
+        assert meta["model_id"] == "stabilityai/stable-video-diffusion-img2vid-xt"
+        assert meta["image_path"] == str(img)
+
+    def test_generate_from_image_uses_selected_resolution(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        """Mock backend must be called with the params the provider chose."""
+        import cv2
+        import numpy as np
+        from integrations.local_svd import LocalSVDProvider, MockSVDBackend
+
+        monkeypatch.setenv("SVD_PROVIDER_OUTPUT_DIR", str(tmp_path))
+
+        img = tmp_path / "input.png"
+        cv2.imwrite(str(img), np.zeros((400, 600, 3), dtype=np.uint8))
+
+        class _RecordingBackend(MockSVDBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.last_call: dict = {}
+
+            def generate(
+                self,
+                image_path: str,
+                width: int,
+                height: int,
+                fps: int,
+                motion_amplitude: float,
+                num_frames: int,
+                output_dir: str,
+            ) -> list[str]:
+                self.last_call = {
+                    "width": width,
+                    "height": height,
+                    "fps": fps,
+                    "num_frames": num_frames,
+                }
+                # Defer to the real MockSVDBackend.generate (this same
+                # instance) so the _loaded guard and frame writing run.
+                return MockSVDBackend.generate(
+                    self, image_path, width, height, fps, motion_amplitude, num_frames, output_dir
+                )
+
+        recorder = _RecordingBackend()
+        provider = LocalSVDProvider(backend=recorder, device="cuda")
+
+        result = provider.generate_from_image(str(img), duration=1)
+
+        assert result.video_url.endswith(".mp4")
+        # 12GB CUDA defaults: 576x320, 7 fps.  1s * 7fps = 7 frames.
+        assert recorder.last_call["width"] == 576
+        assert recorder.last_call["height"] == 320
+        assert recorder.last_call["fps"] == 7
+        assert recorder.last_call["num_frames"] == 7
+
+    def test_mock_backend_loads_before_generate(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        """Backend.load() must run before backend.generate()."""
+        import cv2
+        import numpy as np
+        from integrations.local_svd import LocalSVDProvider, MockSVDBackend
+
+        monkeypatch.setenv("SVD_PROVIDER_OUTPUT_DIR", str(tmp_path))
+
+        img = tmp_path / "input.png"
+        cv2.imwrite(str(img), np.zeros((400, 600, 3), dtype=np.uint8))
+
+        backend = MockSVDBackend()
+        provider = LocalSVDProvider(backend=backend, device="mps")
+
+        provider.generate_from_image(str(img), duration=1)
+        assert backend._loaded is True
+
+    def test_generate_from_image_validates_image_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Missing image → ValidationError from image_prep before the backend loads."""
+        from integrations.local_svd import LocalSVDProvider, MockSVDBackend
+
+        backend = MockSVDBackend()
+        provider = LocalSVDProvider(backend=backend, device="cuda")
+        with pytest.raises(ValueError, match="Image file not found"):
+            provider.generate_from_image("/nonexistent/photo.png")
+        assert backend._loaded is False
+
+    def test_model_id_override_via_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from integrations.local_svd import LocalSVDProvider
+
+        monkeypatch.setenv("SVD_MODEL_ID", "owner/my-svd-fine-tune")
+        provider = LocalSVDProvider()
+        assert provider._model_id == "owner/my-svd-fine-tune"
+
+
+class TestLocalSVDRealBackendDependency:
+    """Real backend only tested for the actionable missing-dependency error.
+
+    CI has no diffusers and no weights, so we verify the *error text* the
+    operator sees rather than any inference.  These tests deliberately do
+    not import diffusers at the top of the module.
+    """
+
+    def _real_backend(self):
+        from integrations.local_svd import _DiffusersSVDBackend
+
+        return _DiffusersSVDBackend()
+
+    def test_load_missing_diffusers_error_is_actionable(self) -> None:
+        """Missing diffusers class → actionable RuntimeError naming the pip install command."""
+        import sys
+        import types
+
+        backend = self._real_backend()
+        # Inject a fake `diffusers` module that has no pipeline class, so the
+        # `from diffusers import StableVideoDiffusionPipeline` inside load()
+        # raises ImportError — which the backend re-wraps as RuntimeError.
+        fake_mod = types.ModuleType("diffusers")
+        original = sys.modules.get("diffusers")
+        try:
+            sys.modules["diffusers"] = fake_mod
+            with pytest.raises(RuntimeError, match="pip install diffusers torch"):
+                backend.load("stabilityai/stable-video-diffusion-img2vid-xt", "cuda", True)
+        finally:
+            if original is None:
+                sys.modules.pop("diffusers", None)
+            else:
+                sys.modules["diffusers"] = original
+
+    def test_missing_dependency_message_naming_pip_install(self) -> None:
+        """The dependency error message tells the user how to fix it."""
+        from integrations.local_svd import _DiffusersSVDBackend
+
+        backend = _DiffusersSVDBackend()
+        msg = str(backend._missing_dependency_error(ImportError("no module named diffusers")))
+        assert "pip install diffusers torch" in msg
+        assert "diffusers" in msg
+
+    def test_missing_model_message_naming_vram(self) -> None:
+        """The missing-weights error names VRAM requirements and the install command."""
+        from integrations.local_svd import _DiffusersSVDBackend
+
+        backend = _DiffusersSVDBackend()
+        msg = str(
+            backend._missing_model_error("stabilityai/stable-video-diffusion-img2vid-xt", RuntimeError("no weights"))
+        )
+        assert "pip install diffusers torch" in msg
+        assert "12 GB VRAM" in msg
+        assert "stabilityai/stable-video-diffusion-img2vid-xt" in msg
+
+    def test_get_backend_builds_real_when_no_injection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With no backend injected, _get_backend() constructs the real one."""
+        from integrations.local_svd import LocalSVDProvider, _DiffusersSVDBackend
+
+        provider = LocalSVDProvider()
+        backend = provider._get_backend()
+        assert isinstance(backend, _DiffusersSVDBackend)
+        # The real backend is stored for reuse.
+        assert provider._get_backend() is backend
+
+
+class TestLocalSVDHelperFunctions:
+    def test_frames_for_duration_capped_at_25(self) -> None:
+        from integrations.local_svd import _frames_for_duration
+
+        assert _frames_for_duration(1, 7) == 7
+        # Long durations cap at 25 frames (SVD-XT produces ~25).
+        assert _frames_for_duration(5, 7) == 25
+        # Zero duration still yields at least one frame.
+        assert _frames_for_duration(0, 7) >= 1
+
+    def test_frames_for_duration_rounding(self) -> None:
+        from integrations.local_svd import _frames_for_duration
+
+        assert _frames_for_duration(3, 7) == 21
