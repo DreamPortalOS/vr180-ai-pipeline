@@ -305,6 +305,35 @@ class TestCLIBackend:
     @patch("pipeline.video_upscaler.subprocess.run")
     @patch("pipeline.video_upscaler._get_video_height", return_value=1080)
     @patch("pipeline.video_upscaler._assert_cuda", return_value=None)
+    def test_relative_paths_absolutized(
+        self,
+        mock_cuda: MagicMock,
+        mock_height: MagicMock,
+        mock_run: MagicMock,
+    ) -> None:
+        """Relative input/output must be absolutized before the subprocess call.
+
+        The CLI runs with cwd=node_dir; passing caller-relative paths through
+        verbatim makes the input unresolvable (and the output would land
+        inside the node checkout). Regression for the lead's real-run failure:
+        ``FileNotFoundError: Input path not found: video/xxx.mp4``.
+        """
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stderr = ""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "inference_cli.py").write_text("# fake")
+            backend = CLIBackend(node_dir=tmpdir)
+            backend.upscale("video/in.mp4", "video/tmp/out.mp4", factor=2, batch_size=5)
+            cmd = mock_run.call_args[0][0]
+            inp = cmd[2]
+            outp = cmd[cmd.index("--output") + 1]
+            assert Path(inp).is_absolute(), f"input not absolutized: {inp}"
+            assert Path(outp).is_absolute(), f"output not absolutized: {outp}"
+            assert Path(outp).parent.is_dir(), "output parent dir not created"
+
+    @patch("pipeline.video_upscaler.subprocess.run")
+    @patch("pipeline.video_upscaler._get_video_height", return_value=1080)
+    @patch("pipeline.video_upscaler._assert_cuda", return_value=None)
     def test_command_contains_12gb_flags(
         self,
         mock_cuda: MagicMock,
