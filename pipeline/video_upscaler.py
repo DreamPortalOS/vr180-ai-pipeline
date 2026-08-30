@@ -517,6 +517,13 @@ class CLIBackend(UpscaleBackend):
 
         resolution_str = self._resolve_resolution(input_path, factor)
 
+        # The subprocess runs with cwd=node_dir, so relative caller paths would
+        # resolve against the node checkout, not the repo (input then "not
+        # found"; output would land inside node_dir). Absolutize both.
+        input_path = str(Path(input_path).resolve())
+        output_path = str(Path(output_path).resolve())
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
         # Build command list (NO shell=True for security)
         cmd: list[str] = [
             self.python_exe,
