@@ -61,6 +61,9 @@ INREPO_PYTHON = INREPO_VENV_DIR / (Path("Scripts") / "python.exe" if os.name == 
 # Stable cu124 torch — the README's nightly cu130 is pinned off in favour of
 # the release wheel, which is what the 12 GB RTX 4070S target needs.
 TORCH_VERSION = "2.6.0"
+# torchvision has its own versioning scheme — 0.21.0 is the release paired
+# with torch 2.6.0 (torchvision==2.6.0 does not exist; installing it fails).
+TORCHVISION_VERSION = "0.21.0"
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
 
 # Model weights: numz/SeedVR2_comfyUI on HuggingFace.  Sizes are lead-verified.
@@ -207,7 +210,7 @@ def ensure_venv_and_deps(pip_mirror: str | None, *, dry_run: bool, buffer: DryRu
         "--retries",
         "10",
         f"torch=={TORCH_VERSION}",
-        f"torchvision=={TORCH_VERSION}",
+        f"torchvision=={TORCHVISION_VERSION}",
         "--index-url",
         TORCH_INDEX_URL,
         *_pip_mirror_args(pip_mirror),

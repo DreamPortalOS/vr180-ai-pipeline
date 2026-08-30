@@ -230,7 +230,9 @@ class TestEnsureVenvAndDeps:
         tc = torch_calls[0]
         # Must pin 2.6.0
         assert any(tok == "torch==2.6.0" for tok in tc), f"torch not pinned to 2.6.0: {tc}"
-        assert any(tok == "torchvision==2.6.0" for tok in tc), f"torchvision not pinned: {tc}"
+        # torchvision pairs with torch 2.6.0 as 0.21.0 (its own version scheme —
+        # torchvision==2.6.0 does not exist on the index).
+        assert any(tok == "torchvision==0.21.0" for tok in tc), f"torchvision not pinned: {tc}"
         # Must use the stable cu124 index — NOT nightly
         assert setup.TORCH_INDEX_URL in tc
         assert "cu124" in " ".join(tc)
