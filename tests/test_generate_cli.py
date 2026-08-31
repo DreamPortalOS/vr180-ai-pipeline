@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from unittest.mock import MagicMock, patch
+
+import httpx
 
 
 def _probe(out_path):
@@ -85,3 +88,119 @@ class TestGenerateCliImageMode:
         assert r.returncode != 0
         combined = (r.stdout + r.stderr).lower()
         assert "prompt" in combined
+
+
+def _mock_httpx_client():
+    """Return a MagicMock httpx.Client usable as both value and context manager."""
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.__enter__.return_value = mock_client
+    return mock_client
+
+
+class TestGenerateCliGenTierPassthrough:
+    """H-2: --gen-resolution / --gen-ratio / --duration reach the seedance
+    request body (CLI → provider kwargs → HTTP body). No real network: the
+    httpx.Client is patched and the poll returns a local file so the download
+    step copies a real artefact rather than fetching.
+    """
+
+    def _seedance_httpx(self, video_path: str):
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"id": "cgt-cli-passthrough-01"}
+        submit_resp.raise_for_status.return_value = None
+
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {
+            "id": "cgt-cli-passthrough-01",
+            "status": "succeeded",
+            "content": {"video_url": video_path},
+        }
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+        return mock_client
+
+    def test_high_tier_reaches_request_body(self, tmp_path, monkeypatch) -> None:
+        """--gen-resolution 720p --gen-ratio 16:9 --duration 8 land in the body."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        # The poll returns a local path so _download_video copies it (no network).
+        src = tmp_path / "src.mp4"
+        src.write_bytes(b"fake-mp4")
+        out = tmp_path / "out.mp4"
+
+        mock_client = self._seedance_httpx(str(src))
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+        ):
+            import scripts.generate as gen
+
+            rc = gen.main(
+                [
+                    "pan left",
+                    "--image",
+                    "https://example.com/p.png",
+                    "--provider",
+                    "seedance",
+                    "--duration",
+                    "8",
+                    "--gen-resolution",
+                    "720p",
+                    "--gen-ratio",
+                    "16:9",
+                    "--output",
+                    str(out),
+                ]
+            )
+
+        assert rc == 0
+        body = mock_client.post.call_args[1]["json"]
+        assert body["resolution"] == "720p"
+        assert body["ratio"] == "16:9"
+        assert body["duration"] == 8
+        assert out.exists()
+
+    def test_defaults_are_480p_5s_adaptive(self, tmp_path, monkeypatch) -> None:
+        """With no --gen-* flags the body still reflects 480p / 5s / adaptive."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        src = tmp_path / "src.mp4"
+        src.write_bytes(b"fake-mp4")
+        out = tmp_path / "out.mp4"
+
+        mock_client = self._seedance_httpx(str(src))
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+        ):
+            import scripts.generate as gen
+
+            rc = gen.main(
+                [
+                    "pan left",
+                    "--image",
+                    "https://example.com/p.png",
+                    "--provider",
+                    "seedance",
+                    "--output",
+                    str(out),
+                ]
+            )
+
+        assert rc == 0
+        body = mock_client.post.call_args[1]["json"]
+        assert body["resolution"] == "480p"
+        assert body["ratio"] == "adaptive"
+        assert body["duration"] == 5
+
+    def test_parser_defaults(self) -> None:
+        """The argparse defaults keep the quota discipline (480p / 5s / adaptive)."""
+        import scripts.generate as gen
+
+        args = gen.build_parser().parse_args(["--image", "x.png", "--provider", "mock"])
+        assert args.gen_resolution == "480p"
+        assert args.gen_ratio == "adaptive"
+        assert args.duration == 5

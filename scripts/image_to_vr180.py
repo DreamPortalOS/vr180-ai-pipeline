@@ -62,6 +62,11 @@ class JobArgs:
     prompt: str = ""
     provider: str = "mock"
     duration: int = 5
+    # Generation tier (H-2): passed through to the provider as kwargs so
+    # raising the tier is a CLI switch, not a code change. Defaults keep
+    # the quota discipline (480p / 5s / adaptive).
+    gen_resolution: str = "480p"
+    gen_ratio: str = "adaptive"
     upscale: str = "none"
     quality: str = "preview"
 
@@ -220,12 +225,22 @@ def stage_generate(args: JobArgs, prepared_image: str | None = None) -> str:
     Path(args.generated_video).parent.mkdir(parents=True, exist_ok=True)
 
     log.info(
-        "🛠️  Stage generate: provider=%s duration=%ds prompt=%r → %s",
+        "🛠️  Stage generate: provider=%s duration=%ds resolution=%s ratio=%s prompt=%r → %s",
         args.provider,
         args.duration,
+        args.gen_resolution,
+        args.gen_ratio,
         args.prompt or "(none)",
         args.generated_video,
     )
+
+    # Generation-tier kwargs (H-2): handed to the provider so it can put
+    # resolution/ratio into the request body. Seedance reads these; the mock
+    # provider ignores them (per the card's "mock provider 忽略即可").
+    gen_kwargs: dict[str, str] = {
+        "resolution": args.gen_resolution,
+        "ratio": args.gen_ratio,
+    }
 
     # Ensure the mock provider (and any other provider) writes into our workdir
     # so downstream stages and manifest hashing stay inside tmp_path/CI scratch.
@@ -238,6 +253,7 @@ def stage_generate(args: JobArgs, prepared_image: str | None = None) -> str:
         duration=args.duration,
         aspect_ratio="16:9",
         fps=24,
+        **gen_kwargs,
     )
 
     video_path = result.video_url
@@ -540,7 +556,12 @@ def run_pipeline(
             "generate",
             inputs=[prepared],
             outputs=[generated],
-            params={"provider": args.provider, "duration": args.duration},
+            params={
+                "provider": args.provider,
+                "duration": args.duration,
+                "resolution": args.gen_resolution,
+                "ratio": args.gen_ratio,
+            },
         )
         _persist_manifest(manifest, args)
     else:
@@ -642,6 +663,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--duration", type=int, default=5, help="Generated video duration in seconds (default: 5)")
     parser.add_argument(
+        "--gen-resolution",
+        default="480p",
+        choices=["480p", "720p", "1080p"],
+        help="Generation resolution tier (default: 480p — quota discipline). "
+        "Higher tiers consume more quota; a reminder is logged when >480p is selected.",
+    )
+    parser.add_argument(
+        "--gen-ratio",
+        default="adaptive",
+        help="Generation aspect ratio passed through to the provider (default: adaptive). "
+        "Seedance accepts e.g. adaptive/16:9/9:16/1:1.",
+    )
+    parser.add_argument(
         "--upscale",
         default="none",
         choices=["seedvr2", "none"],
@@ -683,12 +717,18 @@ def main(argv: list[str] | None = None) -> int:
             prompt=args.prompt,
             provider=args.provider,
             duration=args.duration,
+            gen_resolution=args.gen_resolution,
+            gen_ratio=args.gen_ratio,
             upscale=args.upscale,
             quality=args.quality,
             workdir=args.workdir or "",
             manifest_path=args.manifest,
             resume_from=args.resume_from,
         )
+        # H-2: remind the operator that a high generation tier burns more
+        # quota. Default stays 480p so the discipline is unchanged.
+        if job.gen_resolution != "480p":
+            log.warning("⚠️  高档位（%s）消耗更多额度，请确认后再继续。", job.gen_resolution)
         resolve_paths(job)
         log.info("Image-to-VR180 pipeline starting → input=%s output=%s", job.image, job.vr180_output)
 

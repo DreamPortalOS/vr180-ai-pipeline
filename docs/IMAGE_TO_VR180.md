@@ -121,6 +121,23 @@ python scripts/image_to_vr180.py \
   --manifest build/cat_job.json
 ```
 
+**提档（owner 流程验证通过后）**：生成档位现已是 CLI 开关，不再改代码——
+
+```bash
+# 提到 720p / 16:9 / 8s（会 log 一行「高档位消耗更多额度」提醒）
+python scripts/image_to_vr180.py \
+  --image cat.png \
+  --provider seedance \
+  --gen-resolution 720p \
+  --gen-ratio 16:9 \
+  --duration 8 \
+  --quality standard \
+  --manifest build/cat_job.json
+```
+
+> ⚠️ 提档即提消耗：`720p`/`1080p` 与更长 `--duration` 都会显著增加方舟额度消耗。
+> 默认 `480p`/`5s`/`adaptive` 是额度纪律底线，确认需要再提。
+
 **Seedance 默认模型** `doubao-seedance-2-0-fast-260128`（quota 受限，故选低成本档）；
 分辨率默认 `480p`、比例 `adaptive`。模型未在方舟开通时会报 `ModelNotOpen`，
 按提示去方舟控制台开通对应模型。
@@ -151,7 +168,9 @@ python scripts/image_to_vr180.py \
 | `--image` / `-i` | （必填） | 输入图片路径；支持 jpg/png/webp。I2V 约束：每边 300–6000px、宽高比 0.4–2.5、≤30MB、扩展名 jpg/jpeg/png/webp（`validate_image_for_i2v`）。`http(s)` URL 直接透传给 provider。 |
 | `--prompt` | `""` | **只描述运动**（镜头推进/环绕/静止），画面内容由图决定；留空=纯图驱动。运动幅度默认保守（大运动 → 深度噪声 → 重影）。 |
 | `--provider` | `mock` | `mock` / `kling` / `seedance` / `veo`。 |
-| `--duration` | `5` | 生成视频秒数。 |
+| `--duration` | `5` | 生成视频秒数（透传给 provider；`seedance` 字段 `duration`）。 |
+| `--gen-resolution` | `480p` | 生成分辨率档位 `480p` / `720p` / `1080p`，透传为 provider 请求体的 `resolution`。**默认 480p 以守住额度纪律**；选 `>480p` 时 log 一行提醒「高档位消耗更多额度」。 |
+| `--gen-ratio` | `adaptive` | 生成宽高比，透传为 provider 请求体的 `ratio`（如 `adaptive` / `16:9` / `9:16` / `1:1`）。 |
 | `--upscale` | `none` | `none` / `seedvr2`（SeedVR2 超分，需 CUDA）。 |
 | `--quality` | `preview` | `preview`(1920²/眼) / `standard`(2880²/眼) / `high`(3840²/眼)。码率按像素面积自适应。 |
 | `--manifest` | （无） | 断点 manifest 写入路径。 |

@@ -457,7 +457,7 @@
     "seedance": {"api_key": "sk-xxx", "base_url": "..."},
     "kling": {"api_key": "xxx", "secret": "xxx"},
     "suno": {"api_key": "xxx"},
-    "elevenlabs": {"api_key": "xxx"}
+    "elevenlabs": {"api_key": "xxx"},
 }
 ```
 
@@ -660,8 +660,9 @@ def detect_best_device():
         print(f"🟢 CUDA: {gpu_name} ({vram:.0f} GB)")
         return "cuda"
 
-    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         import platform
+
         chip = platform.processor()
         print(f"🟢 MPS: Apple {chip}")
         return "mps"
@@ -685,10 +686,9 @@ def upscale_tiled(frame, upscaler, scale=4, tile_size=512):
 
     for y in range(0, H, tile_size):
         for x in range(0, W, tile_size):
-            tile = frame[y:y+tile_size, x:x+tile_size]
+            tile = frame[y : y + tile_size, x : x + tile_size]
             tile_up = upscaler.upscale_frame(tile)
-            output[y*scale:(y+tile_size)*scale,
-                   x*scale:(x+tile_size)*scale] = tile_up
+            output[y * scale : (y + tile_size) * scale, x * scale : (x + tile_size) * scale] = tile_up
 
     return output
 ```
