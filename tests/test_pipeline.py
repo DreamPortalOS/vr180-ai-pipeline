@@ -418,6 +418,12 @@ class TestRunPipelineChunked:
         args.temporal_smoothing = 0.3
         args.ipd = 0.064
         args.max_disparity = 0.02
+        # I-3 (#88): run_stereo_stage now reads convergence / temporal_smooth
+        # off args (resolved by run_pipeline._apply_comfort_preset).  Set them
+        # explicitly so the MagicMock isn't an auto-Mock that breaks numpy
+        # broadcasting inside StereoRenderer.
+        args.convergence = 0.3
+        args.temporal_smooth = True
         args.no_temporal = False
         args.chunk_size = chunk_size
         args.overlap = overlap

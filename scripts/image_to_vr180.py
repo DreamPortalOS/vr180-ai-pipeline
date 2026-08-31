@@ -76,6 +76,15 @@ class JobArgs:
     upscale: str = "none"
     quality: str = "preview"
 
+    # I-3 (#88): comfort preset passed through to the VR180 conversion
+    # stage.  Mirrors --quality: it's a starting point, and explicit
+    # max_disparity / convergence overrides the preset via run_pipeline's
+    # resolve_comfort.  Stored as strings / None (the argparse types) so the
+    # synthetic argv run_convert_default builds is lossless.
+    comfort: str = "balanced"
+    max_disparity: float | None = None
+    convergence: float | None = None
+
     # H-1: explicit audio source for the audio remux stage. When ``None``
     # (default), the stage falls back to ``args.generated_video`` and detects
     # an audio stream there automatically.
@@ -452,12 +461,20 @@ def run_convert_default(args: JobArgs, input_path: str) -> str:
         args.quality,
         "--bitrate",
         args.bitrate,
+        "--comfort",
+        args.comfort,
         "--device",
         "cpu",
         "--max-frames",
         "60",
         "--no-ffmpeg-v360",
     ]
+    # I-3: forward explicit comfort overrides so the converter resolves the
+    # same effective values the operator asked for at the image-to-vr180 CLI.
+    if args.max_disparity is not None:
+        argv += ["--max-disparity", str(args.max_disparity)]
+    if args.convergence is not None:
+        argv += ["--convergence", str(args.convergence)]
 
     # run_pipeline.main() reads sys.argv; run_pipeline.apply_quality_preset
     # is already applied above (and again inside main — idempotent), keeping
@@ -846,6 +863,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="VR180 quality preset passed through to the converter (default: preview)",
     )
     parser.add_argument(
+        "--comfort",
+        default="balanced",
+        choices=["safe", "balanced", "strong"],
+        help=(
+            "I-3: stereo comfort preset passed through to the converter (default: balanced). "
+            "safe = low disparity / far convergence (watch-long-no-nausea, weak 3D); "
+            "balanced = middle ground; strong = max pop, needs solid depth. "
+            "Explicit --max-disparity / --convergence override the preset."
+        ),
+    )
+    parser.add_argument(
+        "--max-disparity",
+        type=float,
+        default=None,
+        help="Explicit max-disparity override for the converter (overrides --comfort preset).",
+    )
+    parser.add_argument(
+        "--convergence",
+        type=float,
+        default=None,
+        help="Explicit convergence-plane override for the converter (overrides --comfort preset).",
+    )
+    parser.add_argument(
         "--manifest",
         default=None,
         metavar="PATH",
@@ -887,6 +927,9 @@ def main(argv: list[str] | None = None) -> int:
             gen_ratio=args.gen_ratio,
             upscale=args.upscale,
             quality=args.quality,
+            comfort=args.comfort,
+            max_disparity=args.max_disparity,
+            convergence=args.convergence,
             copy_audio_from=args.copy_audio_from,
             workdir=args.workdir or "",
             manifest_path=args.manifest,

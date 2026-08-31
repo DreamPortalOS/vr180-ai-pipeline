@@ -198,6 +198,12 @@ class TestHwEncoderCliPassthrough(unittest.TestCase):
             args.output = "out.mp4"
             args.max_frames = None
             args.hw_encoder = hw_encoder_value
+            # I-3 (#88): main() now resolves --comfort via _apply_comfort_preset,
+            # which reads comfort / convergence / no_temporal off args.  Set them
+            # so the MagicMock does not auto-stub to a Mock (truthy / non-None).
+            args.comfort = "balanced"
+            args.convergence = None
+            args.no_temporal = False
 
             pipeline_inst = MagicMock()
             pipeline_inst.process_stream.return_value = "out.mp4"
