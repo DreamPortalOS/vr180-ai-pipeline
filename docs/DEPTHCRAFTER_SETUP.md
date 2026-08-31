@@ -44,6 +44,22 @@ python scripts/setup_depthcrafter.py --pip-mirror https://pypi.tuna.tsinghua.edu
 > is never the project-root venv.  It pins `torch==2.6.0` +
 > `torchvision==0.21.0` on the official `cu124` index (the paired torchvision
 > release — `torchvision==2.6.0` does not exist).
+>
+> **Node-deps install strategy.**  The upstream
+> [`Tencent/DepthCrafter`](https://github.com/Tencent/DepthCrafter) repo
+> declares its dependencies in **`pyproject.toml`** (there is no
+> `requirements.txt` at the repo root).  The bootstrap therefore runs
+> `pip install -e .` from inside the node dir so diffusers/transformers/…
+> come in off that declaration.  A legacy `requirements.txt` is still honored
+> if upstream ever adds one (both are probed; pyproject wins).  The bootstrap
+> also pins `fire` explicitly — `run.py` imports it at load time but upstream's
+> pyproject omits it.  If the checkout has *neither* manifest, the bootstrap
+> fails hard (exit 1) rather than silently reporting success.
+>
+> **Self-check is a hard gate.**  The final step runs `run.py --help` with the
+> dedicated venv and treats any non-zero exit (or missing venv-python / missing
+> `run.py`) as a fatal failure — the bootstrap exits 1 and prints the real
+> stderr, so an unusable environment can never look like success.
 
 ### First inference run: ~10 GB auto-download
 

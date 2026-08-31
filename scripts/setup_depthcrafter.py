@@ -16,7 +16,11 @@ Steps (idempotent — re-running only fills missing pieces):
        ``--repo-dir`` can point at an existing checkout instead (e.g. ``D:/DepthCrafter``).
     2. Build a **dedicated** venv inside the node dir (never the project-root venv):
        - torch==2.6.0 + torchvision==0.21.0 on the official cu124 index (stable, NOT nightly).
-       - ``pip install -r requirements.txt`` (diffusers / transformers etc.).
+       - Node deps: the upstream DepthCrafter repo ships **``pyproject.toml```` (not
+         ``requirements.txt``), so we ``pip install -e .`` from the node dir.  A
+         legacy ``requirements.txt`` is still honored if present (both probed,
+         pyproject wins).  ``fire`` is additionally pinned because upstream's
+         pyproject omits it yet ``run.py`` needs it at import time.
     3. Download ``tencent/DepthCrafter`` weights into ``models/DepthCrafter/`` via
        ``huggingface_hub.snapshot_download`` (existing download is skipped).
        The base model ``stabilityai/stable-video-diffusion-img2vid-xt`` is pulled
@@ -66,6 +70,12 @@ INREPO_PYTHON = INREPO_VENV_DIR / (Path("Scripts") / "python.exe" if os.name == 
 TORCH_VERSION = "2.6.0"
 TORCHVISION_VERSION = "0.21.0"
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
+
+# Runtime deps the upstream pyproject.toml omits but run.py imports at load time.
+# Upstream (Tencent/DepthCrafter) declares its deps via pyproject.toml; fire is
+# used by run.py's fire-style CLI yet is missing from that declaration, so we
+# pin it explicitly to keep ``run.py --help`` working.
+EXTRA_RUNTIME_DEPS: tuple[str, ...] = ("fire",)
 
 # HuggingFace repo for the diffusers weights.
 _MODEL_REPO_ID = "tencent/DepthCrafter"
@@ -209,6 +219,29 @@ def _venv_python_for(node_dir: Path) -> Path:
     return venv_dir / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
 
 
+def _node_dep_install_target(node_dir: Path) -> tuple[str, str | None]:
+    """Resolve how to install the node repo's own deps.
+
+    Upstream Tencent/DepthCrafter ships ``pyproject.toml`` (no
+    ``requirements.txt``); a legacy ``requirements.txt`` is honored if that is
+    all there is.  Returns ``(kind, value)`` where kind is ``"pyproject"`` /
+    ``"requirements"`` and value is the path (pyproject) or ``None`` (the
+    ``-r`` token already carries the path).  Raises if **neither** is present —
+    a node checkout with no declared deps is fatal, not a WARNING.
+    """
+    has_pyproject = (node_dir / "pyproject.toml").is_file()
+    has_requirements = (node_dir / "requirements.txt").is_file()
+    if has_pyproject:
+        return "pyproject", str(node_dir)
+    if has_requirements:
+        return "requirements", str(node_dir / "requirements.txt")
+    raise RuntimeError(
+        "No pyproject.toml or requirements.txt found in the DepthCrafter checkout "
+        f"at {node_dir} — cannot install node deps. The repo clone may be incomplete "
+        "(check that `git clone` finished, or re-run the bootstrap)."
+    )
+
+
 def ensure_venv_and_deps(
     explicit_repo_dir: str | None,
     pip_mirror: str | None,
@@ -216,7 +249,7 @@ def ensure_venv_and_deps(
     dry_run: bool,
     buffer: DryRunBuffer,
 ) -> None:
-    """Create the dedicated venv and install torch (cu124) + the repo's requirements."""
+    """Create the dedicated venv and install torch (cu124) + the repo's deps."""
     node_dir = _effective_node_dir(explicit_repo_dir)
     venv_dir = node_dir / ".venv"
     python_exe = _venv_python_for(node_dir)
@@ -229,12 +262,9 @@ def ensure_venv_and_deps(
             subprocess.check_call(venv_cmd, timeout=300)
         else:
             log.info("Dedicated venv already exists at %s — re-installing requirements.", venv_dir)
-        if not (node_dir / "requirements.txt").is_file():
-            log.warning(
-                "requirements.txt not found at %s — skipping pip install of node deps.",
-                node_dir / "requirements.txt",
-            )
-            return
+
+    # Probe the node's dep manifest.  Fatal if neither is present.
+    dep_kind, dep_value = _node_dep_install_target(node_dir) if not dry_run else ("pyproject", None)
 
     # In dry-run mode, always plan the venv-creation step (it would be needed if the venv is absent).
     if dry_run:
@@ -261,20 +291,19 @@ def ensure_venv_and_deps(
     ]
     run_step(cmd_torch, dry_run=dry_run, buffer=buffer, timeout=1200)
 
-    # (b) the repo's own requirements.txt.
-    requirements_txt = node_dir / "requirements.txt"
-    cmd_reqs = [
-        str(python_exe),
-        "-m",
-        "pip",
-        "install",
-        "--retries",
-        "10",
-        "-r",
-        str(requirements_txt),
-        *_pip_mirror_args(pip_mirror),
-    ]
-    run_step(cmd_reqs, dry_run=dry_run, buffer=buffer, timeout=1200)
+    # (b) the node repo's own deps.
+    #
+    # pyproject.toml path → ``pip install -e .`` from the node dir (the upstream
+    # Tencent/DepthCrafter layout).  legacy requirements.txt path → ``-r <file>``.
+    base_cmd = [str(python_exe), "-m", "pip", "install", "--retries", "10"]
+    mirror_args = _pip_mirror_args(pip_mirror)
+    if dep_kind == "pyproject":
+        cmd_node = [*base_cmd, "-e", dep_value, *EXTRA_RUNTIME_DEPS, *mirror_args]
+        label_node = f"pip install -e {dep_value} {' '.join(EXTRA_RUNTIME_DEPS)}".rstrip()
+    else:
+        cmd_node = [*base_cmd, "-r", dep_value, *mirror_args]
+        label_node = f"pip install -r {dep_value}"
+    run_step(cmd_node, dry_run=dry_run, buffer=buffer, timeout=1200, label=label_node)
 
 
 # ---------------------------------------------------------------------------
@@ -357,24 +386,32 @@ def self_check(
     dry_run: bool,
     buffer: DryRunBuffer,
 ) -> None:
-    """Run ``run.py --help`` with the dedicated venv (exit 0 = good)."""
+    """Run ``run.py --help`` with the dedicated venv.
+
+    A non-zero exit, a missing venv python, or a missing ``run.py`` is fatal —
+    the environment is not usable if the CLI can't even import.  The raw stderr
+    is surfaced so the caller (and the user) can see the real reason.
+    """
     node_dir = _effective_node_dir(explicit_repo_dir)
     python_exe = _venv_python_for(node_dir)
     cli_script = node_dir / "run.py"
-
-    if not dry_run:
-        if not python_exe.is_file():
-            log.warning("Dedicated venv python not found at %s — skipping self-check.", python_exe)
-            return
-        if not cli_script.is_file():
-            log.warning("run.py not found at %s — skipping self-check.", cli_script)
-            return
 
     cmd = [str(python_exe), "run.py", "--help"]
     label = f"{_cmd_line(cmd)}  (self-check)"
     if dry_run:
         buffer.record(label)
         return
+
+    if not python_exe.is_file():
+        raise RuntimeError(
+            f"Dedicated venv python not found at {python_exe} — self-check cannot run. "
+            "Re-run the bootstrap to (re)create the venv."
+        )
+    if not cli_script.is_file():
+        raise RuntimeError(
+            f"run.py not found at {cli_script} — self-check cannot run. "
+            "The DepthCrafter checkout is incomplete; re-run the bootstrap."
+        )
 
     log.info("▶ %s", label)
     try:
@@ -384,12 +421,14 @@ def self_check(
 
     if result.returncode == 0:
         log.info("✓ Self-check passed — run.py loads cleanly.")
-    else:
-        log.warning(
-            "Self-check returned exit code %s (may be non-fatal, e.g. missing model).\n  stderr: %s",
-            result.returncode,
-            result.stderr.strip()[:500],
-        )
+        return
+
+    # Non-zero: the environment is broken. Surface the real stderr and fail hard.
+    stderr = result.stderr.strip() or result.stdout.strip() or "<no output>"
+    indented = "\n".join("    " + line for line in stderr[:800].splitlines())
+    raise RuntimeError(
+        f"Self-check FAILED: run.py --help returned exit code {result.returncode}.\n  stderr:\n{indented}"
+    )
 
 
 def _cmd_line(cmd: list[str]) -> str:
@@ -508,24 +547,28 @@ def main(argv: list[str] | None = None) -> None:
     if args.dry_run:
         log.info("[dry-run] no side effects will be performed")
 
-    # Step 1 — node repo
-    log.info("\n── Step 1/4: repo ──")
-    ensure_node_repo(args.repo_dir, dry_run=args.dry_run, buffer=buffer)
+    try:
+        # Step 1 — node repo
+        log.info("\n── Step 1/4: repo ──")
+        ensure_node_repo(args.repo_dir, dry_run=args.dry_run, buffer=buffer)
 
-    # Step 2 — venv + deps
-    log.info("\n── Step 2/4: dedicated venv + pip install ──")
-    if args.skip_deps:
-        log.info("--skip-deps: venv + pip install skipped")
-    else:
-        ensure_venv_and_deps(args.repo_dir, args.pip_mirror, dry_run=args.dry_run, buffer=buffer)
+        # Step 2 — venv + deps
+        log.info("\n── Step 2/4: dedicated venv + pip install ──")
+        if args.skip_deps:
+            log.info("--skip-deps: venv + pip install skipped")
+        else:
+            ensure_venv_and_deps(args.repo_dir, args.pip_mirror, dry_run=args.dry_run, buffer=buffer)
 
-    # Step 3 — models
-    log.info("\n── Step 3/4: model weights ──")
-    download_models(args.repo_dir, args.skip_model, dry_run=args.dry_run, buffer=buffer)
+        # Step 3 — models
+        log.info("\n── Step 3/4: model weights ──")
+        download_models(args.repo_dir, args.skip_model, dry_run=args.dry_run, buffer=buffer)
 
-    # Step 4 — self-check
-    log.info("\n── Step 4/4: self-check ──")
-    self_check(args.repo_dir, dry_run=args.dry_run, buffer=buffer)
+        # Step 4 — self-check
+        log.info("\n── Step 4/4: self-check ──")
+        self_check(args.repo_dir, dry_run=args.dry_run, buffer=buffer)
+    except (RuntimeError, subprocess.CalledProcessError) as exc:
+        log.error("Bootstrap FAILED at: %s", exc)
+        sys.exit(1)
 
     if args.dry_run:
         log.info("\n[dry-run] planned steps:")
