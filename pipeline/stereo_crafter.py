@@ -1,12 +1,27 @@
 """StereoCrafter — depth-aware stereo video generation with disocclusion inpainting.
 
-Provides a StereoCrafterRenderer that delegates to Tencent/StereoCrafter
+Provides a StereoCrafterRenderer that delegates to TencentARC/StereoCrafter
 inference scripts via a pluggable backend (default: CLIBackend).
 CUDA-only; raises clear errors on CPU/Mac builds.
 
-StereoCrafter (Tencent) uses depth-guided forward splatting + video diffusion
+StereoCrafter (TencentARC) uses depth-guided forward splatting + video diffusion
 inpainting to produce clean stereoscopic left/right views without the
 ghosting/smear artifacts of simple depth-based shifting.
+
+The upstream repo exposes **two** fire-style entry scripts (no ``run.py``):
+
+* ``depth_splatting_inference.py`` (Stage 1) — runs DepthCrafter internally to
+  estimate per-frame depth, then forward-splats the left view to produce a
+  *splatting* video whose right half holds the disocclusion mask.
+* ``inpainting_inference.py`` (Stage 2 — the disocclusion-inpainting step this
+  repo needs) — takes the Stage-1 splatting video and video-diffusion-inpaints
+  the disocclusion regions, writing a side-by-side (SBS) stereoscopic video
+  (left = splatted view, right = inpainted view).
+
+The canonical invocation order is documented in the repo's ``run_inference.sh``
+(Stage 1 → Stage 2).  :class:`CLIBackend` reproduces that two-stage flow and
+then splits the resulting SBS video into the separate left/right files the
+pipeline expects.
 
 Usage::
 
@@ -16,7 +31,7 @@ Usage::
     left_video, right_video = renderer.render_video("input.mp4", depth_maps)
 
 Reference:
-    https://github.com/Tencent/StereoCrafter
+    https://github.com/TencentARC/StereoCrafter
 """
 
 from __future__ import annotations
@@ -47,6 +62,27 @@ INREPO_CKPT_DIR = _REPO_ROOT / "models" / "StereoCrafter"
 # 12 GB VRAM (RTX 4070 SUPER) safe defaults.  512 short-side is the sweet spot;
 # bump to 768/1024 on larger GPUs via --stereocrafter-max-res or the env var.
 DEFAULT_MAX_RESOLUTION = 512
+
+# Upstream TencentARC/StereoCrafter has NO ``run.py``.  Its root-level fire-style
+# entry scripts (verified against the actual checkout, 2026-09-01) are:
+#
+#   depth_splatting_inference.py  — Stage 1: depth-guided forward splatting
+#   inpainting_inference.py      — Stage 2: disocclusion inpainting (this repo's step)
+#
+# Both ``from fire import Fire`` and accept ``--help``.  Listed in call order;
+# Stage 2 (the disocclusion-inpainting step the pipeline needs) is the primary
+# entry point — but it consumes Stage 1's splatting video as its input, so the
+# backend drives both in sequence.
+INFERENCE_SCRIPT_STAGE1 = "depth_splatting_inference.py"
+INFERENCE_SCRIPT_STAGE2 = "inpainting_inference.py"
+# Candidate entry scripts the backend will look for, in priority order.  Only the
+# two real upstream names are recognized; legacy guesses (``run.py``,
+# ``inference.py``, ``scripts/inference.py``) are deliberately absent so a
+# mislabeled checkout is not silently accepted.
+INFERENCE_SCRIPT_CANDIDATES = [
+    INFERENCE_SCRIPT_STAGE2,  # Stage 2 (inpainting) — primary entry this repo drives
+    INFERENCE_SCRIPT_STAGE1,  # Stage 1 (splatting)  — upstream stage, run first
+]
 
 
 def _inrepo_env_hint() -> str:
@@ -123,14 +159,22 @@ class CLIBackend(StereoCrafterBackend):
     :mod:`scripts/setup_stereocrafter.py`) adopted only when the paths
     actually exist on disk:
 
-    ========================== ========================= =============================================
-    Constructor param          Env var                   Default (if env unset)
-    ========================== ========================= =============================================
-    ``repo_dir``               ``STEREOCRAFTER_REPO_DIR`` in-repo ``third_party/StereoCrafter`` *(if exists)*
-    ``python_exe``             ``STEREOCRAFTER_PYTHON``   in-repo venv python *(if exists)*, else ``python``
-    ``checkpoint_dir``         ``STEREOCRAFTER_CKPT_DIR`` in-repo ``models/StereoCrafter`` *(if exists)*, else ``(repo_dir)/checkpoints``
-    ``max_resolution``         ``STEREOCRAFTER_MAX_RES``  ``512`` (12 GB VRAM safe)
-    ========================== ========================= =============================================
+    ========================== =============================== =============================================
+    Constructor param          Env var                         Default (if env unset)
+    ========================== =============================== =============================================
+    ``repo_dir``               ``STEREOCRAFTER_REPO_DIR``      in-repo ``third_party/StereoCrafter`` *(if exists)*
+    ``python_exe``             ``STEREOCRAFTER_PYTHON``        in-repo venv python *(if exists)*, else ``python``
+    ``checkpoint_dir``         ``STEREOCRAFTER_CKPT_DIR``      in-repo ``models/StereoCrafter`` *(if exists)*, else ``(repo_dir)/checkpoints``
+    ``pre_trained_path``       ``STEREOCRAFTER_SVD_PATH``      ``(repo_dir)/weights/stable-video-diffusion-img2vid-xt-1-1``
+    ``depthcrafter_unet_path`` ``STEREOCRAFTER_DC_UNET_PATH``  ``(repo_dir)/weights/DepthCrafter``
+    ``max_resolution``         ``STEREOCRAFTER_MAX_RES``       ``512`` (12 GB VRAM safe)
+    ========================== =============================== =============================================
+
+    ``checkpoint_dir`` is the StereoCrafter UNet dir (Stage 2 ``--unet_path``);
+    ``depthcrafter_unet_path`` is the DepthCrafter UNet dir (Stage 1
+    ``--unet_path``); ``pre_trained_path`` is the SVD base model dir used as
+    ``--pre_trained_path`` by both stages.  See the upstream ``run_inference.sh``
+    for the canonical two-stage call order.
 
     If none of repo_dir / env / in-repo resolve, the constructor raises and
     points to ``scripts/setup_stereocrafter.py``.
@@ -141,6 +185,8 @@ class CLIBackend(StereoCrafterBackend):
         repo_dir: str | None = None,
         python_exe: str | None = None,
         checkpoint_dir: str | None = None,
+        pre_trained_path: str | None = None,
+        depthcrafter_unet_path: str | None = None,
         max_resolution: int | None = None,
     ) -> None:
         # repo_dir: explicit > env > in-repo default (only if it exists on disk)
@@ -161,7 +207,8 @@ class CLIBackend(StereoCrafterBackend):
         else:
             self.python_exe = "python"
 
-        # checkpoint_dir: explicit > env > in-repo default > (repo_dir)/checkpoints
+        # checkpoint_dir (StereoCrafter UNet, Stage 2 --unet_path):
+        #   explicit > env > in-repo default > (repo_dir)/checkpoints
         if checkpoint_dir:
             self.checkpoint_dir = str(Path(checkpoint_dir).resolve())
         elif os.environ.get("STEREOCRAFTER_CKPT_DIR"):
@@ -170,6 +217,24 @@ class CLIBackend(StereoCrafterBackend):
             self.checkpoint_dir = str(INREPO_CKPT_DIR)
         else:
             self.checkpoint_dir = str(Path(self.repo_dir) / "checkpoints")
+
+        # pre_trained_path (SVD base model, --pre_trained_path for both stages):
+        #   explicit > env > (repo_dir)/weights/stable-video-diffusion-img2vid-xt-1-1
+        if pre_trained_path:
+            self.pre_trained_path = str(Path(pre_trained_path).resolve())
+        elif os.environ.get("STEREOCRAFTER_SVD_PATH"):
+            self.pre_trained_path = str(Path(os.environ["STEREOCRAFTER_SVD_PATH"]).resolve())
+        else:
+            self.pre_trained_path = str(Path(self.repo_dir) / "weights" / "stable-video-diffusion-img2vid-xt-1-1")
+
+        # depthcrafter_unet_path (DepthCrafter UNet, Stage 1 --unet_path):
+        #   explicit > env > (repo_dir)/weights/DepthCrafter
+        if depthcrafter_unet_path:
+            self.depthcrafter_unet_path = str(Path(depthcrafter_unet_path).resolve())
+        elif os.environ.get("STEREOCRAFTER_DC_UNET_PATH"):
+            self.depthcrafter_unet_path = str(Path(os.environ["STEREOCRAFTER_DC_UNET_PATH"]).resolve())
+        else:
+            self.depthcrafter_unet_path = str(Path(self.repo_dir) / "weights" / "DepthCrafter")
 
         # max resolution for inference (short side); 512 is the 12 GB VRAM safe default.
         self.max_resolution = max_resolution or int(
@@ -194,42 +259,44 @@ class CLIBackend(StereoCrafterBackend):
                 f"  Run the one-command bootstrap to deploy it in-repo:\n"
                 f"    python scripts/setup_stereocrafter.py\n"
                 f"  Or clone the repo manually:\n"
-                f"    git clone https://github.com/Tencent/StereoCrafter.git\n"
+                f"    git clone https://github.com/TencentARC/StereoCrafter.git\n"
                 f"  See docs/STEREOCRAFTER_SETUP.md for details."
             )
 
-        # Look for a known inference entry point
+        # Look for a known inference entry point.  Only the real upstream names
+        # are recognized (inpainting_inference.py / depth_splatting_inference.py);
+        # a stray inference.py / run.py is NOT accepted as a substitute.
         if repo.is_dir():
-            candidates = [
-                repo / "run.py",
-                repo / "inference.py",
-                repo / "scripts" / "inference.py",
-                repo / "stereocrafter" / "inference.py",
-            ]
+            candidates = [repo / name for name in INFERENCE_SCRIPT_CANDIDATES]
             found = any(c.is_file() for c in candidates)
             if not found:
                 issues.append(
                     f"No known inference script found in {self.repo_dir}.\n"
-                    f"  Expected one of: {', '.join(str(c.relative_to(repo)) for c in candidates)}\n"
+                    f"  Expected one of: {', '.join(INFERENCE_SCRIPT_CANDIDATES)}\n"
                     f"  See docs/STEREOCRAFTER_SETUP.md for the required file layout."
                 )
 
         if issues:
             raise RuntimeError("StereoCrafter setup is incomplete:\n" + "\n".join(f"  \u2022 {i}" for i in issues))
 
-    def _find_inference_script(self) -> str:
-        """Return the path to the first known inference entry point."""
+    def _find_inference_script(self, name: str | None = None) -> str:
+        """Return the path to an inference entry point in the repo.
+
+        With *name* given, resolve that specific entry (raises if absent).
+        Without *name*, return the first candidate that exists on disk
+        (Stage 2 / inpainting is preferred).
+        """
         repo = Path(self.repo_dir)
-        candidates = [
-            repo / "run.py",
-            repo / "inference.py",
-            repo / "scripts" / "inference.py",
-            repo / "stereocrafter" / "inference.py",
-        ]
-        for c in candidates:
-            if c.is_file():
-                return str(c)
-        raise RuntimeError(f"No known inference script found in {self.repo_dir}. See docs/STEREOCRAFTER_SETUP.md.")
+        names = [name] if name else list(INFERENCE_SCRIPT_CANDIDATES)
+        for n in names:
+            candidate = repo / n
+            if candidate.is_file():
+                return str(candidate)
+        raise RuntimeError(
+            f"No known inference script found in {self.repo_dir}. "
+            f"Expected one of: {', '.join(INFERENCE_SCRIPT_CANDIDATES)}. "
+            f"See docs/STEREOCRAFTER_SETUP.md."
+        )
 
     # ------------------------------------------------------------------
     # Main inference method
@@ -243,27 +310,111 @@ class CLIBackend(StereoCrafterBackend):
     ) -> tuple[str, str]:
         _assert_cuda()
 
-        inference_script = self._find_inference_script()
+        # StereoCrafter upstream is a *two-stage* fire-style pipeline (see the
+        # repo's run_inference.sh).  The repo needs the disocclusion-inpainting
+        # step (Stage 2 / inpainting_inference.py), but that script consumes
+        # Stage 1's splatting video as its input, so the backend drives both:
+        #
+        #   Stage 1  depth_splatting_inference.py
+        #     --pre_trained_path <SVD base>  --unet_path <DepthCrafter unet>
+        #     --input_video_path <in>       --output_video_path <splat>
+        #     [--max_disp 20.0] [--process_length -1] [--batch_size 10]
+        #
+        #   Stage 2  inpainting_inference.py        ← the disocclusion step
+        #     --pre_trained_path <SVD base>  --unet_path <StereoCrafter unet>
+        #     --input_video_path <splat>    --save_dir <dir>
+        #     [--frames_chunk 23] [--overlap 3] [--tile_num 1]
+        #
+        # Stage 2 writes a single side-by-side video (<name>_sbs.mp4); the
+        # pipeline contract wants separate left/right files, so the backend
+        # splits the SBS frame into L/R afterwards.
+        #
+        # NOTE: StereoCrafter runs its OWN internal depth estimation in Stage 1
+        # (DepthCrafterDemo) — the caller-supplied *depth_dir* is therefore not
+        # forwarded to the subprocess.  It is accepted for interface
+        # compatibility with the pipeline (which always passes it) and must
+        # already exist as a directory; StereoCrafter simply does not consume
+        # the external DepthCrafter depth maps.
 
-        # Build command list (NO shell=True for security)
-        cmd: list[str] = [
+        if depth_dir and not os.path.isdir(depth_dir):
+            raise NotADirectoryError(
+                f"Depth directory not found: {depth_dir}. Provide a valid --depth-dir or ensure depth maps are saved."
+            )
+
+        # Absolutize caller paths: the subprocess runs with cwd=repo_dir, so
+        # relative paths would resolve against the StereoCrafter checkout.
+        abs_input = str(Path(input_path).resolve())
+        work_dir = Path(tempfile.mkdtemp(prefix="stereocrafter_work_"))
+        splat_video = str((work_dir / "splatting_results.mp4").resolve())
+        sbs_dir = str(work_dir.resolve())
+
+        # --- Stage 1: depth splatting -------------------------------------
+        stage1_script = self._find_inference_script(INFERENCE_SCRIPT_STAGE1)
+        cmd1: list[str] = [
             self.python_exe,
-            inference_script,
-            "--video",
-            input_path,
-            "--depth_dir",
-            depth_dir,
-            "--output_left",
-            output_left,
-            "--output_right",
-            output_right,
-            "--max_resolution",
-            str(self.max_resolution),
-            "--checkpoint_dir",
-            self.checkpoint_dir,
+            stage1_script,
+            "--pre_trained_path",
+            self.pre_trained_path,
+            "--unet_path",
+            self.depthcrafter_unet_path,
+            "--input_video_path",
+            abs_input,
+            "--output_video_path",
+            splat_video,
         ]
+        self._run_subprocess(cmd1, label="Stage 1 (depth splatting)")
 
-        log.info("StereoCrafter CLIBackend command: %s", " ".join(cmd))
+        # --- Stage 2: disocclusion inpainting -----------------------------
+        stage2_script = self._find_inference_script(INFERENCE_SCRIPT_STAGE2)
+        cmd2: list[str] = [
+            self.python_exe,
+            stage2_script,
+            "--pre_trained_path",
+            self.pre_trained_path,
+            "--unet_path",
+            self.checkpoint_dir,
+            "--input_video_path",
+            splat_video,
+            "--save_dir",
+            sbs_dir,
+        ]
+        self._run_subprocess(cmd2, label="Stage 2 (disocclusion inpainting)")
+
+        # --- Split the SBS output into separate L/R videos ---------------
+        # inpainting_inference.py writes <video_name>_sbs.mp4 in save_dir, where
+        # video_name = basename(input).replace(".mp4","").replace("_splatting_results","")
+        #                + "_inpainting_results".
+        video_name = (
+            Path(splat_video).name.replace(".mp4", "").replace("_splatting_results", "") + "_inpainting_results"
+        )
+        sbs_path = Path(sbs_dir) / f"{video_name}_sbs.mp4"
+        if not sbs_path.is_file():
+            raise RuntimeError(
+                f"StereoCrafter finished but SBS output not found:\n"
+                f"  {sbs_path}\n"
+                f"  Check the inpainting_inference.py output format "
+                f"in docs/STEREOCRAFTER_SETUP.md."
+            )
+
+        self._split_sbs_video(str(sbs_path), output_left, output_right)
+
+        log.info(
+            "StereoCrafter: L → %s, R → %s",
+            output_left,
+            output_right,
+        )
+        return output_left, output_right
+
+    # ------------------------------------------------------------------
+    # Subprocess helpers
+    # ------------------------------------------------------------------
+    def _run_subprocess(self, cmd: list[str], *, label: str) -> None:
+        """Run a StereoCrafter subprocess stage, raising on failure.
+
+        The command is always a list (never ``shell=True``).  *label* names
+        the stage for error messages.
+        """
+        log.info("StereoCrafter CLIBackend %s command: %s", label, " ".join(cmd))
         log.info("StereoCrafter CLIBackend cwd: %s", self.repo_dir)
 
         try:
@@ -288,34 +439,62 @@ class CLIBackend(StereoCrafterBackend):
         if result.returncode != 0:
             stderr = result.stderr.strip()
             raise RuntimeError(
-                f"StereoCrafter inference failed (exit code {result.returncode}):\n"
+                f"StereoCrafter {label} failed (exit code {result.returncode}):\n"
                 f"  {stderr}\n"
                 f"  Command: {' '.join(cmd)}\n"
                 f"  See docs/STEREOCRAFTER_SETUP.md for troubleshooting."
             )
 
-        # Verify outputs exist
-        left_path = Path(output_left)
-        right_path = Path(output_right)
+    def _split_sbs_video(self, sbs_path: str, output_left: str, output_right: str) -> None:
+        """Split a StereoCrafter SBS video into separate left/right files.
+
+        Uses OpenCV (already a pipeline dependency) to read each SBS frame,
+        halve it vertically into left/right, and write two output videos with
+        the source fps / codec.
+        """
+        import cv2
+
+        cap = cv2.VideoCapture(sbs_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open StereoCrafter SBS video for splitting: {sbs_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if frame_w == 0 or frame_h == 0:
+            cap.release()
+            raise RuntimeError(f"Could not read SBS video dimensions from {sbs_path}")
+        half_w = frame_w // 2
+
+        Path(output_left).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_right).parent.mkdir(parents=True, exist_ok=True)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        w_left = cv2.VideoWriter(output_left, fourcc, fps, (half_w, frame_h))
+        w_right = cv2.VideoWriter(output_right, fourcc, fps, (half_w, frame_h))
+
         missing: list[str] = []
-        if not left_path.is_file():
-            missing.append(str(left_path))
-        if not right_path.is_file():
-            missing.append(str(right_path))
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                w_left.write(frame[:, :half_w])
+                w_right.write(frame[:, half_w:])
+        finally:
+            cap.release()
+            w_left.release()
+            w_right.release()
+
+        if not Path(output_left).is_file():
+            missing.append(output_left)
+        if not Path(output_right).is_file():
+            missing.append(output_right)
         if missing:
             raise RuntimeError(
-                f"StereoCrafter finished but output video(s) not found:\n"
+                f"StereoCrafter SBS split finished but output video(s) not found:\n"
                 f"  {', '.join(missing)}\n"
-                f"  Check the inference script output format "
-                f"in docs/STEREOCRAFTER_SETUP.md."
+                f"  Check the SBS output format in docs/STEREOCRAFTER_SETUP.md."
             )
-
-        log.info(
-            "StereoCrafter: L → %s, R → %s",
-            str(left_path),
-            str(right_path),
-        )
-        return str(left_path), str(right_path)
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +518,8 @@ class StereoCrafterRenderer:
         repo_dir: str | None = None,
         python_exe: str | None = None,
         checkpoint_dir: str | None = None,
+        pre_trained_path: str | None = None,
+        depthcrafter_unet_path: str | None = None,
         max_resolution: int | None = None,
     ) -> None:
         _assert_cuda()
@@ -350,6 +531,8 @@ class StereoCrafterRenderer:
                 repo_dir=repo_dir,
                 python_exe=python_exe,
                 checkpoint_dir=checkpoint_dir,
+                pre_trained_path=pre_trained_path,
+                depthcrafter_unet_path=depthcrafter_unet_path,
                 max_resolution=max_resolution,
             )
 
