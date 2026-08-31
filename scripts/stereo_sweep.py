@@ -27,6 +27,8 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from pipeline.comfort_presets import COMFORT_PRESETS
+
 log = logging.getLogger("stereo-sweep")
 
 # ---------------------------------------------------------------------------
@@ -46,6 +48,30 @@ CONVERGENCE_PRESETS: dict[str, float] = {
 }
 
 SCORE_COLUMNS: tuple[str, ...] = ("清晰度", "重影", "立体感", "舒适度")
+
+
+def build_comfort_grid() -> list[dict]:
+    """I-3 (#88): default sweep grid = the three owner-tuned comfort presets.
+
+    Each comfort preset is one row of the grid (not a Cartesian product), so
+    a default sweep renders exactly three variants — ``safe``, ``balanced``,
+    ``strong`` — each encoding the matched max_disparity / convergence pair
+    the operator should A/B in the headset.  ``convergence_name`` holds the
+    preset label so it survives into the filename (``sweep_d0.035_cbalanced``)
+    and the variants.md manifest.  ``temporal_smooth`` is True in every tier
+    (see pipeline.comfort_presets).
+    """
+    out: list[dict] = []
+    for name, cfg in COMFORT_PRESETS.items():
+        out.append(
+            {
+                "max_disparity": float(cfg["max_disparity"]),
+                "convergence_name": name,
+                "convergence": float(cfg["convergence"]),
+                "temporal_smooth": bool(cfg["temporal_smooth"]),
+            }
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +275,8 @@ def run_sweep(
     convergences: Sequence[str] | None = None,
     render_variant: Callable[[str, str, dict, float], str] | None = None,
     fps: int | None = None,
+    *,
+    comfort_presets: bool | None = None,
 ) -> list[dict]:
     """Render every grid variant and write the manifest.
 
@@ -256,19 +284,31 @@ def run_sweep(
         input_path: source video path.
         outdir: output directory (created if missing).
         limit_seconds: only convert the first N seconds of the source.
-        disparities / convergences: grid axes (see :func:`build_grid`).
+        disparities / convergences: grid axes (see :func:`build_grid`).  When
+            both are ``None`` and *comfort_presets* is not ``False``, the grid
+            defaults to the three I-3 comfort presets via
+            :func:`build_comfort_grid`.
         render_variant: injectable render callable with signature
             ``(input_path, output_path, variant, limit_seconds) -> str``.
             Defaults to :func:`run_pipeline_variant`.  Tests inject a fake
             runner so no real conversion/ffmpeg runs.
         fps: optional output fps override passed to the default runner.
+        comfort_presets: if ``True`` (or left ``None`` with no custom axes),
+            sweep the three comfort presets instead of the legacy
+            disparities×convergences Cartesian product.  ``False`` forces the
+            legacy product even when no custom axes are given.
 
     Returns:
         The variant list (with ``filename`` filled in) that was written to
         ``variants.md``.
     """
     runner = render_variant or run_pipeline_variant
-    variants = build_grid(disparities=disparities, convergences=convergences)
+    if comfort_presets is False:
+        variants = build_grid(disparities=disparities, convergences=convergences)
+    elif disparities is None and convergences is None:
+        variants = build_comfort_grid()
+    else:
+        variants = build_grid(disparities=disparities, convergences=convergences)
 
     out_path = Path(outdir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -310,14 +350,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--disparities",
-        default=",".join(f"{d:g}" for d in DEFAULT_DISPARITIES),
-        help=f"Comma-separated max_disparity values (default: {','.join(f'{d:g}' for d in DEFAULT_DISPARITIES)})",
+        default=None,
+        help=(
+            "Comma-separated max_disparity values for a custom grid "
+            "(e.g. 0.02,0.04,0.06). When omitted the default grid sweeps the "
+            "three --comfort presets (safe/balanced/strong) instead."
+        ),
     )
     parser.add_argument(
         "--convergences",
-        default=",".join(DEFAULT_CONVERGENCES),
-        help=f"Comma-separated convergence presets from {sorted(CONVERGENCE_PRESETS)} "
-        f"(default: {','.join(DEFAULT_CONVERGENCES)})",
+        default=None,
+        help=(
+            f"Comma-separated convergence presets from {sorted(CONVERGENCE_PRESETS)} "
+            "for a custom grid (e.g. near,mid,far). Requires --disparities; "
+            "when both are omitted the default grid sweeps the three comfort presets."
+        ),
     )
     parser.add_argument("--fps", type=int, default=None, help="Output fps (default: inherit from source)")
     return parser.parse_args(argv)
@@ -328,12 +375,24 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     args = parse_args(argv)
 
-    try:
-        disparities = [float(x) for x in args.disparities.split(",") if x.strip()]
-    except ValueError:
-        print(f"Error: --disparities must be comma-separated numbers, got {args.disparities!r}", file=sys.stderr)
-        return 1
-    convergences = [c.strip() for c in args.convergences.split(",") if c.strip()]
+    disparities: list[float] | None = None
+    convergences: list[str] | None = None
+    if args.disparities is not None or args.convergences is not None:
+        # A custom grid axis was given → use the legacy disparities×convergences
+        # product (build_grid validates convergence names). A missing axis falls
+        # back to the module default so e.g. ``--convergences bogus`` still
+        # surfaces the "unknown convergence" validation error rather than a
+        # usage message.
+        try:
+            disparities = [float(x) for x in (args.disparities or "").split(",") if x.strip()] or list(
+                DEFAULT_DISPARITIES
+            )
+        except ValueError:
+            print(f"Error: --disparities must be comma-separated numbers, got {args.disparities!r}", file=sys.stderr)
+            return 1
+        convergences = [c.strip() for c in (args.convergences or "").split(",") if c.strip()] or list(
+            DEFAULT_CONVERGENCES
+        )
 
     try:
         run_sweep(

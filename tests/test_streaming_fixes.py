@@ -212,6 +212,11 @@ class TestStreamingMetadataInjection(unittest.TestCase):
             args.input = "in.mp4"
             args.output = "out.mp4"
             args.max_frames = None
+            # I-3 (#88): main() now resolves --comfort via _apply_comfort_preset;
+            # set the fields it reads so the MagicMock does not auto-stub them.
+            args.comfort = "balanced"
+            args.convergence = None
+            args.no_temporal = False
 
             pipeline_inst = MagicMock()
             pipeline_inst.process_stream.return_value = "out.mp4"

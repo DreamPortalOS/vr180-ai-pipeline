@@ -34,6 +34,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
+from pipeline.comfort_presets import COMFORT_PRESETS, DEFAULT_COMFORT, resolve_comfort
 from pipeline.depth_crafter import DepthCrafterEstimator
 from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import detect_best_device, resolve_device
@@ -76,7 +77,43 @@ def parse_args(argv: list[str] | None = None):
     )
     parser.add_argument("--device", default=None, help="Compute device (cuda, mps, cpu)")
     parser.add_argument("--ipd", type=float, default=0.064, help="Interpupillary distance in meters")
-    parser.add_argument("--max-disparity", type=float, default=0.05, help="Max disparity as fraction of image width")
+
+    # I-3 (#88): comfort presets — owner-tuned low-parallax tiers.  A preset is
+    # a starting point: an explicit --max-disparity / --convergence /
+    # --no-temporal always wins over the preset (see resolve_comfort).  The
+    # three flags below use None as a sentinel so the preset can tell "user did
+    # not set this" from "user explicitly chose 0".
+    parser.add_argument(
+        "--comfort",
+        choices=sorted(COMFORT_PRESETS),
+        default=DEFAULT_COMFORT,
+        help=(
+            f"Comfort preset for stereo parallax strength (default: {DEFAULT_COMFORT}). "
+            f"safe = low disparity, far convergence — '久看不晕', weak 3D; "
+            f"balanced = middle ground, survives shaky depth; "
+            f"strong = max pop, needs solid depth (DepthCrafter/StereoCrafter). "
+            "Explicit --max-disparity/--convergence/--no-temporal override the preset."
+        ),
+    )
+    parser.add_argument(
+        "--max-disparity",
+        type=float,
+        default=None,
+        help=(
+            "Max disparity as fraction of image width. Overrides the --comfort preset's value; "
+            "when omitted the preset fills it in (default balanced = 0.035)."
+        ),
+    )
+    parser.add_argument(
+        "--convergence",
+        type=float,
+        default=None,
+        help=(
+            "StereoRenderer convergence plane (fraction of normalised depth where zero parallax "
+            "sits; larger = zero plane farther away = more of the scene recedes). Overrides "
+            "--comfort preset (default balanced = 0.35)."
+        ),
+    )
     parser.add_argument("--codec", choices=["h264", "h265"], default="h264", help="Output video codec")
     parser.add_argument("--crf", type=int, default=23, help="Constant rate factor")
     parser.add_argument("--fps", type=int, default=None, help="Output frame rate (default: inherit from source video)")
@@ -590,7 +627,8 @@ def run_stereo_stage(args, frames, depths):
     renderer = StereoRenderer(
         ipd=args.ipd,
         max_disparity=args.max_disparity,
-        temporal_smooth=not args.no_temporal,
+        convergence=getattr(args, "convergence", 0.3),
+        temporal_smooth=getattr(args, "temporal_smooth", not args.no_temporal),
     )
 
     left_dir = get_temp_dir(args, "left")
@@ -1124,6 +1162,38 @@ def apply_quality_preset(args):
         log.info("📶 Adaptive bitrate: %.1f Mbps (scaled from 1920² baseline)", mbps)
 
 
+def _apply_comfort_preset(args) -> None:
+    """Resolve ``--comfort`` into concrete stereo comfort values (I-3, #88).
+
+    Mirrors :func:`apply_quality_preset`: the preset fills in values the user
+    did not explicitly pass, and explicit ``--max-disparity`` /
+    ``--convergence`` / ``--no-temporal`` always win.  After this call
+    ``args.max_disparity`` and ``args.convergence`` are guaranteed to be
+    concrete floats and ``args.temporal_smooth`` is a concrete bool, so both
+    the batch and streaming stereo paths see fully-resolved values.
+    """
+    explicit: dict[str, object] = {}
+    if args.max_disparity is not None:
+        explicit["max_disparity"] = args.max_disparity
+    if args.convergence is not None:
+        explicit["convergence"] = args.convergence
+    if args.no_temporal:
+        explicit["temporal_smooth"] = False
+
+    resolved = resolve_comfort(args.comfort, explicit or None)
+    args.max_disparity = float(resolved["max_disparity"])
+    args.convergence = float(resolved["convergence"])
+    args.temporal_smooth = bool(resolved["temporal_smooth"])
+
+    log.info(
+        "🎧 --comfort %s → max_disparity=%.3f, convergence=%.2f, temporal_smooth=%s",
+        args.comfort,
+        args.max_disparity,
+        args.convergence,
+        args.temporal_smooth,
+    )
+
+
 # ---------------------------------------------------------------------------
 # V-3: job manifest / cross-machine relay helpers (issue #36)
 # ---------------------------------------------------------------------------
@@ -1291,6 +1361,7 @@ def _manifest_prepare(args):
 def main():
     args = parse_args()
     apply_quality_preset(args)
+    _apply_comfort_preset(args)
 
     # V-3: job manifest — load/create, hash-validate completed stages,
     # compute which stages to skip.  None when no manifest flags are given
