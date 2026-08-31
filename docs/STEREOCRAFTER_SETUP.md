@@ -111,12 +111,14 @@ For each path, the resolution order is **constructor arg > env var >
 in-repo default (only if it exists on disk)**; if none resolve, the
 backend raises and points at `scripts/setup_stereocrafter.py`.
 
-| Setting             | Env var                   | Default (if env unset) |
-|---------------------|---------------------------|------------------------|
-| `repo_dir`          | `STEREOCRAFTER_REPO_DIR`  | `third_party/StereoCrafter` *(if exists)* |
-| `python_exe`        | `STEREOCRAFTER_PYTHON`    | in-repo venv python *(if exists)*, else `python` |
-| `checkpoint_dir`    | `STEREOCRAFTER_CKPT_DIR`  | `models/StereoCrafter` *(if exists)*, else `(<repo>)/checkpoints` |
-| `max_resolution`    | `STEREOCRAFTER_MAX_RES`   | `512` |
+| Setting                 | Env var                        | Default (if env unset) |
+|-------------------------|--------------------------------|------------------------|
+| `repo_dir`              | `STEREOCRAFTER_REPO_DIR`       | `third_party/StereoCrafter` *(if exists)* |
+| `python_exe`            | `STEREOCRAFTER_PYTHON`         | in-repo venv python *(if exists)*, else `python` |
+| `checkpoint_dir`        | `STEREOCRAFTER_CKPT_DIR`       | `models/StereoCrafter` *(if exists)*, else `(<repo>)/checkpoints` — Stage 2 `--unet_path` |
+| `pre_trained_path`      | `STEREOCRAFTER_SVD_PATH`       | `(<repo>)/weights/stable-video-diffusion-img2vid-xt-1-1` — SVD base (`--pre_trained_path` both stages) |
+| `depthcrafter_unet_path`| `STEREOCRAFTER_DC_UNET_PATH`   | `(<repo>)/weights/DepthCrafter` — Stage 1 `--unet_path` |
+| `max_resolution`        | `STEREOCRAFTER_MAX_RES`        | `512` |
 
 ---
 
@@ -145,23 +147,41 @@ slightly softer output).  Set it with `--stereocrafter-max-res` or the
 ## 5. What the pipeline actually does with StereoCrafter
 
 ```
-Input Video ──► DepthCrafter ──► Depth Maps ──► StereoCrafter ──► L/R Videos
-    │                                              │
-    │                                              │
-    └── stereo_crafter.py                          │
-        │                                          │
-        ├── StereoCrafterRenderer (CUDA guard)     │
-        │   └── render_video(input, depth, ...)    │
-        │                                          │
-        └── CLIBackend                             │
-            └── subprocess(<inference_entry_point>, ...) ───────────┘
+Input Video ──► StereoCrafter CLIBackend ──► L/R Videos
+                   │
+                   ├─ Stage 1: depth_splatting_inference.py
+                   │    (runs DepthCrafter internally → forward-splats L view)
+                   │    → splatting video (intermediate)
+                   │
+                   ├─ Stage 2: inpainting_inference.py   ← the disocclusion step
+                   │    (video-diffusion-inpaints the disocclusion mask)
+                   │    → <name>_sbs.mp4 (side-by-side stereo video)
+                   │
+                   └─ SBS split → separate left.mp4 / right.mp4
 ```
+
+The upstream `TencentARC/StereoCrafter` repo has **no `run.py`**.  It exposes
+two `fire`-style entry scripts at the repo root (both accept `--help`):
+
+| Script | Stage | Purpose |
+|--------|-------|---------|
+| `depth_splatting_inference.py` | 1 | Estimate per-frame depth (its own internal DepthCrafter), then forward-splat the left view to expose the disocclusion mask. Flags: `--pre_trained_path`, `--unet_path`, `--input_video_path`, `--output_video_path`, `--max_disp`, `--process_length`, `--batch_size`. |
+| `inpainting_inference.py` | 2 | The disocclusion-inpainting step this repo needs. Takes the Stage-1 splatting video and video-diffusion-inpaints the masked regions, writing `<video_name>_sbs.mp4` (left = splatted view, right = inpainted view) plus an anaglyph preview. Flags: `--pre_trained_path`, `--unet_path`, `--input_video_path`, `--save_dir`, `--frames_chunk`, `--overlap`, `--tile_num`. |
+
+The canonical call order is the repo's own `run_inference.sh` (Stage 1 → Stage 2).
+`CLIBackend` reproduces that order, then splits the SBS output into the
+separate left/right files the pipeline expects.
+
+> **Note on depth:** StereoCrafter runs its **own** internal depth estimation in
+> Stage 1 — it does **not** consume the external DepthCrafter depth maps the
+> pipeline passes via `--depth-dir`. The `depth_dir` argument is accepted for
+> interface compatibility and must exist, but is not forwarded to the subprocess.
 
 `StereoCrafterRenderer` handles:
 1. **CUDA guard** — raises a clear error if no GPU.
 2. **Input assembly** — the pipeline stages frames + depth into a temp video.
-3. **Subprocess delegation** — calls the repo's inference entry point.
-4. **Output verification** — checks both L/R videos were created.
+3. **Subprocess delegation** — runs Stage 1 then Stage 2 (fire-style flags).
+4. **SBS split + output verification** — splits the SBS video into L/R files.
 
 For testing, inject a `MockStereoCrafterBackend` to bypass all model
 dependencies (see `tests/test_stereo_crafter.py`).
@@ -173,12 +193,14 @@ dependencies (see `tests/test_stereo_crafter.py`).
 | Symptom | Likely Cause | Fix |
 |---------|--------------|-----|
 | `CUDA out of memory` | Resolution too high for your GPU | Lower `--stereocrafter-max-res` (e.g. 512 → 384) |
+| `No known inference script found` | Repo checkout missing `inpainting_inference.py` / `depth_splatting_inference.py` (the only recognized entry names — a stray `run.py`/`inference.py` is NOT accepted) | Re-run the bootstrap; or clone `TencentARC/StereoCrafter` into `third_party/StereoCrafter/` |
 | `No module named '...'` | Runtime dep missing from the dedicated venv | Add it to `RUNTIME_DEPS` in `scripts/setup_stereocrafter.py` and re-run |
 | `FileNotFoundError: python` | Wrong venv python path | The bootstrap writes it in-repo; run the bootstrap, or set `STEREOCRAFTER_PYTHON` |
 | Self-check fails | The inference entry point can't import | `python <venv>/python inpainting_inference.py --help` inside `third_party/StereoCrafter/` to see the real error |
 | `git clone` fails | Network / proxy (common from mainland China) | Set `http(s).proxy`, or clone manually then pass `--repo-dir` |
 | `snapshot_download` fails | HF access / network | Re-run the bootstrap; or clone `https://huggingface.co/TencentARC/StereoCrafter` into `models/StereoCrafter/` manually |
-| Subprocess non-zero exit | StereoCrafter internal error | Run the inference entry point directly to isolate; check `docs/STEREOCRAFTER_SETUP.md` |
+| Subprocess non-zero exit | StereoCrafter internal error | Run the relevant entry script directly to isolate which stage failed; check `docs/STEREOCRAFTER_SETUP.md` |
+| `SBS output not found` | Stage 2 succeeded but did not write `<name>_sbs.mp4` where expected | Confirm `--save_dir` is writable and the inpainting step completed; check stderr of Stage 2 |
 
 ### If the bootstrap is not run / paths missing
 

@@ -197,11 +197,26 @@ class TestStereoCrafterRenderer:
                 depth_dir=str(tmp_path / "nonexistent_depth"),
             )
 
-    def test_backend_unavailable_error_message(self):
-        """CLIBackend without repo_dir raises clear, actionable error."""
+    def test_backend_unavailable_error_message(self, tmp_path, monkeypatch):
+        """CLIBackend without repo_dir raises clear, actionable error.
+
+        Hermetic: the in-repo default repo/python/checkpoint paths are
+        monkeypatched to non-existent tmp_path dirs so the test is independent
+        of whether this host actually has a deployed StereoCrafter checkout
+        (mirror of the I-1.3 DepthCrafter fix — otherwise this host, which
+        has a real checkout, hits a different branch and the assertion fails).
+        """
+        from pipeline import stereo_crafter as sc
         from pipeline.stereo_crafter import CLIBackend
 
-        with pytest.raises(RuntimeError) as exc_info:
+        absent_repo = tmp_path / "third_party" / "StereoCrafter_no_exist"
+        absent_py = tmp_path / "venv_no_exist" / "python"
+        absent_ckpt = tmp_path / "models" / "StereoCrafter_no_exist"
+        monkeypatch.setattr(sc, "INREPO_REPO_DIR", absent_repo, raising=True)
+        monkeypatch.setattr(sc, "INREPO_PYTHON_EXE", absent_py, raising=True)
+        monkeypatch.setattr(sc, "INREPO_CKPT_DIR", absent_ckpt, raising=True)
+
+        with patch.dict(os.environ, {}, clear=True), pytest.raises(RuntimeError) as exc_info:
             CLIBackend(repo_dir=None)
         msg = str(exc_info.value)
         assert "STEREOCRAFTER_REPO_DIR" in msg
@@ -250,9 +265,21 @@ class TestPipelineIntegration:
 class TestCLIBackendConstruction:
     """Tests for CLIBackend path validation and construction."""
 
-    def test_cli_backend_requires_repo_dir(self):
-        """CLIBackend raises error when no repo_dir is provided."""
+    def test_cli_backend_requires_repo_dir(self, tmp_path, monkeypatch):
+        """CLIBackend raises error when no repo_dir is provided.
+
+        Hermetic: in-repo default paths are neutralized so this is independent
+        of host deployment state (I-1.3 pattern).
+        """
+        from pipeline import stereo_crafter as sc
         from pipeline.stereo_crafter import CLIBackend
+
+        absent_repo = tmp_path / "third_party" / "StereoCrafter_no_exist"
+        absent_py = tmp_path / "venv_no_exist" / "python"
+        absent_ckpt = tmp_path / "models" / "StereoCrafter_no_exist"
+        monkeypatch.setattr(sc, "INREPO_REPO_DIR", absent_repo, raising=True)
+        monkeypatch.setattr(sc, "INREPO_PYTHON_EXE", absent_py, raising=True)
+        monkeypatch.setattr(sc, "INREPO_CKPT_DIR", absent_ckpt, raising=True)
 
         with patch.dict(os.environ, {}, clear=True), pytest.raises(RuntimeError) as exc_info:
             CLIBackend()
@@ -293,6 +320,57 @@ class TestCLIBackendConstruction:
         msg = str(exc_info.value)
         assert "No known inference script found" in msg
 
+    def test_cli_backend_finds_inpainting_entry(self, tmp_path):
+        """CLIBackend accepts the real upstream inpainting_inference.py entry.
+
+        Acceptance criterion: a tmp_path repo with inpainting_inference.py
+        must be found by the candidate list (Stage 2 / disocclusion step).
+        """
+        from pipeline.stereo_crafter import CLIBackend
+
+        repo = tmp_path / "stereocrafter"
+        repo.mkdir()
+        (repo / "inpainting_inference.py").write_text("# fake stage-2 entry")
+
+        backend = CLIBackend(repo_dir=str(repo))
+        assert backend._find_inference_script("inpainting_inference.py") == str(
+            (repo / "inpainting_inference.py").resolve()
+        )
+
+    def test_cli_backend_finds_splatting_entry(self, tmp_path):
+        """CLIBackend accepts the real upstream depth_splatting_inference.py.
+
+        Stage 1 (depth splatting) — the upstream stage run before inpainting.
+        """
+        from pipeline.stereo_crafter import CLIBackend
+
+        repo = tmp_path / "stereocrafter"
+        repo.mkdir()
+        (repo / "depth_splatting_inference.py").write_text("# fake stage-1 entry")
+
+        backend = CLIBackend(repo_dir=str(repo))
+        assert backend._find_inference_script("depth_splatting_inference.py") == str(
+            (repo / "depth_splatting_inference.py").resolve()
+        )
+
+    def test_cli_backend_rejects_legacy_inference_py_name(self, tmp_path):
+        """A repo with only the legacy ``inference.py`` name is NOT accepted.
+
+        Acceptance criterion: the old fictional name ``inference.py`` must not
+        be misrecognized as a valid entry — upstream has no such file.
+        """
+        from pipeline.stereo_crafter import CLIBackend
+
+        repo = tmp_path / "stereocrafter"
+        repo.mkdir()
+        (repo / "inference.py").write_text("# legacy fictional name — must NOT match")
+        (repo / "run.py").write_text("# also not an upstream entry")
+
+        with pytest.raises(RuntimeError) as exc_info:
+            CLIBackend(repo_dir=str(repo))
+        msg = str(exc_info.value)
+        assert "No known inference script found" in msg
+
 
 class TestCLIBackendInRepoFallback:
     """Tests for the in-repo default path fallback (G-6 / I-2 pattern).
@@ -308,7 +386,8 @@ class TestCLIBackendInRepoFallback:
         """Create in-repo StereoCrafter layout under tmp_path and point constants at it."""
         repo = tmp_path / "third_party" / "StereoCrafter"
         repo.mkdir(parents=True)
-        (repo / "run.py").write_text("# fake")
+        # Real upstream entry (Stage 2 / inpainting), NOT the fictional run.py.
+        (repo / "inpainting_inference.py").write_text("# fake stage-2 entry")
 
         venv_dir = repo / ".venv"
         venv_dir.mkdir()
@@ -343,7 +422,7 @@ class TestCLIBackendInRepoFallback:
 
         explicit_repo = tmp_path / "custom_repo"
         explicit_repo.mkdir()
-        (explicit_repo / "run.py").write_text("# fake")
+        (explicit_repo / "inpainting_inference.py").write_text("# fake stage-2 entry")
         explicit_ckpt = tmp_path / "custom_ckpt"
         explicit_ckpt.mkdir()
         (explicit_ckpt / "w.bin").write_text("w")
@@ -401,17 +480,28 @@ class TestCLIBackendInRepoFallback:
 
 
 class TestCLIBackendInference:
-    """Tests for the actual subprocess invocation (subprocess mocked)."""
+    """Tests for the actual subprocess invocation (subprocess mocked).
 
-    def test_render_video_success(self, tmp_path):
-        """Successful subprocess returns L/R paths."""
-        from pipeline.stereo_crafter import CLIBackend
+    The real StereoCrafter flow is two fire-style stages (splatting then
+    inpainting) plus an SBS-split post-step.  These tests stub ``subprocess.run``
+    and ``_split_sbs_video`` so no real inference or video I/O happens; they
+    verify the command structure, call order, and error handling.
+    """
 
+    @staticmethod
+    def _make_repo(tmp_path):
+        """A repo dir with both real upstream entry scripts (valid for construction)."""
         repo = tmp_path / "stereocrafter"
         repo.mkdir()
-        script = repo / "run.py"
-        script.write_text("")
+        (repo / "inpainting_inference.py").write_text("# stage 2")
+        (repo / "depth_splatting_inference.py").write_text("# stage 1")
+        return repo
 
+    def test_render_video_success(self, tmp_path):
+        """Both stages succeed; backend returns the L/R paths from the split step."""
+        from pipeline.stereo_crafter import CLIBackend
+
+        repo = self._make_repo(tmp_path)
         backend = CLIBackend(repo_dir=str(repo))
 
         depth_dir = tmp_path / "depth"
@@ -421,33 +511,115 @@ class TestCLIBackendInference:
         left_out = str(tmp_path / "left_out.mp4")
         right_out = str(tmp_path / "right_out.mp4")
 
-        Path(left_out).write_text("data")
-        Path(right_out).write_text("data")
+        # Pin the work dir so we can pre-create the SBS output the backend looks for.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        sbs_name = "splatting_results_inpainting_results_sbs.mp4"
+        (work_dir / sbs_name).write_text("fake sbs")
 
-        with patch("subprocess.run") as mock_run:
+        with (
+            patch("subprocess.run") as mock_run,
+            patch.object(CLIBackend, "_split_sbs_video", return_value=None) as mock_split,
+            patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
+            patch("pipeline.stereo_crafter.tempfile.mkdtemp", return_value=str(work_dir)),
+        ):
             mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
 
-            with patch("pipeline.stereo_crafter._assert_cuda", return_value=None):
-                result_l, result_r = backend.render_video(
-                    input_path=str(input_video),
-                    depth_dir=str(depth_dir),
-                    output_left=left_out,
-                    output_right=right_out,
-                )
+            # _split_sbs_video is responsible for materializing the outputs.
+            def _fake_split(sbs_path, left, right):
+                Path(left).write_text("data")
+                Path(right).write_text("data")
+
+            mock_split.side_effect = _fake_split
+
+            result_l, result_r = backend.render_video(
+                input_path=str(input_video),
+                depth_dir=str(depth_dir),
+                output_left=left_out,
+                output_right=right_out,
+            )
 
         assert result_l == left_out
         assert result_r == right_out
-        mock_run.assert_called_once()
+        # Two stages → two subprocess calls, in stage order.
+        assert mock_run.call_count == 2
+        mock_split.assert_called_once()
+        # Stage 1 must run before Stage 2 (splatting script first).
+        first_cmd = mock_run.call_args_list[0].args[0]
+        second_cmd = mock_run.call_args_list[1].args[0]
+        assert first_cmd[1].endswith("depth_splatting_inference.py")
+        assert second_cmd[1].endswith("inpainting_inference.py")
 
-    def test_render_video_subprocess_failure(self, tmp_path):
-        """Subprocess non-zero exit raises clear RuntimeError."""
+    def test_render_video_command_uses_real_fire_flags(self, tmp_path):
+        """Commands use the real upstream fire-style flags (not the old fictional ones)."""
         from pipeline.stereo_crafter import CLIBackend
 
-        repo = tmp_path / "stereocrafter"
-        repo.mkdir()
-        script = repo / "run.py"
-        script.write_text("")
+        repo = self._make_repo(tmp_path)
+        backend = CLIBackend(
+            repo_dir=str(repo),
+            python_exe="python3",
+            checkpoint_dir=str(tmp_path / "sc_unet"),
+            pre_trained_path=str(tmp_path / "svd"),
+            depthcrafter_unet_path=str(tmp_path / "dc_unet"),
+        )
 
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        input_video = tmp_path / "input.mp4"
+        input_video.write_text("")
+
+        # Pin the work dir and pre-create the SBS file so the flow reaches the split.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        (work_dir / "splatting_results_inpainting_results_sbs.mp4").write_text("fake sbs")
+
+        with (
+            patch("subprocess.run") as mock_run,
+            patch.object(CLIBackend, "_split_sbs_video", return_value=None),
+            patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
+            patch("pipeline.stereo_crafter.tempfile.mkdtemp", return_value=str(work_dir)),
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            backend.render_video(
+                input_path=str(input_video),
+                depth_dir=str(depth_dir),
+                output_left=str(tmp_path / "left.mp4"),
+                output_right=str(tmp_path / "right.mp4"),
+            )
+
+        cmd1 = mock_run.call_args_list[0].args[0]
+        cmd2 = mock_run.call_args_list[1].args[0]
+        # Stage 1 real flags.
+        assert "--pre_trained_path" in cmd1
+        assert "--unet_path" in cmd1
+        assert "--input_video_path" in cmd1
+        assert "--output_video_path" in cmd1
+        assert cmd1[0] == "python3"
+        # Stage 2 real flags.
+        assert "--pre_trained_path" in cmd2
+        assert "--unet_path" in cmd2
+        assert "--input_video_path" in cmd2
+        assert "--save_dir" in cmd2
+        # The fictional flags must NOT appear.
+        for fictional in (
+            "--video",
+            "--depth_dir",
+            "--output_left",
+            "--output_right",
+            "--max_resolution",
+            "--checkpoint_dir",
+        ):
+            assert fictional not in cmd1
+            assert fictional not in cmd2
+        # shell=True must never be used.
+        for call in mock_run.call_args_list:
+            assert call.kwargs.get("shell") in (None, False)
+
+    def test_render_video_subprocess_failure(self, tmp_path):
+        """A non-zero exit in a stage raises a clear RuntimeError naming the stage."""
+        from pipeline.stereo_crafter import CLIBackend
+
+        repo = self._make_repo(tmp_path)
         backend = CLIBackend(repo_dir=str(repo))
 
         depth_dir = tmp_path / "depth"
@@ -455,15 +627,12 @@ class TestCLIBackendInference:
         input_video = tmp_path / "input.mp4"
         input_video.write_text("")
 
-        with patch("subprocess.run") as mock_run:
+        with patch("subprocess.run") as mock_run, patch("pipeline.stereo_crafter._assert_cuda", return_value=None):
             mock_run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=1, stdout="", stderr="CUDA OOM error"
             )
 
-            with (
-                patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
-                pytest.raises(RuntimeError) as exc_info,
-            ):
+            with pytest.raises(RuntimeError) as exc_info:
                 backend.render_video(
                     input_path=str(input_video),
                     depth_dir=str(depth_dir),
@@ -471,18 +640,14 @@ class TestCLIBackendInference:
                     output_right=str(tmp_path / "right.mp4"),
                 )
         msg = str(exc_info.value)
-        assert "StereoCrafter inference failed" in msg
+        assert "failed" in msg
         assert "CUDA OOM" in msg
 
-    def test_render_video_missing_outputs(self, tmp_path):
-        """Subprocess succeeds but outputs not created -> clear error."""
+    def test_render_video_missing_sbs_output(self, tmp_path):
+        """Both stages succeed but the SBS file is absent -> clear error."""
         from pipeline.stereo_crafter import CLIBackend
 
-        repo = tmp_path / "stereocrafter"
-        repo.mkdir()
-        script = repo / "run.py"
-        script.write_text("")
-
+        repo = self._make_repo(tmp_path)
         backend = CLIBackend(repo_dir=str(repo))
 
         depth_dir = tmp_path / "depth"
@@ -490,13 +655,10 @@ class TestCLIBackendInference:
         input_video = tmp_path / "input.mp4"
         input_video.write_text("")
 
-        with patch("subprocess.run") as mock_run:
+        with patch("subprocess.run") as mock_run, patch("pipeline.stereo_crafter._assert_cuda", return_value=None):
             mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
 
-            with (
-                patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
-                pytest.raises(RuntimeError) as exc_info,
-            ):
+            with pytest.raises(RuntimeError) as exc_info:
                 backend.render_video(
                     input_path=str(input_video),
                     depth_dir=str(depth_dir),
@@ -504,4 +666,4 @@ class TestCLIBackendInference:
                     output_right=str(tmp_path / "missing_right.mp4"),
                 )
         msg = str(exc_info.value)
-        assert "output video(s) not found" in msg
+        assert "SBS output not found" in msg
