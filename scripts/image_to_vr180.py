@@ -111,15 +111,33 @@ def resolve_paths(args: JobArgs) -> None:
     """Fill in artefact paths on *args* so every stage reads the same values.
 
     Paths live under ``args.workdir`` (created lazily by :func:`ensure_workdir`).
+
+    K-1.2 (issue #106): when a caller (e.g. :mod:`scripts.batch_runner`) has
+    already set ``args.vr180_output`` to a *scene-named* target, we MUST NOT
+    overwrite it with the image-stem default — that was the bug that let two
+    jobs sharing an input image silently collide on the same final file.
+    When the final output is caller-driven, the intermediate artefacts
+    (``_prep.png`` / ``_generated.mp4`` / ``_upscaled.mp4``) are likewise
+    keyed off the output filename stem so co-located jobs cannot clobber each
+    other's intermediates. The standalone CLI path (no pre-set output) keeps
+    its original image-stem behaviour, so its contract is unchanged.
     """
     if not args.workdir:
         args.workdir = _default_workdir(args.image)
     w = Path(args.workdir)
-    stem = Path(args.image).stem
+
+    # K-1.2: if the caller chose the final filename (scene naming), honor it
+    # and derive the intermediate stems from it so co-located jobs are
+    # isolated. Otherwise fall back to the image stem.
+    if args.vr180_output:
+        stem = Path(args.vr180_output).stem
+    else:
+        stem = Path(args.image).stem
+        args.vr180_output = str(w / f"{stem}_vr180.mp4")
+
     args.prepared_image = str(w / f"{stem}_prep.png")
     args.generated_video = str(w / f"{stem}_generated.mp4")
     args.upscaled_video = str(w / f"{stem}_upscaled.mp4")
-    args.vr180_output = str(w / f"{stem}_vr180.mp4")
 
 
 # ---------------------------------------------------------------------------

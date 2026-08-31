@@ -624,3 +624,106 @@ class TestSceneNamedOutputs:
             p_out = state["jobs"][sid]["output_path"]
             assert Path(p_out).is_file()
             assert "seg01_vr180" in p_out
+
+    def test_two_jobs_same_image_real_orchestrator_never_collides(self, tmp_path, capsys):
+        """K-1.2 / issue #106 end-to-end regression: two jobs sharing the
+        *same* input image but different scene_ids must land on two *distinct*
+        scene-named files even when the orchestrator runs for real (i.e. it
+        calls :func:`image_to_vr180.resolve_paths` internally, which used to
+        overwrite the runner's scene-named ``vr180_output`` with the
+        image-stem default and cause the silent overwrite).
+
+        This drives the *real* ``run_pipeline`` through injected stage
+        callables (no ffmpeg / models), so it exercises the exact wiring that
+        #104's original fix failed to cover.
+        """
+        shared_image = tmp_path / "test_input_image.png"
+        shared_image.write_bytes(b"img")
+        jobs = [
+            {"image": str(shared_image), "scene_id": "s01"},
+            {"image": str(shared_image), "scene_id": "s02"},
+        ]
+        p = _write_jobs(tmp_path, jobs)
+        state_path = tmp_path / "state.json"
+
+        # Record the orchestrator-returned output AND the intermediates each
+        # job's ``run_pipeline`` resolved, to prove neither final files nor
+        # intermediates collide.
+        resolved_outputs: list[str] = []
+        resolved_generated: list[str] = []
+        resolved_prepared: list[str] = []
+
+        def _trace_prepare(job: i2v.JobArgs) -> str:
+            resolved_prepared.append(job.prepared_image)
+            Path(job.prepared_image).parent.mkdir(parents=True, exist_ok=True)
+            Path(job.prepared_image).write_bytes(b"fake-prep")
+            return job.prepared_image
+
+        def _trace_generate(job: i2v.JobArgs, prepared: str | None) -> str:
+            resolved_generated.append(job.generated_video)
+            Path(job.generated_video).parent.mkdir(parents=True, exist_ok=True)
+            Path(job.generated_video).write_bytes(b"fake-gen")
+            return job.generated_video
+
+        def _trace_convert(job: i2v.JobArgs, input_video: str, _convert=None) -> str:
+            resolved_outputs.append(job.vr180_output)
+            Path(job.vr180_output).parent.mkdir(parents=True, exist_ok=True)
+            Path(job.vr180_output).write_bytes(b"fake-vr180")
+            return job.vr180_output
+
+        # Wire up the real run_pipeline with only the I2V-heavy stages mocked.
+        # The batch runner reads ``scripts.image_to_vr180.run_pipeline`` (by
+        # dotted package name), so we MUST patch that exact module object.
+        # Because the test also inserts ``scripts/`` onto sys.path, a bare
+        # ``import image_to_vr180`` yields a *different* module object from
+        # ``scripts.image_to_vr180`` — patching the wrong one would silently
+        # no-op (the very pitfall this test guards against).
+        import scripts.image_to_vr180 as _i2v_pkg  # local import: package-form needed for patching
+
+        _real_run = _i2v_pkg.run_pipeline
+
+        def _real_pipeline(job: i2v.JobArgs):
+            # stage_qa is not injectable (run_pipeline calls it directly), so
+            # stub it to a passing verdict for this wiring test.
+            with patch.object(_i2v_pkg, "stage_qa", side_effect=lambda p: 0):
+                return _real_run(
+                    job,
+                    prepare=_trace_prepare,
+                    generate=_trace_generate,
+                    streamcheck=lambda p: None,
+                    upscale=lambda a, p: p,
+                    convert=_trace_convert,
+                )
+
+        with patch.object(_i2v_pkg, "run_pipeline", side_effect=_real_pipeline):
+            rc = br.main(["--jobs", str(p), "--state", str(state_path)])
+
+        assert rc == br.EXIT_OK
+        out = capsys.readouterr().out
+
+        # The two recorded orchestrator outputs must be distinct scene-named
+        # paths — this is the exact assertion #104's fix broke.
+        outputs = {Path(o).name for o in resolved_outputs}
+        assert len(resolved_outputs) == 2
+        assert len(outputs) == 2, f"outputs collided: {resolved_outputs}"
+        # Neither is the image-stem default (the #106 regression signature).
+        for o in resolved_outputs:
+            stem = Path(o).stem
+            assert stem != "test_input_image_vr180", f"orchestrator ignored caller output: {o}"
+            assert "s01" in stem or "s02" in stem
+            assert Path(o).is_file()
+
+        # Intermediates must also be per-scene (no *_generated.mp4 collision).
+        assert len({Path(g).name for g in resolved_generated}) == 2, resolved_generated
+        assert len({Path(p).name for p in resolved_prepared}) == 2, resolved_prepared
+        assert len({Path(g).name for g in resolved_generated}) >= 2
+
+        # Summary table lists two success rows with distinct paths.
+        assert "succeeded: 2" in out
+        assert "failed: 0" in out
+
+        # State file records two distinct output_path values.
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state["jobs"]["s01"]["output_path"] != state["jobs"]["s02"]["output_path"]
+        for sid in ("s01", "s02"):
+            assert Path(state["jobs"][sid]["output_path"]).is_file()
