@@ -217,6 +217,11 @@ class TestStreamingMetadataInjection(unittest.TestCase):
             args.comfort = "balanced"
             args.convergence = None
             args.no_temporal = False
+            # D-2 (#79): main() now resolves --preset via apply_playback_preset;
+            # set source (passthrough) + gop=None so the resolution is a no-op
+            # on the MagicMock.
+            args.preset = "source"
+            args.gop = None
 
             pipeline_inst = MagicMock()
             pipeline_inst.process_stream.return_value = "out.mp4"

@@ -25,6 +25,32 @@ import numpy as np
 
 from pipeline.spherical_injector import inject_spherical_metadata
 
+
+def _preset_encode_args(
+    gop: int | None = None,
+    force_idr: bool = False,
+    faststart: bool | None = None,
+) -> list[str]:
+    """D-2 (#79): ffmpeg args for the playback-preset encode knobs.
+
+    Mirrors :func:`pipeline.streaming_pipeline.preset_encode_args` but kept
+    local to avoid importing the full streaming model chain (cv2 /
+    DepthEstimator / StereoRenderer) into this encode-only module.  The arg
+    set is intentionally tiny and stable so the duplication is cheaper than
+    the coupling.
+    """
+    args: list[str] = []
+    if gop:
+        args += ["-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0"]
+        if force_idr:
+            args += ["-force_key_frames", f"expr:gte(t,n_forced*{gop})"]
+    if faststart is True:
+        args += ["-movflags", "+faststart"]
+    elif faststart is False:
+        args += ["-movflags", "0"]
+    return args
+
+
 # Google Spherical Video V2 XML template (for VR180)
 SPHERICAL_XML_TEMPLATE = """<?xml version="1.0"?>
 <rdf:SphericalVideo
@@ -57,6 +83,9 @@ class VRMetadataEmbedder:
         fps: int = 30,
         stereo_mode: str = "sbs",
         bitrate: str | None = None,
+        gop: int | None = None,
+        force_idr: bool = False,
+        faststart: bool | None = None,
     ):
         self.codec = codec
         self.crf = crf
@@ -64,6 +93,10 @@ class VRMetadataEmbedder:
         self.fps = fps
         self.stereo_mode = stereo_mode
         self.bitrate = bitrate
+        # D-2 (#79): playback-preset encode knobs (fixed GOP / IDR / faststart).
+        self.gop = gop
+        self.force_idr = force_idr
+        self.faststart = faststart
 
     def _codec_name(self) -> str:
         return "libx265" if self.codec == "h265" else "libx264"
@@ -140,11 +173,14 @@ class VRMetadataEmbedder:
                 cmd += ["-b:v", self.bitrate]
             else:
                 cmd += ["-crf", str(self.crf)]
+            # D-2 (#79): playback-preset encode knobs; preserve +faststart
+            # default when no preset is in play (faststart None).
+            cmd += _preset_encode_args(self.gop, self.force_idr, self.faststart)
+            if self.faststart is None:
+                cmd += ["-movflags", "+faststart"]
             cmd += [
                 "-pix_fmt",
                 "yuv420p",
-                "-movflags",
-                "+faststart",
                 temp_path,
             ]
 
@@ -208,6 +244,8 @@ class VRMetadataEmbedder:
             self.preset,
             "-crf",
             str(self.crf),
+            # D-2 (#79): preset knobs on the fallback path too.
+            *_preset_encode_args(self.gop, self.force_idr, self.faststart),
             "-pix_fmt",
             "yuv420p",
             temp_path,

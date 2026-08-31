@@ -204,6 +204,12 @@ class TestHwEncoderCliPassthrough(unittest.TestCase):
             args.comfort = "balanced"
             args.convergence = None
             args.no_temporal = False
+            # D-2 (#79): main() now resolves --preset via apply_playback_preset,
+            # which reads preset / gop / codec / crf / bitrate off args.  Set
+            # source (passthrough) + gop=None so the resolution is a no-op on
+            # the MagicMock (does not auto-stub to a Mock).
+            args.preset = "source"
+            args.gop = None
 
             pipeline_inst = MagicMock()
             pipeline_inst.process_stream.return_value = "out.mp4"

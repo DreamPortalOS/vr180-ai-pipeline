@@ -85,6 +85,12 @@ class JobArgs:
     max_disparity: float | None = None
     convergence: float | None = None
 
+    # D-2 (#79): downstream playback preset passed through to the VR180
+    # conversion stage.  Mirrors --comfort: it's a starting point, and
+    # explicit --codec/--crf/--bitrate/--gop override the preset via
+    # run_pipeline's resolve_playback.  ``source`` (default) = passthrough.
+    preset: str = "source"
+
     # H-1: explicit audio source for the audio remux stage. When ``None``
     # (default), the stage falls back to ``args.generated_video`` and detects
     # an audio stream there automatically.
@@ -463,6 +469,8 @@ def run_convert_default(args: JobArgs, input_path: str) -> str:
         args.bitrate,
         "--comfort",
         args.comfort,
+        "--preset",
+        args.preset,
         "--device",
         "cpu",
         "--max-frames",
@@ -803,6 +811,8 @@ def _write_sidecar(output_path: str, args: JobArgs) -> None:
         "upscaler": args.upscale if args.upscale != "none" else None,
         "source_image": args.image,
         "prompt": args.prompt,
+        # D-2 (#79): which playback tier the artefact was tuned for.
+        "preset": args.preset,
     }
     # Drop None values so the JSON stays clean for DreamPortal.
     generation = {k: v for k, v in generation.items() if v is not None}
@@ -886,6 +896,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Explicit convergence-plane override for the converter (overrides --comfort preset).",
     )
     parser.add_argument(
+        "--preset",
+        default="source",
+        choices=["pcvr", "standalone", "source"],
+        help=(
+            "D-2: downstream playback preset passed through to the converter (default: source). "
+            "pcvr = HEVC CRF 18, 1s GOP, IDR, +faststart (PC NVDEC, quality first); "
+            "standalone = HEVC CRF 23, 1s GOP, IDR, +faststart (Quest 3 power/bitrate); "
+            "source = passthrough (no encode tuning)."
+        ),
+    )
+    parser.add_argument(
         "--manifest",
         default=None,
         metavar="PATH",
@@ -930,6 +951,7 @@ def main(argv: list[str] | None = None) -> int:
             comfort=args.comfort,
             max_disparity=args.max_disparity,
             convergence=args.convergence,
+            preset=args.preset,
             copy_audio_from=args.copy_audio_from,
             workdir=args.workdir or "",
             manifest_path=args.manifest,

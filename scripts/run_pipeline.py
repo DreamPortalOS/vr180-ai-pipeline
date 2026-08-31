@@ -29,6 +29,7 @@ import os
 import platform
 import sys
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -41,6 +42,11 @@ from pipeline.device_utils import detect_best_device, resolve_device
 from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.fulldome_mapper import FulldomeMapper
 from pipeline.outpainter import Outpainter
+from pipeline.playback_presets import (
+    DEFAULT_PLAYBACK,
+    PLAYBACK_PRESETS,
+    resolve_playback,
+)
 from pipeline.stereo_crafter import StereoCrafterRenderer
 from pipeline.stereo_renderer import StereoRenderer
 from pipeline.streaming_pipeline import (
@@ -114,8 +120,43 @@ def parse_args(argv: list[str] | None = None):
             "--comfort preset (default balanced = 0.35)."
         ),
     )
-    parser.add_argument("--codec", choices=["h264", "h265"], default="h264", help="Output video codec")
-    parser.add_argument("--crf", type=int, default=23, help="Constant rate factor")
+    # --codec / --crf default to None (sentinel) so D-2's --preset can tell
+    # "user did not set this" from "user explicitly chose h264/crf 23".  The
+    # legacy h264/23 defaults are back-filled in apply_playback_preset so the
+    # resolved values the encode stages see are unchanged when no --preset is
+    # given (source = passthrough).
+    parser.add_argument(
+        "--codec",
+        choices=["h264", "h265"],
+        default=None,
+        help="Output video codec (default: h264; h265 when --preset pcvr/standalone)",
+    )
+    parser.add_argument(
+        "--crf", type=int, default=None, help="Constant rate factor (default: 23; 18 pcvr / 23 standalone)"
+    )
+    parser.add_argument(
+        "--gop",
+        type=int,
+        default=None,
+        help="Fixed GOP length in frames (1s seek-precision default when --preset "
+        "pcvr/standalone is set). 0 = let ffmpeg pick. Explicit value wins over preset.",
+    )
+    # D-2 (#79): downstream playback presets — PCVR / Quest standalone / source.
+    # A preset is a starting point: an explicit --codec / --crf / --bitrate / --gop
+    # always wins (see resolve_playback).  ``source`` (default) fills in nothing,
+    # so pre-D-2 behaviour is bit-exact unless the operator opts in.
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PLAYBACK_PRESETS),
+        default=DEFAULT_PLAYBACK,
+        help=(
+            f"Downstream playback preset (default: {DEFAULT_PLAYBACK}). "
+            "pcvr = HEVC CRF 18, 1s GOP, IDR, +faststart (PC NVDEC, quality first); "
+            "standalone = HEVC CRF 23, 1s GOP, IDR, +faststart (Quest 3 power/bitrate); "
+            "source = passthrough (no encode tuning — keeps --codec/--crf as-is). "
+            "Explicit --codec/--crf/--bitrate/--gop override the preset."
+        ),
+    )
     parser.add_argument("--fps", type=int, default=None, help="Output frame rate (default: inherit from source video)")
     parser.add_argument(
         "--quality",
@@ -814,6 +855,9 @@ def run_metadata_stage(args, sbs_frames):
         crf=args.crf,
         fps=args.fps,
         bitrate=args.bitrate,
+        gop=getattr(args, "gop", None),
+        force_idr=getattr(args, "_preset_force_idr", False),
+        faststart=getattr(args, "_preset_faststart", None),
     )
 
     output_path = get_output_path(args)
@@ -906,6 +950,9 @@ def run_chunked_fused_stage(args, frames, depths):
         fps=args.fps or 30,
         bitrate=args.bitrate,
         hw_encoder=hw,
+        gop=getattr(args, "gop", None),
+        force_idr=getattr(args, "_preset_force_idr", False),
+        faststart=getattr(args, "_preset_faststart", None),
     ) as writer:
         for i, (left, right) in enumerate(iterator):
             # Per-frame equirect (chunk mode forces this — batched map_sequence
@@ -1318,6 +1365,68 @@ def _apply_comfort_preset(args) -> None:
     )
 
 
+def apply_playback_preset(args) -> None:
+    """Resolve ``--preset`` into concrete encode knobs (D-2, #79).
+
+    Mirrors :func:`apply_quality_preset` / :func:`_apply_comfort_preset`: the
+    preset fills in values the user did not explicitly pass, and explicit
+    ``--codec`` / ``--crf`` / ``--bitrate`` / ``--gop`` always win.  After
+    this call ``args.codec`` and ``args.crf`` are guaranteed to be concrete
+    (``h264`` / ``23`` when nothing was set, matching the pre-D-2 defaults),
+    and ``args.gop`` is either a concrete frame count or ``None`` (let ffmpeg
+    pick).
+
+    ``source`` (default) fills in nothing → the legacy ``h264``/``23``
+    defaults are applied as the back-fill, so behaviour is bit-exact with
+    pre-D-2 unless the operator opts into ``pcvr``/``standalone``.
+    """
+    explicit: dict[str, object] = {}
+    if args.codec is not None:
+        explicit["codec"] = args.codec
+    if args.crf is not None:
+        explicit["crf"] = args.crf
+    # --bitrate is set by apply_quality_preset (adaptive scaling); when the
+    # quality path already set a bitrate it must win over the preset's None.
+    if args.bitrate is not None:
+        explicit["bitrate"] = args.bitrate
+    if args.gop is not None:
+        explicit["gop_seconds"] = None  # explicit frame count wins; skip preset GOP
+
+    resolved = resolve_playback(args.preset, explicit or None)
+
+    # codec / crf: back-fill the legacy defaults when the preset left them
+    # None (source path, or the operator explicitly unset via --preset source).
+    args.codec = resolved.get("codec") or "h264"
+    args.crf = resolved.get("crf") if resolved.get("crf") is not None else 23
+
+    # GOP: translate the preset's gop_seconds into a frame count using the
+    # resolved fps (1s default per the playback-side seek-precision guidance).
+    # An explicit --gop (frame count) always wins; it is already on args.gop.
+    gop_seconds = resolved.get("gop_seconds")
+    if args.gop is None and gop_seconds is not None:
+        fps = int(args.fps) if args.fps else 30
+        args.gop = round(gop_seconds * fps)
+        # keyint_min follows the same count so the first keyframe lands on the
+        # GOP boundary (IDR-seekable segments).
+        args._gop_keyint_min = args.gop  # type: ignore[attr-defined]
+    else:
+        args._gop_keyint_min = args.gop  # type: ignore[attr-defined]  # may be None
+
+    # faststart / force_idr are read by the ffmpeg command-builder; store
+    # them on args so the streaming / chunked / metadata paths all see them.
+    args._preset_faststart = resolved.get("faststart")  # type: ignore[attr-defined]
+    args._preset_force_idr = resolved.get("force_idr")  # type: ignore[attr-defined]
+
+    log.info(
+        "📺 --preset %s → codec=%s, crf=%s, gop=%s, faststart=%s",
+        args.preset,
+        args.codec,
+        args.crf,
+        args.gop,
+        args._preset_faststart,
+    )
+
+
 # ---------------------------------------------------------------------------
 # V-3: job manifest / cross-machine relay helpers (issue #36)
 # ---------------------------------------------------------------------------
@@ -1486,6 +1595,8 @@ def main():
     args = parse_args()
     apply_quality_preset(args)
     _apply_comfort_preset(args)
+    # D-2 (#79): the playback preset is resolved after fps inheritance below
+    # (the 1-second GOP needs a frame rate to translate to a frame count).
 
     # V-3: job manifest — load/create, hash-validate completed stages,
     # compute which stages to skip.  None when no manifest flags are given
@@ -1525,6 +1636,12 @@ def main():
         args.fps = round(src_fps) if src_fps and src_fps > 0 else 30
         log.info(f"📹 Output fps inherited from source: {args.fps}")
 
+    # D-2 (#79): resolve the playback preset now that fps is known (the 1s
+    # GOP must be translated to a frame count).  codec/crf back-fill, GOP,
+    # +faststart, and IDR flags land on args here so every encode path below
+    # (streaming / chunked / metadata) sees them.  ``source`` = no-op.
+    apply_playback_preset(args)
+
     # Streaming pipeline mode (PRD §7.2).  V-3: the streaming path is a
     # single fused run — it cannot be split across machines, so --stages /
     # --resume-from force the batch path.
@@ -1543,6 +1660,9 @@ def main():
             fps=args.fps,
             bitrate=args.bitrate,
             hw_encoder=args.hw_encoder,
+            gop=getattr(args, "gop", None),
+            force_idr=getattr(args, "_preset_force_idr", False),
+            faststart=getattr(args, "_preset_faststart", None),
         )
         output = get_output_path(args)
         result = pipeline.process_stream(args.input, output, max_frames=args.max_frames)
@@ -1956,8 +2076,16 @@ def _write_sidecar_from_args(
         if w and h:
             immersive["eye_resolution"] = [w, h]
 
+    # D-2 (#79): record the playback preset in the generation block so the
+    # downstream player knows which encode tier the artefact was tuned for.
+    generation: dict[str, Any] = {"route": route}
+    if args is not None:
+        preset = getattr(args, "preset", None)
+        if preset:
+            generation["preset"] = preset
+
     try:
-        write_sidecar(output_path, immersive=normalize_immersive(immersive), generation={"route": route})
+        write_sidecar(output_path, immersive=normalize_immersive(immersive), generation=generation)
     except Exception as exc:
         log.warning("⚠️  Sidecar write failed for %s: %s", output_path, exc)
 
