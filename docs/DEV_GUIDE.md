@@ -255,14 +255,8 @@ vr180-ai-pipeline/
 # integrations/base.py
 class VideoGenClient(ABC):
     async def generate(
-        self,
-        prompt: str,
-        duration_sec: float,
-        aspect_ratio: str = "16:9",
-        fps: int = 24,
-        **kwargs
-    ) -> AsyncIterator[GenerationEvent]:
-        ...
+        self, prompt: str, duration_sec: float, aspect_ratio: str = "16:9", fps: int = 24, **kwargs
+    ) -> AsyncIterator[GenerationEvent]: ...
 ```
 
 **B2 — 优先接入 Kling API**

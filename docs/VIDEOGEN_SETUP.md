@@ -208,10 +208,10 @@ result = provider.generate(
 )
 
 # Result fields
-print(result.video_url)     # downloadable URL
-print(result.job_id)        # provider's job identifier (may be None)
-print(result.provider)      # "kling", "seedance" or "veo"
-print(result.metadata)      # raw API response dict
+print(result.video_url)  # downloadable URL
+print(result.job_id)  # provider's job identifier (may be None)
+print(result.provider)  # "kling", "seedance" or "veo"
+print(result.metadata)  # raw API response dict
 ```
 
 ## Architecture

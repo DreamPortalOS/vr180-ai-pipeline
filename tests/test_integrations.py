@@ -891,6 +891,44 @@ class TestSeedanceImageToVideo:
         assert result.provider == "seedance"
         assert mock_client.post.call_args[1]["json"]["content"][0] == {"type": "text", "text": ""}
 
+    def test_i2v_kwargs_override_resolution_ratio_duration(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        """H-2: generate_from_image threads resolution/ratio/duration kwargs
+        into the Ark request body (field names match the t2v path)."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        provider = SeedanceProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"id": "cgt-20260828090000-i2vkw"}
+        submit_resp.raise_for_status.return_value = None
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {
+            "id": "cgt-20260828090000-i2vkw",
+            "status": "succeeded",
+            "content": {"video_url": "https://ark-cdn.volces.com/i2v.mp4"},
+        }
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+        ):
+            provider.generate_from_image(
+                "https://example.com/p.png",
+                prompt="pan left",
+                duration=8,
+                resolution="720p",
+                ratio="16:9",
+            )
+
+        body = mock_client.post.call_args[1]["json"]
+        assert body["resolution"] == "720p"
+        assert body["ratio"] == "16:9"
+        assert body["duration"] == 8
+
 
 class TestVeoImageToVideo:
     def test_i2v_sends_image_payload(self, monkeypatch: pytest.MonkeyPatch) -> None:

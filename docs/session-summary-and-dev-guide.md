@@ -116,11 +116,17 @@ def _calc_vertical_fov(self, src_width, src_height):
 **修复**: 完全放弃手动 ISOBMFF 操作，改用 Google spatial-media CLI 工具：
 ```python
 cmd = [
-    "python3", "-m", "spatialmedia",
-    "-i", "-2",  # V2 spec (sv3d + st3d)
-    "-s", "left-right",
-    "-p", "equirectangular",
-    input_path, output_path,
+    "python3",
+    "-m",
+    "spatialmedia",
+    "-i",
+    "-2",  # V2 spec (sv3d + st3d)
+    "-s",
+    "left-right",
+    "-p",
+    "equirectangular",
+    input_path,
+    output_path,
 ]
 subprocess.run(cmd, check=True)
 ```

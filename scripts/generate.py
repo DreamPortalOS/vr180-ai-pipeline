@@ -101,6 +101,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Target duration in seconds (default: 5).",
     )
     parser.add_argument(
+        "--gen-resolution",
+        default="480p",
+        choices=["480p", "720p", "1080p"],
+        help="Generation resolution tier (default: 480p — quota discipline). "
+        "Higher tiers consume more quota; a reminder is logged when >480p is selected.",
+    )
+    parser.add_argument(
+        "--gen-ratio",
+        default="adaptive",
+        help="Generation aspect ratio passed through to the provider (default: adaptive). "
+        "Seedance accepts e.g. adaptive/16:9/9:16/1:1.",
+    )
+    parser.add_argument(
         "--aspect-ratio",
         "-a",
         type=str,
@@ -184,6 +197,13 @@ def main(argv: list[str] | None = None) -> int:
     kwargs: dict[str, str | int | float] = {}
     if negative_prompt:
         kwargs["negative_prompt"] = negative_prompt
+    # H-2: generation-tier passthrough. Seedance reads resolution/ratio from
+    # the request body; other providers ignore unknown kwargs. Default stays
+    # 480p/adaptive so the quota discipline is unchanged.
+    kwargs["resolution"] = args.gen_resolution
+    kwargs["ratio"] = args.gen_ratio
+    if args.gen_resolution != "480p":
+        log.warning("⚠️  高档位（%s）消耗更多额度，请确认后再继续。", args.gen_resolution)
 
     # Generate — text-to-video or image-to-video
     if args.image:

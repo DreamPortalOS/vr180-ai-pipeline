@@ -274,8 +274,13 @@ class TestOrchestrationCallOrder:
         assert by_name["prepare"]["outputs"] == [job.prepared_image]
         assert by_name["prepare"]["params"]["target_width"] == 1280
 
-        # generate: provider + duration captured; output is the generated video.
-        assert by_name["generate"]["params"] == {"provider": "mock", "duration": 7}
+        # generate: provider + duration + gen-tier captured; output is the generated video.
+        assert by_name["generate"]["params"] == {
+            "provider": "mock",
+            "duration": 7,
+            "resolution": "480p",
+            "ratio": "adaptive",
+        }
         assert by_name["generate"]["outputs"] == [job.generated_video]
 
         # upscale: seedvr2 produces a distinct upscaled artefact.
@@ -499,6 +504,18 @@ class TestCLI:
         with pytest.raises(SystemExit):
             i2v.parse_args(["--image", "x.png", "--provider", "bogus"])
 
+    def test_gen_tier_defaults(self):
+        """H-2: CLI defaults keep the quota discipline (480p / 5s / adaptive)."""
+        args = i2v.parse_args(["--image", "x.png"])
+        assert args.gen_resolution == "480p"
+        assert args.gen_ratio == "adaptive"
+        assert args.duration == 5
+
+    def test_gen_resolution_choices_enforced(self):
+        """Only 480p/720p/1080p are accepted."""
+        with pytest.raises(SystemExit):
+            i2v.parse_args(["--image", "x.png", "--gen-resolution", "4k"])
+
 
 class TestQualityPresetResolution:
     """V-2 lesson: the converter must see concrete dimensions, never None."""
@@ -510,6 +527,145 @@ class TestQualityPresetResolution:
         assert job.output_width == expected_eye
         assert job.output_height == expected_eye
         assert job.bitrate is not None and job.bitrate.endswith("M")
+
+
+# ---------------------------------------------------------------------------
+# H-2: generation-tier passthrough (resolution / ratio / duration → request body)
+# ---------------------------------------------------------------------------
+
+
+def _seedance_httpx(video_path: str):
+    """Build a MagicMock httpx.Client whose submit returns a task id and whose
+    single poll returns a *local* video path (so stage_generate's file check +
+    rename succeed without any network)."""
+    from unittest.mock import MagicMock
+
+    import httpx
+
+    submit_resp = MagicMock(spec=httpx.Response)
+    submit_resp.json.return_value = {"id": "cgt-i2v-passthrough-01"}
+    submit_resp.raise_for_status.return_value = None
+
+    poll_resp = MagicMock(spec=httpx.Response)
+    poll_resp.json.return_value = {
+        "id": "cgt-i2v-passthrough-01",
+        "status": "succeeded",
+        "content": {"video_url": video_path},
+    }
+    poll_resp.raise_for_status.return_value = None
+
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.__enter__.return_value = mock_client
+    mock_client.post.return_value = submit_resp
+    mock_client.get.return_value = poll_resp
+    return mock_client
+
+
+class TestGenTierPassthrough:
+    """H-2: CLI → JobArgs → stage_generate kwargs → seedance request body.
+
+    Drives the *real* SeedanceProvider through ``stage_generate`` with a mocked
+    httpx.Client (no network, no key-on-the-wire).  The poll returns a local file
+    so the orchestrator's file check and rename succeed.
+    """
+
+    def _job(self, synthetic_image, tmp_path, **overrides) -> i2v.JobArgs:
+        kw = dict(
+            image=str(synthetic_image),
+            provider="seedance",
+            workdir=str(tmp_path / "w"),
+            manifest_path=str(tmp_path / "job.json"),
+        )
+        kw.update(overrides)
+        job = i2v.JobArgs(**kw)
+        i2v.resolve_paths(job)
+        i2v.ensure_workdir(job)
+        return job
+
+    def test_high_tier_reaches_request_body(self, synthetic_image, tmp_path, monkeypatch):
+        """720p / 16:9 / 8s flow from JobArgs into the seedance HTTP body."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        # stage_generate renames the provider output to generated_video; give
+        # the poll a real file at the canonical path so rename is a no-op.
+        job = self._job(
+            synthetic_image,
+            tmp_path,
+            gen_resolution="720p",
+            gen_ratio="16:9",
+            duration=8,
+        )
+        Path(job.generated_video).parent.mkdir(parents=True, exist_ok=True)
+        Path(job.generated_video).write_bytes(b"fake-generated-video")
+
+        mock_client = _seedance_httpx(job.generated_video)
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+        ):
+            video = i2v.stage_generate(job, prepared_image=str(synthetic_image))
+
+        assert video == job.generated_video
+        body = mock_client.post.call_args[1]["json"]
+        assert body["resolution"] == "720p"
+        assert body["ratio"] == "16:9"
+        assert body["duration"] == 8
+
+    def test_defaults_are_480p_5s_adaptive(self, synthetic_image, tmp_path, monkeypatch):
+        """With no tier overrides the body reflects 480p / 5s / adaptive."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        job = self._job(synthetic_image, tmp_path)
+        Path(job.generated_video).parent.mkdir(parents=True, exist_ok=True)
+        Path(job.generated_video).write_bytes(b"fake-generated-video")
+
+        mock_client = _seedance_httpx(job.generated_video)
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+        ):
+            i2v.stage_generate(job, prepared_image=str(synthetic_image))
+
+        body = mock_client.post.call_args[1]["json"]
+        assert body["resolution"] == "480p"
+        assert body["ratio"] == "adaptive"
+        assert body["duration"] == 5
+
+    def test_manifest_records_gen_tier_params(self, synthetic_image, tmp_path, monkeypatch):
+        """The generate stage's manifest params capture resolution + ratio."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        job = self._job(
+            synthetic_image,
+            tmp_path,
+            gen_resolution="1080p",
+            gen_ratio="9:16",
+            duration=10,
+        )
+        Path(job.generated_video).parent.mkdir(parents=True, exist_ok=True)
+        Path(job.generated_video).write_bytes(b"fake-generated-video")
+
+        mock_client = _seedance_httpx(job.generated_video)
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+            patch.object(i2v, "stage_qa", side_effect=_qa_pass),
+            patch.object(i2v, "stage_streamcheck", side_effect=_no_op_streamcheck),
+        ):
+            i2v.run_pipeline(
+                job,
+                prepare=i2v.stage_prepare,
+                generate=i2v.stage_generate,
+                upscale=_passthrough_upscale,
+                convert=_fake_converter,
+            )
+
+        m = json.loads(Path(job.manifest_path).read_text())
+        gen = next(s for s in m["stages"] if s["name"] == "generate")
+        assert gen["params"]["resolution"] == "1080p"
+        assert gen["params"]["ratio"] == "9:16"
+        assert gen["params"]["duration"] == 10
+        assert gen["params"]["provider"] == "seedance"
 
 
 # ---------------------------------------------------------------------------
