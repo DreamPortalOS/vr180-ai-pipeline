@@ -278,6 +278,14 @@ class TestEnsureVenvAndDeps:
         RUNTIME_DEPS or the self-check --help will ImportError (issue #111)."""
         assert "fire" in setup.RUNTIME_DEPS, setup.RUNTIME_DEPS
 
+    def test_decord_is_in_runtime_deps(self):
+        """Both entry scripts (inpainting_inference.py &
+        depth_splatting_inference.py) ``from decord import VideoReader, cpu`` —
+        decord must be in RUNTIME_DEPS or the self-check --help will
+        ModuleNotFoundError (issue #116).  Mirrors the decord assertion in
+        test_setup_depthcrafter.py."""
+        assert "decord" in setup.RUNTIME_DEPS, setup.RUNTIME_DEPS
+
     def test_pip_mirror_forwarded_to_pip(self, sandbox):
         """--pip-mirror adds -i to the curated-deps install; torch keeps --index-url cu124."""
         sandbox.venv_dir.mkdir(parents=True)
