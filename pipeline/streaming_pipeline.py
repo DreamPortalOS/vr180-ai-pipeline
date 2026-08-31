@@ -209,6 +209,49 @@ def resolve_quality(
     return eye_size, streaming
 
 
+def preset_encode_args(
+    gop: int | None = None,
+    force_idr: bool = False,
+    faststart: bool | None = None,
+) -> list[str]:
+    """Build the ffmpeg args for the D-2 playback-preset encode knobs.
+
+    Encapsulates the three playback-side constraints (issue #79):
+
+      - **Fixed 1s GOP** (``-g`` / ``-keyint_min``) so seek precision is
+        bounded to one second.  ``-sc_threshold 0`` disables scene-cut
+        keyframes so the GOP stays fixed.
+      - **Segment-head IDR** (``-force_key_frames``) — a closed, seekable
+        GOP head as the playback end's dual-MediaPlayer crossfade needs.
+      - **+faststart** (``-movflags +faststart``) — moov 前置 for fast起播.
+        ``None`` = leave the caller's movflags untouched (passthrough).
+
+    Args:
+        gop: GOP length in frames (already translated from seconds by the
+            caller).  ``None``/``0`` = let ffmpeg pick (no GOP args).
+        force_idr: force an IDR at every GOP boundary.
+        faststart: ``True`` adds ``+faststart``; ``False`` drops it; ``None``
+            leaves the caller's movflags as-is.
+
+    Returns:
+        A flat list of ffmpeg arguments, possibly empty.
+    """
+    args: list[str] = []
+    if gop:  # 0 or None = unset
+        args += ["-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0"]
+        if force_idr:
+            # Force an IDR-style keyframe at the GOP interval.  Using the
+            # interval form avoids pinning every single frame position
+            # (which would defeat the fixed-GOP intent on variable fps).
+            args += ["-force_key_frames", f"expr:gte(t,n_forced*{gop})"]
+    if faststart is True:
+        args += ["-movflags", "+faststart"]
+    elif faststart is False:
+        args += ["-movflags", "0"]
+    # None = no movflags args (caller keeps its own)
+    return args
+
+
 def scaled_bitrate_mbps(
     eye_size: int,
     base_mbps: float = BASELINE_BITRATE_MBPS,
@@ -267,6 +310,9 @@ class StreamingPipeline:
         fps: int = 30,
         bitrate: str | None = None,
         hw_encoder: bool | str | None = None,
+        gop: int | None = None,
+        force_idr: bool = False,
+        faststart: bool | None = None,
     ):
         self.model_size = model_size
         self.device = resolve_device(device)
@@ -279,6 +325,11 @@ class StreamingPipeline:
         self.crf = crf
         self.fps = fps
         self.bitrate = bitrate
+        # D-2 (#79): playback-preset encode knobs — fixed 1s GOP, segment-head
+        # IDR, +faststart.  ``None``/False = off (pre-D-2 behaviour).
+        self.gop = gop
+        self.force_idr = force_idr
+        self.faststart = faststart
         # Hardware (NVENC) encoding — issue #49: CUDA availability does NOT
         # imply NVENC works (driver/ffmpeg ABI mismatch). "auto" (None) probes
         # the actual encoder with a tiny synthetic encode and falls back to
@@ -339,11 +390,16 @@ class StreamingPipeline:
             cmd += ["-b:v", self.bitrate]
         else:
             cmd += ["-crf", str(self.crf)]
+        # D-2 (#79): playback-preset encode knobs (fixed GOP / IDR / faststart).
+        # When no preset set a movflags (faststart is None), preserve the
+        # pre-D-2 default of +faststart so behaviour is unchanged without a
+        # preset; otherwise preset_encode_args owns the movflags arg.
+        cmd += preset_encode_args(self.gop, self.force_idr, self.faststart)
+        if self.faststart is None:
+            cmd += ["-movflags", "+faststart"]
         cmd += [
             "-pix_fmt",
             "yuv420p",
-            "-movflags",
-            "+faststart",
             output_path,
         ]
         return cmd
@@ -541,6 +597,9 @@ class RawFrameFFmpegWriter:
         bitrate: str | None = None,
         hw_encoder: bool = False,
         ffmpeg: str = "ffmpeg",
+        gop: int | None = None,
+        force_idr: bool = False,
+        faststart: bool | None = None,
     ):
         self.output_path = output_path
         self.width = width
@@ -551,6 +610,10 @@ class RawFrameFFmpegWriter:
         self.bitrate = bitrate
         self.hw_encoder = hw_encoder
         self.ffmpeg = ffmpeg
+        # D-2 (#79): playback-preset encode knobs.
+        self.gop = gop
+        self.force_idr = force_idr
+        self.faststart = faststart
         self._proc: subprocess.Popen | None = None
         self._stderr_file = None
         self._frames_written = 0
@@ -577,7 +640,12 @@ class RawFrameFFmpegWriter:
             cmd += ["-b:v", self.bitrate]
         else:
             cmd += ["-crf", str(self.crf)]
-        cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", self.output_path]
+        # D-2 (#79): preset encode knobs; preserve +faststart default when no
+        # preset is in play (faststart None).
+        cmd += preset_encode_args(self.gop, self.force_idr, self.faststart)
+        if self.faststart is None:
+            cmd += ["-movflags", "+faststart"]
+        cmd += ["-pix_fmt", "yuv420p", self.output_path]
         return cmd
 
     def open(self) -> "RawFrameFFmpegWriter":
