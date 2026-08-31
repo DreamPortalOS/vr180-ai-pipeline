@@ -22,7 +22,7 @@ python scripts/setup_stereocrafter.py
 
 The script is **idempotent** — re-running it only fills missing pieces.  It:
 
-1. Clones `Tencent/StereoCrafter` into `third_party/StereoCrafter/` (or
+1. Clones `TencentARC/StereoCrafter` into `third_party/StereoCrafter/` (or
    `git pull`s if already present).
 2. Builds a **dedicated** Python venv inside that checkout (never the
    project-root venv) and installs:
@@ -41,7 +41,7 @@ The script is **idempotent** — re-running it only fills missing pieces.  It:
 Created layout (everything is gitignored):
 
 ```
-third_party/StereoCrafter/    ← Tencent/StereoCrafter checkout (+ its own .venv)
+third_party/StereoCrafter/    ← TencentARC/StereoCrafter checkout (+ its own .venv)
 models/StereoCrafter/         ← TencentARC/StereoCrafter weights
 ```
 
@@ -175,7 +175,7 @@ dependencies (see `tests/test_stereo_crafter.py`).
 | `CUDA out of memory` | Resolution too high for your GPU | Lower `--stereocrafter-max-res` (e.g. 512 → 384) |
 | `No module named '...'` | Runtime dep missing from the dedicated venv | Add it to `RUNTIME_DEPS` in `scripts/setup_stereocrafter.py` and re-run |
 | `FileNotFoundError: python` | Wrong venv python path | The bootstrap writes it in-repo; run the bootstrap, or set `STEREOCRAFTER_PYTHON` |
-| Self-check fails | The inference entry point can't import | `python <venv>/python run.py --help` inside `third_party/StereoCrafter/` to see the real error |
+| Self-check fails | The inference entry point can't import | `python <venv>/python inpainting_inference.py --help` inside `third_party/StereoCrafter/` to see the real error |
 | `git clone` fails | Network / proxy (common from mainland China) | Set `http(s).proxy`, or clone manually then pass `--repo-dir` |
 | `snapshot_download` fails | HF access / network | Re-run the bootstrap; or clone `https://huggingface.co/TencentARC/StereoCrafter` into `models/StereoCrafter/` manually |
 | Subprocess non-zero exit | StereoCrafter internal error | Run the inference entry point directly to isolate; check `docs/STEREOCRAFTER_SETUP.md` |

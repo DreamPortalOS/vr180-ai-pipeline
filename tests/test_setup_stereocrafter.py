@@ -31,6 +31,30 @@ def _load_setup_module():
 setup = _load_setup_module()
 
 
+# ---------------------------------------------------------------------------
+# Constants: the clone URL must point at TencentARC (not Tencent), and the
+# weight repo must be TencentARC/StereoCrafter.  Pinned to guard against the
+# org-name typo that broke the bootstrap in issue #111.
+# ---------------------------------------------------------------------------
+
+
+class TestRepoUrls:
+    def test_clone_url_uses_tencent_arc_org(self):
+        """The git clone URL must use the TencentARC org (Tencent/ is wrong)."""
+        assert "TencentARC/StereoCrafter" in setup.NODE_REPO_URL, setup.NODE_REPO_URL
+        assert "Tencent/StereoCrafter" not in setup.NODE_REPO_URL, (
+            f"clone URL still uses the wrong Tencent/ org: {setup.NODE_REPO_URL}"
+        )
+
+    def test_clone_url_is_https_github(self):
+        assert setup.NODE_REPO_URL.startswith("https://github.com/")
+        assert setup.NODE_REPO_URL.endswith(".git")
+
+    def test_model_repo_id_uses_tencent_arc(self):
+        """The HF weight repo id must be TencentARC/StereoCrafter."""
+        assert setup._MODEL_REPO_ID == "TencentARC/StereoCrafter"
+
+
 @pytest.fixture
 def sandbox(monkeypatch, tmp_path):
     """Redirect every in-repo path constant to a tmp_path-based sandbox."""
@@ -249,6 +273,11 @@ class TestEnsureVenvAndDeps:
         # torch / torchvision must NOT be part of the curated-deps install.
         assert not any("torch==" in tok for tok in dc), f"torch leaks into deps install: {dc}"
 
+    def test_fire_is_in_runtime_deps(self, sandbox):
+        """The entry scripts use ``from fire import Fire`` — fire must be in
+        RUNTIME_DEPS or the self-check --help will ImportError (issue #111)."""
+        assert "fire" in setup.RUNTIME_DEPS, setup.RUNTIME_DEPS
+
     def test_pip_mirror_forwarded_to_pip(self, sandbox):
         """--pip-mirror adds -i to the curated-deps install; torch keeps --index-url cu124."""
         sandbox.venv_dir.mkdir(parents=True)
@@ -332,7 +361,7 @@ class TestSelfCheck:
         sandbox.venv_dir.mkdir(parents=True)
         sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
         sandbox.python_exe.write_text("# fake")
-        (sandbox.node_dir / "run.py").write_text("# fake")
+        (sandbox.node_dir / "inpainting_inference.py").write_text("# fake")
 
         fake_result = MagicMock()
         fake_result.returncode = 0
@@ -359,6 +388,31 @@ class TestSelfCheck:
         buf = setup.DryRunBuffer()
         setup.self_check(None, dry_run=True, buffer=buf)
         assert any("self-check" in s for s in buf.steps)
+
+    def test_dry_run_label_uses_real_entry_script_name(self, sandbox):
+        """The dry-run self-check label must reference the real upstream entry
+        script (inpainting_inference.py), not the non-existent run.py."""
+        buf = setup.DryRunBuffer()
+        setup.self_check(None, dry_run=True, buffer=buf)
+        label = buf.steps[-1]
+        assert "inpainting_inference.py" in label, label
+        assert "run.py" not in label, label
+
+    def test_find_inference_script_prefers_inpainting(self, sandbox):
+        """Upstream has no run.py; _find_inference_script must find the real
+        root-level fire-style entry scripts (issue #111)."""
+        sandbox.node_dir.mkdir(parents=True)
+        (sandbox.node_dir / "inpainting_inference.py").write_text("# fake")
+        found = setup._find_inference_script(sandbox.node_dir)
+        assert found is not None
+        assert found.name == "inpainting_inference.py"
+
+    def test_find_inference_script_falls_back_to_depth_splatting(self, sandbox):
+        sandbox.node_dir.mkdir(parents=True)
+        (sandbox.node_dir / "depth_splatting_inference.py").write_text("# fake")
+        found = setup._find_inference_script(sandbox.node_dir)
+        assert found is not None
+        assert found.name == "depth_splatting_inference.py"
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +455,7 @@ class TestMain:
         sandbox.venv_dir.mkdir(parents=True)
         sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
         sandbox.python_exe.write_text("# fake")
-        (sandbox.node_dir / "run.py").write_text("# fake")
+        (sandbox.node_dir / "inpainting_inference.py").write_text("# fake")
 
         with (
             patch("subprocess.check_call") as mock_cc,
@@ -418,7 +472,7 @@ class TestMain:
         sandbox.venv_dir.mkdir(parents=True)
         sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
         sandbox.python_exe.write_text("# fake")
-        (sandbox.node_dir / "run.py").write_text("# fake")
+        (sandbox.node_dir / "inpainting_inference.py").write_text("# fake")
         sandbox.model_dir.mkdir(parents=True)
         (sandbox.model_dir / "dummy.bin").write_text("w")
 
