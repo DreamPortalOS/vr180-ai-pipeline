@@ -30,6 +30,35 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# In-repo default paths (managed by scripts/setup_stereocrafter.py)
+# ---------------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# StereoCrafter checkout lives under third_party/ (gitignored).
+INREPO_REPO_DIR = _REPO_ROOT / "third_party" / "StereoCrafter"
+# Dedicated venv python created inside the checkout (never the project venv).
+INREPO_PYTHON_EXE = (
+    INREPO_REPO_DIR / ".venv" / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
+)
+# Model weights under models/StereoCrafter (models/ is gitignored).
+INREPO_CKPT_DIR = _REPO_ROOT / "models" / "StereoCrafter"
+
+# 12 GB VRAM (RTX 4070 SUPER) safe defaults.  512 short-side is the sweet spot;
+# bump to 768/1024 on larger GPUs via --stereocrafter-max-res or the env var.
+DEFAULT_MAX_RESOLUTION = 512
+
+
+def _inrepo_env_hint() -> str:
+    """Text appended to errors when no StereoCrafter paths were configured/found."""
+    return (
+        "No StereoCrafter repo/python/checkpoint paths were configured or found in-repo.\n"
+        "  Set --stereocrafter-repo-dir / STEREOCRAFTER_REPO_DIR to your checkout, or\n"
+        "  run the one-command bootstrap to deploy StereoCrafter inside the repo:\n"
+        "    python scripts/setup_stereocrafter.py\n"
+        "  See docs/STEREOCRAFTER_SETUP.md for disk/VRAM requirements and troubleshooting."
+    )
+
 
 # ---------------------------------------------------------------------------
 # CUDA guard
@@ -90,16 +119,21 @@ class CLIBackend(StereoCrafterBackend):
 
     Spawns the StereoCrafter repository's inference script — no server
     required.  All paths can be set via constructor arguments or
-    environment variables:
+    environment variables, with in-repo defaults (set by
+    :mod:`scripts/setup_stereocrafter.py`) adopted only when the paths
+    actually exist on disk:
 
-    ========================== ========================= ===============================
-    Constructor param          Env var                   Default
-    ========================== ========================= ===============================
-    ``repo_dir``               ``STEREOCRAFTER_REPO_DIR`` ``(none, required)``
-    ``python_exe``             ``STEREOCRAFTER_PYTHON``   ``python``
-    ``checkpoint_dir``         ``STEREOCRAFTER_CKPT_DIR`` ``(repo_dir)/checkpoints``
-    ``max_resolution``         ``STEREOCRAFTER_MAX_RES``  ``1024``
-    ========================== ========================= ===============================
+    ========================== ========================= =============================================
+    Constructor param          Env var                   Default (if env unset)
+    ========================== ========================= =============================================
+    ``repo_dir``               ``STEREOCRAFTER_REPO_DIR`` in-repo ``third_party/StereoCrafter`` *(if exists)*
+    ``python_exe``             ``STEREOCRAFTER_PYTHON``   in-repo venv python *(if exists)*, else ``python``
+    ``checkpoint_dir``         ``STEREOCRAFTER_CKPT_DIR`` in-repo ``models/StereoCrafter`` *(if exists)*, else ``(repo_dir)/checkpoints``
+    ``max_resolution``         ``STEREOCRAFTER_MAX_RES``  ``512`` (12 GB VRAM safe)
+    ========================== ========================= =============================================
+
+    If none of repo_dir / env / in-repo resolve, the constructor raises and
+    points to ``scripts/setup_stereocrafter.py``.
     """
 
     def __init__(
@@ -109,30 +143,38 @@ class CLIBackend(StereoCrafterBackend):
         checkpoint_dir: str | None = None,
         max_resolution: int | None = None,
     ) -> None:
-        # repo_dir: required (env fallback)
+        # repo_dir: explicit > env > in-repo default (only if it exists on disk)
         _repo_dir = repo_dir or os.environ.get("STEREOCRAFTER_REPO_DIR")
+        if not _repo_dir and INREPO_REPO_DIR.is_dir():
+            _repo_dir = str(INREPO_REPO_DIR)
         if not _repo_dir:
-            raise RuntimeError(
-                "StereoCrafter repository directory not specified.\n"
-                "Set --stereocrafter-repo-dir or the STEREOCRAFTER_REPO_DIR "
-                "environment variable.\n"
-                "See docs/STEREOCRAFTER_SETUP.md for setup instructions."
-            )
+            raise RuntimeError(_inrepo_env_hint())
         self.repo_dir: str = str(Path(_repo_dir).resolve())
 
-        # python_exe
-        self.python_exe = python_exe or os.environ.get("STEREOCRAFTER_PYTHON", "python")
+        # python_exe: explicit > env > in-repo venv python (only if exists) > "python"
+        if python_exe:
+            self.python_exe = python_exe
+        elif os.environ.get("STEREOCRAFTER_PYTHON"):
+            self.python_exe = os.environ["STEREOCRAFTER_PYTHON"]
+        elif INREPO_PYTHON_EXE.is_file():
+            self.python_exe = str(INREPO_PYTHON_EXE)
+        else:
+            self.python_exe = "python"
 
-        # checkpoint_dir
+        # checkpoint_dir: explicit > env > in-repo default > (repo_dir)/checkpoints
         if checkpoint_dir:
             self.checkpoint_dir = str(Path(checkpoint_dir).resolve())
         elif os.environ.get("STEREOCRAFTER_CKPT_DIR"):
             self.checkpoint_dir = str(Path(os.environ["STEREOCRAFTER_CKPT_DIR"]).resolve())
+        elif INREPO_CKPT_DIR.is_dir():
+            self.checkpoint_dir = str(INREPO_CKPT_DIR)
         else:
             self.checkpoint_dir = str(Path(self.repo_dir) / "checkpoints")
 
-        # max resolution for inference (short side)
-        self.max_resolution = max_resolution or int(os.environ.get("STEREOCRAFTER_MAX_RES", "1024"))
+        # max resolution for inference (short side); 512 is the 12 GB VRAM safe default.
+        self.max_resolution = max_resolution or int(
+            os.environ.get("STEREOCRAFTER_MAX_RES", str(DEFAULT_MAX_RESOLUTION))
+        )
 
         # Verify paths
         self._validate_paths()
@@ -149,7 +191,9 @@ class CLIBackend(StereoCrafterBackend):
         if not repo.is_dir():
             issues.append(
                 f"StereoCrafter repository not found at: {self.repo_dir}\n"
-                f"  Clone the repo:\n"
+                f"  Run the one-command bootstrap to deploy it in-repo:\n"
+                f"    python scripts/setup_stereocrafter.py\n"
+                f"  Or clone the repo manually:\n"
                 f"    git clone https://github.com/Tencent/StereoCrafter.git\n"
                 f"  See docs/STEREOCRAFTER_SETUP.md for details."
             )
