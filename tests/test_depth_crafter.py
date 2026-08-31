@@ -118,9 +118,11 @@ def test_estimator_input_not_found(mock_cuda: MagicMock) -> None:
 
 @patch("pipeline.depth_crafter._assert_cuda")
 def test_cli_backend_no_repo_dir(mock_cuda: MagicMock) -> None:
-    """CLIBackend should raise if no repo_dir provided."""
-    with pytest.raises(RuntimeError, match="repository directory not specified"):
-        CLIBackend(repo_dir=None)
+    """CLIBackend should raise if no repo_dir provided and no in-repo default exists."""
+    with patch("pipeline.depth_crafter.INREPO_REPO_DIR") as mock_inrepo:
+        mock_inrepo.is_dir.return_value = False
+        with pytest.raises(RuntimeError, match="repository directory not specified"):
+            CLIBackend(repo_dir=None)
 
 
 @patch("pipeline.depth_crafter._assert_cuda")
@@ -132,8 +134,8 @@ def test_cli_backend_repo_not_found(mock_cuda: MagicMock) -> None:
 
 @patch("pipeline.depth_crafter._assert_cuda")
 def test_cli_backend_no_inference_script(mock_cuda: MagicMock) -> None:
-    """CLIBackend should raise if repo dir exists but no inference script."""
-    with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(RuntimeError, match="No known inference script found"):
+    """CLIBackend should raise if repo dir exists but no run.py entry point."""
+    with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(RuntimeError, match=r"run\.py not found"):
         CLIBackend(repo_dir=tmpdir)
 
 
@@ -162,7 +164,7 @@ def test_cli_backend_subprocess_command(
     mock_run: MagicMock,
     mock_cuda: MagicMock,
 ) -> None:
-    """CLIBackend should build correct subprocess command."""
+    """CLIBackend should build the fire-style run.py command (lead-verified shape)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         script_path = Path(tmpdir) / "run.py"
         script_path.write_text("print('ok')")
@@ -187,18 +189,25 @@ def test_cli_backend_subprocess_command(
                 output_dir=outdir,
             )
 
-        # Verify command structure
+        # Verify the fire-style command structure:
+        #   python3 run.py <video> --save_folder <dir> --max_res 768 --cpu_offload model
         assert mock_run.call_count == 1
         args, kwargs = mock_run.call_args
         cmd = args[0]
         assert cmd[0] == "python3"
         assert cmd[1] == str(script_path)
-        assert cmd[2] == "--video"
-        assert cmd[4] == "--output_dir"
-        assert cmd[6] == "--max_resolution"
-        assert cmd[7] == "768"
-        assert cmd[8] == "--checkpoint_dir"
-        assert cmd[9] == str(Path(tmpdir) / "checkpoints")
+        # Positional video path (fire-style, not --video)
+        assert cmd[2] == str(script_path.resolve())
+        assert cmd[3] == "--save_folder"
+        assert cmd[5] == "--max_res"
+        assert cmd[6] == "768"
+        assert "--cpu_offload" in cmd
+        assert cmd[cmd.index("--cpu_offload") + 1] == "model"
+        # No legacy argparse flags should be present.
+        assert "--video" not in cmd
+        assert "--output_dir" not in cmd
+        assert "--max_resolution" not in cmd
+        assert "--checkpoint_dir" not in cmd
         assert kwargs.get("cwd") == str(Path(tmpdir).resolve())
         assert kwargs.get("shell") in (None, False)  # never shell=True
 
@@ -308,3 +317,130 @@ def test_cli_backend_env_vars(mock_cuda: MagicMock) -> None:
         backend = CLIBackend()  # no argument — uses env var
         assert backend.repo_dir == str(Path(tmpdir).resolve())
         assert backend.python_exe == "python"
+
+
+# ---------------------------------------------------------------------------
+# CLIBackend — in-repo default path fallback (G-6 style)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_backend_inrepo_defaults(tmp_path) -> None:
+    """When no args/env are set but in-repo dirs exist, CLIBackend picks them up."""
+    # Build a tmp_path-based in-repo layout (third_party/DepthCrafter + .venv + models).
+    repo_dir = tmp_path / "third_party" / "DepthCrafter"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "run.py").write_text("print('ok')")
+
+    venv_dir = repo_dir / ".venv"
+    python_dir = venv_dir / "Scripts" if os.name == "nt" else venv_dir / "bin"
+    python_dir.mkdir(parents=True)
+    (python_dir / "python").write_text("# fake")
+
+    model_dir = tmp_path / "models" / "DepthCrafter"
+    model_dir.mkdir(parents=True)
+    (model_dir / "readme").write_text("weights")
+
+    with (
+        patch("pipeline.depth_crafter._assert_cuda"),
+        patch("pipeline.depth_crafter.INREPO_REPO_DIR", repo_dir),
+        patch("pipeline.depth_crafter.INREPO_PYTHON_EXE", python_dir / "python"),
+        patch("pipeline.depth_crafter.INREPO_MODEL_DIR", model_dir),
+    ):
+        backend = CLIBackend()  # no args, no env
+
+    assert backend.repo_dir == str(repo_dir.resolve())
+    assert backend.python_exe == str((python_dir / "python").resolve())
+    assert backend.model_dir == str(model_dir.resolve())
+    # 12 GB VRAM-safe default.
+    assert backend.max_resolution == 512
+
+
+def test_cli_backend_inrepo_python_absent_falls_to_python(tmp_path) -> None:
+    """If the in-repo venv python is absent, python_exe falls back to 'python'."""
+    repo_dir = tmp_path / "third_party" / "DepthCrafter"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "run.py").write_text("print('ok')")
+    model_dir = tmp_path / "models" / "DepthCrafter"
+    model_dir.mkdir(parents=True)
+
+    with (
+        patch("pipeline.depth_crafter._assert_cuda"),
+        patch("pipeline.depth_crafter.INREPO_REPO_DIR", repo_dir),
+        patch("pipeline.depth_crafter.INREPO_PYTHON_EXE") as mock_py,
+        patch("pipeline.depth_crafter.INREPO_MODEL_DIR", model_dir),
+    ):
+        mock_py.is_file.return_value = False
+        backend = CLIBackend()
+    assert backend.python_exe == "python"
+
+
+def test_cli_backend_inrepo_nonexistent_skipped(tmp_path) -> None:
+    """If in-repo dirs are absent, CLIBackend falls through to the (required) env/args path."""
+    repo_dir = tmp_path / "third_party" / "DepthCrafter"  # does NOT exist
+    model_dir = tmp_path / "models" / "DepthCrafter"  # does NOT exist
+
+    with (
+        patch("pipeline.depth_crafter._assert_cuda"),
+        patch("pipeline.depth_crafter.INREPO_REPO_DIR", repo_dir),
+        patch("pipeline.depth_crafter.INREPO_PYTHON_EXE") as mock_py,
+        patch("pipeline.depth_crafter.INREPO_MODEL_DIR", model_dir),
+    ):
+        mock_py.is_file.return_value = False
+        # No in-repo default, no env → should raise the in-repo hint.
+        with pytest.raises(RuntimeError, match=r"setup_depthcrafter\.py"):
+            CLIBackend()
+
+
+def test_cli_backend_default_max_res_512() -> None:
+    """DEPTHCRAFTER_MAX_RES defaults to 512 (12 GB VRAM-safe) when unset."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "run.py").write_text("print('ok')")
+        # Wipe any env override so the module default is exercised.
+        with (
+            patch.dict(os.environ, {"DEPTHCRAFTER_REPO_DIR": tmpdir}, clear=False),
+            patch("pipeline.depth_crafter._assert_cuda"),
+        ):
+            backend = CLIBackend()
+        assert backend.max_resolution == 512
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_passes_process_length_and_target_fps(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """Optional --process_length / --target_fps are forwarded when set, omitted when None."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "run.py").write_text("print('ok')")
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        backend = CLIBackend(
+            repo_dir=tmpdir,
+            max_resolution=512,
+            process_length=64,
+            target_fps=24,
+        )
+
+        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="no depth files found"):
+            backend.estimate_video(input_path=str(Path(tmpdir) / "run.py"), output_dir=outdir)
+
+        cmd = mock_run.call_args[0][0]
+        assert "--process_length" in cmd
+        assert cmd[cmd.index("--process_length") + 1] == "64"
+        assert "--target_fps" in cmd
+        assert cmd[cmd.index("--target_fps") + 1] == "24"
+
+        # With the knobs unset, they must be absent from the command.
+        mock_run.reset_mock()
+        backend2 = CLIBackend(repo_dir=tmpdir, max_resolution=512)
+        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="no depth files found"):
+            backend2.estimate_video(input_path=str(Path(tmpdir) / "run.py"), output_dir=outdir)
+        cmd2 = mock_run.call_args[0][0]
+        assert "--process_length" not in cmd2
+        assert "--target_fps" not in cmd2
