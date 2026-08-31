@@ -6,11 +6,13 @@ import pytest
 
 from pipeline.naming import (
     PRESETS,
+    PROJECTION_MARKS,
     ROUTES,
     NamingError,
     SceneAssetSpec,
     compose_scene_name,
     parse_scene_name,
+    projection_mark_to_immersive,
     sidecar_scene_fields,
     validate_spec,
 )
@@ -318,3 +320,107 @@ class TestSidecarFields:
         fields = sidecar_scene_fields(SceneAssetSpec("s03", "santorini", 1, "vr180", "standalone"))
         # Should not raise.
         json.dumps(fields)
+
+
+# ---------------------------------------------------------------------------
+# D-3 (issue #80): optional projection mark in filename
+# ---------------------------------------------------------------------------
+
+
+class TestProjectionMarkCompose:
+    def test_default_no_mark_preserves_five_field_name(self):
+        """Backward compat: no mark -> exact pre-D-3 five-field name."""
+        spec = SceneAssetSpec("s03", "santorini", 1, "vr180", "standalone")
+        assert compose_scene_name(spec) == "s03_santorini_seg01_vr180_standalone.mp4"
+
+    def test_vr180_sbs_mark(self):
+        spec = SceneAssetSpec("s03", "santorini", 1, "vr180", "standalone", projection_mark="sbs")
+        assert compose_scene_name(spec) == "s03_santorini_seg01_vr180_sbs_standalone.mp4"
+
+    def test_fulldome_dome_mark(self):
+        spec = SceneAssetSpec("s05", "aurora", 2, "fulldome", "pcvr", projection_mark="dome")
+        assert compose_scene_name(spec) == "s05_aurora_seg02_fulldome_dome_pcvr.mp4"
+
+    def test_360_mark(self):
+        spec = SceneAssetSpec("s07", "globe", 1, "vr180", "source", projection_mark="equirect360")
+        assert compose_scene_name(spec) == "s07_globe_seg01_vr180_equirect360_source.mp4"
+
+
+class TestProjectionMarkParse:
+    def test_parse_five_field_gives_no_mark(self):
+        """A pre-D-3 filename parses with projection_mark=None."""
+        spec = parse_scene_name("s03_santorini_seg01_vr180_standalone.mp4")
+        assert spec.projection_mark is None
+        assert spec.route == "vr180"
+        assert spec.preset == "standalone"
+
+    def test_parse_six_field_gives_mark(self):
+        spec = parse_scene_name("s03_santorini_seg01_vr180_sbs_standalone.mp4")
+        assert spec.projection_mark == "sbs"
+        assert spec.route == "vr180"
+        assert spec.preset == "standalone"
+
+    def test_parse_dome_mark(self):
+        spec = parse_scene_name("s05_aurora_seg02_fulldome_dome_pcvr.mp4")
+        assert spec.projection_mark == "dome"
+        assert spec.route == "fulldome"
+
+    def test_parse_mark_with_underscored_scene_name(self):
+        """A scene_name containing underscores still round-trips with a mark."""
+        spec = parse_scene_name("s03_santorini_sunset_seg01_vr180_sbs_standalone.mp4")
+        assert spec.scene_name == "santorini_sunset"
+        assert spec.projection_mark == "sbs"
+
+
+class TestProjectionMarkRoundTrip:
+    def test_sbs_round_trips(self):
+        spec = SceneAssetSpec("s03", "santorini", 1, "vr180", "standalone", projection_mark="sbs")
+        assert parse_scene_name(compose_scene_name(spec)) == spec
+
+    @pytest.mark.parametrize("mark", list(PROJECTION_MARKS))
+    def test_all_marks_round_trip(self, mark):
+        spec = SceneAssetSpec("s01", "x", 1, "vr180", "standalone", projection_mark=mark)
+        assert parse_scene_name(compose_scene_name(spec)).projection_mark == mark
+
+
+class TestProjectionMarkValidation:
+    def test_unknown_mark_raises(self):
+        with pytest.raises(NamingError, match="projection_mark"):
+            validate_spec(SceneAssetSpec("s01", "x", 1, "vr180", "standalone", projection_mark="bad"))
+
+
+class TestProjectionMarkToImmersive:
+    """The mark -> immersive-field mapping is the filename-side mirror of
+    the D-3 contract the sidecar carries."""
+
+    def test_sbs_maps_to_vr180_equirect(self):
+        assert projection_mark_to_immersive("sbs") == {
+            "projection": "equirect",
+            "fov_deg": 180,
+            "stereo_layout": "side_by_side",
+        }
+
+    def test_dome_maps_to_fisheye_mono(self):
+        assert projection_mark_to_immersive("dome") == {
+            "projection": "fisheye_domemaster",
+            "fov_deg": 180,
+            "stereo_layout": "mono",
+        }
+
+    def test_equirect360_maps_to_360_mono(self):
+        assert projection_mark_to_immersive("equirect360") == {
+            "projection": "equirect360",
+            "fov_deg": 360,
+            "stereo_layout": "mono",
+        }
+
+    @pytest.mark.parametrize("mark", list(PROJECTION_MARKS))
+    def test_every_mark_maps(self, mark):
+        contract = projection_mark_to_immersive(mark)
+        assert contract["projection"]
+        assert 0 < contract["fov_deg"] <= 360
+        assert contract["stereo_layout"] in ("mono", "side_by_side")
+
+    def test_unknown_mark_raises(self):
+        with pytest.raises(NamingError, match="projection_mark"):
+            projection_mark_to_immersive("bogus")

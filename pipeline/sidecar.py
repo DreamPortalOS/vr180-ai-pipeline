@@ -44,6 +44,30 @@ import pipeline
 
 log = logging.getLogger("sidecar")
 
+# ---------------------------------------------------------------------------
+# D-3: projection contract (issue #80) — the machine-readable anchor that
+# DreamPortal's EPanoProjection switches on.  Values here are the single
+# source of truth; the enum literal strings MUST match the DreamPortal enum
+# names (Equirect360 / Equirect180_SBS / Fisheye_Dome) lowercased for JSON.
+# ---------------------------------------------------------------------------
+
+# Canonical projection tags.  Ordered to mirror the historical adoption
+# path (VR180 → dome → future 360) but extensible: a downstream that sees an
+# unknown value should fall back to a generic viewer, never crash.
+PROJECTION_EQUIRECT360 = "equirect360"  # 360° mono equirect (future)
+PROJECTION_EQUIRECT180 = "equirect"  # 180° equirect (VR180 family)
+PROJECTION_FISHEYE_DOME = "fisheye_domemaster"  # Domemaster azimuthal-equidistant
+PROJECTIONS = (PROJECTION_EQUIRECT360, PROJECTION_EQUIRECT180, PROJECTION_FISHEYE_DOME)
+
+# Canonical stereo layout tags.  "mono" = single frame (dome, 360, flat 2D);
+# "side_by_side" = left-right SBS equirect (VR180).
+STEREO_MONO = "mono"
+STEREO_SIDE_BY_SIDE = "side_by_side"
+STEREO_LAYOUTS = (STEREO_MONO, STEREO_SIDE_BY_SIDE)
+
+# Field names that MUST be present in every published immersive block (D-3).
+IMMERSIVE_REQUIRED_FIELDS = ("projection", "fov_deg", "stereo_layout", "eye_resolution")
+
 # ffprobe / ffmpeg binary resolution (mirrors pipeline.audio_mux).
 _FFPROBE_BIN = shutil.which("ffprobe") or "ffprobe"
 _FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
@@ -139,6 +163,11 @@ class SidecarError(Exception):
     """Raised when the sidecar cannot be written (missing file, ffprobe fail)."""
 
 
+class ImmersiveError(ValueError, SidecarError):
+    """Raised when the ``immersive`` block violates the D-3 projection contract
+    (missing required field, unknown projection / stereo tag, invalid FOV)."""
+
+
 def build_sidecar(
     video_path: str | Path,
     *,
@@ -212,8 +241,7 @@ def build_sidecar(
             "sample_rate": int(astream.get("sample_rate", 0)),
         }
 
-    if immersive is None:
-        immersive = _default_immersive(video_path)
+    immersive = _default_immersive(video_path, video) if immersive is None else normalize_immersive(immersive)
 
     gen = dict(generation or {})
     gen.setdefault("pipeline_version", pipeline.__version__)
@@ -290,28 +318,129 @@ def _out_path(video_path: str | Path, out_dir: str | Path | None) -> Path:
     return parent / f"{p.stem}.json"
 
 
-def _default_immersive(video_path: str | Path) -> dict[str, Any]:
+def _default_immersive(video_path: str | Path, video: dict[str, Any] | None = None) -> dict[str, Any]:
     """Infer a minimal immersive block from the file itself.
 
     Presence of *both* sv3d and st3d ISOBMFF boxes signals a VR180 SBS equirect
     artefact; otherwise (e.g. fulldome or plain mono) we fall back to a neutral
-    mono-fisheye-like block with empty ``spatial_metadata``. The caller should
-    overwrite when they know more (route, fov, eye resolution).
+    mono-fisheye-like block with empty ``spatial_metadata``. ``eye_resolution``
+    is inferred from the video stream dimensions when the caller has not
+    supplied it (D-3 requires the field to always be present). The caller
+    should overwrite when they know more (route, fov, exact eye size).
     """
     present = _scan_boxes(video_path)
+    # eye_resolution: [left_width, left_height] for SBS; [width, height] for
+    # mono.  For SBS the full frame is 2×eye-width, so halve the width.
+    v = video or {}
+    w = int(v.get("width", 0))
+    h = int(v.get("height", 0))
+    eye_resolution = [w, h]
+    if "sv3d" in present and "st3d" in present and w > 0:
+        eye_resolution = [w // 2, h]
+
     if "sv3d" in present and "st3d" in present:
         return {
-            "projection": "equirect",
+            "projection": PROJECTION_EQUIRECT180,
             "fov_deg": 180,
-            "stereo_layout": "side_by_side",
+            "stereo_layout": STEREO_SIDE_BY_SIDE,
+            "eye_resolution": eye_resolution,
             "spatial_metadata": ["sv3d", "st3d"],
         }
     return {
-        "projection": "fisheye_domemaster",
+        "projection": PROJECTION_FISHEYE_DOME,
         "fov_deg": 180,
-        "stereo_layout": "mono",
+        "stereo_layout": STEREO_MONO,
+        "eye_resolution": eye_resolution,
         "spatial_metadata": [b.decode("ascii") for b in _BOX_SCAN if b in [p.encode("ascii") for p in present]],
     }
+
+
+# ---------------------------------------------------------------------------
+# D-3: immersive block validation / normalisation
+# ---------------------------------------------------------------------------
+
+
+def normalize_immersive(immersive: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalise a caller-supplied ``immersive`` block.
+
+    Enforces the D-3 projection contract: the four fields
+    ``projection`` / ``fov_deg`` / ``stereo_layout`` / ``eye_resolution``
+    are required and must carry recognised values.  An unknown projection
+    tag is **not** rejected — the contract is extensible for future
+    projections (e.g. a hypothetical 180-over-under) — but unknown
+    ``stereo_layout`` values are rejected because the downstream stereo
+    renderer has a closed set.
+
+    Parameters
+    ----------
+    immersive:
+        The caller-supplied block (a mutable dict; this function never mutates
+        the input).
+
+    Returns
+    -------
+    dict
+        A clean copy with all four required fields present and valid.
+
+    Raises
+    ------
+    ImmersiveError
+        If a required field is missing, projection is unknown, stereo layout
+        is unknown, ``fov_deg`` is out of the supported range, or
+        ``eye_resolution`` is malformed.
+    """
+    out = dict(immersive)
+
+    # projection
+    proj = out.get("projection")
+    if proj is None:
+        raise ImmersiveError("immersive block missing required field 'projection'")
+    if proj not in PROJECTIONS:
+        # Allow unknown projections (extensibility) but warn so a typo is
+        # surfaced in logs; the downstream maps unknown → generic viewer.
+        log.warning("immersive.projection=%r is not in %s — passing through for extensibility", proj, list(PROJECTIONS))
+    out["projection"] = proj
+
+    # fov_deg
+    fov = out.get("fov_deg")
+    if fov is None:
+        raise ImmersiveError("immersive block missing required field 'fov_deg'")
+    try:
+        fov = float(fov)
+    except (TypeError, ValueError):
+        raise ImmersiveError(f"immersive.fov_deg must be numeric, got {fov!r}") from None
+    if not (0 < fov <= 360):
+        raise ImmersiveError(f"immersive.fov_deg must be in (0, 360], got {fov}")
+    # Keep int-looking FOVs as ints for clean JSON (180 not 180.0).
+    out["fov_deg"] = int(fov) if fov == int(fov) else fov
+
+    # stereo_layout
+    layout = out.get("stereo_layout")
+    if layout is None:
+        raise ImmersiveError("immersive block missing required field 'stereo_layout'")
+    if layout not in STEREO_LAYOUTS:
+        raise ImmersiveError(f"immersive.stereo_layout {layout!r} not in {list(STEREO_LAYOUTS)}")
+    out["stereo_layout"] = layout
+
+    # eye_resolution
+    eye = out.get("eye_resolution")
+    if eye is None:
+        raise ImmersiveError("immersive block missing required field 'eye_resolution'")
+    out["eye_resolution"] = _coerce_eye_resolution(eye)
+
+    return out
+
+
+def _coerce_eye_resolution(eye: Any) -> list[int]:
+    """Coerce ``eye_resolution`` to a two-element int list [width, height]."""
+    try:
+        w, h = eye
+    except (TypeError, ValueError):
+        raise ImmersiveError(f"immersive.eye_resolution must be a 2-tuple/list [w, h], got {eye!r}") from None
+    try:
+        return [int(w), int(h)]
+    except (TypeError, ValueError):
+        raise ImmersiveError(f"immersive.eye_resolution must be numeric, got {eye!r}") from None
 
 
 def _run_qa(path: str, ffprobe: str) -> dict[str, Any]:
