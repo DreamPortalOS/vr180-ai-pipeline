@@ -334,6 +334,17 @@ def parse_args(argv: list[str] | None = None):
         "Can also set SEEDVR2_RESOLUTION env var (default: 1440).",
     )
 
+    # H-1: audio passthrough (issue #73)
+    parser.add_argument(
+        "--copy-audio-from",
+        default=None,
+        metavar="PATH",
+        help="H-1: attach an audio track from this source file to the final VR180 "
+        "output (lossless -c copy remux). The sv3d/st3d VR metadata is preserved. "
+        "Implied audio source is the input video when omitted; pass an explicit path "
+        "to attach a different track.",
+    )
+
     # R-6: 180° Outpaint fill
     parser.add_argument(
         "--outpaint",
@@ -1478,6 +1489,16 @@ def main():
         if output:
             log.info(f"✅ Pipeline complete → {output}")
 
+        # H-1: audio passthrough. After all metadata (sv3d/st3d) is embedded,
+        # remux an audio track in with -c copy. ffmpeg -c copy preserves the
+        # user-data boxes, so the VR metadata survives; the audio source is
+        # explicit --copy-audio-from or, if omitted, the input video itself.
+        if output and getattr(args, "copy_audio_from", None):
+            _copy_audio_to_output(output, args.copy_audio_from)
+        elif output:
+            # Implicit: if the input video has an audio stream, copy it in.
+            _maybe_copy_audio_from_input(output, args.input)
+
         # V-3: persist the job manifest (write new / update resumed one).
         manifest_out = args.manifest if isinstance(args.manifest, str) else None
         if manifest is not None and manifest_out:
@@ -1524,6 +1545,34 @@ def main():
         files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
         frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
         run_metadata_stage(args, frames)
+
+
+# ---------------------------------------------------------------------------
+# H-1: audio passthrough helpers (issue #73)
+# ---------------------------------------------------------------------------
+
+
+def _copy_audio_to_output(output: str, source: str) -> None:
+    """Attach an audio track from *source* to the finished VR180 *output*."""
+    from pipeline.audio_mux import copy_audio_to
+
+    log.info("🔊 Copying audio track %s → %s", source, output)
+    copy_audio_to(output, source)
+    log.info("✅ Audio remux complete → %s", output)
+
+
+def _maybe_copy_audio_from_input(output: str, input_path: str) -> None:
+    """If the input video has an audio stream, copy it into the VR180 output.
+
+    No-op (silent) when the input has no audio — matches the orchestrator's
+    behaviour. Does not raise on missing audio; only on a real remux failure.
+    """
+    from pipeline.audio_mux import has_audio_stream
+
+    if not has_audio_stream(input_path):
+        return
+    log.info("🔊 Input %s has an audio stream — remuxing into %s", input_path, output)
+    _copy_audio_to_output(output, input_path)
 
 
 if __name__ == "__main__":

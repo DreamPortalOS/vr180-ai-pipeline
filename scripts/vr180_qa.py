@@ -68,6 +68,9 @@ class QAReport:
     bitrate_kbps: float = 0.0
     duration_s: float = 0.0
     codec: str = ""
+    # H-1: audio passthrough (issue #73). Empty string means "no audio stream".
+    audio_codec: str = ""
+    audio_bitrate_kbps: float = 0.0
 
     @property
     def failed(self) -> bool:
@@ -118,6 +121,36 @@ def _extract_stream_info(probe: dict, report: QAReport) -> None:
     bitrate = stream.get("bit_rate") or fmt.get("bit_rate") or 0
     report.bitrate_kbps = int(bitrate) / 1000.0
     report.duration_s = float(fmt.get("duration", 0.0) or 0.0)
+    _extract_audio_info(probe, report)
+
+
+def _extract_audio_info(probe: dict, report: QAReport) -> None:
+    """Populate audio_codec / audio_bitrate_kbps from the first audio stream.
+
+    H-1: the QA report surfaces audio presence so operators can tell a silent
+    VR180 from one with a track at a glance. Absence is a warning, not a fail.
+    """
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "audio":
+            report.audio_codec = stream.get("codec_name", "unknown")
+            abr = stream.get("bit_rate") or 0
+            report.audio_bitrate_kbps = int(abr) / 1000.0
+            return
+
+
+def _audio_check(report: QAReport) -> Check:
+    """Build the audio QA check. Present → pass with codec/bitrate; absent → warn."""
+    if report.audio_codec:
+        return Check(
+            "audio stream",
+            "pass",
+            f"{report.audio_codec} @ {report.audio_bitrate_kbps:.0f} kbps",
+        )
+    return Check(
+        "audio stream",
+        "warn",
+        "no audio stream — video will be silent (consider --copy-audio-from or a provider with AAC)",
+    )
 
 
 def _scan_boxes(path: str) -> dict[str, dict]:
@@ -167,6 +200,9 @@ def run_qa(path: str, ffprobe: str = "ffprobe") -> QAReport:
             f"{report.fps:.3g} fps, {report.bitrate_kbps:.0f} kbps, {report.duration_s:.1f}s",
         )
     )
+
+    # H-1: audio presence (warn, never fail).
+    report.checks.append(_audio_check(report))
 
     # ── ISOBMFF boxes ─────────────────────────────────────────────────────
     boxes = _scan_boxes(path)
