@@ -47,14 +47,33 @@ python scripts/setup_depthcrafter.py --pip-mirror https://pypi.tuna.tsinghua.edu
 >
 > **Node-deps install strategy.**  The upstream
 > [`Tencent/DepthCrafter`](https://github.com/Tencent/DepthCrafter) repo
-> declares its dependencies in **`pyproject.toml`** (there is no
-> `requirements.txt` at the repo root).  The bootstrap therefore runs
-> `pip install -e .` from inside the node dir so diffusers/transformers/…
-> come in off that declaration.  A legacy `requirements.txt` is still honored
-> if upstream ever adds one (both are probed; pyproject wins).  The bootstrap
-> also pins `fire` explicitly — `run.py` imports it at load time but upstream's
-> pyproject omits it.  If the checkout has *neither* manifest, the bootstrap
-> fails hard (exit 1) rather than silently reporting success.
+> declares its dependencies in **`pyproject.toml`**, but the bootstrap
+> deliberately does **not** run `pip install -e .` against it.  Instead it
+> installs a curated subset of the packages `run.py` actually imports
+> (``fire diffusers transformers accelerate huggingface-hub mediapy decord``),
+> exposed as the `RUNTIME_DEPS` constant in the script.  Reasons we do not
+> follow the upstream pyproject wholesale:
+>
+> - **Editable install is broken.**  The upstream repo is a *flat-layout*
+>   (`depthcrafter/` + `visualization/` top-level packages), so setuptools
+>   rejects `pip install -e .` with "Multiple top-level packages discovered in
+>   a flat-layout".  DepthCrafter is run as a script (`run.py`), never installed
+>   as a package, so an editable install is unnecessary.
+> - **Python / torch version conflicts.**  The upstream pyproject declares
+>   `requires-python = ">=3.13"` and pins `torch>=2.7.1` / `torchvision>=0.22.1`.
+>   Our dedicated venv runs **Python 3.12** and pins `torch==2.6.0` +
+>   `torchvision==0.21.0` (cu124) in Step 2 of the bootstrap.  Following the
+>   upstream declaration would either bump torch off the verified cu124 pairing
+>   or fail outright on Python 3.12.
+> - **Heavy demo/dev deps are excluded.**  `gradio`, `xformers`, `pytest` and
+>   `matplotlib` from the upstream set are demo/development dependencies and
+>   are intentionally left out of the 12 GB VRAM inference environment.
+>
+> The curated list keeps the venv aligned with our pinned cu124 torch pairing
+> and with what `run.py` actually needs at import time.  If the list needs to
+> grow (e.g. a new hard import in `run.py`), update `RUNTIME_DEPS` in
+> `scripts/setup_depthcrafter.py` — torch/torchvision stay in Step 2 so a
+> transitive dependency can never bump them.
 >
 > **Self-check is a hard gate.**  The final step runs `run.py --help` with the
 > dedicated venv and treats any non-zero exit (or missing venv-python / missing

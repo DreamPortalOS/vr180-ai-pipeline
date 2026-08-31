@@ -16,11 +16,13 @@ Steps (idempotent — re-running only fills missing pieces):
        ``--repo-dir`` can point at an existing checkout instead (e.g. ``D:/DepthCrafter``).
     2. Build a **dedicated** venv inside the node dir (never the project-root venv):
        - torch==2.6.0 + torchvision==0.21.0 on the official cu124 index (stable, NOT nightly).
-       - Node deps: the upstream DepthCrafter repo ships **``pyproject.toml```` (not
-         ``requirements.txt``), so we ``pip install -e .`` from the node dir.  A
-         legacy ``requirements.txt`` is still honored if present (both probed,
-         pyproject wins).  ``fire`` is additionally pinned because upstream's
-         pyproject omits it yet ``run.py`` needs it at import time.
+       - Node runtime deps: a curated subset (``RUNTIME_DEPS``) of the packages
+         ``run.py`` actually imports.  We deliberately do NOT run ``pip install
+         -e .`` against the upstream pyproject — it is a flat-layout (setuptools
+         rejects it with "Multiple top-level packages"), declares
+         ``requires-python >= 3.13`` and pins torch>=2.7.1/torchvision>=0.22.1,
+         which would conflict with our Python 3.12 + pinned cu124 torch.
+         See docs/DEPTHCRAFTER_SETUP.md for the full rationale.
     3. Download ``tencent/DepthCrafter`` weights into ``models/DepthCrafter/`` via
        ``huggingface_hub.snapshot_download`` (existing download is skipped).
        The base model ``stabilityai/stable-video-diffusion-img2vid-xt`` is pulled
@@ -71,11 +73,35 @@ TORCH_VERSION = "2.6.0"
 TORCHVISION_VERSION = "0.21.0"
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
 
-# Runtime deps the upstream pyproject.toml omits but run.py imports at load time.
-# Upstream (Tencent/DepthCrafter) declares its deps via pyproject.toml; fire is
-# used by run.py's fire-style CLI yet is missing from that declaration, so we
-# pin it explicitly to keep ``run.py --help`` working.
-EXTRA_RUNTIME_DEPS: tuple[str, ...] = ("fire",)
+# Curated runtime deps that run.py actually imports.
+#
+# Deliberately NOT a full install of the upstream pyproject.toml.  Reasons:
+#   1. The upstream repo is a flat-layout (``depthcrafter/`` + ``visualization/``
+#      top-level packages), so ``pip install -e .`` fails with
+#      "Multiple top-level packages discovered in a flat-layout".  DepthCrafter
+#      is run as a script (``run.py``), so it never needs to be installed as a
+#      package — the curated list is all the CLI needs.
+#   2. The upstream pyproject declares ``requires-python = ">=3.13"`` and pins
+#      ``torch>=2.7.1``, ``torchvision>=0.22.1``, ``xformers``, ``gradio`` and
+#      ``decord``.  Our dedicated venv runs Python 3.12 and pins
+#      ``torch==2.6.0`` / ``torchvision==0.21.0`` (cu124) in Step 2 — following
+#      the upstream declaration wholesale would either bump torch (breaking the
+#      cu124 pairing) or fail outright on Python 3.12.
+#   3. ``gradio`` / ``xformers`` / ``pytest`` / ``matplotlib`` are demo/dev
+#      dependencies and are intentionally left out; ``decord`` is present as a
+#      hard video-loader dependency that run.py may require at load time.
+#
+# torch / torchvision are intentionally NOT here — they are pinned in Step 2
+# against the cu124 index so they can never be bumped by a transitive dep.
+RUNTIME_DEPS: tuple[str, ...] = (
+    "fire",  # run.py's fire-style CLI
+    "diffusers",  # DepthCrafter pipeline weights + inference
+    "transformers",  # pulled by diffusers models
+    "accelerate",  # used by diffusers SVD loader
+    "huggingface-hub",  # weight download / caching
+    "mediapy",  # video I/O (numpy-media)
+    "decord",  # video loader (used at load time)
+)
 
 # HuggingFace repo for the diffusers weights.
 _MODEL_REPO_ID = "tencent/DepthCrafter"
@@ -219,29 +245,6 @@ def _venv_python_for(node_dir: Path) -> Path:
     return venv_dir / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
 
 
-def _node_dep_install_target(node_dir: Path) -> tuple[str, str | None]:
-    """Resolve how to install the node repo's own deps.
-
-    Upstream Tencent/DepthCrafter ships ``pyproject.toml`` (no
-    ``requirements.txt``); a legacy ``requirements.txt`` is honored if that is
-    all there is.  Returns ``(kind, value)`` where kind is ``"pyproject"`` /
-    ``"requirements"`` and value is the path (pyproject) or ``None`` (the
-    ``-r`` token already carries the path).  Raises if **neither** is present —
-    a node checkout with no declared deps is fatal, not a WARNING.
-    """
-    has_pyproject = (node_dir / "pyproject.toml").is_file()
-    has_requirements = (node_dir / "requirements.txt").is_file()
-    if has_pyproject:
-        return "pyproject", str(node_dir)
-    if has_requirements:
-        return "requirements", str(node_dir / "requirements.txt")
-    raise RuntimeError(
-        "No pyproject.toml or requirements.txt found in the DepthCrafter checkout "
-        f"at {node_dir} — cannot install node deps. The repo clone may be incomplete "
-        "(check that `git clone` finished, or re-run the bootstrap)."
-    )
-
-
 def ensure_venv_and_deps(
     explicit_repo_dir: str | None,
     pip_mirror: str | None,
@@ -261,10 +264,7 @@ def ensure_venv_and_deps(
             log.info("Creating dedicated venv at %s (this may take a moment)...", venv_dir)
             subprocess.check_call(venv_cmd, timeout=300)
         else:
-            log.info("Dedicated venv already exists at %s — re-installing requirements.", venv_dir)
-
-    # Probe the node's dep manifest.  Fatal if neither is present.
-    dep_kind, dep_value = _node_dep_install_target(node_dir) if not dry_run else ("pyproject", None)
+            log.info("Dedicated venv already exists at %s — re-installing runtime deps.", venv_dir)
 
     # In dry-run mode, always plan the venv-creation step (it would be needed if the venv is absent).
     if dry_run:
@@ -291,18 +291,17 @@ def ensure_venv_and_deps(
     ]
     run_step(cmd_torch, dry_run=dry_run, buffer=buffer, timeout=1200)
 
-    # (b) the node repo's own deps.
+    # (b) the curated runtime deps for run.py.
     #
-    # pyproject.toml path → ``pip install -e .`` from the node dir (the upstream
-    # Tencent/DepthCrafter layout).  legacy requirements.txt path → ``-r <file>``.
+    # See the RUNTIME_DEPS constant above for why we install a curated subset
+    # instead of ``pip install -e .`` from the upstream pyproject.  Notably:
+    # no -e (DepthCrafter is run as a script, never installed as a package),
+    # and no torch/torchvision (those are pinned in step (a) so a transitive
+    # dep can never bump them off the cu124 pairing).
     base_cmd = [str(python_exe), "-m", "pip", "install", "--retries", "10"]
     mirror_args = _pip_mirror_args(pip_mirror)
-    if dep_kind == "pyproject":
-        cmd_node = [*base_cmd, "-e", dep_value, *EXTRA_RUNTIME_DEPS, *mirror_args]
-        label_node = f"pip install -e {dep_value} {' '.join(EXTRA_RUNTIME_DEPS)}".rstrip()
-    else:
-        cmd_node = [*base_cmd, "-r", dep_value, *mirror_args]
-        label_node = f"pip install -r {dep_value}"
+    cmd_node = [*base_cmd, *RUNTIME_DEPS, *mirror_args]
+    label_node = f"pip install {' '.join(RUNTIME_DEPS)}"
     run_step(cmd_node, dry_run=dry_run, buffer=buffer, timeout=1200, label=label_node)
 
 
