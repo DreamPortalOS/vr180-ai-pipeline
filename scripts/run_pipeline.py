@@ -1393,7 +1393,7 @@ def main():
         output = get_output_path(args, suffix="_dome.mp4")
         result = mapper.convert(args.input, output)
         log.info(f"✅ Fulldome conversion complete → {result}")
-        _write_sidecar_from_args(result, "fulldome", args)
+        _write_sidecar_from_args(result, "fulldome", args, fov=args.dome_fov, eye_size=(args.dome_size, args.dome_size))
         return
 
     if args.stage == "all":
@@ -1668,24 +1668,56 @@ def _write_sidecar(output_path: str, route: str) -> None:
     _write_sidecar_from_args(output_path, route, None)
 
 
-def _write_sidecar_from_args(output_path: str, route: str, args: argparse.Namespace | None) -> None:
+def _write_sidecar_from_args(
+    output_path: str,
+    route: str,
+    args: argparse.Namespace | None,
+    *,
+    fov: float | None = None,
+    eye_size: tuple[int, int] | None = None,
+) -> None:
     """``_write_sidecar`` with optional args so the batch stage (which holds
-    ``args.output_width`` / ``args.output_height``) can include eye resolution."""
-    from pipeline.sidecar import write_sidecar
+    ``args.output_width`` / ``args.output_height``) can include eye resolution.
 
+    ``fov`` and ``eye_size`` are optional overrides so the fulldome path can
+    pass its (potentially non-180°) dome_fov and its square output_size.  When
+    omitted the VR180 defaults (180°, args.resolved eye) apply.
+
+    D-3: the ``immersive`` block is normalised through
+    :func:`pipeline.sidecar.normalize_immersive` so the D-3 projection
+    contract (required projection/fov_deg/stereo_layout/eye_resolution) is
+    enforced and the projection/stereo tags come from the canonical enums.
+    """
+    from pipeline.sidecar import (
+        PROJECTION_EQUIRECT180,
+        PROJECTION_FISHEYE_DOME,
+        STEREO_MONO,
+        STEREO_SIDE_BY_SIDE,
+        normalize_immersive,
+        write_sidecar,
+    )
+
+    vr180 = route == "vr180"
     immersive = {
-        "projection": "equirect" if route == "vr180" else "fisheye_domemaster",
-        "fov_deg": 180,
-        "stereo_layout": "side_by_side" if route == "vr180" else "mono",
-        "spatial_metadata": ["sv3d", "st3d"] if route == "vr180" else [],
+        "projection": PROJECTION_EQUIRECT180 if vr180 else PROJECTION_FISHEYE_DOME,
+        "fov_deg": (fov if fov is not None else 180),
+        "stereo_layout": STEREO_SIDE_BY_SIDE if vr180 else STEREO_MONO,
+        "spatial_metadata": ["sv3d", "st3d"] if vr180 else [],
     }
-    if route == "vr180" and args is not None:
+
+    # eye_resolution: required by the D-3 contract.  Prefer the explicit
+    # eye_size override (fulldome), else resolve from args (VR180 SBS).
+    if eye_size is not None:
+        w, h = eye_size
+        immersive["eye_resolution"] = [int(w), int(h)]
+    elif args is not None:
         w = int(getattr(args, "output_width", 0) or 0)
         h = int(getattr(args, "output_height", 0) or 0)
         if w and h:
             immersive["eye_resolution"] = [w, h]
+
     try:
-        write_sidecar(output_path, immersive=immersive, generation={"route": route})
+        write_sidecar(output_path, immersive=normalize_immersive(immersive), generation={"route": route})
     except Exception as exc:
         log.warning("⚠️  Sidecar write failed for %s: %s", output_path, exc)
 

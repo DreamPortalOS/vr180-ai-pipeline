@@ -762,12 +762,17 @@ def _write_sidecar(output_path: str, args: JobArgs) -> None:
     :func:`scripts.vr180_qa.run_qa`; that is cheap (ffprobe + box scan only)
     and keeps this orchestrator decoupled from the QA report shape.
     """
-    from pipeline.sidecar import write_sidecar
+    from pipeline.sidecar import (
+        PROJECTION_EQUIRECT180,
+        STEREO_SIDE_BY_SIDE,
+        normalize_immersive,
+        write_sidecar,
+    )
 
     immersive = {
-        "projection": "equirect",
+        "projection": PROJECTION_EQUIRECT180,
         "fov_deg": 180,
-        "stereo_layout": "side_by_side",
+        "stereo_layout": STEREO_SIDE_BY_SIDE,
         "spatial_metadata": ["sv3d", "st3d"],
     }
     w = int(args.output_width or 0)
@@ -786,7 +791,7 @@ def _write_sidecar(output_path: str, args: JobArgs) -> None:
     generation = {k: v for k, v in generation.items() if v is not None}
 
     try:
-        write_sidecar(output_path, immersive=immersive, generation=generation)
+        write_sidecar(output_path, immersive=normalize_immersive(immersive), generation=generation)
     except Exception as exc:
         log.warning("⚠️  Sidecar write failed for %s: %s", output_path, exc)
 

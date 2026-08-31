@@ -19,8 +19,15 @@ import pytest
 import pipeline
 from pipeline import sidecar
 from pipeline.sidecar import (
+    IMMERSIVE_REQUIRED_FIELDS,
+    PROJECTION_EQUIRECT180,
+    PROJECTION_EQUIRECT360,
+    PROJECTION_FISHEYE_DOME,
+    PROJECTIONS,
+    ImmersiveError,
     SidecarError,
     build_sidecar,
+    normalize_immersive,
     write_sidecar,
 )
 from pipeline.spherical_injector import (
@@ -253,10 +260,186 @@ class TestBuildSidecar:
         assert record["immersive"]["stereo_layout"] == "mono"
         assert record["immersive"]["spatial_metadata"] == []
 
+    def test_fulldome_default_includes_eye_resolution(self, tmp_path, monkeypatch):
+        """D-3: the default fulldome immersive block MUST carry eye_resolution
+        (the dome frame size), not just VR180."""
+        mp4 = _make_mp4(tmp_path, "auto_dome.mp4")  # no sv3d/st3d
+        _mock_ffprobe(monkeypatch, _probe_json(width=4096, height=4096))
+        _mock_run_qa(monkeypatch, passed=True)
+
+        record = build_sidecar(mp4)
+        assert record["immersive"]["eye_resolution"] == [4096, 4096]
+
+    def test_vr180_default_includes_halved_eye_resolution(self, tmp_path, monkeypatch):
+        """D-3: VR180 SBS default infers eye resolution by halving the SBS
+        frame width (one eye = half the frame)."""
+        mp4 = _make_mp4(tmp_path, "auto_vr180.mp4", _sv3d_st3d_for(5760, 2880))
+        _mock_ffprobe(monkeypatch, _probe_json(width=5760, height=2880))
+        _mock_run_qa(monkeypatch, passed=True)
+
+        record = build_sidecar(mp4)
+        assert record["immersive"]["eye_resolution"] == [2880, 2880]
+
 
 # ---------------------------------------------------------------------------
-# Sidecar writer — file IO tests
+# D-3: projection contract — normalize_immersive + required fields
 # ---------------------------------------------------------------------------
+
+
+class TestNormalizeImmersive:
+    """Issue #80: the immersive block is the DreamPortal EPanoProjection
+    contract anchor.  ``projection`` / ``fov_deg`` / ``stereo_layout`` /
+    ``eye_resolution`` are all required and validated."""
+
+    def test_canonical_vr180_block_passes(self):
+        block = normalize_immersive(
+            {
+                "projection": "equirect",
+                "fov_deg": 180,
+                "stereo_layout": "side_by_side",
+                "eye_resolution": [2880, 2880],
+                "spatial_metadata": ["sv3d", "st3d"],
+            }
+        )
+        assert block["projection"] == PROJECTION_EQUIRECT180
+        assert block["fov_deg"] == 180
+        assert block["eye_resolution"] == [2880, 2880]
+
+    def test_canonical_fulldome_block_passes(self):
+        block = normalize_immersive(
+            {
+                "projection": "fisheye_domemaster",
+                "fov_deg": 180,
+                "stereo_layout": "mono",
+                "eye_resolution": [4096, 4096],
+            }
+        )
+        assert block["projection"] == PROJECTION_FISHEYE_DOME
+
+    def test_360_fov_passes(self):
+        """Future 360 support uses the same field with fov_deg=360."""
+        block = normalize_immersive(
+            {
+                "projection": "equirect360",
+                "fov_deg": 360,
+                "stereo_layout": "mono",
+                "eye_resolution": [4096, 2048],
+            }
+        )
+        assert block["fov_deg"] == 360
+        assert block["projection"] == PROJECTION_EQUIRECT360
+
+    def test_fov_kept_int_when_integer_valued(self):
+        block = normalize_immersive(
+            {"projection": "equirect", "fov_deg": 180, "stereo_layout": "side_by_side", "eye_resolution": [1, 1]}
+        )
+        assert isinstance(block["fov_deg"], int)
+        assert block["fov_deg"] == 180
+
+    def test_fov_kept_float_when_fractional(self):
+        block = normalize_immersive(
+            {"projection": "equirect", "fov_deg": 220.5, "stereo_layout": "mono", "eye_resolution": [1, 1]}
+        )
+        assert block["fov_deg"] == 220.5
+
+    def test_missing_projection_raises(self):
+        with pytest.raises(ImmersiveError, match="projection"):
+            normalize_immersive({"fov_deg": 180, "stereo_layout": "mono", "eye_resolution": [1, 1]})
+
+    def test_missing_fov_raises(self):
+        with pytest.raises(ImmersiveError, match="fov_deg"):
+            normalize_immersive({"projection": "equirect", "stereo_layout": "mono", "eye_resolution": [1, 1]})
+
+    def test_missing_stereo_layout_raises(self):
+        with pytest.raises(ImmersiveError, match="stereo_layout"):
+            normalize_immersive({"projection": "equirect", "fov_deg": 180, "eye_resolution": [1, 1]})
+
+    def test_missing_eye_resolution_raises(self):
+        """The headline D-3 requirement: eye_resolution is now required."""
+        with pytest.raises(ImmersiveError, match="eye_resolution"):
+            normalize_immersive({"projection": "equirect", "fov_deg": 180, "stereo_layout": "side_by_side"})
+
+    @pytest.mark.parametrize("bad_fov", [0, -1, 361, 400])
+    def test_fov_out_of_range_raises(self, bad_fov):
+        with pytest.raises(ImmersiveError, match="fov_deg"):
+            normalize_immersive(
+                {"projection": "equirect", "fov_deg": bad_fov, "stereo_layout": "mono", "eye_resolution": [1, 1]}
+            )
+
+    def test_unknown_stereo_layout_raises(self):
+        with pytest.raises(ImmersiveError, match="stereo_layout"):
+            normalize_immersive(
+                {"projection": "equirect", "fov_deg": 180, "stereo_layout": "over_under", "eye_resolution": [1, 1]}
+            )
+
+    def test_unknown_projection_passes_with_warning(self, caplog):
+        """Unknown projections pass through (extensibility for future
+        projection modes the contract hasn't enumerated yet) but log a
+        warning so typos surface."""
+        with caplog.at_level("WARNING", logger="sidecar"):
+            block = normalize_immersive(
+                {
+                    "projection": "equirect180_over_under",
+                    "fov_deg": 180,
+                    "stereo_layout": "mono",
+                    "eye_resolution": [1, 1],
+                }
+            )
+        assert block["projection"] == "equirect180_over_under"
+        assert "not in" in caplog.text
+
+    def test_eye_resolution_coerced_to_int_list(self):
+        block = normalize_immersive(
+            {
+                "projection": "equirect",
+                "fov_deg": 180,
+                "stereo_layout": "side_by_side",
+                "eye_resolution": ("2880", "2880"),
+            }
+        )
+        assert block["eye_resolution"] == [2880, 2880]
+
+    def test_eye_resolution_malformed_raises(self):
+        with pytest.raises(ImmersiveError, match="eye_resolution"):
+            normalize_immersive(
+                {"projection": "equirect", "fov_deg": 180, "stereo_layout": "mono", "eye_resolution": [1]}
+            )
+
+    def test_input_not_mutated(self):
+        src = {"projection": "equirect", "fov_deg": 180, "stereo_layout": "side_by_side", "eye_resolution": [1, 1]}
+        normalize_immersive(src)
+        # Caller's dict is untouched.
+        assert src == {
+            "projection": "equirect",
+            "fov_deg": 180,
+            "stereo_layout": "side_by_side",
+            "eye_resolution": [1, 1],
+        }
+
+    def test_required_fields_constant_matches_contract(self):
+        """The required-field tuple is the public contract surface; lock it."""
+        assert IMMERSIVE_REQUIRED_FIELDS == ("projection", "fov_deg", "stereo_layout", "eye_resolution")
+
+    def test_projections_constant_has_all_three(self):
+        """The three EPanoProjection enum mirrors are present and ordered."""
+        assert PROJECTIONS == ("equirect360", "equirect", "fisheye_domemaster")
+
+
+class TestBuildSidecarEnforcesContract:
+    """build_sidecar normalises caller-immersive through the D-3 contract,
+    so a caller block missing eye_resolution raises (rather than silently
+    writing a non-compliant sidecar)."""
+
+    def test_caller_immersive_missing_eye_resolution_raises(self, tmp_path, monkeypatch):
+        mp4 = _make_mp4(tmp_path, "bad.mp4", _sv3d_st3d_for(5760, 2880))
+        _mock_ffprobe(monkeypatch, _probe_json())
+        _mock_run_qa(monkeypatch, passed=True)
+
+        with pytest.raises(ImmersiveError, match="eye_resolution"):
+            build_sidecar(
+                mp4,
+                immersive={"projection": "equirect", "fov_deg": 180, "stereo_layout": "side_by_side"},
+            )
 
 
 class TestWriteSidecar:
@@ -345,7 +528,12 @@ def test_immersive_and_generation_override_default(tmp_path, monkeypatch):
 
     record = build_sidecar(
         mp4,
-        immersive={"projection": "equirect", "fov_deg": 180, "stereo_layout": "side_by_side"},
+        immersive={
+            "projection": "equirect",
+            "fov_deg": 180,
+            "stereo_layout": "side_by_side",
+            "eye_resolution": [2048, 2048],
+        },
         generation={"route": "vr180"},
     )
     assert record["immersive"]["projection"] == "equirect"
