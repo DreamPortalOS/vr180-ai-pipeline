@@ -1370,6 +1370,8 @@ def main():
             raise
         os.replace(injected, result)
         log.info(f"✅ Streaming pipeline complete (sv3d/st3d injected) → {result}")
+        # D-1: sidecar — one JSON per output artefact (see pipeline.sidecar).
+        _write_sidecar_from_args(result, "vr180", args)
         return
 
     # R-5: Fulldome projection mode — skip all depth/stereo/equirect/metadata.
@@ -1391,6 +1393,7 @@ def main():
         output = get_output_path(args, suffix="_dome.mp4")
         result = mapper.convert(args.input, output)
         log.info(f"✅ Fulldome conversion complete → {result}")
+        _write_sidecar_from_args(result, "fulldome", args)
         return
 
     if args.stage == "all":
@@ -1546,6 +1549,10 @@ def main():
             # Implicit: if the input video has an audio stream, copy it in.
             _maybe_copy_audio_from_input(output, args.input)
 
+        # D-1: sidecar — one JSON per output artefact (see pipeline.sidecar).
+        if output:
+            _write_sidecar_from_args(output, "vr180", args)
+
         # V-3: persist the job manifest (write new / update resumed one).
         manifest_out = args.manifest if isinstance(args.manifest, str) else None
         if manifest is not None and manifest_out:
@@ -1624,6 +1631,49 @@ def _maybe_copy_audio_from_input(output: str, input_path: str) -> None:
         return
     log.info("🔊 Input %s has an audio stream — remuxing into %s", input_path, output)
     _copy_audio_to_output(output, input_path)
+
+
+# ---------------------------------------------------------------------------
+# D-1: sidecar JSON metadata (issue #78)
+# ---------------------------------------------------------------------------
+
+
+def _write_sidecar(output_path: str, route: str) -> None:
+    """Best-effort sidecar write for *output_path*.
+
+    Route is ``vr180`` (SBS equirect) or ``fulldome`` (mono fisheye). Never
+    fails the pipeline for a sidecar write error — the artefact itself is
+    already delivered; the JSON is supplementary metadata.
+
+    ``eye_resolution`` is omitted here: the run_pipeline CLI resolves it
+    lazily into ``args.output_width`` / ``args.output_height`` *after* quality
+    preset application, and the streaming/fulldome paths already have those
+    values populated on ``args`` when they reach this helper. We prefer to
+    read them off ``args`` directly (see ``_write_sidecar_from_args`` below).
+    """
+    _write_sidecar_from_args(output_path, route, None)
+
+
+def _write_sidecar_from_args(output_path: str, route: str, args: argparse.Namespace | None) -> None:
+    """``_write_sidecar`` with optional args so the batch stage (which holds
+    ``args.output_width`` / ``args.output_height``) can include eye resolution."""
+    from pipeline.sidecar import write_sidecar
+
+    immersive = {
+        "projection": "equirect" if route == "vr180" else "fisheye_domemaster",
+        "fov_deg": 180,
+        "stereo_layout": "side_by_side" if route == "vr180" else "mono",
+        "spatial_metadata": ["sv3d", "st3d"] if route == "vr180" else [],
+    }
+    if route == "vr180" and args is not None:
+        w = int(getattr(args, "output_width", 0) or 0)
+        h = int(getattr(args, "output_height", 0) or 0)
+        if w and h:
+            immersive["eye_resolution"] = [w, h]
+    try:
+        write_sidecar(output_path, immersive=immersive, generation={"route": route})
+    except Exception as exc:
+        log.warning("⚠️  Sidecar write failed for %s: %s", output_path, exc)
 
 
 if __name__ == "__main__":
