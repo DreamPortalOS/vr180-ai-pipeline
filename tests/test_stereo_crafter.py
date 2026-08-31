@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -291,6 +292,112 @@ class TestCLIBackendConstruction:
             CLIBackend(repo_dir=str(repo))
         msg = str(exc_info.value)
         assert "No known inference script found" in msg
+
+
+class TestCLIBackendInRepoFallback:
+    """Tests for the in-repo default path fallback (G-6 / I-2 pattern).
+
+    When env vars are unset, CLIBackend should adopt the in-repo paths
+    (third_party/StereoCrafter / its .venv python / models/StereoCrafter)
+    ONLY when they exist on disk.  These tests build the dirs with tmp_path
+    and monkeypatch the module-level constants so nothing touches the real repo.
+    """
+
+    @pytest.fixture
+    def inrepo_sandbox(self, tmp_path, monkeypatch):
+        """Create in-repo StereoCrafter layout under tmp_path and point constants at it."""
+        repo = tmp_path / "third_party" / "StereoCrafter"
+        repo.mkdir(parents=True)
+        (repo / "run.py").write_text("# fake")
+
+        venv_dir = repo / ".venv"
+        venv_dir.mkdir()
+        python_exe = venv_dir / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
+        python_exe.parent.mkdir(parents=True, exist_ok=True)
+        python_exe.write_text("# fake python")
+
+        model_dir = tmp_path / "models" / "StereoCrafter"
+        model_dir.mkdir(parents=True)
+        (model_dir / "weights.bin").write_text("w")
+
+        from pipeline import stereo_crafter as sc
+
+        monkeypatch.setattr(sc, "INREPO_REPO_DIR", repo, raising=True)
+        monkeypatch.setattr(sc, "INREPO_PYTHON_EXE", python_exe, raising=True)
+        monkeypatch.setattr(sc, "INREPO_CKPT_DIR", model_dir, raising=True)
+        return SimpleNamespace(repo=repo, python_exe=python_exe, model_dir=model_dir)
+
+    def test_fallback_to_inrepo_paths_when_env_unset(self, tmp_path, inrepo_sandbox, monkeypatch):
+        """With no env and no constructor args, in-repo paths are adopted."""
+        from pipeline.stereo_crafter import CLIBackend
+
+        with patch.dict(os.environ, {}, clear=True):
+            backend = CLIBackend()
+        assert backend.repo_dir == str(inrepo_sandbox.repo)
+        assert backend.python_exe == str(inrepo_sandbox.python_exe)
+        assert backend.checkpoint_dir == str(inrepo_sandbox.model_dir)
+
+    def test_env_vars_take_precedence_over_inrepo(self, tmp_path, inrepo_sandbox, monkeypatch):
+        """Env vars win over in-repo defaults even when in-repo paths exist."""
+        from pipeline.stereo_crafter import CLIBackend
+
+        explicit_repo = tmp_path / "custom_repo"
+        explicit_repo.mkdir()
+        (explicit_repo / "run.py").write_text("# fake")
+        explicit_ckpt = tmp_path / "custom_ckpt"
+        explicit_ckpt.mkdir()
+        (explicit_ckpt / "w.bin").write_text("w")
+
+        with patch.dict(
+            os.environ,
+            {
+                "STEREOCRAFTER_REPO_DIR": str(explicit_repo),
+                "STEREOCRAFTER_CKPT_DIR": str(explicit_ckpt),
+            },
+            clear=True,
+        ):
+            backend = CLIBackend()
+        assert backend.repo_dir == str(Path(explicit_repo).resolve())
+        assert backend.checkpoint_dir == str(Path(explicit_ckpt).resolve())
+
+    def test_inrepo_fallback_ignored_when_paths_missing(self, tmp_path, monkeypatch):
+        """If in-repo dirs don't exist, the fallback is skipped and the error points to the bootstrap."""
+        from pipeline.stereo_crafter import CLIBackend
+
+        absent = tmp_path / "third_party" / "StereoCrafter_no_exist"
+        absent_py = tmp_path / "venv_no_exist" / "python"
+        absent_ckpt = tmp_path / "models" / "StereoCrafter_no_exist"
+
+        from pipeline import stereo_crafter as sc
+
+        monkeypatch.setattr(sc, "INREPO_REPO_DIR", absent, raising=True)
+        monkeypatch.setattr(sc, "INREPO_PYTHON_EXE", absent_py, raising=True)
+        monkeypatch.setattr(sc, "INREPO_CKPT_DIR", absent_ckpt, raising=True)
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            CLIBackend()
+        msg = str(exc_info.value)
+        assert "setup_stereocrafter.py" in msg
+        assert "STEREOCRAFTER_SETUP.md" in msg
+
+    def test_max_resolution_default_is_12gb_safe(self, tmp_path, inrepo_sandbox):
+        """Default max_resolution is the 12 GB-safe 512 (overridable via env/arg)."""
+        from pipeline.stereo_crafter import CLIBackend
+
+        with patch.dict(os.environ, {}, clear=True):
+            backend = CLIBackend()
+        assert backend.max_resolution == 512
+
+        with patch.dict(os.environ, {"STEREOCRAFTER_MAX_RES": "768"}, clear=True):
+            backend = CLIBackend()
+        assert backend.max_resolution == 768
+
+        with patch.dict(os.environ, {}, clear=True):
+            backend = CLIBackend(max_resolution=384)
+        assert backend.max_resolution == 384
 
 
 class TestCLIBackendInference:
