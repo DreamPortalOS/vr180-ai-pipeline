@@ -186,3 +186,83 @@ class TestExitCodes:
         for check in report.checks:
             assert check.name in text
         assert "Verdict:" in text
+
+
+# ---------------------------------------------------------------------------
+# H-1: audio stream QA line (issue #73)
+# ---------------------------------------------------------------------------
+
+
+def _probe_json_with_audio(width: int, height: int, codec="aac", bit_rate="160000") -> dict:
+    return {
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": width,
+                "height": height,
+                "avg_frame_rate": "30/1",
+                "bit_rate": "45000000",
+            },
+            {
+                "codec_type": "audio",
+                "codec_name": codec,
+                "bit_rate": str(bit_rate),
+                "sample_rate": "48000",
+            },
+        ],
+        "format": {"bit_rate": "45160000", "duration": "12.5"},
+    }
+
+
+def _mock_probe_audio(monkeypatch, width: int, height: int, codec: str = "aac"):
+    monkeypatch.setattr(
+        vr180_qa,
+        "_probe",
+        lambda path, ffprobe="ffprobe": _probe_json_with_audio(width, height, codec=codec),
+    )
+
+
+class TestAudioLine:
+    """QA report surfaces audio presence (warn, never fail)."""
+
+    def test_audio_present_shows_codec_and_bitrate(self, tmp_path, monkeypatch):
+        path = _make_mp4(tmp_path, "vr180.mp4", _build_sv3d(5760, 2880, "sbs") + _build_st3d("sbs"))
+        _mock_probe_audio(monkeypatch, 5760, 2880, codec="aac")
+        report = vr180_qa.run_qa(path)
+        assert _status(report, "audio stream") == "pass"
+        audio = next(c for c in report.checks if c.name == "audio stream")
+        assert "aac" in audio.detail
+        assert report.audio_codec == "aac"
+        assert report.audio_bitrate_kbps == pytest.approx(160.0)
+        # Audio present does not change the verdict or failure status.
+        assert report.verdict == VERDICT_VR180
+        assert not report.failed
+
+    def test_no_audio_warns_but_does_not_fail(self, tmp_path, monkeypatch):
+        path = _make_mp4(tmp_path, "vr180.mp4", _build_sv3d(5760, 2880, "sbs") + _build_st3d("sbs"))
+        _mock_probe(monkeypatch, 5760, 2880)  # video-only probe
+        report = vr180_qa.run_qa(path)
+        assert _status(report, "audio stream") == "warn"
+        audio = next(c for c in report.checks if c.name == "audio stream")
+        assert "silent" in audio.detail
+        # WARN must not fail the run — a VR180 without audio is still valid.
+        assert report.verdict == VERDICT_VR180
+        assert not report.failed
+        assert report.audio_codec == ""
+
+    def test_audio_codec_variants(self, tmp_path, monkeypatch):
+        """An Opus track is reported correctly (no aac assumption)."""
+        path = _make_mp4(tmp_path, "vr180.mp4", _build_sv3d(5760, 2880, "sbs") + _build_st3d("sbs"))
+        _mock_probe_audio(monkeypatch, 5760, 2880, codec="opus")
+        report = vr180_qa.run_qa(path)
+        audio = next(c for c in report.checks if c.name == "audio stream")
+        assert "opus" in audio.detail
+
+    def test_audio_fields_in_json_output(self, tmp_path, monkeypatch, capsys):
+        path = _make_mp4(tmp_path, "vr180.mp4", _build_sv3d(5760, 2880, "sbs") + _build_st3d("sbs"))
+        _mock_probe_audio(monkeypatch, 5760, 2880)
+        assert vr180_qa.main([path, "--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["audio_codec"] == "aac"
+        assert payload["audio_bitrate_kbps"] == pytest.approx(160.0)

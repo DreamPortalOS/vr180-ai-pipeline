@@ -226,7 +226,15 @@ class TestOrchestrationCallOrder:
         i2v.resolve_paths(job)
         i2v.ensure_workdir(job)
 
-        with patch.object(i2v, "stage_qa", side_effect=lambda p: (calls.append("qa"), _qa_pass(p))[1]):
+        with (
+            patch.object(i2v, "stage_qa", side_effect=lambda p: (calls.append("qa"), _qa_pass(p))[1]),
+            patch.multiple(
+                "pipeline.audio_mux",
+                has_audio_stream=lambda path: False,
+                audio_stream_info=lambda path: None,
+                copy_audio_to=lambda v, a, **kw: v,
+            ),
+        ):
             result = i2v.run_pipeline(
                 job,
                 prepare=trace_prepare,
@@ -236,12 +244,12 @@ class TestOrchestrationCallOrder:
                 convert=trace_convert,
             )
 
+        # H-1: audio stage now sits between convert and qa.
         assert calls == ["prepare", "generate", "streamcheck", "upscale", "convert", "qa"]
-        # Output artefact exists; manifest persisted with all six stages done.
         assert Path(result["output"]).exists()
         m = json.loads(Path(job.manifest_path).read_text())
         done = [s["name"] for s in m["stages"] if s["status"] == "done"]
-        assert done == ["prepare", "generate", "streamcheck", "upscale", "convert", "qa"]
+        assert done == ["prepare", "generate", "streamcheck", "upscale", "convert", "audio", "qa"]
 
     def test_manifest_records_inputs_outputs_params_per_stage(self, synthetic_image, tmp_path):
         job = i2v.JobArgs(
@@ -753,6 +761,261 @@ class TestMockProviderEndToEnd:
 # ---------------------------------------------------------------------------
 # Helpers for splicing real spherical boxes into a real ffmpeg mp4
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# H-1: audio passthrough (issue #73)
+# ---------------------------------------------------------------------------
+
+
+class TestAudioStageUnit:
+    """``stage_audio``: three paths — has audio / no audio / remux failure.
+
+    The heavy modules (``pipeline.audio_mux``) are mocked, so nothing opens
+    ffmpeg or ffprobe. The three acceptance-criteria paths are exercised here.
+    """
+
+    def _job(self, tmp_path: Path, **overrides) -> i2v.JobArgs:
+        job = i2v.JobArgs(
+            image=str(tmp_path / "img.png"),
+            workdir=str(tmp_path / "w"),
+        )
+        i2v.resolve_paths(job)
+        return job
+
+    def _with_mocks(self, has_audio: bool, info: dict | None, copy_raises: bool = False):
+        """Context manager patching audio_mux's three exports for stage_audio."""
+        from unittest.mock import MagicMock
+
+        has = MagicMock(return_value=has_audio)
+        info_fn = MagicMock(return_value=info)
+        copy = MagicMock(side_effect=RuntimeError("no luck") if copy_raises else None)
+        return patch.multiple(
+            "pipeline.audio_mux",
+            has_audio_stream=has,
+            audio_stream_info=info_fn,
+            copy_audio_to=copy,
+        )
+
+    def test_no_audio_stream_skips_and_records_false(self, tmp_path):
+        job = self._job(tmp_path)
+        audio_src = tmp_path / "src.mp4"
+        audio_src.write_bytes(b"audio-source")
+        job.generated_video = str(audio_src)
+
+        with self._with_mocks(has_audio=False, info=None):
+            result = i2v.stage_audio(job, job.vr180_output, job.generated_video)
+
+        assert result["copied"] is False
+        assert result["codec"] is None
+        assert result["source"] == str(audio_src)
+
+    def test_source_not_found_skips(self, tmp_path):
+        job = self._job(tmp_path)
+        job.generated_video = str(tmp_path / "nope.mp4")
+
+        with self._with_mocks(has_audio=True, info=None):
+            result = i2v.stage_audio(job, job.vr180_output, job.generated_video)
+
+        assert result["copied"] is False
+        assert result["source"] == str(tmp_path / "nope.mp4")
+
+    def test_audio_present_remuxes_and_records_true(self, tmp_path):
+        job = self._job(tmp_path)
+        audio_src = tmp_path / "src.mp4"
+        audio_src.write_bytes(b"audio-source")
+        vr = tmp_path / "vr.mp4"
+        vr.write_bytes(b"vr180")
+        job.generated_video = str(audio_src)
+
+        with self._with_mocks(has_audio=True, info={"codec_name": "aac"}):
+            result = i2v.stage_audio(job, str(vr), job.generated_video)
+
+        assert result["copied"] is True
+        assert result["codec"] == "aac"
+
+    def test_copy_audio_from_overrides_generated_video(self, tmp_path):
+        """Explicit --copy-audio-from wins over the generated-video fallback."""
+        job = self._job(tmp_path)
+        explicit = tmp_path / "explicit.mp4"
+        explicit.write_bytes(b"explicit")
+        job.copy_audio_from = str(explicit)
+        job.generated_video = str(tmp_path / "gen.mp4")
+
+        with self._with_mocks(has_audio=True, info={"codec_name": "opus"}):
+            result = i2v.stage_audio(job, str(tmp_path / "vr.mp4"), job.generated_video)
+
+        assert result["source"] == str(explicit)
+        assert result["copied"] is True
+
+    def test_remux_failure_propagates_runtime_error(self, tmp_path):
+        job = self._job(tmp_path)
+        audio_src = tmp_path / "src.mp4"
+        audio_src.write_bytes(b"audio-source")
+        vr = tmp_path / "vr.mp4"
+        vr.write_bytes(b"vr180")
+        job.generated_video = str(audio_src)
+
+        with (
+            self._with_mocks(has_audio=True, info={"codec_name": "aac"}, copy_raises=True),
+            pytest.raises(RuntimeError, match="no luck"),
+        ):
+            i2v.stage_audio(job, str(vr), job.generated_video)
+
+
+class TestAudioStageOrchestration:
+    """The audio stage slots between convert and qa and records into the manifest.
+
+    Fake backends for every stage; the audio stage is driven through its real
+    code with ``pipeline.audio_mux`` mocked.  Two cases: audio present (remux
+    path) and no audio (skip path).
+    """
+
+    def test_audio_stage_recorded_in_manifest_when_audio_present(self, synthetic_image, tmp_path):
+        job = i2v.JobArgs(
+            image=str(synthetic_image),
+            workdir=str(tmp_path / "w"),
+            manifest_path=str(tmp_path / "job.json"),
+        )
+        i2v.resolve_paths(job)
+        i2v.ensure_workdir(job)
+        # Materialise the audio source so stage_audio's Path.exists check passes.
+        Path(job.generated_video).write_bytes(b"fake-generated-with-audio")
+
+        calls: list[str] = []
+
+        def trace_prepare(a):
+            calls.append("prepare")
+            return _fake_prepare(a)
+
+        def trace_generate(a, p):
+            calls.append("generate")
+            return _fake_generate(a, p)
+
+        def trace_convert(a, p, c=None):
+            calls.append("convert")
+            Path(a.vr180_output).write_bytes(b"vr")
+            return a.vr180_output
+
+        with (
+            patch.multiple(
+                "pipeline.audio_mux",
+                has_audio_stream=lambda path: True,
+                audio_stream_info=lambda path: {"codec_name": "aac", "bit_rate": "160000"},
+                copy_audio_to=lambda v, a, **kw: v,
+            ),
+            patch.object(i2v, "stage_qa", side_effect=_qa_pass),
+        ):
+            i2v.run_pipeline(
+                job,
+                prepare=trace_prepare,
+                generate=trace_generate,
+                streamcheck=_no_op_streamcheck,
+                upscale=_passthrough_upscale,
+                convert=trace_convert,
+            )
+
+        # audio stage sits between convert and qa.
+        assert "prepare" in calls and "convert" in calls
+        m = json.loads(Path(job.manifest_path).read_text())
+        done = [s["name"] for s in m["stages"] if s["status"] == "done"]
+        assert done == ["prepare", "generate", "streamcheck", "upscale", "convert", "audio", "qa"]
+        audio_stage = next(s for s in m["stages"] if s["name"] == "audio")
+        assert audio_stage["params"]["copied"] is True
+        assert audio_stage["params"]["codec"] == "aac"
+
+    def test_audio_stage_skipped_in_manifest_when_no_audio(self, synthetic_image, tmp_path):
+        job = i2v.JobArgs(
+            image=str(synthetic_image),
+            workdir=str(tmp_path / "w"),
+            manifest_path=str(tmp_path / "job.json"),
+        )
+        i2v.resolve_paths(job)
+        i2v.ensure_workdir(job)
+        # No audio source file at all → stage_audio records copied=False.
+        calls: list[str] = []
+
+        def trace_prepare(a):
+            calls.append("prepare")
+            return _fake_prepare(a)
+
+        def trace_generate(a, p):
+            calls.append("generate")
+            return _fake_generate(a, p)
+
+        def trace_convert(a, p, c=None):
+            calls.append("convert")
+            Path(a.vr180_output).write_bytes(b"vr")
+            return a.vr180_output
+
+        with (
+            patch.multiple(
+                "pipeline.audio_mux",
+                has_audio_stream=lambda path: False,
+                audio_stream_info=lambda path: None,
+                copy_audio_to=lambda v, a, **kw: v,
+            ),
+            patch.object(i2v, "stage_qa", side_effect=_qa_pass),
+        ):
+            i2v.run_pipeline(
+                job,
+                prepare=trace_prepare,
+                generate=trace_generate,
+                streamcheck=_no_op_streamcheck,
+                upscale=_passthrough_upscale,
+                convert=trace_convert,
+            )
+
+        m = json.loads(Path(job.manifest_path).read_text())
+        audio_stage = next(s for s in m["stages"] if s["name"] == "audio")
+        assert audio_stage["params"]["copied"] is False
+        assert audio_stage["params"]["codec"] is None
+
+    def test_audio_stage_resume_skip(self, synthetic_image, tmp_path):
+        """A manifest with 'audio' already done must skip the stage."""
+        from pipeline.job_manifest import mark_stage_done, new_manifest, save_manifest
+
+        job = i2v.JobArgs(
+            image=str(synthetic_image),
+            workdir=str(tmp_path / "w"),
+            resume_from=str(tmp_path / "prev.json"),
+        )
+        i2v.resolve_paths(job)
+        i2v.ensure_workdir(job)
+        Path(job.prepared_image).write_bytes(b"p")
+        Path(job.generated_video).write_bytes(b"g")
+        Path(job.vr180_output).write_bytes(b"vr")
+
+        prev = new_manifest("job-a", str(synthetic_image), stage_names=i2v.STAGE_ORDER)
+        for name in ("prepare", "generate", "streamcheck", "upscale", "convert", "audio"):
+            mark_stage_done(prev, name, outputs=[job.vr180_output] if name in ("convert", "audio") else [])
+        save_manifest(prev, job.resume_from)
+
+        audio_ran = False
+
+        def fail_audio(v, g):
+            nonlocal audio_ran
+            audio_ran = True
+            raise AssertionError("audio stage must be skipped on resume")
+
+        ran: list[str] = []
+
+        def ok_qa(p):
+            ran.append("qa")
+            return 0
+
+        with patch.object(i2v, "stage_qa", side_effect=ok_qa):
+            i2v.run_pipeline(
+                job,
+                prepare=lambda a: _fake_prepare(a),
+                generate=lambda a, p: _fake_generate(a, p),
+                streamcheck=_no_op_streamcheck,
+                upscale=_passthrough_upscale,
+                convert=lambda a, p, c=None: (ran.append("convert"), a.vr180_output)[1],
+            )
+        # audio must NOT run; qa runs after the skip.
+        assert audio_ran is False
+        assert "qa" in ran
 
 
 def _splice_spherical_boxes(path: Path, width: int, height: int) -> None:

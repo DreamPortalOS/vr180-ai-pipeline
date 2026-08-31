@@ -44,7 +44,13 @@ log = logging.getLogger("image-to-vr180")
 EXIT_QA_FAILED = 3
 
 # Manifest stage names, in the order they run.
-STAGE_ORDER = ("prepare", "generate", "streamcheck", "upscale", "convert", "qa")
+STAGE_ORDER = ("prepare", "generate", "streamcheck", "upscale", "convert", "audio", "qa")
+
+
+# H-1: audio passthrough. The generated video (``args.generated_video``) is the
+# default audio source (Seedance 2.0 embeds a synced AAC track). A caller may
+# override it via ``copy_audio_from`` to attach an arbitrary audio track.
+DEFAULT_AUDIO_SOURCE_ATTR = "generated_video"
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +75,11 @@ class JobArgs:
     gen_ratio: str = "adaptive"
     upscale: str = "none"
     quality: str = "preview"
+
+    # H-1: explicit audio source for the audio remux stage. When ``None``
+    # (default), the stage falls back to ``args.generated_video`` and detects
+    # an audio stream there automatically.
+    copy_audio_from: str | None = None
 
     workdir: str = ""
     manifest_path: str | None = None
@@ -445,7 +456,64 @@ def run_convert_default(args: JobArgs, input_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Stage 6: QA
+# Stage 6: audio passthrough (issue #73, H-1)
+# ---------------------------------------------------------------------------
+
+
+def _audio_source_path(args: JobArgs, generated_video: str) -> str:
+    """Resolve the audio source path for the remux stage.
+
+    Explicit ``copy_audio_from`` wins; otherwise fall back to the generated
+    video (which for real providers like Seedance carries the synced AAC
+    track).
+    """
+    if args.copy_audio_from:
+        return args.copy_audio_from
+    return generated_video
+
+
+def stage_audio(args: JobArgs, vr180_path: str, generated_video: str) -> dict[str, Any]:
+    """Optional lossless audio remux: attach a source audio track to the VR180.
+
+    Order matters: this stage runs *after* convert (which injected sv3d/st3d)
+    and *before* QA. ffmpeg ``-c copy`` never touches user-data boxes, so the
+    VR180 metadata survives the remux; the following QA stage then verifies
+    sv3d/st3d are still present — a natural gate.
+
+    Three paths:
+      1. **No audio**  — source has no audio stream → skip, log, record ``copied=False``.
+      2. **Copied**    — remux succeeds → atomic replace, record ``copied=True`` + codec.
+      3. **Failed**    — remux raises → propagate RuntimeError (pipeline stops).
+
+    Returns:
+        A small result dict ``{"copied": bool, "codec": str|None, "source": str}``
+        used by the manifest recorder.
+    """
+    from pipeline.audio_mux import audio_stream_info, copy_audio_to, has_audio_stream
+
+    source = _audio_source_path(args, generated_video)
+    result: dict[str, Any] = {"copied": False, "codec": None, "source": source}
+
+    if not Path(source).is_file():
+        log.info("🔊 Stage audio: source not found (%s) — skipping", source)
+        return result
+
+    if not has_audio_stream(source):
+        log.info("🔊 Stage audio: no audio stream in %s — skipping (video will be silent)", source)
+        return result
+
+    info = audio_stream_info(source)
+    codec = (info or {}).get("codec_name", "unknown") if info else "unknown"
+    log.info("🔊 Stage audio: copying %s track (%s) %s → %s", codec, source, codec, vr180_path)
+    copy_audio_to(vr180_path, source)
+    result["copied"] = True
+    result["codec"] = codec
+    log.info("✅ Stage audio done — copied %s track", codec)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Stage 7: QA
 # ---------------------------------------------------------------------------
 
 
@@ -475,6 +543,7 @@ def _stage_label(name: str) -> str:
         "streamcheck": "streamcheck",
         "upscale": "upscale",
         "convert": "vr180_convert",
+        "audio": "audio_remux",
         "qa": "qa",
     }
     return labels.get(name, name)
@@ -615,6 +684,26 @@ def run_pipeline(
         log.info("⏭️  Stage convert: skipped (already done in manifest)")
         converted = args.vr180_output
 
+    # H-1: audio passthrough. Runs after sv3d/st3d injection, before QA.
+    if "audio" not in done:
+        log.info("▶  Stage audio starting")
+        audio_result = stage_audio(args, converted, generated)
+        log.info("✔  Stage audio complete (copied=%s)", audio_result.get("copied"))
+        _record_stage(
+            manifest,
+            "audio",
+            inputs=[converted, audio_result.get("source", "")],
+            outputs=[converted],
+            params={
+                "copied": audio_result.get("copied"),
+                "codec": audio_result.get("codec"),
+                "source": audio_result.get("source"),
+            },
+        )
+        _persist_manifest(manifest, args)
+    else:
+        log.info("⏭️  Stage audio: skipped (already done in manifest)")
+
     log.info("▶  Stage qa starting")
     qa_exit = stage_qa(converted)
     log.info("✔  Stage qa complete (exit=%d)", qa_exit)
@@ -704,6 +793,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Working directory for intermediate artefacts (default: <image_dir>/<image_stem>_vr180)",
     )
+    parser.add_argument(
+        "--copy-audio-from",
+        default=None,
+        metavar="PATH",
+        help="H-1: attach an audio track from this source file to the VR180 output. "
+        "If omitted, the audio stage detects an audio stream in the generated video "
+        "(e.g. Seedance's synced AAC) and copies it in; if present there, no flag needed.",
+    )
     return parser.parse_args(argv)
 
 
@@ -721,6 +818,7 @@ def main(argv: list[str] | None = None) -> int:
             gen_ratio=args.gen_ratio,
             upscale=args.upscale,
             quality=args.quality,
+            copy_audio_from=args.copy_audio_from,
             workdir=args.workdir or "",
             manifest_path=args.manifest,
             resume_from=args.resume_from,
