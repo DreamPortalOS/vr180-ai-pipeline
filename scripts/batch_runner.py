@@ -29,6 +29,19 @@ Batch-level checkpoint (``--state batch_state.json``) records each job's
 status and artefact so a re-run can resume: already-succeeded jobs are
 skipped. This is a *batch-level* state file (NOT a per-stage job manifest;
 job_manifest is untouched).
+
+Output naming (issue #96 / K-1.1): the final artefact per job is named by
+scene, not by input image, via :func:`pipeline.naming.compose_scene_name`
+(D-4). ``scene_id`` falls back to a zero-padded job index (``job001``) when
+omitted, so jobs are never silently homonymous. The summary table and the
+state file record each job's *actual* scene-named output path.
+
+Collision policy (auto-suffix, chosen over hard-fail): before writing, the
+runner checks whether the target path already exists. If it does NOT match a
+previously-succeeded artefact of the same scene run, the runner appends
+``_c1``, ``_c2``, … to the filename until a free name is found. This is
+robust to partial prior runs in a reused workdir while still guaranteeing no
+silent overwrite.
 """
 
 from __future__ import annotations
@@ -36,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -43,6 +57,13 @@ from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("batch-runner")
+
+# Collision-guard: when a scene-named target already exists and is NOT a
+# previously-succeeded artefact of the same scene_id, we append an auto-
+# suffix ``_c<N>`` (N = smallest integer >= 1 that yields a free filename).
+# This is the chosen policy over hard-fail: it is robust to partial prior
+# runs in the same workdir while still guaranteeing no silent overwrite.
+_COLLISION_SUFFIX_RE = re.compile(r"_c(\d+)$")
 
 
 # Exit codes (machine-detectable).
@@ -85,6 +106,83 @@ class JobResult:
     output_path: str = ""
     error: str = ""
     duration_s: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Scene-oriented naming (D-4 / issue #81)
+# ---------------------------------------------------------------------------
+
+# Regex mirror of pipeline.naming._SCENE_ID_RE — used to sanitize user-supplied
+# scene_ids that would otherwise fail compose_scene_name. Characters outside
+# the convention are stripped (rather than rejecting) so the runner stays
+# tolerant of free-form identifiers while still emitting a valid filename.
+_VALID_SCENE_ID_RE = re.compile(r"[^a-z0-9_-]+")
+
+
+def _safe_scene_id(raw: str) -> str:
+    """Sanitize a user-supplied scene_id into a valid naming token.
+
+    Lowercases and strips any character not allowed by :func:`compose_scene_name`
+    (``[a-z0-9_-]+``). Collapses empties to ``"scene"``.
+    """
+    token = _VALID_SCENE_ID_RE.sub("", raw.lower()).strip("_-")
+    return token or "scene"
+
+
+def _build_output_path(spec: JobSpec, workdir: Path) -> Path:
+    """Compose the scene-named final output path for one job.
+
+    Uses :func:`pipeline.naming.compose_scene_name` (D-4) so the final file
+    is parseable by downstream assembly and — critically — is distinct per
+    ``scene_id`` even when multiple jobs share the same input image.
+
+    ``route`` is always ``vr180`` (this runner's route); ``preset`` mirrors the
+    job's ``quality`` (preview/standard/high map to standalone/pcvr/...), with
+    ``preview`` defaulting to the convention's standalone default.
+    """
+    from pipeline.naming import SceneAssetSpec, compose_scene_name
+
+    # Map the runner's quality tiers onto the naming convention's presets.
+    preset_by_quality = {"preview": "standalone", "standard": "standalone", "high": "pcvr"}
+    preset = preset_by_quality.get(spec.quality, "standalone")
+
+    spec_scene = SceneAssetSpec(
+        scene_id=_safe_scene_id(spec.scene_id),
+        scene_name=spec.scene_id,
+        segment_index=1,
+        route="vr180",
+        preset=preset,
+    )
+    filename = compose_scene_name(spec_scene, extension="mp4")
+    return workdir / filename
+
+
+def _resolve_collision(target: Path, prior_successes: set[str]) -> Path:
+    """Return a free output path, appending ``_c<N>`` if ``target`` already exists
+    and is NOT a previously-succeeded artefact of this same scene run.
+
+    A file that matches a known prior-success path is the orchestrator's own
+    durable output from an earlier run of this very job — that is safe and
+    expected (resume). Any other existing file is a foreign artefact and we
+    refuse to silently overwrite it; instead we emit ``_c1``, ``_c2``, … until
+    a free name is found.
+    """
+    target_str = str(target)
+    if not target.is_file():
+        return target
+    # Same path as a previously-succeeded artefact → the orchestrator would
+    # just re-write it anyway (idempotent). Safe to keep.
+    if target_str in prior_successes:
+        return target
+    # Auto-suffix policy: append _c1 / _c2 / … until free.
+    stem = target.stem
+    suffix = target.suffix
+    n = 1
+    while True:
+        candidate = target.parent / f"{stem}_c{n}{suffix}"
+        if not candidate.is_file():
+            return candidate
+        n += 1
 
 
 # ---------------------------------------------------------------------------
@@ -261,22 +359,57 @@ def _make_job_args(spec: JobSpec, tmp_workdir: Path | None = None) -> Any:
     return job
 
 
+def _prior_success_outputs(state: dict[str, dict[str, Any]]) -> set[str]:
+    """Return the set of output_path values of previously-succeeded jobs."""
+    return {
+        rec.get("output_path", "")
+        for rec in state.values()
+        if isinstance(rec, dict) and rec.get("status") == "success" and rec.get("output_path")
+    }
+
+
 def run_one_job(
     spec: JobSpec,
     *,
     tmp_workdir: Path | None = None,
     run_pipeline=None,
+    state: dict[str, dict[str, Any]] | None = None,
 ) -> JobResult:
     """Run a single job through the orchestrator and return a :class:`JobResult`.
+
+    The final ``vr180_output`` is recomputed from the job's ``scene_id`` via
+    :func:`_build_output_path` (D-4 scene naming). This guarantees that two
+    jobs sharing the same input image still produce distinct, parseable files.
 
     ``run_pipeline`` may be injected (tests) so the real I2V pipeline is
     never invoked in tests. By default it resolves to
     :func:`scripts.image_to_vr180.run_pipeline`.
+
+    ``state`` carries previously-succeeded records so collision detection can
+    distinguish "this file is my own durable output from a prior run" from
+    "a foreign file happens to occupy this name" (see :func:`_resolve_collision`).
     """
     if run_pipeline is None:
         run_pipeline = _i2v().run_pipeline
 
     job = _make_job_args(spec, tmp_workdir=tmp_workdir)
+    state = state or {}
+    prior = _prior_success_outputs(state)
+
+    # Re-derive the final output path per scene so co-located jobs sharing an
+    # input image do not silently overwrite each other. The orchestrator then
+    # writes into this path regardless of its internal (image-stem-based)
+    # ``vr180_output`` default.
+    workdir = Path(job.workdir)
+    target = _resolve_collision(_build_output_path(spec, workdir), prior)
+    job.vr180_output = str(target)
+    # Guarantee the output directory is writable. When the runner omits
+    # --workdir the orchestrator sets a default workdir but does not always
+    # create it; and the scene-named target may live in a sub-location the
+    # orchestrator never makedirs's. Either way, the runner owns the final
+    # path now, so it must ensure its parent exists.
+    target.parent.mkdir(parents=True, exist_ok=True)
+
     start = time.perf_counter()
     try:
         result = run_pipeline(job)
@@ -446,7 +579,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         log.info("▶  Running %s (image=%s)", spec.scene_id, spec.image)
-        result = run_one_job(spec)
+        result = run_one_job(spec, state=state)
         results.append(result)
 
         if args.state:

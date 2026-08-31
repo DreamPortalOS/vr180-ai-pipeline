@@ -478,3 +478,149 @@ class TestCLI:
         assert args.gen_ratio == "adaptive"
         assert args.upscale == "none"
         assert args.quality == "preview"
+
+
+# ---------------------------------------------------------------------------
+# Issue #96 / K-1.1: scene-named outputs, no silent overwrite
+# ---------------------------------------------------------------------------
+
+
+class TestSceneNamedOutputs:
+    """Outputs must be distinct per scene even when jobs share an input image."""
+
+    def test_two_jobs_same_image_produce_two_different_files(self, tmp_path, capsys):
+        """AC: two jobs with different scene_id but identical input image
+        yield two distinct output files, both present after the batch."""
+        shared_image = tmp_path / "test_input_image.png"
+        shared_image.write_bytes(b"img")
+        jobs = [
+            {"image": str(shared_image), "scene_id": "s01"},
+            {"image": str(shared_image), "scene_id": "s02"},
+        ]
+        p = _write_jobs(tmp_path, jobs)
+
+        written: list[str] = []
+
+        def fake(job):
+            written.append(job.vr180_output)
+            # Simulate the orchestrator actually writing into its target.
+            Path(job.vr180_output).write_bytes(b"video")
+            return {"output": job.vr180_output}
+
+        with patch("scripts.image_to_vr180.run_pipeline", side_effect=fake):
+            rc = br.main(["--jobs", str(p)])
+
+        assert rc == br.EXIT_OK
+        # Two distinct target paths were chosen.
+        assert len(set(written)) == 2
+        # Both files actually exist on disk.
+        for w in written:
+            assert Path(w).is_file(), f"output missing: {w}"
+        # Names are scene-derived, not image-stem-derived.
+        for w in written:
+            stem = Path(w).stem
+            assert "s01" in stem or "s02" in stem
+            assert stem != "test_input_image_vr180"
+
+        # Summary table reports both success with their distinct paths.
+        out = capsys.readouterr().out
+        assert written[0] in out
+        assert written[1] in out
+        assert "succeeded: 2" in out
+
+    def test_missing_scene_id_falls_back_to_job_index(self, tmp_path):
+        """AC: when scene_id is omitted, the fallback name is per-job (job001, job002...)."""
+        img = tmp_path / "a.png"
+        img.write_bytes(b"img")
+        defaults = br._cli_defaults(br.parse_args(["--jobs", "x"]))
+        spec_a = br.resolve_job({"image": str(img)}, defaults, 0)
+        spec_b = br.resolve_job({"image": str(img)}, defaults, 5)
+        # Fallback is zero-padded job index.
+        assert spec_a.scene_id == "job-000"
+        assert spec_b.scene_id == "job-005"
+        # And the composed output paths differ even with the same image.
+        pa = br._build_output_path(spec_a, tmp_path)
+        pb = br._build_output_path(spec_b, tmp_path)
+        assert pa != pb
+        # Both names are scene-derived, not image-stem-derived.
+        assert pa.stem != "a_vr180"
+        assert "job" in pa.stem and "job" in pb.stem
+
+    def test_composed_output_path_uses_naming_convention(self, tmp_path):
+        """Output filename follows D-4: <scene_id>_<scene_name>_segNN_vr180_<preset>.mp4."""
+        img = tmp_path / "a.png"
+        img.write_bytes(b"img")
+        defaults = br._cli_defaults(br.parse_args(["--jobs", "x", "--quality", "high"]))
+        spec = br.resolve_job({"image": str(img), "scene_id": "s07", "quality": "high"}, defaults, 3)
+        path = br._build_output_path(spec, tmp_path)
+        # route=vr180 and preset=pcvr (quality=high).
+        assert path.stem == "s07_s07_seg01_vr180_pcvr"
+        assert path.suffix == ".mp4"
+
+    def test_collision_appends_auto_suffix(self, tmp_path):
+        """AC: when the scene-named target already exists (foreign artefact),
+        an auto-suffix ``_c1`` / ``_c2`` is appended; no silent overwrite."""
+        img = tmp_path / "a.png"
+        img.write_bytes(b"img")
+        defaults = br._cli_defaults(br.parse_args(["--jobs", "x"]))
+        spec = br.resolve_job({"image": str(img), "scene_id": "s01"}, defaults, 0)
+
+        base = br._build_output_path(spec, tmp_path)
+        # Simulate a foreign file already occupying the target.
+        (tmp_path / "foreign").write_bytes(b"x")
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_bytes(b"foreign-output")
+
+        resolved = br._resolve_collision(base, prior_successes=set())
+        assert resolved != base
+        assert resolved.stem.endswith("_c1")
+        assert resolved.suffix == ".mp4"
+        # The original foreign file was NOT overwritten.
+        assert base.read_bytes() == b"foreign-output"
+
+        # A second collision bumps to _c2.
+        resolved.write_bytes(b"me")
+        resolved2 = br._resolve_collision(base, prior_successes=set())
+        assert resolved2.stem.endswith("_c2")
+
+    def test_collision_keeps_own_prior_success(self, tmp_path):
+        """A target that matches a previously-succeeded artefact of this
+        scene is the orchestrator's own durable output (resume) — kept as-is."""
+        img = tmp_path / "a.png"
+        img.write_bytes(b"img")
+        defaults = br._cli_defaults(br.parse_args(["--jobs", "x"]))
+        spec = br.resolve_job({"image": str(img), "scene_id": "s01"}, defaults, 0)
+        base = br._build_output_path(spec, tmp_path)
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_bytes(b"my-own")
+
+        prior = {str(base)}
+        resolved = br._resolve_collision(base, prior_successes=prior)
+        assert resolved == base
+
+    def test_state_records_scene_named_output_path(self, tmp_path, capsys):
+        """The batch state file records each job's real scene-named output path."""
+        img = tmp_path / "a.png"
+        img.write_bytes(b"img")
+        jobs = [
+            {"image": str(img), "scene_id": "s01"},
+            {"image": str(img), "scene_id": "s02"},
+        ]
+        p = _write_jobs(tmp_path, jobs)
+        state_path = tmp_path / "state.json"
+
+        def fake(job):
+            Path(job.vr180_output).write_bytes(b"video")
+            return {"output": job.vr180_output}
+
+        with patch("scripts.image_to_vr180.run_pipeline", side_effect=fake):
+            rc = br.main(["--jobs", str(p), "--state", str(state_path)])
+        assert rc == br.EXIT_OK
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert state["jobs"]["s01"]["output_path"] != state["jobs"]["s02"]["output_path"]
+        # Both recorded paths exist on disk.
+        for sid in ("s01", "s02"):
+            p_out = state["jobs"][sid]["output_path"]
+            assert Path(p_out).is_file()
+            assert "seg01_vr180" in p_out
