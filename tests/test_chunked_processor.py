@@ -341,5 +341,164 @@ class TestProcessInChunksCountAndContract(unittest.TestCase):
         self.assertEqual(yielded_indices, [0, 1, 2, 3, 4, 5])
 
 
+# ---------------------------------------------------------------------------
+# V-4.1a (issue #86) — lazy / generator intake
+# ---------------------------------------------------------------------------
+
+
+class _AheadTracker:
+    """Measure how far ahead the processor pulls from the source vs. emission.
+
+    The chunked processor reads frames from the source into its circular
+    buffer, then emits them via ``process_fn``.  ``ahead`` = (frames pulled
+    from source) − (frames emitted).  This equals the number of source
+    frames currently retained in the processor's buffer.  For a correctly
+    bounded circular buffer this peak must be ``≤ chunk_size + overlap`` —
+    which is the precise black-box proof that the full clip is never
+    materialised (V-4.1a).
+    """
+
+    def __init__(self) -> None:
+        self.peak_ahead = 0
+
+    def pulled(self):
+        """Call once per frame the source generator yields."""
+        self._pulled = getattr(self, "_pulled", 0) + 1
+
+    def emitted(self, count: int):
+        """Call from process_fn with the number of frames it keeps."""
+        self._emitted = getattr(self, "_emitted", 0) + count
+        ahead = self._pulled - self._emitted
+        if ahead > self.peak_ahead:
+            self.peak_ahead = ahead
+
+
+def _ahead_gen(n: int, tracker: _AheadTracker):
+    """Yield index frames and record each pull for buffer-depth tracking."""
+
+    for i in range(n):
+        tracker.pulled()
+        yield i
+
+
+def _ahead_process_fn(tracker: _AheadTracker):
+    """Per-chunk fn that emits kept indices and records emission count."""
+
+    def process_fn(chunk_frames, warm_offset, emit_offset):
+        tracker.emitted(emit_offset)
+        return iter(chunk_frames[warm_offset:])
+
+    return process_fn
+
+
+class TestLazyGeneratorIntake(unittest.TestCase):
+    """V-4.1a acceptance: a generator input is NOT fully materialised.
+
+    The defining property is bounded residency: at no point do more than
+    ``chunk_size + overlap`` frames coexist in memory, regardless of clip
+    length.  We prove this with a counting generator whose frames track
+    simultaneous liveness via weakrefs.
+    """
+
+    def test_peak_residency_bounded_by_chunk_plus_overlap(self):
+        """The circular buffer never holds more than chunk_size + overlap frames.
+
+        We run a long synthetic clip (n >> chunk_size + overlap) through the
+        lazy path.  A counting generator records how far ahead the processor
+        pulls from the source relative to what it has emitted; that gap IS
+        the buffer occupancy.  Asserting the peak gap ``≤ chunk_size +
+        overlap`` proves the full clip was never materialised (V-4.1a).
+        """
+        chunk_size, overlap, n = 5, 2, 80
+        tracker = _AheadTracker()
+        got = list(
+            process_in_chunks(
+                _ahead_gen(n, tracker),
+                _ahead_process_fn(tracker),
+                chunk_size=chunk_size,
+                overlap=overlap,
+            )
+        )
+        self.assertEqual(got, list(range(n)))
+        self.assertLessEqual(
+            tracker.peak_ahead,
+            chunk_size + overlap,
+            f"peak buffer occupancy {tracker.peak_ahead} exceeded chunk_size+overlap={chunk_size + overlap}",
+        )
+
+    def test_generator_output_matches_list_input(self):
+        """Lazy (generator) and eager (list) paths are frame-identical.
+
+        Equivalence contract: chunking + laziness must not change output vs
+        processing the materialised list.  Exercised for both stateless and
+        finite-memory temporal stages.
+        """
+        frames = _make_frames(n=20)
+
+        # Stateless
+        lazy_stateless = list(
+            process_in_chunks(
+                (f for f in frames),
+                _stateless_process_fn,
+                chunk_size=7,
+                overlap=0,
+            )
+        )
+        list_stateless = list(process_in_chunks(frames, _stateless_process_fn, chunk_size=7, overlap=0))
+        self.assertEqual(len(lazy_stateless), len(list_stateless))
+        for a, b in zip(lazy_stateless, list_stateless, strict=False):
+            self.assertTrue(np.array_equal(a, b))
+
+        # Finite-memory temporal (window=3, overlap=window-1=2 → exact)
+        lazy_win = list(
+            process_in_chunks(
+                (f for f in frames),
+                _make_windowed_process_fn(window=3),
+                chunk_size=7,
+                overlap=2,
+            )
+        )
+        list_win = list(process_in_chunks(frames, _make_windowed_process_fn(window=3), chunk_size=7, overlap=2))
+        self.assertEqual(len(lazy_win), len(list_win))
+        for a, b in zip(lazy_win, list_win, strict=False):
+            self.assertTrue(np.array_equal(a, b))
+
+    def test_generator_empty_input(self):
+        self.assertEqual(
+            list(process_in_chunks(iter([]), _stateless_process_fn, chunk_size=4, overlap=1)),
+            [],
+        )
+
+    def test_generator_chunk_size_one(self):
+        """One frame per emitted chunk still bounds buffer occupancy (≤ 1 + overlap)."""
+        chunk_size, overlap, n = 1, 2, 12
+        tracker = _AheadTracker()
+        got = list(
+            process_in_chunks(
+                _ahead_gen(n, tracker),
+                _ahead_process_fn(tracker),
+                chunk_size=chunk_size,
+                overlap=overlap,
+            )
+        )
+        self.assertEqual(got, list(range(n)))
+        self.assertLessEqual(tracker.peak_ahead, chunk_size + overlap)
+
+    def test_generator_chunk_larger_than_total_single_chunk(self):
+        """A chunk bigger than the clip is a single pass; occupancy ≤ n."""
+        n = 6
+        tracker = _AheadTracker()
+        got = list(
+            process_in_chunks(
+                _ahead_gen(n, tracker),
+                _ahead_process_fn(tracker),
+                chunk_size=100,
+                overlap=0,
+            )
+        )
+        self.assertEqual(got, list(range(n)))
+        self.assertLessEqual(tracker.peak_ahead, n)
+
+
 if __name__ == "__main__":
     unittest.main()

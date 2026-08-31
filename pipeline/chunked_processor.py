@@ -30,7 +30,8 @@ documented in their call sites with an explicit RAM upper-bound estimate.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TypeVar
 
 T = TypeVar("T")
@@ -117,7 +118,7 @@ def chunk_ranges(
 
 
 def process_in_chunks(
-    frames: list,
+    frames: Sequence | Iterable,
     process_fn: Callable[[list, int, int], Iterator[T]],
     *,
     chunk_size: int | None = None,
@@ -144,7 +145,7 @@ def process_in_chunks(
     ``process_fn`` is called once per chunk as
     ``process_fn(chunk_frames, warm_offset, emit_offset)`` where:
 
-      * ``chunk_frames`` — the slice ``frames[warm_start:emit_end]`` (warmup
+      * ``chunk_frames`` — the slice covering ``[warm_start, emit_end)`` (warmup
         prefix + emit window);
       * ``warm_offset`` — number of leading warmup frames in ``chunk_frames``
         whose output must be **discarded** (state rebuilt only);
@@ -157,9 +158,15 @@ def process_in_chunks(
     state (e.g. ``StereoRenderer._prev_disparity``) but yields nothing for
     them.
 
+    ``frames`` may be a random-access ``Sequence`` (list) **or** a lazy
+    ``Iterable`` (generator).  In the lazy case the total frame count is
+    discovered by streaming; a circular buffer keeps at most
+    ``chunk_size + overlap`` frames resident at once, so peak memory is
+    bounded by the chunk, not by clip length (V-4.1a).
+
     Args:
-        frames: Full input frame list (read-only here; never copied — only
-            short slices are passed to ``process_fn``).
+        frames: Input frames — a ``Sequence`` or a lazy ``Iterable``/generator.
+            Read-only here; never fully materialised when an ``Iterable``.
         process_fn: Per-chunk callable described above.
         chunk_size: Emitted frames per chunk (default
             :func:`default_chunk_size`).  ``None`` ⇒ default.
@@ -172,11 +179,112 @@ def process_in_chunks(
     if chunk_size is None:
         chunk_size = default_chunk_size()
 
+    if _is_sequence(frames):
+        return _process_in_chunks_seq(frames, process_fn, chunk_size=chunk_size, overlap=overlap)
+    return _process_in_chunks_lazy(frames, process_fn, chunk_size=chunk_size, overlap=overlap)
+
+
+def _is_sequence(obj: Sequence | Iterable) -> bool:
+    """True when *obj* supports random access (``__len__`` + ``__getitem__``).
+
+    ``str``/``bytes`` are excluded (never valid frame streams). Generators and
+    other iterables lacking ``__len__`` return False.
+    """
+    if isinstance(obj, (str, bytes)):
+        return False
+    return hasattr(obj, "__len__") and hasattr(obj, "__getitem__")
+
+
+def _process_in_chunks_seq(
+    frames: Sequence,
+    process_fn: Callable[[list, int, int], Iterator[T]],
+    *,
+    chunk_size: int,
+    overlap: int,
+) -> Iterator[T]:
+    """Random-access (list) path — original behaviour, unchanged."""
     n = len(frames)
     for emit_start, emit_end, warm_start in chunk_ranges(n, chunk_size, overlap):
-        chunk = frames[warm_start:emit_end]
+        chunk = list(frames[warm_start:emit_end])
         warm_offset = emit_start - warm_start
         emit_offset = emit_end - emit_start
-        # process_fn yields exactly `emit_offset` kept outputs (warmup outputs
-        # are consumed internally for state and not yielded).
         yield from process_fn(chunk, warm_offset, emit_offset)
+
+
+def _process_in_chunks_lazy(
+    frames: Iterable,
+    process_fn: Callable[[list, int, int], Iterator[T]],
+    *,
+    chunk_size: int,
+    overlap: int,
+) -> Iterator[T]:
+    """Lazy (generator) path — bounded circular buffer, single pass, no full materialisation.
+
+    A single streaming pass over the source both counts frames (to drive the
+    chunk window boundaries) and maintains a circular ``deque`` that holds at
+    most ``chunk_size + overlap`` frames.  As each emitted frame arrives, the
+    buffer is kept to exactly the current window ``[warm_start .. emit_end)``
+    (warmup + emit); the oldest frames are popped from the head, so at every
+    moment at most ``chunk_size + overlap`` frames are resident.
+
+    Because a generator is single-use, we cannot count first and replay — the
+    windows are emitted in a single forward pass.  The first ``overlap`` frames
+    before ``chunk_size`` cannot form a full emit window, so they are held as
+    the initial warmup buffer and only ``process_fn`` is called once the first
+    full emit window ``[0, chunk_size)`` is complete; subsequent windows emit
+    as soon as ``emit_end`` is reached.
+    """
+    it = iter(frames)
+
+    buf: deque = deque(maxlen=chunk_size + overlap)
+    idx = 0  # next frame index to read from the source (0-based)
+    emit_start = 0  # start of the current emit window [emit_start, emit_end)
+    first = True
+
+    while True:
+        warm_start = emit_start if first else max(0, emit_start - overlap)
+
+        # Pull frames until we have filled the current emit window.
+        pulled = False
+        try:
+            while True:
+                frame = next(it)
+                buf.append(frame)
+                idx += 1
+                pulled = True
+
+                # Once the buffer holds frames through this new ``idx-1``, check
+                # whether the current emit window [emit_start, emit_end) is full.
+                # emit_end = min(emit_start + chunk_size, idx).  The window is
+                # full when idx reaches emit_start + chunk_size OR the source
+                # is exhausted (handled by the StopIteration below).
+                target = emit_start + chunk_size
+                if idx >= target:
+                    break
+        except StopIteration:
+            pass  # source exhausted — emit whatever remains, then stop.
+
+        if not pulled and idx <= emit_start:
+            # Source ended before we even reached the current window — done.
+            break
+
+        emit_end = min(emit_start + chunk_size, idx)
+        if emit_end <= emit_start:
+            # Nothing new to emit this cycle.
+            first = False
+            continue
+
+        # Trim head so buffer covers exactly [warm_start, emit_end).
+        while buf and (idx - len(buf)) < warm_start:
+            buf.popleft()
+
+        chunk = list(buf)
+        warm_offset = emit_start - warm_start
+        emit_offset = emit_end - emit_start
+        yield from process_fn(chunk, warm_offset, emit_offset)
+
+        emit_start = emit_end
+        first = False
+        if idx < emit_start:
+            # Source exhausted before the next window starts.
+            break

@@ -403,6 +403,55 @@ def read_frames(video_path: str, max_frames: int | None = None):
     cap.release()
 
 
+def _intake_frames(video_path: str, max_frames: int | None, lazy: bool):
+    """Load source frames for the batch pipeline.
+
+    Returns ``(frames, total)`` where ``total`` is the (capped) frame count.
+
+    When ``lazy=True`` (V-4.1a, only when ``--chunk-size`` is active), ``frames``
+    is a generator — ``read_frames`` is returned directly so the full clip is
+    never materialised in RAM.  Downstream chunked stages (depth, via
+    ``process_in_chunks``) stream through it with a bounded circular buffer.
+    ``total`` still comes from the cheap ``CAP_PROP_FRAME_COUNT`` metadata so
+    progress bars can show a known count without materialising any frames.
+
+    When ``lazy=False`` the legacy behaviour is preserved exactly: frames are
+    materialised into a list and a large-buffer warning is emitted if RAM use
+    exceeds 1 GB.  This keeps the non-``--chunk-size`` path bit-for-bit
+    unchanged.
+    """
+    frames_gen = read_frames(video_path, max_frames)
+
+    # Peek the total off the generator's metadata is not directly exposed, so
+    # pull the first frame to materialise the cv2 header logging in read_frames
+    # AND obtain a reliable count.  read_frames logs fps/total/size from
+    # CAP_PROP_* metadata (no full materialisation).  To get ``total`` without
+    # consuming frames we probe the same metadata cheaply:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if max_frames:
+        total = min(total, max_frames)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    if lazy:
+        return frames_gen, total
+
+    frames = list(frames_gen)
+    log.info("Loaded %d frames", len(frames))
+    if frames and h and w:
+        mem_mb = len(frames) * h * w * 3 / (1024 * 1024)
+        if mem_mb > 1024:
+            log.warning(
+                "⚠️  Frame buffer uses ~%.0f MB in RAM. For large videos, consider using --max-frames or --temp-dir.",
+                mem_mb,
+            )
+    return frames, total
+
+
 def get_output_path(args, suffix=".mp4"):
     """Get output path or generate default."""
     if args.output:
@@ -517,7 +566,7 @@ def run_depth_stage(args, frames):
             tqdm(
                 process_in_chunks(frames, _depth_process_fn, chunk_size=chunk_size, overlap=overlap),
                 desc="Estimating depth (chunked)",
-                total=len(frames),
+                total=len(frames) if hasattr(frames, "__len__") else None,
             )
         )
     else:
@@ -1382,20 +1431,14 @@ def main():
                 _manifest_record_stage(manifest, args, mname)
                 manifest_touched.add(mname)
 
-        # Load frames if needed
+        # Load frames if needed.  V-4.1a: when --chunk-size is active the
+        # intake is a lazy generator (never fully materialised); otherwise the
+        # legacy list path is preserved exactly for the non-chunked stages
+        # (upscale / stereo) that need random access.
+        _chunked = bool(getattr(args, "chunk_size", None))
         frames = None
         if need_frames or "depth" in stages_to_run:
-            frames = list(read_frames(args.input, args.max_frames))
-            log.info(f"Loaded {len(frames)} frames")
-
-            if frames:
-                H, W = frames[0].shape[:2]
-                mem_mb = len(frames) * H * W * 3 / (1024 * 1024)
-                if mem_mb > 1024:
-                    log.warning(
-                        f"⚠️  Frame buffer uses ~{mem_mb:.0f} MB in RAM. "
-                        f"For large videos, consider using --max-frames or --temp-dir."
-                    )
+            frames, _total = _intake_frames(args.input, args.max_frames, lazy=_chunked)
 
         # Run stages sequentially with checkpointing
         depths = None
@@ -1425,8 +1468,12 @@ def main():
                     depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
                     depths = [np.load(f) for f in depth_files]
                     log.info(f"📂 Loaded {len(depths)} depth maps from checkpoint")
-                if frames is None:
-                    frames = list(read_frames(args.input, args.max_frames))
+                if frames is None or _chunked:
+                    # Stereo needs frames as a materialised list (zip over
+                    # frames+depths).  When chunked, the intake generator was
+                    # already consumed by the depth stage, so re-read here.
+                    # (Full frame/depth buffer reuse is V-4.1b — out of scope.)
+                    frames, _ = _intake_frames(args.input, args.max_frames, lazy=False)
                 left_frames, right_frames = run_stereo_stage(args, frames, depths)
                 save_checkpoint(temp_dir, "stereo", {"num_frames": len(left_frames)})
                 _record("stereo")
@@ -1507,10 +1554,14 @@ def main():
             save_manifest(manifest, manifest_out)
 
     elif args.stage == "depth":
-        frames = list(read_frames(args.input, args.max_frames))
+        # Depth is the sole chunked consumer here — intake lazily when
+        # --chunk-size is set (V-4.1a); legacy list otherwise.
+        _lazy_depth = bool(getattr(args, "chunk_size", None))
+        frames, _ = _intake_frames(args.input, args.max_frames, lazy=_lazy_depth)
         run_depth_stage(args, frames)
 
     elif args.stage == "stereo":
+        # Stereo needs frames as a materialised list; keep legacy intake.
         frames = list(read_frames(args.input, args.max_frames))
         depth_dir = get_temp_dir(args, "depth")
         depths = []
