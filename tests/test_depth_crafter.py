@@ -140,14 +140,26 @@ def test_cli_backend_no_inference_script(mock_cuda: MagicMock) -> None:
 
 
 @patch("pipeline.depth_crafter._assert_cuda")
-def test_cli_backend_finds_inference_script(mock_cuda: MagicMock) -> None:
-    """CLIBackend should find run.py in the repo dir."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Create a fake inference script
+def test_cli_backend_finds_inference_script(mock_cuda: MagicMock, tmp_path) -> None:
+    """CLIBackend should find run.py in the repo dir.
+
+    Hermetic: patch the in-repo default paths to non-existent tmp_path dirs
+    so the python_exe default is guaranteed to be 'python' regardless of
+    whether this host happens to have a real DepthCrafter checkout.
+    """
+    fake_inrepo_repo = tmp_path / "nope_depthcrafter"  # does NOT exist
+    fake_inrepo_py = tmp_path / "nope_python"  # does NOT exist
+    fake_inrepo_model = tmp_path / "nope_model"  # does NOT exist
+
+    with (
+        patch("pipeline.depth_crafter.INREPO_REPO_DIR", fake_inrepo_repo),
+        patch("pipeline.depth_crafter.INREPO_PYTHON_EXE", fake_inrepo_py),
+        patch("pipeline.depth_crafter.INREPO_MODEL_DIR", fake_inrepo_model),
+        tempfile.TemporaryDirectory() as tmpdir,
+    ):
         script_path = Path(tmpdir) / "run.py"
         script_path.write_text("print('ok')")
 
-        # We expect subprocess to fail because there's no video, but that's fine
         backend = CLIBackend(repo_dir=tmpdir)
         assert backend.repo_dir == str(Path(tmpdir).resolve())
         assert backend.python_exe == "python"
@@ -309,9 +321,23 @@ def test_cli_backend_timeout(
 
 
 @patch("pipeline.depth_crafter._assert_cuda")
-def test_cli_backend_env_vars(mock_cuda: MagicMock) -> None:
-    """CLIBackend should read DEPTHCRAFTER_REPO_DIR from env."""
-    with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {"DEPTHCRAFTER_REPO_DIR": tmpdir}):
+def test_cli_backend_env_vars(mock_cuda: MagicMock, tmp_path) -> None:
+    """CLIBackend should read DEPTHCRAFTER_REPO_DIR from env.
+
+    Hermetic: the in-repo python_exe must be neutralized so the assertion
+    on python_exe is machine-independent.
+    """
+    fake_inrepo_py = tmp_path / "nope_python"  # does NOT exist
+    fake_inrepo_repo = tmp_path / "nope_repo"
+    fake_inrepo_model = tmp_path / "nope_model"
+
+    with (
+        tempfile.TemporaryDirectory() as tmpdir,
+        patch.dict(os.environ, {"DEPTHCRAFTER_REPO_DIR": tmpdir}),
+        patch("pipeline.depth_crafter.INREPO_REPO_DIR", fake_inrepo_repo),
+        patch("pipeline.depth_crafter.INREPO_PYTHON_EXE", fake_inrepo_py),
+        patch("pipeline.depth_crafter.INREPO_MODEL_DIR", fake_inrepo_model),
+    ):
         script_path = Path(tmpdir) / "run.py"
         script_path.write_text("print('ok')")
         backend = CLIBackend()  # no argument — uses env var
