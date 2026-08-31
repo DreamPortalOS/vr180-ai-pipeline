@@ -829,6 +829,130 @@ def run_metadata_stage(args, sbs_frames):
     return result
 
 
+def run_chunked_fused_stage(args, frames, depths):
+    """V-4.1b (#89): fused stereo→equirect→encode under ``--chunk-size``.
+
+    Instead of ``run_stereo_stage`` returning full ``left_frames`` /
+    ``right_frames`` lists, ``run_equirect_stage`` accumulating all SBS frames,
+    and ``run_metadata_stage``'s ``b"".join``-ing the whole raw byte stream, this
+    fuses all three into a single persistent ffmpeg raw-pipe process and writes
+    each chunk's per-frame SBS bytes incrementally.  Peak RAM is proportional to
+    ``chunk_size`` (one chunk's L/R + SBS frames), **not** to clip length — the
+    V-4.1b memory contract.
+
+    Equivalence: the StereoRenderer is a single persistent instance across chunks
+    (so ``_prev_disparity`` is continuous → bit-exact vs whole-sequence with
+    overlap=0); equirect uses the per-frame ``map_stereo_pair`` path (the batched
+    ``map_sequence`` requires the full sequence, so the two are mutually
+    exclusive — chunk mode forces per-frame equirect).
+
+    Args:
+        args: Parsed CLI args (``--chunk-size``, ``--overlap``, ``--codec``,
+            ``--crf``, ``--bitrate``, ``--hw-encoder``, ``--output-width`` …).
+        frames: Materialised list of source RGB frames (same length as depths).
+        depths: Matching depth maps (same length).
+
+    Returns:
+        Output video path (with sv3d/st3d injected, matching the legacy
+        metadata stage's contract).
+    """
+    from pipeline.streaming_pipeline import RawFrameFFmpegWriter, _resolve_hw_encoder
+
+    log.info("=== Stage 2+3+4 (fused, chunked incremental encode) ===")
+
+    renderer = StereoRenderer(
+        ipd=args.ipd,
+        max_disparity=args.max_disparity,
+        convergence=getattr(args, "convergence", 0.3),
+        temporal_smooth=getattr(args, "temporal_smooth", not args.no_temporal),
+    )
+    mapper = EquirectangularMapper(
+        output_width=args.output_width,
+        output_height=args.output_height,
+        src_hfov=args.src_hfov,
+        use_ffmpeg=not args.no_ffmpeg_v360,
+    )
+
+    output_path = get_output_path(args)
+    out_w = args.output_width * 2
+    out_h = args.output_height
+    log.info("Target output: %dx%d (SBS, %d² per eye, chunked incremental)", out_w, out_h, args.output_width)
+
+    # Resolve NVENC once (issue #49): CUDA availability does not imply a working
+    # NVENC encoder.  Reuse the streaming path's probe + select_encoder.
+    device = resolve_device(args.device)
+    hw = _resolve_hw_encoder(device, args.codec, out_w, getattr(args, "hw_encoder", "auto"))
+
+    # Per-chunk L/R checkpoint dirs (kept for checkpoint restore compatibility
+    # with the separate stereo/equirect stages — the manifest validates them).
+    left_dir = get_temp_dir(args, "left")
+    right_dir = get_temp_dir(args, "right")
+    eq_dir = get_temp_dir(args, "equirect")
+
+    chunk_size = getattr(args, "chunk_size", None) or len(frames)
+    overlap = getattr(args, "overlap", 0)
+
+    # render_sequence_chunked drives one persistent StereoRenderer across chunks
+    # → _prev_disparity continuous → bit-exact vs whole-sequence (overlap=0).
+    chunked = renderer.render_sequence_chunked(frames, depths, chunk_size=chunk_size, overlap=overlap)
+    iterator = tqdm(chunked, desc="Stereo→project→encode (chunked)", total=len(frames))
+
+    with RawFrameFFmpegWriter(
+        output_path,
+        out_w,
+        out_h,
+        codec=args.codec,
+        crf=args.crf,
+        fps=args.fps or 30,
+        bitrate=args.bitrate,
+        hw_encoder=hw,
+    ) as writer:
+        for i, (left, right) in enumerate(iterator):
+            # Per-frame equirect (chunk mode forces this — batched map_sequence
+            # needs the full sequence and is mutually exclusive with chunking).
+            sbs = mapper.map_stereo_pair(left, right)
+            writer.write(sbs)
+
+            # Checkpoint PNGs so resume/manifest hash validation still works.
+            cv2.imwrite(
+                os.path.join(left_dir, f"left_{i:06d}.png"),
+                cv2.cvtColor(left, cv2.COLOR_RGB2BGR),
+            )
+            cv2.imwrite(
+                os.path.join(right_dir, f"right_{i:06d}.png"),
+                cv2.cvtColor(right, cv2.COLOR_RGB2BGR),
+            )
+            cv2.imwrite(
+                os.path.join(eq_dir, f"equirect_{i:06d}.png"),
+                cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR),
+            )
+            # Release the chunk's intermediates so only the current frame's L/R/SBS
+            # are resident — peak RAM ∝ chunk_size, not clip length.
+            del left, right, sbs
+
+    log.info("✅ Chunked incremental encode complete → %s", output_path)
+
+    # Inject sv3d/st3d so HMDs recognise the stream as 180° 3D (matches the
+    # streaming path + the legacy metadata stage's contract).
+    from pipeline.spherical_injector import inject_spherical_metadata
+
+    injected = output_path + ".vr.mp4"
+    try:
+        inject_spherical_metadata(
+            output_path,
+            injected,
+            width=out_w,
+            height=out_h,
+            stereo_mode="sbs",
+        )
+    except Exception as e:
+        log.error("❌ VR metadata injection failed for %s: %s", output_path, e)
+        raise
+    os.replace(injected, output_path)
+    log.info("✅ sv3d/st3d injected → %s", output_path)
+    return output_path
+
+
 def run_seedvr2_prestage(args) -> str:
     """Stage 0: SeedVR2 video upscaling (runs on the whole video file before frame loading).
 
@@ -1519,6 +1643,21 @@ def main():
         left_frames, right_frames = None, None
         sbs_frames = None
         output = None
+        _fused_done: set[str] = set()
+
+        # V-4.1b (#89): when --chunk-size is set and the full stereo→equirect→
+        # metadata tail is to run (no outpaint — outpaint needs the whole SBS
+        # list in RAM, which is out of scope for this card), fuse them into a
+        # single persistent-ffmpeg incremental encode so peak RSS ∝ chunk_size,
+        # not clip length.  The separate stages are skipped (marked done below).
+        _fused_pending = (
+            _chunked
+            and "stereo" in stages_to_run
+            and "equirect" in stages_to_run
+            and "metadata" in stages_to_run
+            and getattr(args, "outpaint", "none") == "none"
+            and not is_sbs
+        )
 
         for stage in stages_to_run:
             if stage == "upscale":
@@ -1532,6 +1671,30 @@ def main():
                 depths = run_depth_stage(args, frames)
                 save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
                 _record("depth")
+
+            elif stage == "stereo" and _fused_pending:
+                # V-4.1b: fused stereo→equirect→metadata incremental encode.
+                # Depths came from the (already-run) depth stage; frames are
+                # re-materialised here (the lazy intake generator was consumed
+                # by the depth stage).  Peak RAM ∝ chunk_size, not clip length.
+                if depths is None:
+                    depth_dir = get_temp_dir(args, "depth")
+                    import glob
+
+                    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
+                    depths = [np.load(f) for f in depth_files]
+                    log.info(f"📂 Loaded {len(depths)} depth maps from checkpoint")
+                if frames is None or _chunked:
+                    frames, _ = _intake_frames(args.input, args.max_frames, lazy=False)
+                output = run_chunked_fused_stage(args, frames, depths)
+                save_checkpoint(temp_dir, "stereo", {"num_frames": len(depths)})
+                _record("stereo")
+                _record("equirect")
+                _record("metadata")
+                # The equirect/outpaint/metadata iterations below are no-ops for
+                # the fused path — record them consumed so the loop doesn't
+                # double-encode.
+                _fused_done = {"equirect", "outpaint", "metadata"}
 
             elif stage == "stereo":
                 if depths is None:
@@ -1553,6 +1716,8 @@ def main():
                 _record("stereo")
 
             elif stage == "equirect":
+                if stage in _fused_done:
+                    continue
                 if is_sbs and left_frames is None:
                     # SBS input: split each frame into left/right halves
                     log.info("🔲 SBS input detected — splitting frames into left/right")
@@ -1585,6 +1750,8 @@ def main():
                 _record("equirect")
 
             elif stage == "outpaint":
+                if stage in _fused_done:
+                    continue
                 if sbs_frames is None:
                     import glob
 
@@ -1597,6 +1764,8 @@ def main():
                 _record("outpaint")
 
             elif stage == "metadata":
+                if stage in _fused_done:
+                    continue
                 if sbs_frames is None:
                     import glob
 

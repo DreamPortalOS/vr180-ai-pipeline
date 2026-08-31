@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 
 import cv2
+import numpy as np
 
 from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import resolve_device
@@ -501,6 +502,168 @@ class StreamingPipeline:
 
         log.info(f"✅ Streaming complete: {frame_idx} frames → {output_path}")
         return output_path
+
+
+class RawFrameFFmpegWriter:
+    """Persistent raw-pipe ffmpeg writer for incremental, chunked encoding (V-4.1b, #89).
+
+    The streaming :class:`StreamingPipeline` fuses depth→stereo→project→encode
+    per *frame* (O(1)).  The batch ``--chunk-size`` path cannot fuse per-frame
+    (it needs chunk-sized depth/stereo batches for temporal state), but it can
+    still avoid buffering the **whole clip's** SBS bytes: it writes each chunk's
+    per-frame SBS raw bytes straight into a *single* persistent ffmpeg process
+    opened here, instead of accumulating a full-length ``left_frames`` /
+    ``right_frames`` / ``sbs_frames`` list and ``b"".join``-ing the raw bytes at
+    the end (the V-4.1b memory contract — peak RSS ∝ ``chunk_size``, not clip
+    length).
+
+    Encoder selection reuses :func:`select_encoder` + :func:`probe_nvenc`
+    (the same machinery the streaming path uses) — *imported, not duplicated*.
+    stderr is captured to a temp file (issue #49) so a dead encoder surfaces a
+    real error with its stderr tail instead of silently producing a bad file.
+
+    Use as a context manager::
+
+        with RawFrameFFmpegWriter(out, W, H, codec="h264", ...) as w:
+            for chunk ...:
+                w.write(sbs_frame)   # one ndarray per frame, in order
+    """
+
+    def __init__(
+        self,
+        output_path: str,
+        width: int,
+        height: int,
+        *,
+        codec: str = "h264",
+        crf: int = 23,
+        fps: int = 30,
+        bitrate: str | None = None,
+        hw_encoder: bool = False,
+        ffmpeg: str = "ffmpeg",
+    ):
+        self.output_path = output_path
+        self.width = width
+        self.height = height
+        self.codec = codec
+        self.crf = crf
+        self.fps = fps
+        self.bitrate = bitrate
+        self.hw_encoder = hw_encoder
+        self.ffmpeg = ffmpeg
+        self._proc: subprocess.Popen | None = None
+        self._stderr_file = None
+        self._frames_written = 0
+
+    def _build_cmd(self) -> list[str]:
+        cmd = [
+            self.ffmpeg,
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{self.width}x{self.height}",
+            "-r",
+            str(self.fps),
+            "-i",
+            "pipe:0",
+        ]
+        cmd += select_encoder(self.codec, self.width, hw=self.hw_encoder)
+        if self.bitrate:
+            cmd += ["-b:v", self.bitrate]
+        else:
+            cmd += ["-crf", str(self.crf)]
+        cmd += ["-pix_fmt", "yuv420p", "-movflags", "+faststart", self.output_path]
+        return cmd
+
+    def open(self) -> "RawFrameFFmpegWriter":
+        """Spawn the persistent ffmpeg process. Called by ``__enter__``."""
+        cmd = self._build_cmd()
+        log.info("ffmpeg cmd: %s", " ".join(cmd))
+        # stderr → temp file (issue #49): a PIPE would deadlock once its 64 KB
+        # buffer fills; DEVNULL hides fatal errors. The file is OS-drained at
+        # no cost; we read only the tail on failure.
+        self._stderr_file = tempfile.TemporaryFile(prefix="vr180-ffmpeg-stderr-")  # noqa: SIM115
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=self._stderr_file,
+        )
+        return self
+
+    def __enter__(self) -> "RawFrameFFmpegWriter":
+        return self.open()
+
+    def write(self, frame: np.ndarray) -> None:
+        """Write one SBS frame's raw RGB bytes to the ffmpeg pipe.
+
+        Args:
+            frame: ``(H, W, 3)`` uint8 ndarray — must match the ``width`` /
+                ``height`` this writer was opened with.
+        """
+        assert self._proc is not None and self._proc.stdin is not None, "writer not open"
+        try:
+            self._proc.stdin.write(frame.astype(np.uint8).tobytes())
+        except BrokenPipeError:
+            raise RuntimeError(
+                f"ffmpeg encoder died after {self._frames_written} frames — "
+                "check encoder availability/limits for this resolution "
+                f"({self.width}×{self.height}). ffmpeg stderr: {self._stderr_summary()}"
+            ) from None
+        except OSError as e:
+            if e.errno in (22, 32):  # EINVAL (Windows broken pipe) / EPIPE
+                raise RuntimeError(
+                    f"ffmpeg encoder died after {self._frames_written} frames "
+                    f"(pipe write failed, errno={e.errno}; exit code "
+                    f"{self._proc.poll()}). ffmpeg stderr: {self._stderr_summary()}"
+                ) from None
+            raise
+        self._frames_written += 1
+
+    def close(self) -> None:
+        """Finalise the ffmpeg process and raise on failure (no silent bad files)."""
+        if self._proc is None:
+            return
+        try:
+            if self._proc.stdin is not None:
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    self._proc.stdin.close()
+            self._proc.wait()
+            if self._proc.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg encoding failed (exit code {self._proc.returncode}) "
+                    f"after {self._frames_written} frames. "
+                    f"ffmpeg stderr: {self._stderr_summary()}"
+                )
+        finally:
+            if self._stderr_file is not None:
+                with contextlib.suppress(OSError):
+                    self._stderr_file.close()
+            self._proc = None
+            self._stderr_file = None
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _stderr_summary(self) -> str:
+        f = self._stderr_file
+        if f is None:
+            return "(stderr not captured)"
+        try:
+            f.flush()
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - STDERR_TAIL_BYTES))
+            tail = f.read()
+            text = tail.decode("utf-8", errors="replace").strip()
+            return text or "(ffmpeg produced no stderr output)"
+        except (OSError, ValueError):
+            return "(stderr unreadable)"
 
 
 def run_streaming_pipeline(
