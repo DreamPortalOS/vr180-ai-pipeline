@@ -1537,14 +1537,17 @@ def main():
             log.info(f"✅ Pipeline complete → {output}")
 
         # H-1: audio passthrough. After all metadata (sv3d/st3d) is embedded,
-        # remux an audio track in with -c copy. ffmpeg -c copy preserves the
-        # user-data boxes, so the VR metadata survives; the audio source is
-        # explicit --copy-audio-from or, if omitted, the input video itself.
+        # remux an audio track in with -c copy.  NOTE (issue #91): ffmpeg
+        # -c copy with -map 0:v -map 1:a does NOT preserve the sv3d/st3d
+        # sample-entry boxes, so the audio remux MUST be followed by a
+        # re-injection that self-verifies the boxes survived.  The audio
+        # source is explicit --copy-audio-from or, if omitted, the input
+        # video itself.
         if output and getattr(args, "copy_audio_from", None):
-            _copy_audio_to_output(output, args.copy_audio_from)
+            _copy_audio_to_output(output, args.copy_audio_from, re_inject=True)
         elif output:
             # Implicit: if the input video has an audio stream, copy it in.
-            _maybe_copy_audio_from_input(output, args.input)
+            _maybe_copy_audio_from_input(output, args.input, re_inject=True)
 
         # V-3: persist the job manifest (write new / update resumed one).
         manifest_out = args.manifest if isinstance(args.manifest, str) else None
@@ -1603,16 +1606,27 @@ def main():
 # ---------------------------------------------------------------------------
 
 
-def _copy_audio_to_output(output: str, source: str) -> None:
-    """Attach an audio track from *source* to the finished VR180 *output*."""
+def _copy_audio_to_output(output: str, source: str, *, re_inject: bool = False) -> None:
+    """Attach an audio track from *source* to the finished VR180 *output*.
+
+    When *re_inject* is True, re-embeds sv3d/st3d after the remux — required
+    because ffmpeg ``-c copy`` with ``-map 0:v -map 1:a`` drops the sample-
+    entry boxes (issue #91). The re-injection is self-verifying and raises
+    on failure.
+    """
     from pipeline.audio_mux import copy_audio_to
+    from pipeline.spherical_injector import inject_spherical_metadata
 
     log.info("🔊 Copying audio track %s → %s", source, output)
     copy_audio_to(output, source)
+    if re_inject:
+        log.info("🔊 Re-injecting sv3d/st3d (ffmpeg -c copy drops sample-entry boxes)")
+        inject_spherical_metadata(output, output + ".vr.mp4", stereo_mode="sbs")
+        os.replace(output + ".vr.mp4", output)
     log.info("✅ Audio remux complete → %s", output)
 
 
-def _maybe_copy_audio_from_input(output: str, input_path: str) -> None:
+def _maybe_copy_audio_from_input(output: str, input_path: str, *, re_inject: bool = False) -> None:
     """If the input video has an audio stream, copy it into the VR180 output.
 
     No-op (silent) when the input has no audio — matches the orchestrator's
@@ -1623,7 +1637,7 @@ def _maybe_copy_audio_from_input(output: str, input_path: str) -> None:
     if not has_audio_stream(input_path):
         return
     log.info("🔊 Input %s has an audio stream — remuxing into %s", input_path, output)
-    _copy_audio_to_output(output, input_path)
+    _copy_audio_to_output(output, input_path, re_inject=re_inject)
 
 
 if __name__ == "__main__":
