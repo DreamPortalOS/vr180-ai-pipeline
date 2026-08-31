@@ -1,6 +1,10 @@
 """Tests for pipeline.spherical_injector — ISOBMFF box building and injection."""
 
+import os
 import struct
+import subprocess
+
+import pytest
 
 from pipeline.spherical_injector import (
     _STEREO_LEFT_RIGHT,
@@ -15,6 +19,7 @@ from pipeline.spherical_injector import (
     _stereo_mode_byte,
     _u8,
     _u32,
+    inject_spherical_metadata,
 )
 
 
@@ -245,3 +250,198 @@ class TestSpecLayoutScanning:
         st3d = self._make_box(b"st3d", b"\x00\x00\x00\x00\x02")
         buf = bytearray(self._make_box(b"stbl", st3d))
         assert _find_box_recursive(buf, b"st3d", 0, len(buf)) == 8
+
+
+# ---------------------------------------------------------------------------
+# issue #91: injection self-check + ancestor-size-bump regression
+# ---------------------------------------------------------------------------
+
+
+def _make_tiny_mp4(path: str, w: int = 100, h: int = 100, frames: int = 3, fps: int = 24) -> None:
+    """Produce a tiny real H.264 mp4 via ffmpeg (rawvideo pipe)."""
+    frame = bytes([128]) * (w * h) + bytes([128]) * ((w // 2) * (h // 2)) * 2
+    raw = b"".join(frame for _ in range(frames))
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-s",
+            f"{w}x{h}",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "23",
+            "-movflags",
+            "+faststart",
+            path,
+        ],
+        input=raw,
+        capture_output=True,
+        check=True,
+    )
+
+
+class TestInjectSelfCheck:
+    """issue #91: injection must self-verify via _find_box_recursive and raise
+    on failure — no silent bad output."""
+
+    def test_inject_produces_findable_boxes(self, tmp_path):
+        src = tmp_path / "src.mp4"
+        out = tmp_path / "out.mp4"
+        _make_tiny_mp4(str(src))
+        inject_spherical_metadata(str(src), str(out), stereo_mode="sbs")
+        data = bytearray(out.read_bytes())
+        assert _find_box_recursive(data, b"sv3d", 0, len(data)) != -1
+        assert _find_box_recursive(data, b"st3d", 0, len(data)) != -1
+
+    def test_inject_bumps_ancestor_sizes(self, tmp_path):
+        """issue #91 root cause: ancestor box sizes (stsd, stbl, minf, mdia,
+        trak, moov) must grow by the inserted payload so the box tree stays
+        parseable. A flat top-level walk must reach every box without an
+        early 'break' on a size overrun."""
+        src = tmp_path / "src.mp4"
+        out = tmp_path / "out.mp4"
+        _make_tiny_mp4(str(src))
+        before = bytearray(src.read_bytes())
+        inject_spherical_metadata(str(src), str(out), stereo_mode="sbs")
+        after = bytearray(out.read_bytes())
+
+        def first_box_size(buf, btype):
+            # Walk top-level/known-container boxes to read the size at the
+            # type field (a naive byte-find hits false matches like avc1 in
+            # sample-entry names / udta tags).
+            i = buf.find(btype)
+            return struct.unpack(">I", buf[i - 4 : i])[0] if i >= 0 else None
+
+        # stsd..moov must all have grown by the same delta (the sv3d+st3d
+        # payload length), proving every ancestor was bumped. stsd is the
+        # critical one: it is the FullBox ancestor that the naive injector
+        # used to miss, leaving the avc1 sample entry pointing past stsd's
+        # declared end (scanner false-negative).
+        delta = first_box_size(after, b"stsd") - first_box_size(before, b"stsd")
+        assert delta > 0
+        for btype in (b"stsd", b"stbl", b"minf", b"mdia", b"trak", b"moov"):
+            assert first_box_size(after, btype) - first_box_size(before, btype) == delta, (
+                f"{btype!r} size not bumped by the insertion delta"
+            )
+
+    def test_inject_raises_on_uninjectable_input(self, tmp_path):
+        """An input with no moov/visual sample entry must raise, not silently
+        produce a plain-2D file."""
+        bad = tmp_path / "bad.mp4"
+        bad.write_bytes(b"\x00\x00\x00\x08ftypmp42")  # ftyp only, no moov
+        out = tmp_path / "out.mp4"
+        with pytest.raises(RuntimeError):
+            inject_spherical_metadata(str(bad), str(out), stereo_mode="sbs")
+
+    def test_inject_is_idempotent_safe_after_audio_remux(self, tmp_path):
+        """issue #91: ffmpeg -c copy (audio remux) strips sv3d/st3d; a
+        re-injection on the remuxed file must restore them. This locks the
+        run_pipeline 'remux -> re-inject' contract."""
+        src = tmp_path / "src.mp4"
+        inj = tmp_path / "inj.mp4"
+        aud = tmp_path / "aud.mp4"
+        # 24 frames @ 24fps = 1s, no faststart (avoids the mdat-before-moov
+        # layout that some ffmpeg builds mishandle with -c copy on tiny files).
+        _make_tiny_mp4(str(src), w=128, h=128, frames=24)
+        # silent 1s aac audio source
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "1", "-c:a", "aac", str(aud)],
+            capture_output=True,
+            check=True,
+        )
+        inject_spherical_metadata(str(src), str(inj), stereo_mode="sbs")
+        # audio remux strips the boxes (regression under test)
+        from pipeline.audio_mux import copy_audio_to
+
+        copy_audio_to(str(inj), str(aud))
+        data_after_remux = bytearray(inj.read_bytes())
+        assert _find_box_recursive(data_after_remux, b"sv3d", 0, len(data_after_remux)) == -1, (
+            "precondition: remux must strip boxes for this test to be meaningful"
+        )
+        # re-inject restores them
+        inject_spherical_metadata(str(inj), str(inj) + ".vr.mp4", stereo_mode="sbs")
+        os.replace(str(inj) + ".vr.mp4", str(inj))
+        data = bytearray(inj.read_bytes())
+        assert _find_box_recursive(data, b"sv3d", 0, len(data)) != -1
+        assert _find_box_recursive(data, b"st3d", 0, len(data)) != -1
+
+
+# ---------------------------------------------------------------------------
+# issue #91 acceptance: real end-to-end conversion produces findable boxes
+# ---------------------------------------------------------------------------
+
+
+class TestRealFileEndToEnd:
+    """Slow, real-ffmpeg regression test (issue #91).
+
+    Mocks cannot catch this class of regression — the whole point of #91 is
+    that the inject *path* produced a plain-2D file while still logging
+    success.  We therefore run a tiny *real* conversion end-to-end
+    (ffmpeg rawvideo → libx264 → in-process ISOBMFF injection, with and
+    without an audio remux) and assert the final artefact's byte stream
+    contains sv3d + st3d.
+    """
+
+    @pytest.mark.slow
+    def test_embed_single_frame_batch_produces_vr180_metadata(self, tmp_path):
+        """The metadata stage's real code path (vr_metadata.embed_single_frame_batch)
+        must leave findable sv3d/st3d in the final file."""
+        import numpy as np
+
+        from pipeline.vr_metadata import VRMetadataEmbedder
+
+        frames = [np.full((128, 256, 3), 128, dtype=np.uint8) for _ in range(12)]
+        out = tmp_path / "out.mp4"
+        embedder = VRMetadataEmbedder(codec="h264", crf=23, fps=24)
+        embedder.embed_single_frame_batch(frames, str(out), width=256, height=128)
+
+        data = bytearray(out.read_bytes())
+        assert _find_box_recursive(data, b"sv3d", 0, len(data)) != -1
+        assert _find_box_recursive(data, b"st3d", 0, len(data)) != -1
+
+    @pytest.mark.slow
+    def test_audio_remux_then_reinject_keeps_both_audio_and_metadata(self, tmp_path):
+        """With audio, the 'remux -> re-inject' sequence must leave a file
+        that has BOTH an AAC audio stream AND sv3d/st3d (issue #91 acceptance
+        item 2: 带 --copy-audio-from 时音频与元数据同时存在)."""
+        import numpy as np
+
+        from pipeline.audio_mux import has_audio_stream
+        from pipeline.vr_metadata import VRMetadataEmbedder
+
+        frames = [np.full((128, 256, 3), 128, dtype=np.uint8) for _ in range(24)]
+        video = tmp_path / "video.mp4"
+        embedder = VRMetadataEmbedder(codec="h264", crf=23, fps=24)
+        embedder.embed_single_frame_batch(frames, str(video), width=256, height=128)
+
+        # Build a short AAC audio source.
+        aud = tmp_path / "aud.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "2", "-c:a", "aac", str(aud)],
+            capture_output=True,
+            check=True,
+        )
+
+        # Remux audio in (strips sv3d/st3d), then re-inject — the run_pipeline
+        # contract.
+        from pipeline.audio_mux import copy_audio_to
+
+        copy_audio_to(str(video), str(aud))
+        inject_spherical_metadata(str(video), str(video) + ".vr.mp4", stereo_mode="sbs")
+        os.replace(str(video) + ".vr.mp4", str(video))
+
+        data = bytearray(video.read_bytes())
+        assert _find_box_recursive(data, b"sv3d", 0, len(data)) != -1
+        assert _find_box_recursive(data, b"st3d", 0, len(data)) != -1
+        assert has_audio_stream(str(video))
