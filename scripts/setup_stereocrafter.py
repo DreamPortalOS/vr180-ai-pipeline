@@ -81,15 +81,25 @@ TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
 #      can never bump them.
 # If inpainting_inference.py / depth_splatting_inference.py start importing
 # something new, add it here rather than switching to ``pip install -e .``.
+#
+# Verified against the two upstream entry points' top-level imports (the only
+# two scripts this bootstrap self-checks):
+#   inpainting_inference.py:        os, cv2, numpy, fire, torch, decord,
+#                                   transformers, diffusers (+ local pipeline)
+#   depth_splatting_inference.py:   gc, os, cv2, numpy, torch, torch.nn,
+#                                   torchvision.io, diffusers, fire, decord
+#                                   (+ vendored dependency/ & Forward_Warp)
+# → both import ``decord``; numpy ships transitively via torch/diffusers.
 RUNTIME_DEPS: tuple[str, ...] = (
     "diffusers",  # SD/SVD-based video diffusion backbone used for inpainting
     "transformers",  # pulled by diffusers models
     "accelerate",  # used by diffusers model loaders
     "huggingface-hub",  # weight download / caching
-    "opencv-python",  # video I/O
+    "opencv-python",  # video I/O (cv2)
     "einops",  # tensor reshapes used by the video diffusion blocks
     "ftfy",  # string cleaning (common in HF model code)
     "fire",  # inpainting_inference.py / depth_splatting_inference.py fire-style CLI
+    "decord",  # video loader (VideoReader) — both entry scripts import it
 )
 
 # HuggingFace repo for the StereoCrafter weights.
