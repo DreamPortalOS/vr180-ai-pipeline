@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """One-command, in-repo StereoCrafter bootstrap (CUDA-only, disocclusion inpainting).
 
-Deploys Tencent/StereoCrafter **inside** this repo so the pipeline's
+Deploys TencentARC/StereoCrafter **inside** this repo so the pipeline's
 :mod:`pipeline.stereo_crafter` ``CLIBackend`` can pick it up automatically via
 in-repo default paths — no separate ``D:/StereoCrafter`` install required.
 
 Layout created (everything is gitignored):
 
-    third_party/StereoCrafter/         ← git clone of Tencent/StereoCrafter (incl. its own .venv)
+    third_party/StereoCrafter/         ← git clone of TencentARC/StereoCrafter (incl. its own .venv)
     models/StereoCrafter/              ← TencentARC/StereoCrafter weights (hf snapshot)
 
 Steps (idempotent — re-running only fills missing pieces):
 
-    1. Clone Tencent/StereoCrafter (or ``git pull`` if present).
+    1. Clone TencentARC/StereoCrafter (or ``git pull`` if present).
        ``--repo-dir`` can point at an existing checkout instead (e.g. ``D:/StereoCrafter``).
     2. Build a **dedicated** venv inside the node dir (never the project-root venv):
        - torch==2.6.0 + torchvision==0.21.0 on the official cu124 index (stable, NOT nightly).
@@ -55,7 +55,7 @@ log = logging.getLogger("setup-stereocrafter")
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-NODE_REPO_URL = "https://github.com/Tencent/StereoCrafter.git"
+NODE_REPO_URL = "https://github.com/TencentARC/StereoCrafter.git"
 INREPO_NODE_DIR = REPO_ROOT / "third_party" / "StereoCrafter"
 INREPO_MODEL_DIR = REPO_ROOT / "models" / "StereoCrafter"
 
@@ -79,8 +79,8 @@ TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
 #      blow out the install.  torch / torchvision are intentionally NOT here —
 #      they are pinned in Step 2 against the cu124 index so a transitive dep
 #      can never bump them.
-# If run.py starts importing something new, add it here rather than switching
-# to ``pip install -e .``.
+# If inpainting_inference.py / depth_splatting_inference.py start importing
+# something new, add it here rather than switching to ``pip install -e .``.
 RUNTIME_DEPS: tuple[str, ...] = (
     "diffusers",  # SD/SVD-based video diffusion backbone used for inpainting
     "transformers",  # pulled by diffusers models
@@ -89,6 +89,7 @@ RUNTIME_DEPS: tuple[str, ...] = (
     "opencv-python",  # video I/O
     "einops",  # tensor reshapes used by the video diffusion blocks
     "ftfy",  # string cleaning (common in HF model code)
+    "fire",  # inpainting_inference.py / depth_splatting_inference.py fire-style CLI
 )
 
 # HuggingFace repo for the StereoCrafter weights.
@@ -146,7 +147,7 @@ def ensure_node_repo(
     dry_run: bool,
     buffer: DryRunBuffer,
 ) -> None:
-    """Clone Tencent/StereoCrafter, ``git pull`` if present, or use --repo-dir."""
+    """Clone TencentARC/StereoCrafter, ``git pull`` if present, or use --repo-dir."""
     node_dir = _effective_node_dir(explicit_repo_dir)
 
     if explicit_repo_dir:
@@ -343,12 +344,18 @@ def _has_snapshot_files(model_dir: Path) -> bool:
 
 
 def _find_inference_script(node_dir: Path) -> Path | None:
-    """Return the path to the first known StereoCrafter inference entry point."""
+    """Return the path to the first known StereoCrafter inference entry point.
+
+    The upstream ``TencentARC/StereoCrafter`` repo has no ``run.py`` — its two
+    root-level ``fire``-style entry points are ``inpainting_inference.py``
+    (Stage 2, the active entry ``run_inference.sh`` calls) and
+    ``depth_splatting_inference.py`` (Stage 1).  Both support ``--help``.
+    """
     candidates = [
-        node_dir / "run.py",
+        node_dir / "inpainting_inference.py",
+        node_dir / "depth_splatting_inference.py",
+        node_dir / "run.py",  # legacy fallback in case upstream re-adds it
         node_dir / "inference.py",
-        node_dir / "scripts" / "inference.py",
-        node_dir / "stereocrafter" / "inference.py",
     ]
     for c in candidates:
         if c.is_file():
@@ -373,7 +380,7 @@ def self_check(
 
     cli_script = _find_inference_script(node_dir) if not dry_run else None
 
-    script_name = str(Path("run.py")) if cli_script is None else cli_script.name
+    script_name = str(Path("inpainting_inference.py")) if cli_script is None else cli_script.name
     cmd = [str(python_exe), script_name, "--help"]
     label = f"{_cmd_line(cmd)}  (self-check)"
     if dry_run:
@@ -387,8 +394,9 @@ def self_check(
         )
     if cli_script is None:
         raise RuntimeError(
-            f"No known inference script (run.py / inference.py / scripts/inference.py / "
-            f"stereocrafter/inference.py) found under {node_dir} — self-check cannot run. "
+            f"No known inference script (inpainting_inference.py / "
+            f"depth_splatting_inference.py / run.py / inference.py) found under {node_dir} "
+            "— self-check cannot run. "
             "The StereoCrafter checkout may be incomplete; re-run the bootstrap."
         )
 
