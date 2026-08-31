@@ -78,18 +78,23 @@ class TestDryRunSequence:
         assert any("git clone" in s for s in labels), f"missing git clone in {buf.steps}"
         assert any("venv" in s for s in labels), f"missing venv step in {buf.steps}"
         assert any("torch" in s and "2.6.0" in s for s in labels), f"missing torch step in {buf.steps}"
-        assert any("requirements.txt" in s for s in labels), f"missing requirements step in {buf.steps}"
+        # Node-deps step is now pyproject-based (pip install -e).  Accept either
+        # "pip install -e" (pyproject) or "pip install -r requirements.txt"
+        # (legacy), but *not* anything that silently skipped deps.
+        assert any("pip install -e" in s for s in labels) or any("requirements.txt" in s for s in labels), (
+            f"missing node-deps install step in {buf.steps}: {buf.steps}"
+        )
         assert any("snapshot_download" in s for s in labels), f"missing model step in {buf.steps}"
         assert any("self-check" in s for s in labels), f"missing self-check in {buf.steps}"
 
-        # Order: clone before venv before torch before reqs before model before self-check.
+        # Order: clone before venv before torch before node-deps before model before self-check.
         clone_idx = next(i for i, s in enumerate(labels) if "git clone" in s)
         venv_idx = next(i for i, s in enumerate(labels) if "venv" in s)
         torch_idx = next(i for i, s in enumerate(labels) if "torch" in s)
-        reqs_idx = next(i for i, s in enumerate(labels) if "requirements.txt" in s)
+        node_dep_idx = next(i for i, s in enumerate(labels) if "pip install -e" in s or "requirements.txt" in s)
         model_idx = next(i for i, s in enumerate(labels) if "snapshot_download" in s)
         check_idx = next(i for i, s in enumerate(labels) if "self-check" in s)
-        assert clone_idx < venv_idx < torch_idx < reqs_idx < model_idx < check_idx
+        assert clone_idx < venv_idx < torch_idx < node_dep_idx < model_idx < check_idx
 
     def test_dry_run_performs_no_subprocess(self, sandbox):
         """--dry-run must NOT call subprocess.check_call / subprocess.run at all."""
@@ -177,6 +182,9 @@ class TestEnsureNodeRepo:
 
 class TestEnsureVenvAndDeps:
     def test_creates_venv_when_absent(self, sandbox):
+        sandbox.node_dir.mkdir(parents=True)
+        (sandbox.node_dir / "requirements.txt").write_text("numpy\n")
+
         calls: list[list[str]] = []
 
         def fake_check_call(cmd, *args, **kwargs):
@@ -229,6 +237,35 @@ class TestEnsureVenvAndDeps:
         assert "--retries" in tc
         assert tc[tc.index("--retries") + 1] == "10"
 
+    def test_pyproject_branch_when_no_requirements_txt(self, sandbox):
+        """When the node checkout has pyproject.toml but no requirements.txt,
+        install via ``pip install -e <node_dir>`` (the upstream Tencent layout)."""
+        sandbox.venv_dir.mkdir(parents=True)
+        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
+        sandbox.python_exe.write_text("# fake")
+        (sandbox.node_dir / "pyproject.toml").write_text("[project]\nname='fake'\n")
+        # Deliberately NO requirements.txt.
+
+        calls: list[list[str]] = []
+
+        def fake_check_call(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+
+        with patch("subprocess.check_call", side_effect=fake_check_call):
+            setup.ensure_venv_and_deps(None, None, dry_run=False, buffer=setup.DryRunBuffer())
+
+        # No -r call (no requirements.txt path).
+        reqs_calls = [c for c in calls if "-r" in c]
+        assert reqs_calls == [], f"should not use -r when only pyproject.toml exists: {reqs_calls}"
+
+        # Exactly one editable install with fire pinned.
+        editable = [c for c in calls if "-e" in c]
+        assert len(editable) == 1, f"expected one 'pip install -e' call, got {editable}"
+        e = editable[0]
+        assert str(sandbox.node_dir) in " ".join(e), f"node dir not in editable install: {e}"
+        assert "fire" in e, f"fire must be installed on the pyproject path: {e}"
+        assert setup.EXTRA_RUNTIME_DEPS == ("fire",)
+
     def test_pip_mirror_forwarded_to_pip_not_torch_index(self, sandbox):
         sandbox.venv_dir.mkdir(parents=True)
         sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
@@ -258,11 +295,14 @@ class TestEnsureVenvAndDeps:
         sandbox.venv_dir.mkdir(parents=True)
         sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
         sandbox.python_exe.write_text("# fake")
-        with patch("subprocess.check_call") as mock_cc:
+        with (
+            patch("subprocess.check_call") as mock_cc,
+            pytest.raises(RuntimeError) as exc_info,
+        ):
             setup.ensure_venv_and_deps(None, None, dry_run=False, buffer=setup.DryRunBuffer())
         reqs_calls = [c[0][0] for c in mock_cc.call_args_list if "-r" in c[0][0]]
-        assert reqs_calls == []
-        assert any("requirements.txt not found" in r.message for r in caplog.records)
+        assert reqs_calls == []  # no node-deps install attempted (nothing to install)
+        assert "no pyproject.toml" in str(exc_info.value).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -364,23 +404,55 @@ class TestSelfCheck:
             assert mock_run.call_args.kwargs["cwd"] == str(sandbox.node_dir)
         assert any("self-check passed" in r.message.lower() for r in caplog.records)
 
-    def test_self_check_skips_when_python_missing(self, sandbox, caplog):
+    def test_self_check_raises_when_python_missing(self, sandbox, caplog):
         caplog.set_level("WARNING", logger="setup-depthcrafter")
-        with patch("subprocess.run") as mock_run:
+        with (
+            patch("subprocess.run") as mock_run,
+            pytest.raises(RuntimeError) as exc_info,
+        ):
             setup.self_check(None, dry_run=False, buffer=setup.DryRunBuffer())
             mock_run.assert_not_called()
-        assert any("skipping self-check" in r.message.lower() for r in caplog.records)
+        assert "venv python not found" in str(exc_info.value).lower()
 
-    def test_self_check_skips_when_run_py_missing(self, sandbox, caplog):
+    def test_self_check_raises_when_run_py_missing(self, sandbox, caplog):
         caplog.set_level("WARNING", logger="setup-depthcrafter")
         sandbox.venv_dir.mkdir(parents=True)
         sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
         sandbox.python_exe.write_text("# fake")
         # No run.py created.
-        with patch("subprocess.run") as mock_run:
+        with (
+            patch("subprocess.run") as mock_run,
+            pytest.raises(RuntimeError) as exc_info,
+        ):
             setup.self_check(None, dry_run=False, buffer=setup.DryRunBuffer())
             mock_run.assert_not_called()
-        assert any("skipping self-check" in r.message.lower() for r in caplog.records)
+        assert "run.py not found" in str(exc_info.value).lower()
+
+    def test_self_check_raises_nonzero_exit_and_surface_stderr(self, sandbox, caplog):
+        """A failing run.py --help must raise and include the real stderr."""
+        caplog.set_level("INFO", logger="setup-depthcrafter")
+        sandbox.venv_dir.mkdir(parents=True)
+        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
+        sandbox.python_exe.write_text("# fake")
+        (sandbox.node_dir / "run.py").write_text("# fake")
+
+        fake_result = MagicMock()
+        fake_result.returncode = 1
+        fake_result.stderr = (
+            "Traceback (most recent call last):\n  File 'run.py', line 5\nImportError: No module named 'fire'"
+        )
+        fake_result.stdout = ""
+        with (
+            patch("subprocess.run", return_value=fake_result) as mock_run,
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            setup.self_check(None, dry_run=False, buffer=setup.DryRunBuffer())
+        cmd = mock_run.call_args[0][0]
+        assert cmd[-1] == "--help"
+        assert "run.py" in cmd
+        err_msg = str(exc_info.value)
+        assert "exit code 1" in err_msg
+        assert "No module named 'fire'" in err_msg
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +517,7 @@ class TestMain:
         fake_hf = MagicMock()
         with (
             patch("subprocess.check_call") as mock_cc,
+            patch("tests.test_setup_depthcrafter.setup.self_check"),  # no venv/run.py here
             patch.dict("sys.modules", {"huggingface_hub": fake_hf}),
         ):
             setup.main(["--skip-deps", "--skip-model"])
@@ -482,3 +555,57 @@ class TestMain:
             assert pull_calls[0].kwargs["cwd"] == str(external)
             # self-check ran against the external run.py.
             assert mock_run.call_args.kwargs["cwd"] == str(external)
+
+    def test_main_exits_nonzero_when_self_check_fails(self, sandbox, caplog):
+        """When run.py --help returns non-zero, main() must exit non-zero
+        (propagate the failure), not print a success summary."""
+        caplog.set_level("INFO", logger="setup-depthcrafter")
+        sandbox.node_dir.mkdir(parents=True)
+        (sandbox.node_dir / ".git").mkdir()
+        (sandbox.node_dir / "requirements.txt").write_text("numpy\n")
+        sandbox.venv_dir.mkdir(parents=True)
+        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
+        sandbox.python_exe.write_text("# fake")
+        (sandbox.node_dir / "run.py").write_text("# fake")
+
+        fake_hf = MagicMock()
+        fake_result = MagicMock()
+        fake_result.returncode = 1
+        fake_result.stderr = "ImportError: No module named 'fire'"
+        fake_result.stdout = ""
+
+        with (
+            patch("subprocess.check_call"),
+            patch("subprocess.run", return_value=fake_result),
+            patch.dict("sys.modules", {"huggingface_hub": fake_hf}),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            setup.main([])
+
+        assert exc_info.value.code == 1, "bootstrap must exit non-zero on self-check failure"
+        fake_hf.snapshot_download.assert_called_once()
+        msgs = "\n".join(r.message for r in caplog.records)
+        assert "failed" in msgs.lower() or "exit code" in msgs.lower()
+
+    def test_main_exits_nonzero_when_deps_missing(self, sandbox, caplog):
+        """When the checkout has neither pyproject.toml nor requirements.txt,
+        main() must exit non-zero (deps install is fatal, not a WARNING)."""
+        caplog.set_level("INFO", logger="setup-depthcrafter")
+        sandbox.node_dir.mkdir(parents=True)
+        (sandbox.node_dir / ".git").mkdir()
+        # Deliberately: no pyproject.toml, no requirements.txt.
+        sandbox.venv_dir.mkdir(parents=True)
+        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
+        sandbox.python_exe.write_text("# fake")
+
+        fake_hf = MagicMock()
+        with (
+            patch("subprocess.check_call"),
+            patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+            patch.dict("sys.modules", {"huggingface_hub": fake_hf}),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            setup.main([])
+
+        assert exc_info.value.code == 1
+        fake_hf.snapshot_download.assert_not_called()  # never got past step 2
