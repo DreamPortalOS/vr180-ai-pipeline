@@ -17,6 +17,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def _looks_like_path(tok: str) -> bool:
+    """Heuristic: a token is a filesystem path if it contains a dir separator."""
+    return any(sep in tok for sep in ("/", "\\"))
+
+
 def _load_setup_module():
     spec = importlib.util.spec_from_file_location(
         "setup_depthcrafter",
@@ -78,12 +83,12 @@ class TestDryRunSequence:
         assert any("git clone" in s for s in labels), f"missing git clone in {buf.steps}"
         assert any("venv" in s for s in labels), f"missing venv step in {buf.steps}"
         assert any("torch" in s and "2.6.0" in s for s in labels), f"missing torch step in {buf.steps}"
-        # Node-deps step is now pyproject-based (pip install -e).  Accept either
-        # "pip install -e" (pyproject) or "pip install -r requirements.txt"
-        # (legacy), but *not* anything that silently skipped deps.
-        assert any("pip install -e" in s for s in labels) or any("requirements.txt" in s for s in labels), (
-            f"missing node-deps install step in {buf.steps}: {buf.steps}"
+        # Node-deps step is now a curated-list ``pip install`` (no -e, no -r).
+        # It must contain the curated packages and must NOT be an editable install.
+        assert any("pip install" in s and "fire" in s and "diffusers" in s for s in labels), (
+            f"missing curated node-deps install step in {buf.steps}: {buf.steps}"
         )
+        assert not any("pip install -e" in s for s in labels), f"must not use editable install (-e) in {buf.steps}"
         assert any("snapshot_download" in s for s in labels), f"missing model step in {buf.steps}"
         assert any("self-check" in s for s in labels), f"missing self-check in {buf.steps}"
 
@@ -91,7 +96,7 @@ class TestDryRunSequence:
         clone_idx = next(i for i, s in enumerate(labels) if "git clone" in s)
         venv_idx = next(i for i, s in enumerate(labels) if "venv" in s)
         torch_idx = next(i for i, s in enumerate(labels) if "torch" in s)
-        node_dep_idx = next(i for i, s in enumerate(labels) if "pip install -e" in s or "requirements.txt" in s)
+        node_dep_idx = next(i for i, s in enumerate(labels) if "pip install" in s and "fire" in s)
         model_idx = next(i for i, s in enumerate(labels) if "snapshot_download" in s)
         check_idx = next(i for i, s in enumerate(labels) if "self-check" in s)
         assert clone_idx < venv_idx < torch_idx < node_dep_idx < model_idx < check_idx
@@ -181,9 +186,22 @@ class TestEnsureNodeRepo:
 
 
 class TestEnsureVenvAndDeps:
+    def _run_venv_step(self, sandbox, pip_mirror=None):
+        """Set up a fake venv and capture check_call invocations for the dep step."""
+        sandbox.venv_dir.mkdir(parents=True)
+        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
+        sandbox.python_exe.write_text("# fake")
+        calls: list[list[str]] = []
+
+        def fake_check_call(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+
+        with patch("subprocess.check_call", side_effect=fake_check_call):
+            setup.ensure_venv_and_deps(None, pip_mirror, dry_run=False, buffer=setup.DryRunBuffer())
+        return calls
+
     def test_creates_venv_when_absent(self, sandbox):
         sandbox.node_dir.mkdir(parents=True)
-        (sandbox.node_dir / "requirements.txt").write_text("numpy\n")
 
         calls: list[list[str]] = []
 
@@ -197,34 +215,12 @@ class TestEnsureVenvAndDeps:
         assert str(sandbox.venv_dir) in venv_calls[0]
 
     def test_skips_venv_when_present(self, sandbox):
-        sandbox.venv_dir.mkdir(parents=True)
-        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
-        sandbox.python_exe.write_text("# fake python")
-        (sandbox.node_dir / "requirements.txt").write_text("numpy\n")
-
-        calls: list[list[str]] = []
-
-        def fake_check_call(cmd, *args, **kwargs):
-            calls.append(list(cmd))
-
-        with patch("subprocess.check_call", side_effect=fake_check_call):
-            setup.ensure_venv_and_deps(None, None, dry_run=False, buffer=setup.DryRunBuffer())
+        calls = self._run_venv_step(sandbox)
         venv_calls = [c for c in calls if c[1:3] == ["-m", "venv"]]
         assert not venv_calls, f"venv should not be recreated: {venv_calls}"
 
     def test_torch_uses_stable_cu124_not_nightly(self, sandbox):
-        sandbox.venv_dir.mkdir(parents=True)
-        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
-        sandbox.python_exe.write_text("# fake")
-        (sandbox.node_dir / "requirements.txt").write_text("numpy\n")
-
-        calls: list[list[str]] = []
-
-        def fake_check_call(cmd, *args, **kwargs):
-            calls.append(list(cmd))
-
-        with patch("subprocess.check_call", side_effect=fake_check_call):
-            setup.ensure_venv_and_deps(None, None, dry_run=False, buffer=setup.DryRunBuffer())
+        calls = self._run_venv_step(sandbox)
 
         torch_calls = [c for c in calls if any("torch==" in tok for tok in c)]
         assert torch_calls, f"no torch install call in {calls}"
@@ -237,72 +233,81 @@ class TestEnsureVenvAndDeps:
         assert "--retries" in tc
         assert tc[tc.index("--retries") + 1] == "10"
 
-    def test_pyproject_branch_when_no_requirements_txt(self, sandbox):
-        """When the node checkout has pyproject.toml but no requirements.txt,
-        install via ``pip install -e <node_dir>`` (the upstream Tencent layout)."""
-        sandbox.venv_dir.mkdir(parents=True)
-        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
-        sandbox.python_exe.write_text("# fake")
-        (sandbox.node_dir / "pyproject.toml").write_text("[project]\nname='fake'\n")
-        # Deliberately NO requirements.txt.
-
-        calls: list[list[str]] = []
-
-        def fake_check_call(cmd, *args, **kwargs):
-            calls.append(list(cmd))
-
-        with patch("subprocess.check_call", side_effect=fake_check_call):
-            setup.ensure_venv_and_deps(None, None, dry_run=False, buffer=setup.DryRunBuffer())
-
-        # No -r call (no requirements.txt path).
-        reqs_calls = [c for c in calls if "-r" in c]
-        assert reqs_calls == [], f"should not use -r when only pyproject.toml exists: {reqs_calls}"
-
-        # Exactly one editable install with fire pinned.
-        editable = [c for c in calls if "-e" in c]
-        assert len(editable) == 1, f"expected one 'pip install -e' call, got {editable}"
-        e = editable[0]
-        assert str(sandbox.node_dir) in " ".join(e), f"node dir not in editable install: {e}"
-        assert "fire" in e, f"fire must be installed on the pyproject path: {e}"
-        assert setup.EXTRA_RUNTIME_DEPS == ("fire",)
-
-    def test_pip_mirror_forwarded_to_pip_not_torch_index(self, sandbox):
-        sandbox.venv_dir.mkdir(parents=True)
-        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
-        sandbox.python_exe.write_text("# fake")
-        (sandbox.node_dir / "requirements.txt").write_text("numpy\n")
-        mirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
-
-        calls: list[list[str]] = []
-
-        def fake_check_call(cmd, *args, **kwargs):
-            calls.append(list(cmd))
-
-        with patch("subprocess.check_call", side_effect=fake_check_call):
-            setup.ensure_venv_and_deps(None, mirror, dry_run=False, buffer=setup.DryRunBuffer())
+    def test_node_deps_use_curated_list_not_editable_install(self, sandbox):
+        """The node-deps step must be a curated ``pip install RUNTIME_DEPS``:
+        no ``-e`` (flat-layout setuptools rejects editable), no ``-r`` (legacy
+        manifest path), and it must contain fire/diffusers/transformers/etc."""
+        calls = self._run_venv_step(sandbox)
 
         torch_call = next(c for c in calls if any("torch==" in tok for tok in c))
-        reqs_call = next(c for c in calls if "-r" in c)
-        assert "-i" in reqs_call
-        assert reqs_call[reqs_call.index("-i") + 1] == mirror
+        node_call = next(
+            (c for c in calls if c is not torch_call and "pip" in " ".join(c)),
+            None,
+        )
+        assert node_call is not None, f"no node-deps pip install call in {calls}"
+
+        # Must NOT be an editable or legacy-manifest install.
+        assert "-e" not in node_call, f"must not use -e (editable install): {node_call}"
+        assert "-r" not in node_call, f"must not use -r (requirements.txt path): {node_call}"
+        # And the command body (everything after `-m pip install`) must be the
+        # curated dep list + --retries + optional mirror, never a repo path.
+        try:
+            body_start = node_call.index("install") + 1
+        except ValueError:  # pragma: no cover - defensive
+            body_start = 0
+        body = node_call[body_start:]
+        # Any token that looks like a filesystem path is a leaked repo/manifest arg.
+        assert all(not _looks_like_path(tok) for tok in body), (
+            f"node-deps command body must contain only deps/flags, not a repo path: {body}"
+        )
+
+        # Must contain the curated runtime packages.
+        for dep in setup.RUNTIME_DEPS:
+            assert dep in node_call, f"curated dep {dep!r} missing from {node_call}"
+        assert "--retries" in node_call
+        assert node_call[node_call.index("--retries") + 1] == "10"
+
+    def test_node_deps_do_not_include_torch(self, sandbox):
+        """The curated node-deps command must NOT contain torch/torchvision —
+        those are pinned in step (a) so a transitive dep can never bump them
+        off the cu124 pairing."""
+        calls = self._run_venv_step(sandbox)
+        torch_call = next(c for c in calls if any("torch==" in tok for tok in c))
+        node_call = next(
+            (c for c in calls if c is not torch_call and "pip" in " ".join(c)),
+            None,
+        )
+        assert node_call is not None
+        node_text = " ".join(node_call).lower()
+        assert "torch==" not in node_text, f"node-deps must not re-install torch: {node_call}"
+        assert "torchvision==" not in node_text, f"node-deps must not re-install torchvision: {node_call}"
+
+    def test_runtime_deps_constant_is_curated(self):
+        """RUNTIME_DEPS should be the curated subset: include fire/diffusers,
+        exclude the heavy demo/dev deps and the torch pairing."""
+        deps = setup.RUNTIME_DEPS
+        for required in ("fire", "diffusers", "transformers", "accelerate", "huggingface-hub", "mediapy", "decord"):
+            assert required in deps, f"RUNTIME_DEPS missing {required!r}: {deps}"
+        for excluded in ("torch", "torchvision", "xformers", "gradio", "pytest", "matplotlib"):
+            assert excluded not in deps, f"RUNTIME_DEPS must not include {excluded!r}: {deps}"
+
+    def test_pip_mirror_forwarded_to_both_pip_installs(self, sandbox):
+        mirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
+        calls = self._run_venv_step(sandbox, pip_mirror=mirror)
+
+        torch_call = next(c for c in calls if any("torch==" in tok for tok in c))
+        node_call = next(
+            (c for c in calls if c is not torch_call and "pip" in " ".join(c)),
+            None,
+        )
+        assert node_call is not None
+
         assert "--index-url" in torch_call
         assert setup.TORCH_INDEX_URL in torch_call
         assert "-i" in torch_call
         assert torch_call[torch_call.index("-i") + 1] == mirror
-
-    def test_missing_requirements_warns_and_skips(self, sandbox, caplog):
-        caplog.set_level("WARNING", logger="setup-depthcrafter")
-        sandbox.venv_dir.mkdir(parents=True)
-        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
-        sandbox.python_exe.write_text("# fake")
-        with (
-            patch("subprocess.check_call") as mock_cc,
-            pytest.raises(RuntimeError) as exc_info,
-        ):
-            setup.ensure_venv_and_deps(None, None, dry_run=False, buffer=setup.DryRunBuffer())
-        reqs_calls = [c[0][0] for c in mock_cc.call_args_list if "-r" in c[0][0]]
-        assert reqs_calls == []  # no node-deps install attempted (nothing to install)
-        assert "no pyproject.toml" in str(exc_info.value).lower()
+        assert "-i" in node_call
+        assert node_call[node_call.index("-i") + 1] == mirror
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +499,6 @@ class TestMain:
     def test_main_full_flow_calls_all_steps(self, sandbox):
         sandbox.node_dir.mkdir(parents=True)
         (sandbox.node_dir / ".git").mkdir()
-        (sandbox.node_dir / "requirements.txt").write_text("numpy\n")
         sandbox.venv_dir.mkdir(parents=True)
         sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
         sandbox.python_exe.write_text("# fake")
@@ -531,7 +535,6 @@ class TestMain:
         external = tmp_path / "D_DepthCrafter"
         external.mkdir()
         (external / ".git").mkdir()
-        (external / "requirements.txt").write_text("numpy\n")
         ext_venv = external / ".venv"
         ext_venv.mkdir()
         ext_python = ext_venv / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
@@ -562,7 +565,6 @@ class TestMain:
         caplog.set_level("INFO", logger="setup-depthcrafter")
         sandbox.node_dir.mkdir(parents=True)
         (sandbox.node_dir / ".git").mkdir()
-        (sandbox.node_dir / "requirements.txt").write_text("numpy\n")
         sandbox.venv_dir.mkdir(parents=True)
         sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
         sandbox.python_exe.write_text("# fake")
@@ -587,9 +589,11 @@ class TestMain:
         msgs = "\n".join(r.message for r in caplog.records)
         assert "failed" in msgs.lower() or "exit code" in msgs.lower()
 
-    def test_main_exits_nonzero_when_deps_missing(self, sandbox, caplog):
-        """When the checkout has neither pyproject.toml nor requirements.txt,
-        main() must exit non-zero (deps install is fatal, not a WARNING)."""
+    def test_main_succeeds_without_node_manifest(self, sandbox, caplog):
+        """The curated deps list is a module constant, so the bootstrap no
+        longer depends on the checkout shipping a pyproject.toml or
+        requirements.txt.  A minimal checkout (no manifest) must complete
+        successfully — the old fatal 'no pyproject.toml' path is gone."""
         caplog.set_level("INFO", logger="setup-depthcrafter")
         sandbox.node_dir.mkdir(parents=True)
         (sandbox.node_dir / ".git").mkdir()
@@ -597,15 +601,13 @@ class TestMain:
         sandbox.venv_dir.mkdir(parents=True)
         sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
         sandbox.python_exe.write_text("# fake")
+        (sandbox.node_dir / "run.py").write_text("# fake")
 
         fake_hf = MagicMock()
         with (
             patch("subprocess.check_call"),
             patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
             patch.dict("sys.modules", {"huggingface_hub": fake_hf}),
-            pytest.raises(SystemExit) as exc_info,
         ):
-            setup.main([])
-
-        assert exc_info.value.code == 1
-        fake_hf.snapshot_download.assert_not_called()  # never got past step 2
+            setup.main([])  # must not raise / SystemExit
+        fake_hf.snapshot_download.assert_called_once()
