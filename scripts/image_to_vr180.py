@@ -719,12 +719,58 @@ def run_pipeline(
     if qa_exit != 0:
         raise RuntimeError(f"QA failed for {converted} — refusing to deliver a non-VR180 artefact")
 
+    # D-1: sidecar — one JSON per output artefact (see pipeline.sidecar).
+    # Runs after QA so the qa.block reflects the actual verdict.
+    _write_sidecar(converted, args)
+
     return {"output": converted, "qa_exit": qa_exit, "manifest": manifest or None}
 
 
 def ensure_workdir(args: JobArgs) -> None:
     """Create the workdir so stage output paths are writable."""
     Path(args.workdir).mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# D-1: sidecar JSON metadata (issue #78)
+# ---------------------------------------------------------------------------
+
+
+def _write_sidecar(output_path: str, args: JobArgs) -> None:
+    """Write the per-artefact sidecar JSON after QA succeeds.
+
+    Best-effort: a sidecar failure never aborts a deliverable. The QA block is
+    computed inside :func:`pipeline.sidecar.build_sidecar` by re-running
+    :func:`scripts.vr180_qa.run_qa`; that is cheap (ffprobe + box scan only)
+    and keeps this orchestrator decoupled from the QA report shape.
+    """
+    from pipeline.sidecar import write_sidecar
+
+    immersive = {
+        "projection": "equirect",
+        "fov_deg": 180,
+        "stereo_layout": "side_by_side",
+        "spatial_metadata": ["sv3d", "st3d"],
+    }
+    w = int(args.output_width or 0)
+    h = int(args.output_height or 0)
+    if w and h:
+        immersive["eye_resolution"] = [w, h]
+
+    generation = {
+        "route": "vr180",
+        "i2v_backend": args.provider,
+        "upscaler": args.upscale if args.upscale != "none" else None,
+        "source_image": args.image,
+        "prompt": args.prompt,
+    }
+    # Drop None values so the JSON stays clean for DreamPortal.
+    generation = {k: v for k, v in generation.items() if v is not None}
+
+    try:
+        write_sidecar(output_path, immersive=immersive, generation=generation)
+    except Exception as exc:
+        log.warning("⚠️  Sidecar write failed for %s: %s", output_path, exc)
 
 
 # ---------------------------------------------------------------------------
