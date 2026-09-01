@@ -28,6 +28,7 @@ from scripts.e2e_smoke import (
     build_pipeline_command,
     check_audio_stream,
     check_backend_log,
+    check_depth_meta,
     check_exit_code,
     check_metadata_bytes,
     check_output_probe,
@@ -89,6 +90,9 @@ class TestBuildCommand:
         assert "--stereo-model stereocrafter" in joined
         assert "--comfort safe" in joined
         assert "--quality high" in joined
+        # K-7 (#160): heavy-model acceptance args — lead's whole ritual in one cmd.
+        assert "--src-hfov 150" in joined
+        assert "--max-frames 60" in joined
 
     def test_copy_audio_from_appended(self) -> None:
         cmd = build_pipeline_command("in.mp4", "out.mp4", "full", copy_audio_from="src.mp4")
@@ -418,3 +422,220 @@ class TestCli:
         assert PROFILES["fast"]["eye"] is None and PROFILES["full"]["eye"] is None
         assert "backend_log" not in PROFILES["ci"]["checks"]
         assert "backend_log_na" not in PROFILES["ci"]["checks"]
+        # K-7 (#160): full auto-wires --copy-audio-from=<self> and adds the
+        # fresh-depth meta.json assertion.
+        assert PROFILES["full"].get("copy_audio_self") is True
+        assert "depth_meta" in PROFILES["full"]["checks"]
+
+
+# ---------------------------------------------------------------------------
+# K-7 (#160): full profile --copy-audio-from self + depth meta.json assertion
+# ---------------------------------------------------------------------------
+
+
+class TestFullCopyAudioSelf:
+    """full profile auto-appends --copy-audio-from=<input itself>."""
+
+    def test_full_profile_auto_appends_copy_audio_self(self) -> None:
+        cmd = build_pipeline_command("in.mp4", "out.mp4", "full")
+        # build_pipeline_command sees copy_audio_from=None; the self-wiring
+        # happens in run_smoke.  Here we verify the profile flag is set and
+        # that run_smoke surfaces it into the command.
+        assert PROFILES["full"].get("copy_audio_self") is True
+        joined = " ".join(cmd)
+        # The base args must NOT already contain copy-audio-from (run_smoke
+        # adds it from input_path).
+        assert "--copy-audio-from" not in joined
+
+    def test_run_smoke_full_wires_copy_audio_from_self(self) -> None:
+        # Capture the command the runner was called with.
+        captured = []
+
+        def runner(cmd, capture_output=True, text=True):
+            captured.append(cmd)
+            return _fake_proc(0, stdout="")
+
+        # run_smoke with profile=full and no explicit copy_audio_from must
+        # build a command that carries --copy-audio-from <input>.
+        report = run_smoke("in.mp4", "out.mp4", "full", runner=runner)
+        assert report is not None  # depth_meta check will fail (no meta); we
+        # only care about the built command here.
+        cmd = captured[0]
+        joined = " ".join(cmd)
+        assert "--copy-audio-from in.mp4" in joined
+
+    def test_explicit_copy_audio_from_overrides_self(self) -> None:
+        captured = []
+
+        def runner(cmd, capture_output=True, text=True):
+            captured.append(cmd)
+            return _fake_proc(0, stdout="")
+
+        run_smoke("in.mp4", "out.mp4", "full", copy_audio_from="src.mp4", runner=runner)
+        joined = " ".join(captured[0])
+        assert "--copy-audio-from src.mp4" in joined
+        assert "--copy-audio-from in.mp4" not in joined
+
+
+class TestDepthMeta:
+    """7. (full only) depth meta.json fresh + matches this run (I-6 / #121)."""
+
+    def test_full_fresh_meta_passes(self, tmp_path: Path) -> None:
+        meta = {
+            "depth_model": "depthcrafter",
+            "num_frames": 60,
+            "model_size": "small",
+            "max_res": 512,
+            "temporal_smoothing": 0.0,
+            "timestamp": "2026-09-01T03:00:00",
+        }
+        c = check_depth_meta("o.mp4", "full", meta=meta)
+        assert c.ok
+        assert "depth_model=depthcrafter" in c.measured
+        assert "timestamp=2026-09-01T03:00:00" in c.measured
+
+    def test_full_wrong_model_fails_with_measured(self) -> None:
+        meta = {"depth_model": "depth-anything", "timestamp": "2026-09-01T03:00:00"}
+        c = check_depth_meta("o.mp4", "full", meta=meta)
+        assert not c.ok
+        assert "depth_model=depth-anything" in c.measured and c.hint
+
+    def test_full_missing_timestamp_fails(self) -> None:
+        meta = {"depth_model": "depthcrafter", "timestamp": None}
+        c = check_depth_meta("o.mp4", "full", meta=meta)
+        assert not c.ok and "timestamp=None" in c.measured and c.hint
+
+    def test_full_empty_timestamp_fails(self) -> None:
+        meta = {"depth_model": "depthcrafter", "timestamp": "  "}
+        c = check_depth_meta("o.mp4", "full", meta=meta)
+        assert not c.ok and "timestamp=  " in c.measured and c.hint
+
+    def test_full_no_meta_supplied_fails(self) -> None:
+        c = check_depth_meta("o.mp4", "full", meta=None)
+        assert not c.ok and "no depth meta supplied" in c.measured and c.hint
+
+    def test_non_full_profile_is_na_pass(self) -> None:
+        # depth_meta assertion is full-only: fast/ci must never fail on it.
+        c = check_depth_meta("o.mp4", "fast", meta=None)
+        assert c.ok and "N/A" in c.measured
+        c_ci = check_depth_meta("o.mp4", "ci", meta=None)
+        assert c_ci.ok and "N/A" in c_ci.measured
+
+
+class TestFullOrchestration:
+    def _runner_ok(self, tmp_path: Path, output_path: str, log_line: str):
+        def runner(cmd, capture_output=True, text=True):
+            out = Path(output_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(_synthetic_vr180_bytes("sbs"))
+            sidecar = {
+                "immersive": {
+                    "projection": "equirect180",
+                    "fov_deg": 180,
+                    "stereo_layout": "side_by_side",
+                    "eye_resolution": [3840, 3840],
+                }
+            }
+            (out.parent / (out.stem + ".json")).write_text(json.dumps(sidecar), encoding="utf-8")
+            return _fake_proc(0, stdout=log_line, stderr="")
+
+        return runner
+
+    def test_full_profile_passes_with_fresh_meta(self, tmp_path: Path, monkeypatch) -> None:
+        out = str(tmp_path / "o.mp4")
+        # full auto-wires --copy-audio-from=<self>, so the audio check runs
+        # and needs an audio stream in the probe.
+        monkeypatch.setattr(
+            "scripts.e2e_smoke._ffprobe_streams",
+            lambda path, ffprobe="ffprobe": _probe(7680, 3840, audio=True),  # high = 3840²/eye
+        )
+        runner = self._runner_ok(
+            tmp_path,
+            out,
+            log_line="🎚️  Streaming backends: depth=depthcrafter, stereo=stereocrafter",
+        )
+        meta = {
+            "depth_model": "depthcrafter",
+            "num_frames": 60,
+            "max_res": 512,
+            "timestamp": "2026-09-01T03:00:00",
+        }
+        report = run_smoke("in.mp4", out, "full", depth_meta=meta, runner=runner)
+        assert report.ok, [(c.name, c.measured) for c in report.failed]
+        # Confirm the full-specific checks actually ran (not silently skipped).
+        names = [c.name for c in report.checks]
+        assert "backend log assertion" in names
+        assert "depth meta.json" in names
+
+    def test_full_profile_fails_when_meta_stale(self, tmp_path: Path, monkeypatch) -> None:
+        out = str(tmp_path / "o.mp4")
+        monkeypatch.setattr(
+            "scripts.e2e_smoke._ffprobe_streams",
+            lambda path, ffprobe="ffprobe": _probe(7680, 3840, audio=True),
+        )
+        runner = self._runner_ok(
+            tmp_path,
+            out,
+            log_line="🎚️  Streaming backends: depth=depthcrafter, stereo=stereocrafter",
+        )
+        meta = {"depth_model": "depth-anything", "timestamp": "2026-09-01T02:00:00"}
+        report = run_smoke("in.mp4", out, "full", depth_meta=meta, runner=runner)
+        assert not report.ok
+        depth_check = next(c for c in report.checks if c.name == "depth meta.json")
+        assert not depth_check.ok and "depth_model=depth-anything" in depth_check.measured
+
+
+# ---------------------------------------------------------------------------
+# Regression: ci/fast behaviour must be unchanged (K-7 did not touch them)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionFastCiUnchanged:
+    def test_fast_args_unchanged(self) -> None:
+        cmd = build_pipeline_command("in.mp4", "out.mp4", "fast")
+        joined = " ".join(cmd)
+        assert "--quality preview" in joined and "--max-frames 8" in joined
+        assert "--depth-model" not in cmd and "--stereo-model" not in cmd
+        assert "--copy-audio-from" not in joined
+
+    def test_ci_args_unchanged(self) -> None:
+        cmd = build_pipeline_command("in.mp4", "out.mp4", "ci")
+        joined = " ".join(cmd)
+        assert "--quality preview" in joined and "--max-frames 4" in joined
+        assert "--output-width 256" in joined and "--output-height 256" in joined
+        assert "--force-sbs" in cmd and "--no-ffmpeg-v360" in cmd
+        assert "--depth-model" not in cmd and "--stereo-model" not in cmd
+        assert "--copy-audio-from" not in joined
+
+    def test_fast_profile_run_skips_depth_meta(self, tmp_path: Path, monkeypatch) -> None:
+        out = str(tmp_path / "o.mp4")
+        monkeypatch.setattr(
+            "scripts.e2e_smoke._ffprobe_streams",
+            lambda path, ffprobe="ffprobe": _probe(3840, 1920),
+        )
+
+        # _runner_ok from TestRunSmoke is not imported; build a minimal one.
+        def runner(cmd, capture_output=True, text=True):
+            p = Path(out)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(_synthetic_vr180_bytes("sbs"))
+            (p.parent / (p.stem + ".json")).write_text(
+                json.dumps(
+                    {
+                        "immersive": {
+                            "projection": "equirect180",
+                            "fov_deg": 180,
+                            "stereo_layout": "side_by_side",
+                            "eye_resolution": [3840, 3840],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return _fake_proc(0, stdout="", stderr="")
+
+        report = run_smoke("in.mp4", out, "fast", runner=runner)
+        assert report.ok, [(c.name, c.measured) for c in report.failed]
+        # fast has backend_log_na (N/A), NOT depth_meta.
+        assert "backend log assertion" in [c.name for c in report.checks]
+        assert "depth meta.json" not in [c.name for c in report.checks]
