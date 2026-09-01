@@ -150,7 +150,64 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List available providers and exit.",
     )
+    parser.add_argument(
+        "--template",
+        type=str,
+        default=None,
+        metavar="KEY",
+        help="Render the prompt body from a prompt_library template (e.g. slow_dolly_in). "
+        "Mutually exclusive with the positional prompt argument. "
+        "Use --list-templates to see available keys.",
+    )
+    parser.add_argument(
+        "--template-field",
+        action="append",
+        default=None,
+        metavar="NAME=VALUE",
+        help="Fill a template placeholder. Repeatable. Required when --template is given; "
+        "each value must be NAME=VALUE. Ignored without --template.",
+    )
+    parser.add_argument(
+        "--list-templates",
+        action="store_true",
+        help="List available prompt_library templates (key, summary, placeholders, recommended duration) and exit.",
+    )
     return parser
+
+
+def _parse_template_fields(raw: list[str] | None) -> dict[str, str]:
+    """Parse repeated ``--template-field NAME=VALUE`` into a dict.
+
+    Each entry must contain exactly one ``=``.  An entry missing the ``=``
+    separator is reported by name so the user knows which one is malformed.
+    """
+    fields: dict[str, str] = {}
+    if not raw:
+        return fields
+    for item in raw:
+        if "=" not in item:
+            raise ValueError(f"--template-field expects NAME=VALUE, got {item!r} (missing '=')")
+        name, _, value = item.partition("=")
+        name = name.strip()
+        if not name:
+            raise ValueError(f"--template-field expects NAME=VALUE, got {item!r} (empty name)")
+        fields[name] = value
+    return fields
+
+
+def _list_templates() -> int:
+    """Print every prompt_library template and return exit code 0."""
+    from pipeline.prompt_library import list_templates
+
+    print("Available prompt templates:")
+    for t in list_templates():
+        placeholders = ", ".join(t.placeholders) if t.placeholders else "(none)"
+        print(f"  {t.key}")
+        print(f"      summary : {t.summary}")
+        print(f"      motion  : {t.camera_motion}")
+        print(f"      fields  : {placeholders}")
+        print(f"      duration: {t.recommended_duration:g}s")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -166,9 +223,54 @@ def main(argv: list[str] | None = None) -> int:
         print("Available providers:", ", ".join(list_providers()))
         return 0
 
-    # Optional prompt wrapping
+    if args.list_templates:
+        return _list_templates()
+
+    # --template and the positional prompt are mutually exclusive; at least
+    # one of them (or --image) must supply the prompt text.
+    if args.template and args.prompt:
+        log.error("--template and a positional prompt are mutually exclusive.")
+        return 2
+
     prompt = args.prompt
     negative_prompt: str | None = None
+
+    # Render the prompt body from a template first (if requested), *then*
+    # apply --target-aware wrapping. The two layers are composable, not
+    # alternative: the template decides "what to say", wrap_prompt decides
+    # "what target-projection suffix to append".
+    if args.template:
+        try:
+            fields = _parse_template_fields(args.template_field)
+        except ValueError as exc:
+            log.error("%s", exc)
+            return 2
+        try:
+            from pipeline.prompt_library import (
+                PromptLibraryError,
+                get_template,
+                render,
+            )
+
+            tmpl = get_template(args.template)
+            prompt = render(args.template, **fields)
+            log.info(
+                "使用模板 %s（镜头运动 %s，推荐时长 %gs）",
+                args.template,
+                tmpl.camera_motion,
+                tmpl.recommended_duration,
+            )
+        except KeyError as exc:
+            # Unknown template key — message already lists available keys.
+            log.error("%s", exc)
+            return 2
+        except PromptLibraryError as exc:
+            # Missing / extra placeholder — surface the message verbatim
+            # (it names the offending fields) instead of swallowing it.
+            log.error("%s", exc)
+            return 2
+
+    # Optional prompt wrapping
     if args.target_aware:
         try:
             from pipeline.prompt_builder import wrap_prompt
