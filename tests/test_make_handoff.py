@@ -49,7 +49,7 @@ def _fake_runner(stdout_by_argv: dict[tuple[str, ...], list[dict]]) -> SimpleNam
             argv = argv[1:]
         data: list[dict] | None = None
         for key, val in stdout_by_argv.items():
-            if argv.startswith(key):
+            if argv[: len(key)] == key:
                 data = val
                 break
         if data is None:

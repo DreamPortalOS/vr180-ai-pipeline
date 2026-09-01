@@ -263,7 +263,7 @@ def _pick_stage(labels: list[str]) -> str:
 
 def _pick_priority(labels: list[str]) -> str:
     matches = [lbl for lbl in labels if lbl.startswith("prio:")]
-    return matches[-1] if matches else "P2"
+    return matches[-1].removeprefix("prio:") if matches else "P2"
 
 
 def _issue_sort_key(issue: OpenIssue) -> tuple[int, int, int]:
