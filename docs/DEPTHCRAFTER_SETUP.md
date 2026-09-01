@@ -157,8 +157,24 @@ python run.py <video_path> --save_folder <dir> --max_res 512 --cpu_offload model
     [--process_length N] [--target_fps N]
 ```
 
-Output depth maps are written into `--save_folder` as `.npy` (preferred) or
-`depth_*.png`, which the pipeline then loads as `(H, W)` float32 arrays.
+### Real output format (lead-verified 2026-09-01, issue #126)
+
+The upstream `run.py` does **NOT** write a `.npy` sequence.  For an input
+`src_720p_v2.mp4` it writes **three mp4s** into `--save_folder`:
+
+| File | Meaning |
+|------|---------|
+| `src_720p_v2_depth.mp4` | The depth sequence — an 8-bit **grayscale video** of the per-frame depth maps. |
+| `src_720p_v2_input.mp4` | Copy of the input video (reference). |
+| `src_720p_v2_vis.mp4`   | Side-by-side visualization (input + depth). |
+
+`pipeline/depth_crafter.py::CLIBackend` loads `<stem>_depth.mp4` first
+(decoding each frame to grayscale and normalizing 8-bit → float32 `[0, 1]`;
+the video is already a visualization, so **no histogram stretch** is applied).
+It still falls back to `*.npy` / `depth_*.png` sequences for alternate
+backends, and the output directory is **wiped before every run** so stale
+files from an earlier invocation can never be mistaken for the current
+run's product (the "fake success" bug from issue #126).
 
 ---
 

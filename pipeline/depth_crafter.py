@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -233,9 +234,12 @@ class CLIBackend(DepthCrafterBackend):
     ) -> list[np.ndarray]:
         _assert_cuda()
 
-        # Ensure output dir exists
+        # Ensure output dir exists and is EMPTY.  Reusing a dirty directory is
+        # a real footgun: leftover .npy files from an earlier run get loaded
+        # as if they were this run's product (the "fake success" reported in
+        # issue #126), silently defeating A/B comparisons.
         out_path = Path(output_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
+        self._clean_output_dir(out_path)
 
         # The subprocess runs with cwd=repo_dir, so relative caller paths would
         # resolve against the DepthCrafter checkout, not the repo (input then
@@ -294,28 +298,109 @@ class CLIBackend(DepthCrafterBackend):
                 f"  See docs/DEPTHCRAFTER_SETUP.md for troubleshooting."
             )
 
-        # Load depth maps from output dir
-        depths: list[np.ndarray] = []
-        npy_files = sorted(out_path.glob("*.npy"))
-        png_files = sorted(out_path.glob("depth_*.png"))
+        # Load depth maps from output dir.  The real upstream run.py emits
+        # ``<stem>_depth.mp4`` (an 8-bit grayscale video of the depth maps),
+        # NOT a .npy sequence — see docs/DEPTHCRAFTER_SETUP.md.  Older/alternate
+        # backends may still emit .npy or depth_*.png sequences, so keep those
+        # fallbacks.
+        stem = Path(input_path).stem
+        depths = self._load_depths(out_path, stem)
 
+        log.info("DepthCrafter: loaded %d depth maps from %s", len(depths), output_dir)
+        return depths
+
+    # ------------------------------------------------------------------
+    # Output-dir hygiene
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clean_output_dir(out_path: Path) -> None:
+        """Create *out_path* if missing, then remove any pre-existing contents.
+
+        Only depth artifacts are ever written here by this backend, and the
+        dir is caller-provided (typically a temp dir), so a full wipe is the
+        safe way to guarantee the loaded frames come from THIS run.
+        """
+        out_path.mkdir(parents=True, exist_ok=True)
+        for entry in sorted(out_path.iterdir()):
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+
+    # ------------------------------------------------------------------
+    # Output loading
+    # ------------------------------------------------------------------
+    def _load_depths(self, out_path: Path, stem: str) -> list[np.ndarray]:
+        """Load per-frame depth maps from *out_path*, mp4 first.
+
+        Preference order:
+          1. ``<stem>_depth.mp4`` — upstream DepthCrafter's real output
+             (8-bit grayscale visualization video; decoded and normalized to
+             [0, 1] float32.  No histogram stretch — it is already a vis.)
+          2. ``*.npy`` sequence (legacy / alternate backends).
+          3. ``depth_*.png`` sequence (legacy / alternate backends).
+        Raises RuntimeError listing the dir contents if none are found.
+        """
+        depth_mp4 = self._find_depth_mp4(out_path, stem)
+        if depth_mp4 is not None:
+            return self._load_depths_from_mp4(depth_mp4)
+
+        npy_files = sorted(out_path.glob("*.npy"))
         if npy_files:
-            for f in npy_files:
-                depths.append(np.load(str(f)))
-        elif png_files:
+            return [np.load(str(f)) for f in npy_files]
+
+        png_files = sorted(out_path.glob("depth_*.png"))
+        if png_files:
             import cv2
 
+            imgs: list[np.ndarray] = []
             for f in png_files:
                 img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
                 if img is not None:
-                    depths.append(img.astype(np.float32) / 255.0)
-        else:
-            raise RuntimeError(
-                f"DepthCrafter finished but no depth files found in {output_dir}.\n"
-                f"  Check the inference script output format in docs/DEPTHCRAFTER_SETUP.md."
-            )
+                    imgs.append(img.astype(np.float32) / 255.0)
+            if imgs:
+                return imgs
 
-        log.info("DepthCrafter: loaded %d depth maps from %s", len(depths), output_dir)
+        # Nothing found — list the actual contents so the next person can
+        # see at a glance what the inference script really produced.
+        contents = sorted(p.name for p in out_path.iterdir()) or ["(empty)"]
+        listing = "\n".join(f"    - {name}" for name in contents)
+        raise RuntimeError(
+            f"DepthCrafter finished but no depth files found in {out_path}.\n"
+            f"  Looked for: <stem>_depth.mp4, *.npy, depth_*.png (stem={stem!r}).\n"
+            f"  Actual directory contents:\n{listing}\n"
+            f"  Check the inference script output format in docs/DEPTHCRAFTER_SETUP.md."
+        )
+
+    @staticmethod
+    def _find_depth_mp4(out_path: Path, stem: str) -> Path | None:
+        """Locate the depth video in *out_path* (exact stem match first)."""
+        exact = out_path / f"{stem}_depth.mp4"
+        if exact.is_file():
+            return exact
+        matches = sorted(out_path.glob("*_depth.mp4"))
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _load_depths_from_mp4(mp4_path: Path) -> list[np.ndarray]:
+        """Decode an 8-bit grayscale depth video into float32 [0, 1] frames."""
+        import cv2
+
+        cap = cv2.VideoCapture(str(mp4_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"DepthCrafter produced {mp4_path} but it could not be opened as a video.")
+        depths: list[np.ndarray] = []
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+                depths.append(gray.astype(np.float32) / 255.0)
+        finally:
+            cap.release()
+        if not depths:
+            raise RuntimeError(f"DepthCrafter produced {mp4_path} but no frames could be decoded from it.")
         return depths
 
 
