@@ -66,6 +66,21 @@ TORCH_VERSION = "2.6.0"
 TORCHVISION_VERSION = "0.21.0"
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
 
+# Default subprocess timeout for the pip install steps (issue #166, mirroring
+# the #165 fix on setup_stereocrafter.py).  pip degrades + dependency-tree
+# resolution can take ~20 minutes on mainland-China networks, exceeding the old
+# 1200s ceiling and aborting the whole bootstrap.  Bumped to 1 hour; override
+# via --pip-timeout or the SETUP_PIP_TIMEOUT env var.  The pip *connection*
+# timeout (--timeout 120) is separate: it governs a single socket operation,
+# not the whole install.
+DEFAULT_PIP_TIMEOUT: int = 3600
+
+# pip's own single-connection timeout (--timeout N) used to improve success on
+# weak networks (issue #166, mirroring #165).  Distinct from the
+# subprocess-level timeout (DEFAULT_PIP_TIMEOUT above): that one bounds the
+# whole install; this one bounds a single socket handshake/read.
+PIP_CONNECT_TIMEOUT: int = 120
+
 # Model weights: numz/SeedVR2_comfyUI on HuggingFace.  Sizes are lead-verified.
 _MODEL_REPO_ID = "numz/SeedVR2_comfyUI"
 _MODEL_DIT = "seedvr2_ema_3b_fp8_e4m3fn.safetensors"  # ~3.2 GB
@@ -180,8 +195,21 @@ def _pip_mirror_args(pip_mirror: str | None) -> list[str]:
     return []
 
 
-def ensure_venv_and_deps(pip_mirror: str | None, *, dry_run: bool, buffer: DryRunBuffer) -> None:
-    """Create the dedicated venv and install torch (cu124) + the node's requirements."""
+def ensure_venv_and_deps(
+    pip_mirror: str | None,
+    *,
+    dry_run: bool,
+    buffer: DryRunBuffer,
+    pip_timeout: int = DEFAULT_PIP_TIMEOUT,
+) -> None:
+    """Create the dedicated venv and install torch (cu124) + the node's requirements.
+
+    *pip_timeout* is the subprocess-level timeout (issue #166, mirroring #165):
+    the maximum wall time allowed for each pip install.  Defaults to
+    DEFAULT_PIP_TIMEOUT (3600s) so all existing call sites remain valid
+    without change.  Override via ``--pip-timeout`` on the CLI or the
+    SETUP_PIP_TIMEOUT env var (CLI wins > env > default).
+    """
     # In dry-run mode we always plan every step regardless of on-disk state, so
     # the recorded sequence is stable. In real mode, create the venv first if
     # missing (the torch/reqs pip installs use the venv's python).
@@ -209,13 +237,15 @@ def ensure_venv_and_deps(pip_mirror: str | None, *, dry_run: bool, buffer: DryRu
         "install",
         "--retries",
         "10",
+        "--timeout",
+        str(PIP_CONNECT_TIMEOUT),
         f"torch=={TORCH_VERSION}",
         f"torchvision=={TORCHVISION_VERSION}",
         "--index-url",
         TORCH_INDEX_URL,
         *_pip_mirror_args(pip_mirror),
     ]
-    run_step(cmd_torch, dry_run=dry_run, buffer=buffer, timeout=1200)
+    run_step(cmd_torch, dry_run=dry_run, buffer=buffer, timeout=pip_timeout)
 
     # (b) the node's own requirements.txt.
     requirements_txt = INREPO_NODE_DIR / "requirements.txt"
@@ -230,11 +260,13 @@ def ensure_venv_and_deps(pip_mirror: str | None, *, dry_run: bool, buffer: DryRu
         "install",
         "--retries",
         "10",
+        "--timeout",
+        str(PIP_CONNECT_TIMEOUT),
         "-r",
         str(requirements_txt),
         *_pip_mirror_args(pip_mirror),
     ]
-    run_step(cmd_reqs, dry_run=dry_run, buffer=buffer, timeout=1200)
+    run_step(cmd_reqs, dry_run=dry_run, buffer=buffer, timeout=pip_timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +476,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "torch is ALWAYS installed from the official cu124 index."
         ),
     )
+    parser.add_argument(
+        "--pip-timeout",
+        default=None,
+        type=int,
+        metavar="SECONDS",
+        help=(
+            f"Subprocess timeout for pip install in seconds.  Defaults to "
+            f"{DEFAULT_PIP_TIMEOUT}s (issue #166); override via the "
+            f"SETUP_PIP_TIMEOUT env var.  CLI arg wins > env var > default."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _resolve_pip_timeout(cli_value: int | None) -> int:
+    """Resolve the pip subprocess timeout with the required precedence.
+
+    Order: --pip-timeout (CLI) > SETUP_PIP_TIMEOUT (env) > DEFAULT_PIP_TIMEOUT.
+    Mirrors the #165 implementation on setup_stereocrafter.py so all three
+    setup scripts share the same naming and precedence.
+    """
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get("SETUP_PIP_TIMEOUT")
+    if env_value is not None:
+        try:
+            return int(env_value)
+        except ValueError:
+            log.warning(
+                "SETUP_PIP_TIMEOUT=%r is not a valid integer — falling back to "
+                "the default (%ds).  Pass a plain integer or use --pip-timeout.",
+                env_value,
+                DEFAULT_PIP_TIMEOUT,
+            )
+    return DEFAULT_PIP_TIMEOUT
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -455,29 +521,43 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     buffer = DryRunBuffer()
+    pip_timeout = _resolve_pip_timeout(args.pip_timeout)
 
     log.info("SeedVR2 in-repo bootstrap (repo=%s)", REPO_ROOT)
     if args.dry_run:
         log.info("[dry-run] no side effects will be performed")
 
-    # Step 1 — node repo
-    log.info("\n── Step 1/4: node repo ──")
-    ensure_node_repo(dry_run=args.dry_run, buffer=buffer)
+    try:
+        # Step 1 — node repo
+        log.info("\n── Step 1/4: node repo ──")
+        ensure_node_repo(dry_run=args.dry_run, buffer=buffer)
 
-    # Step 2 — venv + deps
-    log.info("\n── Step 2/4: dedicated venv + pip install ──")
-    if args.skip_deps:
-        log.info("--skip-deps: venv + pip install skipped")
-    else:
-        ensure_venv_and_deps(args.pip_mirror, dry_run=args.dry_run, buffer=buffer)
+        # Step 2 — venv + deps
+        log.info("\n── Step 2/4: dedicated venv + pip install ──")
+        if args.skip_deps:
+            log.info("--skip-deps: venv + pip install skipped")
+        else:
+            ensure_venv_and_deps(
+                args.pip_mirror,
+                dry_run=args.dry_run,
+                buffer=buffer,
+                pip_timeout=pip_timeout,
+            )
 
-    # Step 3 — models
-    log.info("\n── Step 3/4: model weights ──")
-    download_models(args.skip_model, dry_run=args.dry_run, buffer=buffer)
+        # Step 3 — models
+        log.info("\n── Step 3/4: model weights ──")
+        download_models(args.skip_model, dry_run=args.dry_run, buffer=buffer)
 
-    # Step 4 — self-check
-    log.info("\n── Step 4/4: self-check ──")
-    self_check(dry_run=args.dry_run, buffer=buffer)
+        # Step 4 — self-check
+        log.info("\n── Step 4/4: self-check ──")
+        self_check(dry_run=args.dry_run, buffer=buffer)
+    except subprocess.TimeoutExpired as exc:
+        log.warning(
+            "▸ pip install timed out after %ss. 网络慢可加 --pip-mirror <url> 或直接重跑（已完成步骤会跳过）.",
+            exc.timeout,
+        )
+        log.error("Bootstrap FAILED at: %s", exc)
+        sys.exit(1)
 
     if args.dry_run:
         log.info("\n[dry-run] planned steps:")
