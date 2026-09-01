@@ -61,6 +61,8 @@ video/mock_*.mp4
 # Model weights (too large for git)
 models/
 !models/.gitkeep
+# Depth-product cache (content-keyed; models/.cache/depth/<sha256>/) — issue #182
+models/.cache/
 
 # In-repo third-party deps (SeedVR2 node + its dedicated venv — gitignored, never committed)
 third_party/

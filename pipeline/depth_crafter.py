@@ -23,6 +23,8 @@ Reference:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -183,6 +185,149 @@ def load_depth_maps_from_dir(depth_dir: str, stem: str | None = None) -> list[np
 
 
 # ---------------------------------------------------------------------------
+# Issue #182 — depth-product cache (content-keyed, reproducible)
+# ---------------------------------------------------------------------------
+
+#: Size of the head/tail slices used in the video content fingerprint (4 MB).
+#: Reading only the head + tail (not the full file) is the deliberate design:
+#: a depth model's output depends on the *content*, and for long VR180 /
+#: domemaster clips the full-file sha256 would take minutes to compute and
+#: dominate the warm-up cost, defeating the cache's whole point.  The head
+#: + tail hash is a cheap, stable proxy: two bytes-identical clips collide,
+#: and in practice a content change anywhere near the boundaries trips the
+#: fingerprint.  File size is also hashed, so a truncated copy of the same
+#: content cannot collide with the full clip.
+_DEPTH_CACHE_SLICE_BYTES = 4 * 1024 * 1024
+
+
+# The repo root is two parents up from this file (pipeline/depth_crafter.py).
+# Defined here so the cache default path can reference it; the in-repo
+# default paths below (INREPO_REPO_DIR etc.) keep their own derivation for
+# clarity and test-monkeypatchability.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+_DEFAULT_CACHE_ROOT = _REPO_ROOT / "models" / ".cache" / "depth"
+
+
+def _video_content_fingerprint(input_path: str) -> tuple[str, int]:
+    """Return ``(sha256_hex, file_size_bytes)`` of *input_path*'s content.
+
+    The digest is computed over the **file size** and the **first and last
+    4 MB** of the file — never the full file.  See the module-level note on
+    ``_DEPTH_CACHE_SLICE_BYTES`` for why the full file is skipped.
+
+    Raises :class:`OSError` if the file cannot be opened for reading (e.g.
+    the path is held under an incompatible share lock on Windows), so the
+    caller can treat it as a cache miss and let inference proceed.
+
+    The size is returned alongside the hex digest so the tuple is human-
+    inspectable in logs without re-deriving the length from the digest.
+    """
+    h = hashlib.sha256()
+    size = os.path.getsize(input_path)
+    h.update(str(size).encode("utf-8"))
+    with open(input_path, "rb") as f:
+        head = f.read(_DEPTH_CACHE_SLICE_BYTES)
+        h.update(head)
+        # Read the tail only when the file is larger than one slice; for
+        # tiny files the head already covered the entire content, so
+        # re-reading it would double-hash the bytes and break reproducibility
+        # of a full-file digest for small inputs.
+        if size > _DEPTH_CACHE_SLICE_BYTES:
+            tail_size = min(size, _DEPTH_CACHE_SLICE_BYTES)
+            f.seek(max(0, size - tail_size))
+            h.update(f.read(tail_size))
+    return h.hexdigest(), int(size)
+
+
+def _cache_params(backend: DepthCrafterBackend) -> dict:
+    """Extract the key params from *backend* that affect depth output.
+
+    ``max_resolution`` (short-side resolution cap), ``process_length``
+    (temporal window), and ``target_fps`` (frame-rate remapping) all change
+    what the model produces.  Path-like fields (repo_dir, python_exe,
+    model_dir) are deliberately excluded: they describe *where* the code
+    runs, not *what* it computes.
+    """
+    params: dict = {"max_res": backend.max_resolution}
+    if backend.process_length is not None:
+        params["process_length"] = backend.process_length
+    if backend.target_fps is not None:
+        params["target_fps"] = backend.target_fps
+    return params
+
+
+def compute_cache_key(
+    input_path: str,
+    backend: DepthCrafterBackend,
+) -> str:
+    """Compute the depth cache key for this input + backend config.
+
+    The key is ``sha256(fingerprint_hex || model_name || params_json)``, so
+    the same clip hashed against different resolution / window / fps settings
+    yields distinct cache entries.  File names and paths never participate —
+    the same content at a different path must hit the same cache (lead
+    decision, issue #182).
+    """
+    fingerprint_hex, _ = _video_content_fingerprint(input_path)
+    params = _cache_params(backend)
+    params_bytes = json.dumps(params, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    model_name = "depthcrafter"
+    digest = hashlib.sha256()
+    digest.update(fingerprint_hex.encode("utf-8"))
+    digest.update(model_name.encode("utf-8"))
+    digest.update(params_bytes)
+    return digest.hexdigest()
+
+
+def _default_cache_dir(cache_dir: Path | None) -> Path:
+    """Resolve ``cache_dir`` to the repo-local depth cache root."""
+    if cache_dir is not None:
+        return cache_dir
+    return _DEFAULT_CACHE_ROOT
+
+
+def _cache_dir_for_key(cache_root: Path, key: str) -> Path:
+    return cache_root / key
+
+
+def _write_depth_meta(depth_dir: Path, *, num_frames: int, params: dict) -> None:
+    """Write ``meta.json`` into *depth_dir* using the I-6 / #121 structure.
+
+    Reuses the field names and semantics established in ``scripts.run_pipeline``
+    so depth-stability provenance reporting and resume-safety validation
+    keep working across the cache layer without a parallel meta schema.
+    """
+    meta = {
+        "depth_model": "depthcrafter",
+        "num_frames": int(num_frames),
+        "max_res": params.get("max_res"),
+        "process_length": params.get("process_length"),
+        "target_fps": params.get("target_fps"),
+        "temporal_smoothing": 0.0,
+        "model_size": None,
+    }
+    import datetime
+
+    meta["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+    meta_path = depth_dir / "meta.json"
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+
+def _copy_dir_contents(src: Path, dst: Path) -> None:
+    """Copy every entry from *src* into *dst* (flat, no nesting)."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for entry in src.iterdir():
+        target = dst / entry.name
+        if entry.is_file() or entry.is_symlink():
+            shutil.copy2(entry, target)
+        else:
+            shutil.copytree(entry, target, dirs_exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Abstract backend
 # ---------------------------------------------------------------------------
 
@@ -210,8 +355,6 @@ class DepthCrafterBackend(ABC):
 # ---------------------------------------------------------------------------
 # In-repo default paths (managed by scripts/setup_depthcrafter.py)
 # ---------------------------------------------------------------------------
-# The repo root is two parents up from this file (pipeline/depth_crafter.py).
-_REPO_ROOT = Path(__file__).resolve().parent.parent
 INREPO_REPO_DIR = _REPO_ROOT / "third_party" / "DepthCrafter"
 INREPO_PYTHON_EXE = (
     INREPO_REPO_DIR / ".venv" / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
@@ -660,6 +803,16 @@ class DepthCrafterEstimator:
 
     The *backend* argument allows injecting a different backend (e.g.
     for testing).  Defaults to :class:`CLIBackend`.
+
+    Issue #182 cache control:
+
+    - ``use_cache`` (``True`` by default) enables the content-keyed depth
+      product cache.  Passing ``False`` forces a fresh inference even when
+      a matching cache entry exists.
+    - ``cache_dir`` selects the cache root (``models/.cache/depth/``
+      relative to the repo when ``None``).  Each input+params pair maps to
+      a ``<sha256>/`` subdirectory whose contents are copied into the
+      requested output dir on a hit.
     """
 
     def __init__(
@@ -669,6 +822,8 @@ class DepthCrafterEstimator:
         python_exe: str | None = None,
         checkpoint_dir: str | None = None,
         max_resolution: int | None = None,
+        use_cache: bool = True,
+        cache_dir: Path | None = None,
     ) -> None:
         _assert_cuda()
 
@@ -681,6 +836,9 @@ class DepthCrafterEstimator:
                 checkpoint_dir=checkpoint_dir,
                 max_resolution=max_resolution,
             )
+
+        self.use_cache = use_cache
+        self.cache_dir = _default_cache_dir(cache_dir)
 
     def estimate_video(
         self,
@@ -705,7 +863,7 @@ class DepthCrafterEstimator:
         """
         import tempfile
 
-        resolved_output = output_dir or tempfile.mkdtemp(prefix="depthcrafter_")
+        resolved_output = Path(output_dir or tempfile.mkdtemp(prefix="depthcrafter_"))
 
         if not os.path.isfile(input_path):
             raise FileNotFoundError(f"Input video not found: {input_path}")
@@ -716,8 +874,103 @@ class DepthCrafterEstimator:
             resolved_output,
         )
 
-        return self.backend.estimate_video(
+        # Issue #182: cache is resolved against the backend's params, not the
+        # front-facing output_dir.  Compute the key up front so the hit path
+        # can short-circuit before any subprocess is spawned.  The key
+        # depends on being able to read the input file; if that fails (e.g.
+        # the path is held under an incompatible share lock on Windows, or
+        # the file vanished between the existence check and now), treat it as
+        # a cache miss and let inference proceed — the cache is an
+        # optimization, never a correctness gate.
+        key = None
+        if self.use_cache:
+            try:
+                key = compute_cache_key(input_path, self.backend)
+            except OSError:
+                key = None
+
+        cached_dir: Path | None = None
+        if key is not None:
+            cached_dir = _cache_dir_for_key(self.cache_dir, key)
+            if _cache_entry_valid(cached_dir):
+                log.info("[cache] hit %s", key[:8])
+                _copy_dir_contents(cached_dir, resolved_output)
+                # Copy the cache's meta.json into the run's output dir too,
+                # so downstream meta readers (run_pipeline, depth_stability)
+                # see the provenance on the resolved output.
+                src_meta = cached_dir / "meta.json"
+                if src_meta.is_file():
+                    shutil.copy2(src_meta, resolved_output / "meta.json")
+                return load_depth_maps_from_dir(str(resolved_output))
+
+        depths = self.backend.estimate_video(
             input_path=input_path,
-            output_dir=resolved_output,
+            output_dir=str(resolved_output),
             target_size=target_size,
         )
+
+        # Issue #182: on a miss, persist the products into the cache so the
+        # next identical request is a hit.  This runs *after* the backend has
+        # confirmed the products are loadable (``depths`` is non-empty), so
+        # we never cache a partial / failed run.
+        if self.use_cache and key is not None and cached_dir is not None and depths:
+            _persist_cache_hit(
+                cache_dir=cached_dir,
+                source_dir=resolved_output,
+                depths=depths,
+                params=_cache_params(self.backend),
+            )
+            # Also drop meta.json into the run's output dir so downstream
+            # consumers (stereo stage, depth_stability report) can read
+            # provenance without needing to know about the cache layer.
+            _write_depth_meta(
+                resolved_output,
+                num_frames=len(depths),
+                params=_cache_params(self.backend),
+            )
+
+        return depths
+
+
+def _cache_entry_valid(cached_dir: Path) -> bool:
+    """True if *cached_dir* holds both a meta.json and at least one depth product."""
+    if not cached_dir.is_dir():
+        return False
+    if not (cached_dir / "meta.json").is_file():
+        return False
+    # Presence of any mp4 / npy / png indicates a real product, not just an
+    # empty dir left by a crashed run.  ``list(...)`` is intentional: a
+    # glob iterator is truthy regardless of its contents, so ``any()`` on a
+    # bare generator would always short-circuit on the first (empty) glob.
+    return any(
+        list(cached_dir.glob("*_depth.mp4"))
+        or list(cached_dir.glob("depth_*.npy"))
+        or list(cached_dir.glob("*.npy"))
+        or list(cached_dir.glob("depth_*.png"))
+        or list(cached_dir.glob("*.png"))
+    )
+
+
+def _persist_cache_hit(
+    *,
+    cache_dir: Path,
+    source_dir: Path,
+    depths: list[np.ndarray],
+    params: dict,
+) -> None:
+    """Copy the just-produced depth products into the cache and write meta.json."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Wipe any stale cache contents from a previous interrupted run so a
+    # partial product cannot silently satisfy a future hit check.
+    for entry in sorted(cache_dir.iterdir()):
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    _copy_dir_contents(source_dir, cache_dir)
+    _write_depth_meta(
+        cache_dir,
+        num_frames=len(depths),
+        params=params,
+    )
+    log.info("[cache] miss persisted %d frames under %s", len(depths), cache_dir)
