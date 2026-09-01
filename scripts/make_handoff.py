@@ -4,8 +4,11 @@
 Turns the lead's nightly "what did we ship / what's blocked / what needs the
 owner" into a one-page Markdown (or JSON) digest by reading:
 
-1. ``gh pr list --state merged ...`` -- PRs merged inside a time window
-   (``--since`` defaults to the last 12 hours).
+1. ``gh pr list --state merged --limit N --json number,title,mergedAt`` --
+   recently merged PRs; the time window (``--since-hours`` / ``--since``,
+   default last 12h) is applied on the Python side by filtering on
+   ``mergedAt``. ``gh pr list`` has no ``--since`` flag, so we fetch a page of
+   recent merges and slice it ourselves.
 2. ``gh issue list --state open ...`` -- currently open cards, grouped by
    stage / priority. Cards carrying ``needs:muso-decision`` or
    ``needs:hw-verify`` are flagged as **owner action required**.
@@ -116,37 +119,80 @@ def _gh(
 
     Tests inject a fake ``runner`` (or return JSON) so no real gh process is
     spawned. The real path uses list-form ``subprocess.run`` (no shell=True).
+
+    On gh failure (returncode != 0 or unparseable stdout) the error is surfaced
+    to stderr with a label naming the failed query, then an empty list is
+    returned. It is **never** silently swallowed -- a silently-empty result is
+    exactly the class of bug that let a fabricated ``--since`` flag hide for a
+    full release (issue #188): gh rejected the flag, _gh returned ``[]``, and
+    the digest printed "无合并 PR" with no hint anything had gone wrong.
     """
     cmd = [gh_bin, *argv]
     result = runner(cmd, capture_output=True, text=True, timeout=30, check=False)
     if result.returncode != 0:
+        stderr = (getattr(result, "stderr", "") or "").strip()
+        print(
+            f"[make_handoff] gh {' '.join(argv[:2])} failed (rc={result.returncode}): {stderr}",
+            file=sys.stderr,
+        )
         return []
     try:
         parsed = json.loads(result.stdout)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        print(
+            f"[make_handoff] gh {' '.join(argv[:2])} returned non-JSON: {exc}",
+            file=sys.stderr,
+        )
         return []
     if isinstance(parsed, list):
         return parsed
+    print(
+        f"[make_handoff] gh {' '.join(argv[:2])} returned non-list JSON",
+        file=sys.stderr,
+    )
     return []
+
+
+DEFAULT_MERGED_LIMIT = 100
+
+
+def _parse_merged_at(merged_at: str) -> datetime | None:
+    """Parse gh's ``mergedAt`` ISO-8601 into an aware UTC datetime, or None."""
+    try:
+        dt = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def fetch_merged_prs(
     since: datetime,
     gh_bin: str = "gh",
     runner: Any = subprocess.run,
+    limit: int = DEFAULT_MERGED_LIMIT,
 ) -> list[MergedPR]:
-    """Fetch PRs merged at or after *since* (UTC), sorted by merged_at."""
-    since_iso = since.astimezone(timezone.utc).isoformat()
+    """Fetch PRs merged at or after *since* (UTC), sorted by merged_at.
+
+    ``gh pr list`` has **no ``--since`` flag** (issue #188): it was fabricated
+    and gh rejected it, silently producing an empty list. The real query is
+    ``gh pr list --state merged --limit N --json number,title,mergedAt``; the
+    time window is then applied on the Python side by filtering on
+    ``mergedAt``. ``--limit`` defaults to 100 because gh's own default (30) is
+    too small for a busy window and would drop real merges.
+    """
+    since_utc = since.astimezone(timezone.utc)
     rows = _gh(
         [
             "pr",
             "list",
             "--state",
             "merged",
+            "--limit",
+            str(limit),
             "--json",
             "number,title,mergedAt",
-            "--since",
-            since_iso,
         ],
         gh_bin=gh_bin,
         runner=runner,
@@ -155,6 +201,12 @@ def fetch_merged_prs(
     for row in rows:
         merged_at = row.get("mergedAt")
         if not merged_at:
+            continue
+        merged_dt = _parse_merged_at(merged_at)
+        if merged_dt is None:
+            # Keep unparseable timestamps out of a time-windowed list.
+            continue
+        if merged_dt < since_utc:
             continue
         out.append(MergedPR(number=row.get("number", 0), title=row.get("title", ""), merged_at=merged_at))
     out.sort(key=lambda p: p.merged_at)
