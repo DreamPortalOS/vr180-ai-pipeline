@@ -73,6 +73,21 @@ TORCH_VERSION = "2.6.0"
 TORCHVISION_VERSION = "0.21.0"
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
 
+# Default subprocess timeout for the pip install steps (issue #166, mirroring
+# the #165 fix on setup_stereocrafter.py).  pip degrades + dependency-tree
+# resolution can take ~20 minutes on mainland-China networks, exceeding the old
+# 1200s ceiling and aborting the whole bootstrap.  Bumped to 1 hour; override
+# via --pip-timeout or the SETUP_PIP_TIMEOUT env var.  The pip *connection*
+# timeout (--timeout 120) is separate: it governs a single socket operation,
+# not the whole install.
+DEFAULT_PIP_TIMEOUT: int = 3600
+
+# pip's own single-connection timeout (--timeout N) used to improve success on
+# weak networks (issue #166, mirroring #165).  Distinct from the
+# subprocess-level timeout (DEFAULT_PIP_TIMEOUT above): that one bounds the
+# whole install; this one bounds a single socket handshake/read.
+PIP_CONNECT_TIMEOUT: int = 120
+
 # Curated runtime deps that run.py actually imports.
 #
 # Deliberately NOT a full install of the upstream pyproject.toml.  Reasons:
@@ -251,8 +266,16 @@ def ensure_venv_and_deps(
     *,
     dry_run: bool,
     buffer: DryRunBuffer,
+    pip_timeout: int = DEFAULT_PIP_TIMEOUT,
 ) -> None:
-    """Create the dedicated venv and install torch (cu124) + the repo's deps."""
+    """Create the dedicated venv and install torch (cu124) + the repo's deps.
+
+    *pip_timeout* is the subprocess-level timeout (issue #166, mirroring #165):
+    the maximum wall time allowed for each pip install.  Defaults to
+    DEFAULT_PIP_TIMEOUT (3600s) so all existing call sites remain valid
+    without change.  Override via ``--pip-timeout`` on the CLI or the
+    SETUP_PIP_TIMEOUT env var (CLI wins > env > default).
+    """
     node_dir = _effective_node_dir(explicit_repo_dir)
     venv_dir = node_dir / ".venv"
     python_exe = _venv_python_for(node_dir)
@@ -283,13 +306,15 @@ def ensure_venv_and_deps(
         "install",
         "--retries",
         "10",
+        "--timeout",
+        str(PIP_CONNECT_TIMEOUT),
         f"torch=={TORCH_VERSION}",
         f"torchvision=={TORCHVISION_VERSION}",
         "--index-url",
         TORCH_INDEX_URL,
         *_pip_mirror_args(pip_mirror),
     ]
-    run_step(cmd_torch, dry_run=dry_run, buffer=buffer, timeout=1200)
+    run_step(cmd_torch, dry_run=dry_run, buffer=buffer, timeout=pip_timeout)
 
     # (b) the curated runtime deps for run.py.
     #
@@ -298,11 +323,20 @@ def ensure_venv_and_deps(
     # no -e (DepthCrafter is run as a script, never installed as a package),
     # and no torch/torchvision (those are pinned in step (a) so a transitive
     # dep can never bump them off the cu124 pairing).
-    base_cmd = [str(python_exe), "-m", "pip", "install", "--retries", "10"]
+    base_cmd = [
+        str(python_exe),
+        "-m",
+        "pip",
+        "install",
+        "--retries",
+        "10",
+        "--timeout",
+        str(PIP_CONNECT_TIMEOUT),
+    ]
     mirror_args = _pip_mirror_args(pip_mirror)
     cmd_node = [*base_cmd, *RUNTIME_DEPS, *mirror_args]
     label_node = f"pip install {' '.join(RUNTIME_DEPS)}"
-    run_step(cmd_node, dry_run=dry_run, buffer=buffer, timeout=1200, label=label_node)
+    run_step(cmd_node, dry_run=dry_run, buffer=buffer, timeout=pip_timeout, label=label_node)
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +564,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "torch is ALWAYS installed from the official cu124 index."
         ),
     )
+    parser.add_argument(
+        "--pip-timeout",
+        default=None,
+        type=int,
+        metavar="SECONDS",
+        help=(
+            f"Subprocess timeout for pip install in seconds.  Defaults to "
+            f"{DEFAULT_PIP_TIMEOUT}s (issue #166); override via the "
+            f"SETUP_PIP_TIMEOUT env var.  CLI arg wins > env var > default."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _resolve_pip_timeout(cli_value: int | None) -> int:
+    """Resolve the pip subprocess timeout with the required precedence.
+
+    Order: --pip-timeout (CLI) > SETUP_PIP_TIMEOUT (env) > DEFAULT_PIP_TIMEOUT.
+    Mirrors the #165 implementation on setup_stereocrafter.py so all three
+    setup scripts share the same naming and precedence.
+    """
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get("SETUP_PIP_TIMEOUT")
+    if env_value is not None:
+        try:
+            return int(env_value)
+        except ValueError:
+            log.warning(
+                "SETUP_PIP_TIMEOUT=%r is not a valid integer — falling back to "
+                "the default (%ds).  Pass a plain integer or use --pip-timeout.",
+                env_value,
+                DEFAULT_PIP_TIMEOUT,
+            )
+    return DEFAULT_PIP_TIMEOUT
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -541,6 +609,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     buffer = DryRunBuffer()
+    pip_timeout = _resolve_pip_timeout(args.pip_timeout)
 
     log.info("DepthCrafter in-repo bootstrap (repo=%s)", REPO_ROOT)
     if args.dry_run:
@@ -556,7 +625,13 @@ def main(argv: list[str] | None = None) -> None:
         if args.skip_deps:
             log.info("--skip-deps: venv + pip install skipped")
         else:
-            ensure_venv_and_deps(args.repo_dir, args.pip_mirror, dry_run=args.dry_run, buffer=buffer)
+            ensure_venv_and_deps(
+                args.repo_dir,
+                args.pip_mirror,
+                dry_run=args.dry_run,
+                buffer=buffer,
+                pip_timeout=pip_timeout,
+            )
 
         # Step 3 — models
         log.info("\n── Step 3/4: model weights ──")
@@ -565,6 +640,13 @@ def main(argv: list[str] | None = None) -> None:
         # Step 4 — self-check
         log.info("\n── Step 4/4: self-check ──")
         self_check(args.repo_dir, dry_run=args.dry_run, buffer=buffer)
+    except subprocess.TimeoutExpired as exc:
+        log.warning(
+            "▸ pip install timed out after %ss. 网络慢可加 --pip-mirror <url> 或直接重跑（已完成步骤会跳过）.",
+            exc.timeout,
+        )
+        log.error("Bootstrap FAILED at: %s", exc)
+        sys.exit(1)
     except (RuntimeError, subprocess.CalledProcessError) as exc:
         log.error("Bootstrap FAILED at: %s", exc)
         sys.exit(1)
