@@ -210,6 +210,10 @@ class TestHwEncoderCliPassthrough(unittest.TestCase):
             # the MagicMock (does not auto-stub to a Mock).
             args.preset = "source"
             args.gop = None
+            # H-1.2 (#132): main() now remuxes audio after sv3d/st3d injection;
+            # pin the flag off and stub the passthrough helper so no real
+            # ffmpeg/ffprobe runs here.
+            args.copy_audio_from = None
 
             pipeline_inst = MagicMock()
             pipeline_inst.process_stream.return_value = "out.mp4"
@@ -218,6 +222,7 @@ class TestHwEncoderCliPassthrough(unittest.TestCase):
                 patch.object(run_pipeline, "parse_args", return_value=args),
                 patch.object(run_pipeline, "apply_quality_preset"),
                 patch.object(run_pipeline, "StreamingPipeline", return_value=pipeline_inst) as sp_mock,
+                patch.object(run_pipeline, "_maybe_copy_audio_from_input"),
                 patch("pipeline.spherical_injector.inject_spherical_metadata"),
                 patch("os.replace"),
             ):

@@ -501,6 +501,9 @@ class TestStreamingBranchInjection(unittest.TestCase):
             # I-5: request the advanced backends.
             args.depth_model = "depthcrafter"
             args.stereo_model = "stereocrafter"
+            # H-1.2 (#132): bare MagicMock attributes are truthy — pin the
+            # audio-passthrough flag so the branch under test is explicit.
+            args.copy_audio_from = None
 
             captured = {}
 
@@ -519,6 +522,13 @@ class TestStreamingBranchInjection(unittest.TestCase):
                 patch.object(run_pipeline, "build_depth_backend", return_value=(fake_depth, "depthcrafter")),
                 patch.object(run_pipeline, "build_stereo_backend", return_value=(fake_stereo, "stereocrafter")),
                 patch.object(run_pipeline, "StreamingPipeline", side_effect=fake_pipeline_ctor),
+                # H-1.2 (#132): the streaming branch now remuxes audio after
+                # sv3d/st3d injection.  Stub the passthrough helpers so no
+                # real ffmpeg/ffprobe runs on CI; the new TestStreamingAudio
+                # class below asserts this wiring directly.
+                patch.object(run_pipeline, "_copy_audio_to_output"),
+                patch.object(run_pipeline, "_maybe_copy_audio_from_input"),
+                patch.object(run_pipeline, "_write_sidecar_from_args"),
                 patch("pipeline.spherical_injector.inject_spherical_metadata"),
                 patch("os.replace"),
             ):
@@ -539,6 +549,104 @@ class TestStreamingBranchInjection(unittest.TestCase):
         self.assertIn("stereo_renderer", captured)
         self.assertEqual(captured.get("depth_backend_name"), "depthcrafter")
         self.assertEqual(captured.get("stereo_backend_name"), "stereocrafter")
+
+
+# ---------------------------------------------------------------------------
+# H-1.2 (#132): streaming branch remuxes audio after sv3d/st3d injection
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingAudioPassthrough(unittest.TestCase):
+    """The streaming CLI branch (--quality standard|high) must run the same
+    H-1 audio passthrough as the batch path — pre-H-1.2 it returned before
+    reaching it, silently producing a silent video.
+
+    The real module-level helpers (``_copy_audio_to_output`` /
+    ``_maybe_copy_audio_from_input``) run here; only ffmpeg/ffprobe
+    (``pipeline.audio_mux``) and the metadata injector are mocked, so the
+    wiring — including the ``re_inject=True`` re-embedding of sv3d/st3d
+    (issue #91) — is genuinely exercised.
+    """
+
+    def _run_streaming_main(self, *, copy_audio_from, has_audio):
+        sys.path.insert(0, os.path.join(PROJECT_ROOT, "scripts"))
+        try:
+            import run_pipeline
+
+            args = MagicMock()
+            args.video_upscale = "none"
+            args.device = "cpu"
+            args.validate_input = False
+            args.fps = 30
+            args.streaming = True
+            args.stage = "all"
+            args.projection = "vr180"
+            args.model_size = "small"
+            args.ipd = 0.064
+            args.max_disparity = 0.05
+            args.output_width = 2880
+            args.output_height = 2880
+            args.src_hfov = 70.0
+            args.codec = "h264"
+            args.crf = 23
+            args.bitrate = "45M"
+            args.input = "in.mp4"
+            args.output = "out.mp4"
+            args.max_frames = None
+            args.comfort = "balanced"
+            args.convergence = None
+            args.no_temporal = False
+            args.preset = "source"
+            args.gop = None
+            args.depth_model = "depthcrafter"
+            args.stereo_model = "stereocrafter"
+            args.copy_audio_from = copy_audio_from
+
+            pipeline_inst = MagicMock()
+            pipeline_inst.process_stream.return_value = "out.mp4"
+
+            with (
+                patch.object(run_pipeline, "parse_args", return_value=args),
+                patch.object(run_pipeline, "apply_quality_preset"),
+                patch.object(run_pipeline, "build_depth_backend", return_value=(MagicMock(), "depthcrafter")),
+                patch.object(run_pipeline, "build_stereo_backend", return_value=(MagicMock(), "stereocrafter")),
+                patch.object(run_pipeline, "StreamingPipeline", return_value=pipeline_inst),
+                patch.object(run_pipeline, "_write_sidecar_from_args"),
+                patch("pipeline.audio_mux.copy_audio_to") as mock_remux,
+                patch("pipeline.audio_mux.has_audio_stream", return_value=has_audio),
+                patch("pipeline.spherical_injector.inject_spherical_metadata") as mock_inject,
+                patch("os.replace"),
+            ):
+                run_pipeline.main()
+            return mock_remux, mock_inject
+        finally:
+            import contextlib
+
+            with contextlib.suppress(ValueError):
+                sys.path.remove(os.path.join(PROJECT_ROOT, "scripts"))
+            sys.modules.pop("run_pipeline", None)
+
+    def test_copy_audio_from_flag_remuxes_and_reinjects(self):
+        """--copy-audio-from <src>: streaming output gets the src's audio AND
+        sv3d/st3d is re-injected after the remux (issue #91)."""
+        mock_remux, mock_inject = self._run_streaming_main(copy_audio_from="src.mp4", has_audio=False)
+        mock_remux.assert_called_once_with("out.mp4", "src.mp4")
+        # Two injections: post-process_stream sv3d/st3d + post-remux re-inject.
+        self.assertEqual(mock_inject.call_count, 2)
+
+    def test_input_audio_remuxed_when_no_flag(self):
+        """No flag + input has an audio stream → implicit passthrough from
+        the input video, also with sv3d/st3d re-injection."""
+        mock_remux, mock_inject = self._run_streaming_main(copy_audio_from=None, has_audio=True)
+        mock_remux.assert_called_once_with("out.mp4", "in.mp4")
+        self.assertEqual(mock_inject.call_count, 2)
+
+    def test_no_audio_source_is_silent_noop(self):
+        """No flag + input has NO audio → no remux, no error (log-only)."""
+        mock_remux, mock_inject = self._run_streaming_main(copy_audio_from=None, has_audio=False)
+        mock_remux.assert_not_called()
+        # Only the post-process_stream injection runs.
+        self.assertEqual(mock_inject.call_count, 1)
 
 
 if __name__ == "__main__":
