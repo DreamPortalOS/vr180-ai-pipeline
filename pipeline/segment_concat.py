@@ -355,56 +355,48 @@ def _concat_filter(
     runner: Callable[[list[str]], object],
     ffmpeg: str,
 ) -> Path:
-    """Re-encode concat via filter_complex.
+    """Re-encode concat via ``filter_complex``.
 
     When ``crossfade <= 0`` this is a plain ``concat`` video (+ audio) filter.
-    When ``crossfade > 0`` we use ``xfade`` (video) + ``acrossfade`` (audio)
-    with transition offset computed so the total duration equals
-    ``sum(durations) - (n-1) * crossfade``.
+    When ``crossfade > 0`` we daisy-chain ``xfade`` (video) + ``acrossfade``
+    (audio). Each transition's ``offset`` is the timestamp (seconds from the
+    start of the *output* so far) at which the crossfade into the next clip
+    begins, so the total output duration is ``sum(durations) - (n-1)*crossfade``.
     """
     probes = [probe_segment(seg.path) for seg in segments]
     all_have_audio = all(p["has_audio"] for p in probes)
 
     width = probes[0]["width"]
-    fps = probes[0]["fps"]
     encoder_args = encoder if encoder is not None else select_encoder("h264", width)
 
+    # Input list: one -ss (seek to optional start) + -i per segment.  -ss
+    # before -i is fastest (input-seek, demuxer-level) and avoids decoding
+    # frames before the trim point.
     input_args: list[str] = []
-    filter_parts: list[str] = []
-    for _i, seg in enumerate(segments):
-        input_args += [
-            "-ss",
-            str(seg.start or 0),
-            "-i",
-            str(seg.path),
-        ]
+    for seg in segments:
+        if seg.start is not None:
+            input_args += ["-ss", str(seg.start)]
+        input_args += ["-i", str(seg.path)]
 
-    if len(segments) == 1:
-        # Trivial case: one segment, no join needed — still re-encode through
-        # ffmpeg so the same encoder args apply.
-        input_args += ["-c:v", encoder_args[1]]
+    n = len(segments)
+    if n == 1:
+        # Trivial: one segment, no join. Re-encode so the encoder args apply.
+        cmd = [ffmpeg, "-y", *input_args]
+        cmd += encoder_args
         if all_have_audio:
-            input_args.append("-c:a")
-            input_args.append("aac")
-        input_args.append("-movflags")
-        input_args.append("+faststart")
+            cmd += ["-c:a", "aac"]
+        cmd += ["-movflags", "+faststart", str(output_path)]
     else:
-        has_audio_filter = all_have_audio
         if crossfade > 0:
-            v_out, a_out, offsets = _build_xfade(segments, probes, crossfade, fps, has_audio=has_audio_filter)
-            filter_parts = [v_out]
-            if has_audio_filter:
-                filter_parts.append(a_out)
-            offsets_input_args = _build_offsets_input(offsets, input_args)
-            input_args = offsets_input_args
+            v_filter, a_filter = _build_xfade(probes, crossfade, has_audio=all_have_audio)
+            filter_desc = v_filter if not all_have_audio else ";".join([v_filter, a_filter])
         else:
-            v_in = "".join(f"[{i}:v]" for i in range(len(segments)))
-            filter_parts.append(f"{v_in}concat=n={len(segments)}:v=1:a={int(has_audio_filter)}[outv]")
-            if has_audio_filter:
-                a_in = "".join(f"[{i}:a]" for i in range(len(segments)))
-                filter_parts.append(f"{a_in}concat=n={len(segments)}:v=0:a=1[outa]")
+            v_in = "".join(f"[{i}:v]" for i in range(n))
+            filter_desc = f"{v_in}concat=n={n}:v=1:a={int(all_have_audio)}[outv]"
+            if all_have_audio:
+                a_in = "".join(f"[{i}:a]" for i in range(n))
+                filter_desc += ";" + f"{a_in}concat=n={n}:v=0:a=1[outa]"
 
-        filter_desc = ";".join(filter_parts)
         cmd = [
             ffmpeg,
             "-y",
@@ -415,21 +407,10 @@ def _concat_filter(
             "[outv]",
         ]
         cmd += encoder_args
-        if has_audio_filter:
+        if all_have_audio:
             cmd += ["-map", "[outa]", "-c:a", "aac"]
         cmd += ["-movflags", "+faststart", str(output_path)]
 
-        result = runner(cmd)
-        if getattr(result, "returncode", 0) != 0:
-            raise ConcatError(f"concat filter failed (exit {getattr(result, 'returncode', -1)})")
-        return output_path
-
-    cmd = [
-        ffmpeg,
-        "-y",
-        *input_args,
-        str(output_path),
-    ]
     result = runner(cmd)
     if getattr(result, "returncode", 0) != 0:
         raise ConcatError(f"concat filter failed (exit {getattr(result, 'returncode', -1)})")
@@ -437,78 +418,48 @@ def _concat_filter(
 
 
 def _build_xfade(
-    segments: Sequence[ConcatSegment],
     probes: list[dict],
     crossfade: float,
-    fps: float,
     *,
     has_audio: bool,
-) -> tuple[str, str, list[int]]:
-    """Build the xfade / acrossfade filter chain for *n* segments.
+) -> tuple[str, str]:
+    """Build the daisy-chained xfade / acrossfade filter for *n >= 2* clips.
 
-    Returns ``(video_filter, audio_filter, offsets)``. ``audio_filter`` is an
-    empty string when ``has_audio`` is False. ``offsets`` is a list of video
-    frame offsets for each xfade (used to inject ``-t`` duration args into the
-    input list so xfade can address stable input lengths).
+    ``xfade`` takes two video inputs and a crossfade ``duration`` plus an
+    ``offset`` (seconds into the *first* input where the transition begins).
+    For >2 clips we chain: ``[x0] = xfade(0,1)``; ``[x1] = xfade(x0,2)``; …
+    Each chained xfade's offset is the end of the previous result minus the
+    crossfade duration (so transitions overlap correctly). The same shape
+    applies to ``acrossfade`` for audio.
+
+    Returns ``(video_filter, audio_filter)``. ``audio_filter`` is ``""`` when
+    ``has_audio`` is False.
     """
-    n = len(segments)
+    n = len(probes)
     assert n >= 2
+    durations = [p["duration"] for p in probes]
+    # Fall back to a nominal 0s when ffprobe couldn't read duration: xfade
+    # then starts at offset 0, which still produces a well-formed filter.
+    dur = [d if d is not None and d > 0 else 0.0 for d in durations]
 
-    # Offset of the i-th xfade transition (between segment i and i+1):
-    #   offset_i = duration_0 + ... + duration_i - i * crossfade
-    offsets: list[int] = []
-    cumulative = 0.0
-    for i in range(n - 1):
-        cumulative += probes[i]["duration"] or (probes[i]["fps"] * 0)
-        cumulative -= i * crossfade
-        offsets.append(max(0, round(cumulative)))
+    v_parts: list[str] = []
+    a_parts: list[str] = []
+    prev_v = "0:v"
+    prev_a = "0:a"
+    # Running output length (seconds) of the xfade chain so far. The i-th
+    # transition's offset is measured into the *current* chained output, so it
+    # equals (length so far - crossfade), clamped to >= 0. After each
+    # transition the chain's length grows by dur[i] - crossfade.
+    chain_len = dur[0]
+    for i in range(1, n):
+        offset = max(0.0, chain_len - crossfade)
+        out_label = "outv" if i == n - 1 else f"xv{i}"
+        v_parts.append(f"[{prev_v}][{i}:v]xfade=transition=fade:duration={crossfade}:offset={offset}[{out_label}]")
+        prev_v = out_label
+        chain_len = offset + dur[i]
+        if has_audio:
+            out_a = "outa" if i == n - 1 else f"xa{i}"
+            a_parts.append(f"[{prev_a}][{i}:a]acrossfade=d={crossfade}:c1=tri:c2=tri[{out_a}]")
+            prev_a = out_a
 
-    v_inputs = "".join(f"[{i}:v]" for i in range(n))
-    # Offsets may be 0 when durations are unknown (probed as None). Keep the
-    # offset explicit so the ffmpeg expression is well-formed.
-    transitions: list[str] = []
-    for off in offsets:
-        transitions.append(f"trans_len={int(crossfade * fps)}:offset={off}:transition=fade")
-    # Build a daisy-chained xfade: [0:v][1:v]xfade...[x0]; [x0][2:v]xfade...[x1] ...
-    v_chain_parts: list[str] = []
-    if n == 2:
-        v_chain_parts.append(f"{v_inputs}xfade=frame_step=1:{transitions[0]}[outv]")
-    else:
-        prev = "xf0"
-        v_chain_parts.append(f"[0:v][1:v]xfade=frame_step=1:{transitions[0]}[{prev}]")
-        for i in range(2, n):
-            src = f"[{i}:v]"
-            out = f"xf{i - 1}"
-            v_chain_parts.append(f"[{prev}]{src}xfade=frame_step=1:{transitions[i - 1]}[{out}]")
-            prev = out
-        v_chain_parts[-1] = v_chain_parts[-1].rsplit("]", 1)[0] + "][outv]"
-
-    video_filter = "".join(v_chain_parts)
-
-    audio_filter = ""
-    if has_audio:
-        a_chain_parts: list[str] = []
-        a0 = f"[0:a][1:a]acrossfade=d={crossfade}:c1=tri:c2=tri[xa0]"
-        a_chain_parts.append(a0)
-        for i in range(2, n):
-            out = f"xa{i - 1}"
-            if i == n - 1:
-                a_chain_parts.append(f"[xa{i - 2}][{i}:a]acrossfade=d={crossfade}:c1=tri:c2=tri[outa]")
-            else:
-                a_chain_parts.append(f"[xa{i - 2}][{i}:a]acrossfade=d={crossfade}:c1=tri:c2=tri[{out}]")
-        audio_filter = "".join(a_chain_parts)
-
-    return video_filter, audio_filter, offsets
-
-
-def _build_offsets_input(offsets: list[int], input_args: list[str]) -> list[str]:
-    """Prepend a ``-t <first_segment_duration>`` after the first segment's -i
-    so ffmpeg knows the first input's length (needed when xfade references it).
-
-    Kept as a no-op passthrough: the concat filter path uses named inputs and
-    the offsets are already encoded in the filter expression itself, so there
-    is nothing additional to inject. This hook exists so a future variant can
-    add ``-t`` duration bounding without reshaping the public API.
-    """
-    _ = offsets  # offsets already baked into the filter expression
-    return input_args
+    return "".join(v_parts), "".join(a_parts)
