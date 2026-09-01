@@ -1,7 +1,7 @@
 """StereoCrafter — depth-aware stereo video generation with disocclusion inpainting.
 
-Provides a StereoCrafterRenderer that delegates to TencentARC/StereoCrafter
-inference scripts via a pluggable backend (default: CLIBackend).
+Provides a StereoCrafterRenderer that delegates to TencentARC/StereoCrafter's
+``inpainting_inference.py`` via a pluggable backend (default: CLIBackend).
 CUDA-only; raises clear errors on CPU/Mac builds.
 
 StereoCrafter (TencentARC) uses depth-guided forward splatting + video diffusion
@@ -10,18 +10,22 @@ ghosting/smear artifacts of simple depth-based shifting.
 
 The upstream repo exposes **two** fire-style entry scripts (no ``run.py``):
 
-* ``depth_splatting_inference.py`` (Stage 1) — runs DepthCrafter internally to
-  estimate per-frame depth, then forward-splats the left view to produce a
-  *splatting* video whose right half holds the disocclusion mask.
+* ``depth_splatting_inference.py`` (Stage 1) — runs an **embedded** copy of
+  DepthCrafter under ``dependency/DepthCrafter/`` to estimate per-frame depth,
+  then forward-splats the left view to produce the *splatting* grid video.
 * ``inpainting_inference.py`` (Stage 2 — the disocclusion-inpainting step this
-  repo needs) — takes the Stage-1 splatting video and video-diffusion-inpaints
-  the disocclusion regions, writing a side-by-side (SBS) stereoscopic video
-  (left = splatted view, right = inpainted view).
+  repo needs) — takes the Stage-1 grid video and video-diffusion-inpaints the
+  disocclusion regions, writing a side-by-side (SBS) stereoscopic video
+  (left = original view, right = inpainted view).
 
-The canonical invocation order is documented in the repo's ``run_inference.sh``
-(Stage 1 → Stage 2).  :class:`CLIBackend` reproduces that two-stage flow and
-then splits the resulting SBS video into the separate left/right files the
-pipeline expects.
+**This repo drives Stage 2 only** (issue #140).  Stage 1 is *not* run: its
+embedded DepthCrafter would duplicate this repo's own depth chain
+(``--depth-model depthcrafter`` / ``depth-anything``) and its 3 GB of weights,
+and it hard-crashes on a stock checkout (``No module named
+'dependency.DepthCrafter.depthcrafter'``).  Instead :class:`CLIBackend`
+assembles the Stage-2 input grid itself — the pipeline's own per-frame depth
+maps (``depth_dir``) + an in-repo forward-splat of the input video — and feeds
+it to ``inpainting_inference.py``.  See ``docs/STEREOCRAFTER_SETUP.md``.
 
 Usage::
 
@@ -93,6 +97,202 @@ def _dir_listing_block(output_dir: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Stage-2 input assembly (issue #140 — replaces upstream Stage 1)
+# ---------------------------------------------------------------------------
+
+
+def _load_video_frames_rgb(video_path: str) -> tuple[list, float]:
+    """Read a video into a list of RGB uint8 frames + fps (OpenCV, CPU)."""
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open input video for splat assembly: {video_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frames: list = []
+    try:
+        while True:
+            ret, bgr = cap.read()
+            if not ret:
+                break
+            frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    finally:
+        cap.release()
+    if not frames:
+        raise RuntimeError(f"Input video has no readable frames: {video_path}")
+    return frames, fps
+
+
+def _load_depth_maps(depth_dir: str, num_frames: int) -> list:
+    """Load per-frame depth maps from *depth_dir* as float32 arrays in [0, 1].
+
+    The pipeline's depth stage writes ``depth_XXXXXX.npy`` checkpoints; a
+    hand-seeded directory of ``*.png`` images (Depth-Anything visualisations)
+    is also accepted.  Each map is resized to the video frame size by the
+    caller.  Maps are min-max normalised per-frame to [0, 1] — the same
+    convention upstream Stage 1 applies to its DepthCrafter output.
+    """
+    import cv2
+    import numpy as np
+
+    directory = Path(depth_dir)
+    npy_files = sorted(directory.glob("depth_*.npy")) or sorted(directory.glob("*.npy"))
+    depths: list = []
+    if npy_files:
+        depths = [np.load(f) for f in npy_files]
+    else:
+        png_files = sorted(directory.glob("*.png"))
+        for f in png_files:
+            img = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                depths.append(img.astype(np.float32))
+
+    if not depths:
+        raise RuntimeError(
+            f"No depth maps found in {depth_dir}.\n"
+            f"  Expected depth_*.npy (pipeline depth stage) or *.png.\n"
+            f"  Run the depth stage first (--stage depth, or drop --stereo-model stereocrafter\n"
+            f"  so the default depth-shift renderer is used)."
+        )
+    if len(depths) < num_frames:
+        raise RuntimeError(
+            f"Depth dir {depth_dir} has {len(depths)} map(s) but the input video has "
+            f"{num_frames} frame(s) — the depth checkpoint is truncated/stale.  Re-run the "
+            f"depth stage so every frame has a depth map."
+        )
+    return depths[:num_frames]
+
+
+def _forward_splat(frame_rgb, depth, max_disp: float) -> tuple:
+    """Forward-splat the left view to the right eye; return (warped, occlusion).
+
+    In-repo numpy port of upstream ``ForwardWarpStereo`` (softmax-weighted
+    forward splatting, ``occlu_map=True``) — the CUDA-only ``Forward_Warp``
+    extension upstream Stage 1 requires is deliberately NOT used here (issue
+    #140).  *depth* is min-max normalised to [0, 1] per frame (near = 1),
+    matching the convention upstream applies to its DepthCrafter output.
+
+    Returns ``(warped_rgb, occlusion_mask)`` — both ``(H, W, 3)`` float32 in
+    [0, 1]; the mask is 1.0 where the right eye is disoccluded (needs
+    inpainting).
+    """
+    import numpy as np
+
+    h, w = frame_rgb.shape[:2]
+    disp = (depth.astype(np.float32) * 2.0 - 1.0) * max_disp  # (H, W), px
+
+    # Weights: upstream uses 1.414 ** (disp - disp.min()) to avoid overflow.
+    weights = np.power(1.414, disp - disp.min()).astype(np.float32)
+
+    # flow = -disp (right eye looks left); splat each source pixel onto the
+    # target grid and accumulate softmax weights (vectorised over pixels).
+    grid_x = np.arange(w, dtype=np.float32)[None, :].repeat(h, axis=0)
+    target_x = np.clip(np.rint(grid_x - disp).astype(np.int64), 0, w - 1)
+    # Flat 1D target index per source pixel (row-major: row * w + col) — the
+    # accumulators below are 1D length h*w, so a bare reshape(-1) of the 2D
+    # (row, col) target would collapse every row onto the same indices.
+    rows = np.arange(h, dtype=np.int64)[:, None].repeat(w, axis=1)
+    flat_t = (rows * w + target_x).reshape(-1)
+    flat_w = weights.reshape(-1)
+
+    warped = np.empty_like(frame_rgb, dtype=np.float32)
+    for c in range(3):
+        num = np.zeros(h * w, dtype=np.float64)
+        np.add.at(num, flat_t, (frame_rgb[..., c].astype(np.float32) * weights).reshape(-1))
+        den = np.zeros(h * w, dtype=np.float64)
+        np.add.at(den, flat_t, flat_w)
+        den_safe = np.where(den > 1e-6, den, 1.0)
+        warped[..., c] = (num / den_safe).reshape(h, w)
+
+    # Occlusion: splat a ones map; pixels nothing lands on are disoccluded.
+    occ_num = np.zeros(h * w, dtype=np.float64)
+    np.add.at(occ_num, flat_t, flat_w)
+    occlusion = (occ_num.reshape(h, w) <= 1e-6).astype(np.float32)
+    occlusion = np.repeat(occlusion[..., None], 3, axis=-1)
+
+    return warped, occlusion
+
+
+def _colorize_depth(depth) -> object:
+    """Rainbow-colourised depth visualisation (top-right grid quadrant).
+
+    Cosmetic only — upstream Stage 2 crops this quadrant away.  Mirrors the
+    turbo-style colouring of upstream's ``vis_sequence_depth``.
+    """
+    import cv2
+    import numpy as np
+
+    vis = cv2.applyColorMap((np.clip(depth, 0.0, 1.0) * 255).astype(np.uint8), cv2.COLORMAP_RAINBOW)
+    return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+
+def _write_splatting_grid_video(
+    input_path: str,
+    depth_dir: str,
+    output_path: str,
+    max_disp: float,
+) -> None:
+    """Assemble the Stage-2 (``inpainting_inference.py``) input grid video.
+
+    The upstream Stage-2 script consumes a 2×2 grid video of shape
+    ``(2H, 2W, 3)`` whose quadrants are (verified against the actual
+    ``inpainting_inference.py`` source, 2026-09-01)::
+
+        [ left        | depth_vis   ]
+        [ mask        | warped_right]
+
+    Upstream produces this grid in Stage 1 with an embedded DepthCrafter +
+    a CUDA forward-splat kernel.  This repo replaces that step (issue #140):
+    depth comes from the pipeline's own depth stage (*depth_dir*) and the
+    forward-splat is the in-repo numpy port in :func:`_forward_splat`.
+    """
+    import cv2
+    import numpy as np
+
+    frames, fps = _load_video_frames_rgb(input_path)
+    depths = _load_depth_maps(depth_dir, len(frames))
+
+    h, w = frames[0].shape[:2]
+    writer = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (w * 2, h * 2),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open splatting grid video for writing: {output_path}")
+
+    log.info(
+        "StereoCrafter: assembling Stage-2 grid video (%d frames, %dx%d quadrants) → %s",
+        len(frames),
+        w,
+        h,
+        output_path,
+    )
+    try:
+        for frame_rgb, depth in zip(frames, depths, strict=True):
+            depth = np.asarray(depth, dtype=np.float32)
+            if depth.ndim == 3:
+                depth = depth.mean(axis=-1)
+            if depth.shape != (h, w):
+                depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+            d_min, d_max = float(depth.min()), float(depth.max())
+            depth = (depth - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(depth)
+
+            frame_f = frame_rgb.astype(np.float32) / 255.0
+            warped, mask = _forward_splat(frame_f, depth, max_disp)
+            depth_vis = _colorize_depth(depth)
+
+            top = np.concatenate([frame_f, depth_vis], axis=1)
+            bottom = np.concatenate([mask, warped], axis=1)
+            grid = np.concatenate([top, bottom], axis=0)
+            grid_uint8 = np.clip(grid * 255.0, 0, 255).astype(np.uint8)
+            writer.write(cv2.cvtColor(grid_uint8, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+
+
+# ---------------------------------------------------------------------------
 # In-repo default paths (managed by scripts/setup_stereocrafter.py)
 # ---------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -110,29 +310,33 @@ INREPO_CKPT_DIR = _REPO_ROOT / "models" / "StereoCrafter"
 # bump to 768/1024 on larger GPUs via --stereocrafter-max-res or the env var.
 DEFAULT_MAX_RESOLUTION = 512
 
-# Default subprocess timeout per stage (seconds) — the historical hard-coded
-# 2 hours.  Override via STEREOCRAFTER_TIMEOUT_SEC (issue #134).
+# Default subprocess timeout for the inpainting stage (seconds) — the
+# historical hard-coded 2 hours.  Override via STEREOCRAFTER_TIMEOUT_SEC
+# (issue #134).
 DEFAULT_TIMEOUT_SEC = 7200
 
+# Stereo baseline used when forward-splatting the right eye (issue #140).
+# Mirrors the upstream Stage-1 default: disp = (depth * 2 - 1) * MAX_DISP,
+# so near pixels shift up to +20 px and far pixels down to -20 px.
+DEFAULT_MAX_DISP = 20.0
+
 # Upstream TencentARC/StereoCrafter has NO ``run.py``.  Its root-level fire-style
-# entry scripts (verified against the actual checkout, 2026-09-01) are:
-#
-#   depth_splatting_inference.py  — Stage 1: depth-guided forward splatting
-#   inpainting_inference.py      — Stage 2: disocclusion inpainting (this repo's step)
-#
-# Both ``from fire import Fire`` and accept ``--help``.  Listed in call order;
-# Stage 2 (the disocclusion-inpainting step the pipeline needs) is the primary
-# entry point — but it consumes Stage 1's splatting video as its input, so the
-# backend drives both in sequence.
-INFERENCE_SCRIPT_STAGE1 = "depth_splatting_inference.py"
-INFERENCE_SCRIPT_STAGE2 = "inpainting_inference.py"
-# Candidate entry scripts the backend will look for, in priority order.  Only the
-# two real upstream names are recognized; legacy guesses (``run.py``,
-# ``inference.py``, ``scripts/inference.py``) are deliberately absent so a
-# mislabeled checkout is not silently accepted.
+# entry scripts (verified against the actual checkout, 2026-09-01) are
+# ``depth_splatting_inference.py`` (Stage 1) and ``inpainting_inference.py``
+# (Stage 2).  This repo drives **Stage 2 only** (issue #140): Stage 1 imports
+# an *embedded* DepthCrafter (``dependency.DepthCrafter.depthcrafter``) that a
+# stock checkout does not ship — and this repo deliberately never embeds it
+# (the pipeline's own ``--depth-model`` chain already produces the depth, and
+# the forward-splat is assembled in-repo).  The recognized entry is therefore
+# the inpainting script alone.
+INFERENCE_SCRIPT = "inpainting_inference.py"
+# Candidate entry scripts the backend will look for, in priority order.  Only
+# the real upstream Stage-2 name is recognized; legacy guesses (``run.py``,
+# ``inference.py``, ``scripts/inference.py``) and Stage 1
+# (``depth_splatting_inference.py``) are deliberately absent so a mislabeled
+# checkout is not silently accepted.
 INFERENCE_SCRIPT_CANDIDATES = [
-    INFERENCE_SCRIPT_STAGE2,  # Stage 2 (inpainting) — primary entry this repo drives
-    INFERENCE_SCRIPT_STAGE1,  # Stage 1 (splatting)  — upstream stage, run first
+    INFERENCE_SCRIPT,  # Stage 2 (inpainting) — the only entry this repo drives
 ]
 
 
@@ -172,7 +376,7 @@ def _assert_cuda() -> None:
 
 
 class StereoCrafterBackend(ABC):
-    """Pluggable backend for the actual StereoCrafter inference call."""
+    """Pluggable backend for the StereoCrafter Stage-2 inpainting call."""
 
     @abstractmethod
     def render_video(
@@ -186,7 +390,9 @@ class StereoCrafterBackend(ABC):
 
         Args:
             input_path: Path to the input video file.
-            depth_dir: Directory containing depth maps (as .npy or .png).
+            depth_dir: Directory with the pipeline's own per-frame depth maps
+                (``depth_*.npy`` or ``*.png``) — consumed by the in-repo
+                forward-splat assembly (issue #140).
             output_left: Desired path for the left-eye output video.
             output_right: Desired path for the right-eye output video.
 
@@ -210,23 +416,24 @@ class CLIBackend(StereoCrafterBackend):
     :mod:`scripts/setup_stereocrafter.py`) adopted only when the paths
     actually exist on disk:
 
-    ========================== =============================== =============================================
-    Constructor param          Env var                         Default (if env unset)
-    ========================== =============================== =============================================
-    ``repo_dir``               ``STEREOCRAFTER_REPO_DIR``      in-repo ``third_party/StereoCrafter`` *(if exists)*
-    ``python_exe``             ``STEREOCRAFTER_PYTHON``        in-repo venv python *(if exists)*, else ``python``
-    ``checkpoint_dir``         ``STEREOCRAFTER_CKPT_DIR``      in-repo ``models/StereoCrafter`` *(if exists)*, else ``(repo_dir)/checkpoints``
-    ``pre_trained_path``       ``STEREOCRAFTER_SVD_PATH``      ``(repo_dir)/weights/stable-video-diffusion-img2vid-xt-1-1``
-    ``depthcrafter_unet_path`` ``STEREOCRAFTER_DC_UNET_PATH``  ``(repo_dir)/weights/DepthCrafter``
-    ``max_resolution``         ``STEREOCRAFTER_MAX_RES``       ``512`` (12 GB VRAM safe)
-    (stage timeout)            ``STEREOCRAFTER_TIMEOUT_SEC``   ``7200`` (2 hours per stage)
-    ========================== =============================== =============================================
+    ===================== =============================== =============================================
+    Constructor param     Env var                         Default (if env unset)
+    ===================== =============================== =============================================
+    ``repo_dir``          ``STEREOCRAFTER_REPO_DIR``      in-repo ``third_party/StereoCrafter`` *(if exists)*
+    ``python_exe``        ``STEREOCRAFTER_PYTHON``        in-repo venv python *(if exists)*, else ``python``
+    ``checkpoint_dir``    ``STEREOCRAFTER_CKPT_DIR``      in-repo ``models/StereoCrafter`` *(if exists)*, else ``(repo_dir)/checkpoints``
+    ``pre_trained_path``  ``STEREOCRAFTER_SVD_PATH``      ``(repo_dir)/weights/stable-video-diffusion-img2vid-xt-1-1``
+    ``max_resolution``    ``STEREOCRAFTER_MAX_RES``       ``512`` (12 GB VRAM safe)
+    ``max_disp``          ``STEREOCRAFTER_MAX_DISP``      ``20.0`` (stereo baseline, upstream Stage-1 default)
+    (stage timeout)       ``STEREOCRAFTER_TIMEOUT_SEC``   ``7200`` (2 hours)
+    ===================== =============================== =============================================
 
-    ``checkpoint_dir`` is the StereoCrafter UNet dir (Stage 2 ``--unet_path``);
-    ``depthcrafter_unet_path`` is the DepthCrafter UNet dir (Stage 1
-    ``--unet_path``); ``pre_trained_path`` is the SVD base model dir used as
-    ``--pre_trained_path`` by both stages.  See the upstream ``run_inference.sh``
-    for the canonical two-stage call order.
+    ``checkpoint_dir`` is the StereoCrafter UNet dir (``--unet_path``) and
+    ``pre_trained_path`` the SVD base model dir (``--pre_trained_path``), both
+    for the Stage-2 ``inpainting_inference.py`` — the only upstream script this
+    repo drives (issue #140).  The upstream Stage-1 ``--unet_path`` (an embedded
+    DepthCrafter) is gone: depth comes from the pipeline's own depth stage and
+    the forward-splat is assembled in-repo.
 
     If none of repo_dir / env / in-repo resolve, the constructor raises and
     points to ``scripts/setup_stereocrafter.py``.
@@ -238,8 +445,8 @@ class CLIBackend(StereoCrafterBackend):
         python_exe: str | None = None,
         checkpoint_dir: str | None = None,
         pre_trained_path: str | None = None,
-        depthcrafter_unet_path: str | None = None,
         max_resolution: int | None = None,
+        max_disp: float | None = None,
     ) -> None:
         # repo_dir: explicit > env > in-repo default (only if it exists on disk)
         _repo_dir = repo_dir or os.environ.get("STEREOCRAFTER_REPO_DIR")
@@ -270,7 +477,7 @@ class CLIBackend(StereoCrafterBackend):
         else:
             self.checkpoint_dir = str(Path(self.repo_dir) / "checkpoints")
 
-        # pre_trained_path (SVD base model, --pre_trained_path for both stages):
+        # pre_trained_path (SVD base model, --pre_trained_path for Stage 2):
         #   explicit > env > (repo_dir)/weights/stable-video-diffusion-img2vid-xt-1-1
         if pre_trained_path:
             self.pre_trained_path = str(Path(pre_trained_path).resolve())
@@ -279,21 +486,18 @@ class CLIBackend(StereoCrafterBackend):
         else:
             self.pre_trained_path = str(Path(self.repo_dir) / "weights" / "stable-video-diffusion-img2vid-xt-1-1")
 
-        # depthcrafter_unet_path (DepthCrafter UNet, Stage 1 --unet_path):
-        #   explicit > env > (repo_dir)/weights/DepthCrafter
-        if depthcrafter_unet_path:
-            self.depthcrafter_unet_path = str(Path(depthcrafter_unet_path).resolve())
-        elif os.environ.get("STEREOCRAFTER_DC_UNET_PATH"):
-            self.depthcrafter_unet_path = str(Path(os.environ["STEREOCRAFTER_DC_UNET_PATH"]).resolve())
-        else:
-            self.depthcrafter_unet_path = str(Path(self.repo_dir) / "weights" / "DepthCrafter")
-
         # max resolution for inference (short side); 512 is the 12 GB VRAM safe default.
         self.max_resolution = max_resolution or int(
             os.environ.get("STEREOCRAFTER_MAX_RES", str(DEFAULT_MAX_RESOLUTION))
         )
 
-        # Per-stage subprocess timeout in seconds (issue #134: was a hard-coded 2 hours).
+        # Stereo baseline for the in-repo forward-splat (px); mirrors the
+        # upstream Stage-1 --max_disp default.
+        self.max_disp: float = float(
+            max_disp if max_disp is not None else os.environ.get("STEREOCRAFTER_MAX_DISP", str(DEFAULT_MAX_DISP))
+        )
+
+        # Subprocess timeout in seconds (issue #134: was a hard-coded 2 hours).
         self.timeout_sec: int = int(os.environ.get("STEREOCRAFTER_TIMEOUT_SEC", str(DEFAULT_TIMEOUT_SEC)))
 
         # Verify paths
@@ -318,9 +522,9 @@ class CLIBackend(StereoCrafterBackend):
                 f"  See docs/STEREOCRAFTER_SETUP.md for details."
             )
 
-        # Look for a known inference entry point.  Only the real upstream names
-        # are recognized (inpainting_inference.py / depth_splatting_inference.py);
-        # a stray inference.py / run.py is NOT accepted as a substitute.
+        # Look for the Stage-2 inference entry point.  Only the real upstream
+        # name (inpainting_inference.py) is recognized; a stray inference.py /
+        # run.py / depth_splatting_inference.py is NOT accepted as a substitute.
         if repo.is_dir():
             candidates = [repo / name for name in INFERENCE_SCRIPT_CANDIDATES]
             found = any(c.is_file() for c in candidates)
@@ -335,11 +539,11 @@ class CLIBackend(StereoCrafterBackend):
             raise RuntimeError("StereoCrafter setup is incomplete:\n" + "\n".join(f"  \u2022 {i}" for i in issues))
 
     def _find_inference_script(self, name: str | None = None) -> str:
-        """Return the path to an inference entry point in the repo.
+        """Return the path to the Stage-2 inference entry point in the repo.
 
         With *name* given, resolve that specific entry (raises if absent).
-        Without *name*, return the first candidate that exists on disk
-        (Stage 2 / inpainting is preferred).
+        Without *name*, return the first candidate that exists on disk (the
+        inpainting script).
         """
         repo = Path(self.repo_dir)
         names = [name] if name else list(INFERENCE_SCRIPT_CANDIDATES)
@@ -349,7 +553,7 @@ class CLIBackend(StereoCrafterBackend):
                 return str(candidate)
         raise RuntimeError(
             f"No known inference script found in {self.repo_dir}. "
-            f"Expected one of: {', '.join(INFERENCE_SCRIPT_CANDIDATES)}. "
+            f"Expected: {', '.join(INFERENCE_SCRIPT_CANDIDATES)}. "
             f"See docs/STEREOCRAFTER_SETUP.md."
         )
 
@@ -365,35 +569,32 @@ class CLIBackend(StereoCrafterBackend):
     ) -> tuple[str, str]:
         _assert_cuda()
 
-        # StereoCrafter upstream is a *two-stage* fire-style pipeline (see the
-        # repo's run_inference.sh).  The repo needs the disocclusion-inpainting
-        # step (Stage 2 / inpainting_inference.py), but that script consumes
-        # Stage 1's splatting video as its input, so the backend drives both:
+        # Issue #140: this repo drives Stage 2 (inpainting_inference.py) ONLY.
+        # Upstream Stage 1 (depth_splatting_inference.py) embeds its own
+        # DepthCrafter under dependency/DepthCrafter/ — a stock checkout does
+        # not ship it, so Stage 1 hard-crashes (No module named
+        # 'dependency.DepthCrafter.depthcrafter'), and this repo deliberately
+        # never embeds it (duplicate 3 GB weights + a conflicting depth chain).
+        # Instead the backend assembles the Stage-2 input itself:
         #
-        #   Stage 1  depth_splatting_inference.py
-        #     --pre_trained_path <SVD base>  --unet_path <DepthCrafter unet>
-        #     --input_video_path <in>       --output_video_path <splat>
-        #     [--max_disp 20.0] [--process_length -1] [--batch_size 10]
-        #
-        #   Stage 2  inpainting_inference.py        ← the disocclusion step
-        #     --pre_trained_path <SVD base>  --unet_path <StereoCrafter unet>
-        #     --input_video_path <splat>    --save_dir <dir>
-        #     [--frames_chunk 23] [--overlap 3] [--tile_num 1]
+        #   1. In-repo assembly (no subprocess): input video + the pipeline's
+        #      own per-frame depth maps (*depth_dir*) are forward-splatted into
+        #      the 2x2 grid video Stage 2 consumes:
+        #          [ left | depth_vis ]
+        #          [ mask | warped    ]
+        #   2. Stage 2  inpainting_inference.py   ← the disocclusion step
+        #        --pre_trained_path <SVD base>  --unet_path <StereoCrafter unet>
+        #        --input_video_path <grid>     --save_dir <dir>
+        #        [--frames_chunk 23] [--overlap 3] [--tile_num 1]
         #
         # Stage 2 writes a single side-by-side video (<name>_sbs.mp4); the
         # pipeline contract wants separate left/right files, so the backend
         # splits the SBS frame into L/R afterwards.
-        #
-        # NOTE: StereoCrafter runs its OWN internal depth estimation in Stage 1
-        # (DepthCrafterDemo) — the caller-supplied *depth_dir* is therefore not
-        # forwarded to the subprocess.  It is accepted for interface
-        # compatibility with the pipeline (which always passes it) and must
-        # already exist as a directory; StereoCrafter simply does not consume
-        # the external DepthCrafter depth maps.
 
-        if depth_dir and not os.path.isdir(depth_dir):
+        if not depth_dir or not os.path.isdir(depth_dir):
             raise NotADirectoryError(
-                f"Depth directory not found: {depth_dir}. Provide a valid --depth-dir or ensure depth maps are saved."
+                f"Depth directory not found: {depth_dir}. "
+                f"Run the depth stage first (--stage depth) so per-frame depth maps exist."
             )
 
         # Absolutize caller paths: the subprocess runs with cwd=repo_dir, so
@@ -403,25 +604,13 @@ class CLIBackend(StereoCrafterBackend):
         splat_video = str((work_dir / "splatting_results.mp4").resolve())
         sbs_dir = str(work_dir.resolve())
 
-        # --- Stage 1: depth splatting -------------------------------------
-        stage1_script = self._find_inference_script(INFERENCE_SCRIPT_STAGE1)
-        cmd1: list[str] = [
-            self.python_exe,
-            stage1_script,
-            "--pre_trained_path",
-            self.pre_trained_path,
-            "--unet_path",
-            self.depthcrafter_unet_path,
-            "--input_video_path",
-            abs_input,
-            "--output_video_path",
-            splat_video,
-        ]
-        self._run_subprocess(cmd1, label="Stage 1 (depth splatting)", output_dir=sbs_dir)
+        # --- Assemble the Stage-2 input grid (in-repo; replaces upstream
+        #     Stage 1).  Consumes the pipeline's own depth maps via depth_dir.
+        _write_splatting_grid_video(abs_input, depth_dir, splat_video, self.max_disp)
 
         # --- Stage 2: disocclusion inpainting -----------------------------
-        stage2_script = self._find_inference_script(INFERENCE_SCRIPT_STAGE2)
-        cmd2: list[str] = [
+        stage2_script = self._find_inference_script(INFERENCE_SCRIPT)
+        cmd: list[str] = [
             self.python_exe,
             stage2_script,
             "--pre_trained_path",
@@ -433,7 +622,7 @@ class CLIBackend(StereoCrafterBackend):
             "--save_dir",
             sbs_dir,
         ]
-        self._run_subprocess(cmd2, label="Stage 2 (disocclusion inpainting)", output_dir=sbs_dir)
+        self._run_subprocess(cmd, label="Stage 2 (disocclusion inpainting)", output_dir=sbs_dir)
 
         # --- Split the SBS output into separate L/R videos ---------------
         # inpainting_inference.py writes <video_name>_sbs.mp4 in save_dir, where
@@ -637,8 +826,8 @@ class StereoCrafterRenderer:
         python_exe: str | None = None,
         checkpoint_dir: str | None = None,
         pre_trained_path: str | None = None,
-        depthcrafter_unet_path: str | None = None,
         max_resolution: int | None = None,
+        max_disp: float | None = None,
     ) -> None:
         _assert_cuda()
 
@@ -650,8 +839,8 @@ class StereoCrafterRenderer:
                 python_exe=python_exe,
                 checkpoint_dir=checkpoint_dir,
                 pre_trained_path=pre_trained_path,
-                depthcrafter_unet_path=depthcrafter_unet_path,
                 max_resolution=max_resolution,
+                max_disp=max_disp,
             )
 
     def render_video(
@@ -665,9 +854,11 @@ class StereoCrafterRenderer:
 
         Args:
             input_path: Path to input video file.
-            depth_dir: Directory containing per-frame depth maps (as .npy or .png).
-                If None, a temporary directory is created and must be populated
-                by the caller before calling this method.
+            depth_dir: Directory with the pipeline's own per-frame depth maps
+                (``depth_*.npy`` or ``*.png``), consumed by the in-repo
+                forward-splat assembly.  If None, a temporary directory is
+                created and must be populated by the caller before calling
+                this method.
             output_left: Desired path for the left-eye output video.
                 If None, a temp path is generated.
             output_right: Desired path for the right-eye output video.
