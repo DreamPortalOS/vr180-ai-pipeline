@@ -270,23 +270,30 @@ def test_cli_backend_loads_npy_output(
     mock_run: MagicMock,
     mock_cuda: MagicMock,
 ) -> None:
-    """CLIBackend should load .npy depth maps from output dir."""
+    """CLIBackend should load .npy depth maps from output dir.
+
+    NOTE: the output dir is wiped before inference, so the fake products must
+    be written from inside the mocked subprocess call (side_effect), not
+    before estimate_video() runs.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         script_path = Path(tmpdir) / "run.py"
         script_path.write_text("print('ok')")
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = ""
-        mock_result.stderr = ""
-        mock_run.return_value = mock_result
-
-        # Write fake .npy depth files into output dir
         outdir_path = Path(tmpdir) / "depth_output"
-        outdir_path.mkdir(parents=True, exist_ok=True)
-        rng = np.random.default_rng(42)
-        for i in range(3):
-            np.save(str(outdir_path / f"depth_{i:06d}.npy"), rng.random((100, 200)).astype(np.float32))
+
+        def _fake_run(cmd, **kwargs):
+            outdir_path.mkdir(parents=True, exist_ok=True)
+            rng = np.random.default_rng(42)
+            for i in range(3):
+                np.save(str(outdir_path / f"depth_{i:06d}.npy"), rng.random((100, 200)).astype(np.float32))
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        mock_run.side_effect = _fake_run
 
         backend = CLIBackend(repo_dir=tmpdir)
         depths = backend.estimate_video(input_path=str(script_path), output_dir=str(outdir_path))
@@ -470,3 +477,147 @@ def test_cli_backend_passes_process_length_and_target_fps(
         cmd2 = mock_run.call_args[0][0]
         assert "--process_length" not in cmd2
         assert "--target_fps" not in cmd2
+
+
+# ---------------------------------------------------------------------------
+# Issue #126 — real upstream output is ``<stem>_depth.mp4``, not a .npy seq
+# ---------------------------------------------------------------------------
+
+
+def _write_gray_mp4(path: Path, num_frames: int, w: int = 64, h: int = 48, value: int = 128) -> None:
+    """Synthesize a small grayscale mp4 (the shape of DepthCrafter's real output)."""
+    import cv2
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    wr = cv2.VideoWriter(str(path), fourcc, 24, (w, h))
+    assert wr.isOpened(), f"cv2.VideoWriter could not create {path}"
+    try:
+        frame = np.full((h, w, 3), value, dtype=np.uint8)
+        for _ in range(num_frames):
+            wr.write(frame)
+    finally:
+        wr.release()
+
+
+def _mock_success_with_products(mock_run: MagicMock, outdir_path: Path, stem: str, num_frames: int) -> None:
+    """Make mock_run simulate a successful DepthCrafter run that writes mp4 products."""
+
+    def _fake_run(cmd, **kwargs):
+        outdir_path.mkdir(parents=True, exist_ok=True)
+        _write_gray_mp4(outdir_path / f"{stem}_depth.mp4", num_frames=num_frames)
+        (outdir_path / f"{stem}_input.mp4").write_bytes(b"x")  # decoy, must be ignored
+        (outdir_path / f"{stem}_vis.mp4").write_bytes(b"x")  # decoy, must be ignored
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = ""
+        result.stderr = ""
+        return result
+
+    mock_run.side_effect = _fake_run
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_loads_depth_mp4_output(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """The real upstream run.py emits ``<stem>_depth.mp4`` — CLIBackend must decode it.
+
+    Regression test for issue #126: previously the loader only looked for
+    ``*.npy`` / ``depth_*.png`` and died with 'no depth files found'.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = Path(tmpdir) / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "run.py").write_text("print('ok')")
+        input_video = Path(tmpdir) / "myclip.mp4"
+        input_video.write_bytes(b"fake")
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        _mock_success_with_products(mock_run, outdir_path, stem="myclip", num_frames=5)
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        depths = backend.estimate_video(input_path=str(input_video), output_dir=str(outdir_path))
+
+        assert len(depths) == 5
+        assert depths[0].ndim == 2
+        assert depths[0].dtype == np.float32
+        # 8-bit grayscale video, normalized to [0, 1] — no histogram stretch.
+        assert float(depths[0].min()) >= 0.0
+        assert float(depths[0].max()) <= 1.0
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_cleans_output_dir_before_run(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """Pre-existing products must be wiped so stale files can't fake success.
+
+    Regression test for issue #126 'fake success': a leftover .npy in the
+    output dir was previously loaded as if it were the current run's product.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = Path(tmpdir) / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "run.py").write_text("print('ok')")
+        input_video = Path(tmpdir) / "clip.mp4"
+        input_video.write_bytes(b"fake")
+        outdir_path = Path(tmpdir) / "depth_out"
+        outdir_path.mkdir(parents=True)
+        # Stale pollution from an earlier run — must NOT be picked up.
+        np.save(str(outdir_path / "stale_leftover.npy"), np.zeros((4, 4), dtype=np.float32))
+        (outdir_path / "clip_depth.mp4").write_bytes(b"stale bytes, not a video")
+
+        _mock_success_with_products(mock_run, outdir_path, stem="clip", num_frames=3)
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        depths = backend.estimate_video(input_path=str(input_video), output_dir=str(outdir_path))
+
+        # Exactly the 3 fresh frames from this run's mp4 — the stale .npy
+        # was wiped before inference, never loaded.
+        assert len(depths) == 3
+        # The dir now contains only this run's products.
+        assert not (outdir_path / "stale_leftover.npy").exists()
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_error_lists_dir_contents(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """When no product form is found, the error must list what IS in the dir."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = Path(tmpdir) / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "run.py").write_text("print('ok')")
+        input_video = Path(tmpdir) / "src_720p_v2.mp4"
+        input_video.write_bytes(b"fake")
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        def _fake_run(cmd, **kwargs):
+            outdir_path.mkdir(parents=True, exist_ok=True)
+            # The three mp4s the real upstream emits — but with a stem that
+            # doesn't match, so no *_depth.mp4 is found for our stem...
+            # Actually upstream DOES emit <stem>_depth.mp4; here we simulate
+            # a future/renamed output so nothing matches:
+            (outdir_path / "src_720p_v2_input.mp4").write_bytes(b"x")
+            (outdir_path / "src_720p_v2_vis.mp4").write_bytes(b"x")
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        mock_run.side_effect = _fake_run
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        with pytest.raises(RuntimeError) as excinfo:
+            backend.estimate_video(input_path=str(input_video), output_dir=str(outdir_path))
+        msg = str(excinfo.value)
+        assert "no depth files found" in msg
+        assert "src_720p_v2_input.mp4" in msg
+        assert "src_720p_v2_vis.mp4" in msg
