@@ -260,7 +260,14 @@ def concat_segments(
         log.info("crossfade>0 forces filter mode")
         mode = "filter"
 
-    output_path = Path(output_path)
+    # The concat demuxer list file lives in the system temp dir, not the repo.
+    # ffmpeg then resolves any relative paths inside that list against the list
+    # file's directory — so relative caller paths would be resolved against
+    # TMPDIR and silently fail (lead real-run failure; same root cause as
+    # PR #75's seedvr2-cli cwd mismatch). Absolutize segment paths when writing
+    # the list, and absolutize output_path for the same reason.
+    output_path = Path(output_path).resolve()
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     check_compatible(segments)
 
     runner = runner or subprocess.run
@@ -335,7 +342,14 @@ def _write_concat_list(segments: Sequence[ConcatSegment], list_path: Path) -> No
             parts.append(f"in {seg.start}")
         if seg.end is not None:
             parts.append(f"out {seg.end}")
-        parts.append(f"file '{seg.path}'")
+        # Absolute, forward-slash path. The concat demuxer resolves any
+        # relative file entry against the list file's (system temp) directory,
+        # so a caller-relative path would become TMPDIR/relative/path.mp4
+        # and fail. ``.resolve()`` absolutizes; the demuxer accepts both
+        # forward and back slashes, but forward slashes are the portable
+        # cross-platform form recommended by the ffmpeg docs.
+        seg_path = Path(seg.path).resolve().as_posix()
+        parts.append(f"file '{seg_path}'")
         lines.append(" ".join(parts))
     # ffprobe reads the file; use the repo-local encoding.
     list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
