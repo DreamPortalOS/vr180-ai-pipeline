@@ -35,14 +35,22 @@ The script is **idempotent** — re-running it only fills missing pieces.  It:
 3. Downloads `TencentARC/StereoCrafter` weights into
    `models/StereoCrafter/` via `huggingface_hub.snapshot_download`
    (skipped if already present).
-4. Runs a self-check (`<inference_entry_point> --help`) so a broken env
+4. Pre-downloads the **SVD base model**
+   (`stabilityai/stable-video-diffusion-img2vid-xt-1-1`, ~10 GB) into
+   `models/svd-img2vid-xt-1-1/`.  This is a **gated** HF repo — the local
+   HF token is read automatically and the account must have **accepted
+   the license** (see §2.1).  If the account is not yet authorized, the
+   step fails with a clear error naming the application page rather than
+   a bare `403 OSError`.  Skip with `--skip-svd`.
+5. Runs a self-check (`<inference_entry_point> --help`) so a broken env
    is caught early.
 
 Created layout (everything is gitignored):
 
 ```
-third_party/StereoCrafter/    ← TencentARC/StereoCrafter checkout (+ its own .venv)
-models/StereoCrafter/         ← TencentARC/StereoCrafter weights
+third_party/StereoCrafter/      ← TencentARC/StereoCrafter checkout (+ its own .venv)
+models/StereoCrafter/           ← TencentARC/StereoCrafter weights
+models/svd-img2vid-xt-1-1/      ← SVD base model (gated HF repo, ~10 GB)
 ```
 
 ### Bootstrap options
@@ -50,6 +58,9 @@ models/StereoCrafter/         ← TencentARC/StereoCrafter weights
 ```bash
 python scripts/setup_stereocrafter.py --repo-dir D:/StereoCrafter   # use an existing checkout
 python scripts/setup_stereocrafter.py --skip-model                  # weights already downloaded
+python scripts/setup_stereocrafter.py --skip-svd                     # SVD base already downloaded / defer to first run
+python scripts/setup_stereocrafter.py --svd-dir D:/svd               # custom SVD target dir
+python scripts/setup_stereocrafter.py --hf-token hf_...             # explicit HF token (else auto-read)
 python scripts/setup_stereocrafter.py --skip-deps                   # venv + pip already set up
 python scripts/setup_stereocrafter.py --pip-mirror https://pypi.tuna.tsinghua.edu.cn/simple
 python scripts/setup_stereocrafter.py --dry-run                     # print planned steps, no I/O
@@ -65,8 +76,62 @@ python scripts/setup_stereocrafter.py --dry-run                     # print plan
 | CUDA      | CUDA 12.4 (torch is pinned to the cu124 wheel index) |
 | OS        | Windows / Linux / macOS are all supported by the bootstrap; **inference is CUDA-only** |
 | Python    | 3.10+ (the dedicated venv is created by the bootstrap) |
-| Disk      | ~20 GB (checkout + weights + venv) **+ ~10 GB for the SVD base** — auto-downloaded by diffusers on the first inference run, or pre-downloaded via `--svd-dir` |
+| Disk      | ~20 GB (checkout + weights + venv) **+ ~10 GB for the SVD base** — pre-downloaded by the bootstrap; skip with `--skip-svd` to defer to the first inference run |
+| HF access | An Hugging Face account token with **accepted license** for the gated SVD repo [`stabilityai/stable-video-diffusion-img2vid-xt-1-1`](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1) (see §2.1) |
 | Network   | git + HF download (one-time); the bootstrap prints proxy hints if `git clone` fails |
+
+### 2.1 SVD base model — gated HF repo (must accept license)
+
+The StereoCrafter Stage-2 inpainting stage uses the SVD base model
+[`stabilityai/stable-video-diffusion-img2vid-xt-1-1`](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1)
+as its `--pre_trained_path`.  This is a **gated Hugging Face repo** —
+the model's license must be accepted before it can be downloaded.
+
+If the account behind your HF token has not accepted the license, the
+first attempt to download (either by the bootstrap or by diffusers at
+runtime) fails with a bare `403` / `OSError: ... gated repo ...` that
+says nothing useful:
+
+```
+OSError: You are trying to access a gated repo.
+  Cannot access gated repo for url
+  https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1/resolve/main/...
+  403 Client Error. Access to model ... is restricted and you are not in the authorized list.
+```
+
+**Fix (one-time):**
+
+1. Open <https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1>
+   in a browser, sign in with the **same** HF account whose token is on
+   this machine, and accept the license agreement.  Approval is usually
+   instant.
+2. Re-run the bootstrap:
+   ```bash
+   python scripts/setup_stereocrafter.py
+   ```
+   The bootstrap now reads your local HF token automatically
+   (`HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` env var, or
+   `~/.cache/huggingface/token` / `huggingface-cli login`), passes it to
+   `snapshot_download`, and pre-downloads the ~10 GB SVD base into
+   `models/svd-img2vid-xt-1-1/`.  **No re-login is needed** — the token is
+   already on disk; only the license acceptance is required.
+3. If you pass a token explicitly:
+   ```bash
+   python scripts/setup_stereocrafter.py --hf-token hf_xxx
+   ```
+
+**If you decline to accept / cannot get authorization:** the SVD base
+cannot be downloaded legally through any other channel
+(non-official mirror weights are out of scope — see issue #150).  Your
+only option is to skip the pre-download and rely on diffusers at runtime:
+
+```bash
+python scripts/setup_stereocrafter.py --skip-svd
+```
+
+When authorization fails at bootstrap time, the script does **not** print
+a cryptic `403` — it prints the application page and the exact steps
+above, so the fix is actionable on its face.
 
 ---
 
@@ -130,14 +195,18 @@ backend raises and points at `scripts/setup_stereocrafter.py`.
 | `checkpoint_dir`        | `STEREOCRAFTER_CKPT_DIR`       | `models/StereoCrafter` *(if exists)*, else `(<repo>)/checkpoints` — Stage 2 `--unet_path` |
 | `pre_trained_path`      | `STEREOCRAFTER_SVD_PATH`       | `models/svd-img2vid-xt-1-1` *(if exists)*, else the HF id `stabilityai/stable-video-diffusion-img2vid-xt-1-1` — SVD base (Stage 2 `--pre_trained_path`) |
 
-> **SVD base model (~10 GB) — first-run download.**  If no local copy of the
-> SVD base exists, the backend passes the HF model id straight to diffusers,
-> which downloads ~10 GB into the HF cache on the **first inference run**
-> (same behaviour as DepthCrafter's auto-pull).  To front-load the download
-> instead, run `python scripts/setup_stereocrafter.py --svd-dir models/svd-img2vid-xt-1-1`
-> once, or set `STEREOCRAFTER_SVD_PATH` to an existing local snapshot.  A
-> nonexistent local path is never passed — diffusers would treat it as an HF
-> repo id and crash (issue #147).
+> **SVD base model (~10 GB) — pre-downloaded by the bootstrap.**  The
+> bootstrap pre-downloads the SVD base into `models/svd-img2vid-xt-1-1/`
+> by default (it is a **gated** HF repo — see §2.1 for the one-time
+> license-acceptance step).  If you ran the bootstrap with `--skip-svd` and
+> no local copy exists, the backend falls back to passing the HF model id
+> straight to diffusers, which downloads ~10 GB into the HF cache on the
+> **first inference run** (same behaviour as DepthCrafter's auto-pull).  To
+> front-load that download later, re-run
+> `python scripts/setup_stereocrafter.py` (the SVD step is idempotent), or
+> set `STEREOCRAFTER_SVD_PATH` to an existing local snapshot.  A nonexistent
+> local path is never passed — diffusers would treat it as an HF repo id and
+> crash (issue #147).
 | `max_resolution`        | `STEREOCRAFTER_MAX_RES`        | `512` |
 | `max_disp`              | `STEREOCRAFTER_MAX_DISP`       | `20.0` — stereo baseline for the in-repo forward-splat |
 
@@ -255,7 +324,9 @@ dependencies (see `tests/test_stereo_crafter.py`).
 | `FileNotFoundError: python` | Wrong venv python path | The bootstrap writes it in-repo; run the bootstrap, or set `STEREOCRAFTER_PYTHON` |
 | Self-check fails | The inference entry point can't import | `python <venv>/python inpainting_inference.py --help` inside `third_party/StereoCrafter/` to see the real error |
 | `git clone` fails | Network / proxy (common from mainland China) | Set `http(s).proxy`, or clone manually then pass `--repo-dir` |
-| `snapshot_download` fails | HF access / network | Re-run the bootstrap; or clone `https://huggingface.co/TencentARC/StereoCrafter` into `models/StereoCrafter/` manually |
+| `snapshot_download` fails (StereoCrafter weights) | HF access / network | Re-run the bootstrap; or clone `https://huggingface.co/TencentARC/StereoCrafter` into `models/StereoCrafter/` manually |
+| SVD download fails with `gated repo` / `403` / "not in the authorized list" | The HF account behind the local token has **not accepted the SVD model's license** — it is a gated repo (issue #150). The bootstrap prints the application page and steps automatically | Open <https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1>, sign in with the same HF account, accept the license (usually instant), then re-run `python scripts/setup_stereocrafter.py`. See §2.1 |
+| SVD download fails, no token found | No HF token on disk (`~/.cache/huggingface/token`) and no `HF_TOKEN` env var | Run `huggingface-cli login` once, or pass `--hf-token hf_xxx` (see §2.1) |
 | Subprocess non-zero exit | StereoCrafter internal error | Run `inpainting_inference.py` directly inside `third_party/StereoCrafter/` to isolate the failure; check its stderr |
 | `SBS output not found` | Stage 2 succeeded but did not write `<name>_sbs.mp4` where expected | Confirm `--save_dir` is writable and the inpainting step completed; check stderr of Stage 2 |
 

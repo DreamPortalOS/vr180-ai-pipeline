@@ -9,6 +9,7 @@ Layout created (everything is gitignored):
 
     third_party/StereoCrafter/         ← git clone of TencentARC/StereoCrafter (incl. its own .venv)
     models/StereoCrafter/              ← TencentARC/StereoCrafter weights (hf snapshot)
+    models/svd-img2vid-xt-1-1/         ← SVD base model (gated HF repo, ~10 GB)
 
 Steps (idempotent — re-running only fills missing pieces):
 
@@ -21,7 +22,13 @@ Steps (idempotent — re-running only fills missing pieces):
          for the rationale (no ``pip install -e .``, torch pins preserved).
     3. Download ``TencentARC/StereoCrafter`` weights into ``models/StereoCrafter/`` via
        ``huggingface_hub.snapshot_download`` (existing download is skipped).
-    4. Self-check: run the repo's inference entry point with ``--help`` via the
+    4. Pre-download the **SVD base model** (``stabilityai/stable-video-diffusion-img2vid-xt-1-1``,
+       ~10 GB) into ``models/svd-img2vid-xt-1-1/``.  This is a **gated** HF repo — the
+       local HF token is read automatically and the account **must have accepted the
+       model's license** (see :data:`_SVD_REPO_URL`).  A 403 from a non-authorized
+       account produces a clear error pointing at the application page rather than a
+       bare ``OSError`` (issue #150).  Skip with ``--skip-svd``.
+    5. Self-check: run the repo's inference entry point with ``--help`` via the
        dedicated venv.
 
 The script never touches the project-root venv and never downloads anything in CI
@@ -32,7 +39,10 @@ Usage::
     python scripts/setup_stereocrafter.py
     python scripts/setup_stereocrafter.py --repo-dir D:/StereoCrafter   # existing checkout
     python scripts/setup_stereocrafter.py --skip-model                  # weights already downloaded
+    python scripts/setup_stereocrafter.py --skip-svd                    # SVD base already downloaded / defer to first run
     python scripts/setup_stereocrafter.py --skip-deps                   # venv + pip install already done
+    python scripts/setup_stereocrafter.py --svd-dir D:/svd              # custom SVD target dir
+    python scripts/setup_stereocrafter.py --hf-token hf_...             # explicit HF token (else auto-read)
     python scripts/setup_stereocrafter.py --pip-mirror https://pypi.tuna.tsinghua.edu.cn/simple
     python scripts/setup_stereocrafter.py --dry-run                     # print planned steps, no side effects
 """
@@ -105,11 +115,26 @@ RUNTIME_DEPS: tuple[str, ...] = (
 # HuggingFace repo for the StereoCrafter weights.
 _MODEL_REPO_ID = "TencentARC/StereoCrafter"
 
-# SVD base model (Stage 2 --pre_trained_path).  NOT downloaded by default —
-# when absent, pipeline.stereo_crafter passes this HF id straight to diffusers,
-# which downloads it (~10 GB) on the first inference run (issue #147).
+# SVD base model (Stage 2 --pre_trained_path).  Pre-downloaded by default into
+# INREPO_SVD_DIR so the first inference run does not have to fetch ~10 GB.  When
+# the local copy is missing the pipeline instead passes this HF id straight to
+# diffusers, which downloads it on the first inference run (issue #147).
+#
+# IMPORTANT (issue #150): this is a **gated** HF repo — the account behind the
+# local HF token must have accepted the model's license agreement, otherwise
+# snapshot_download / diffusers raise a 403 ``OSError: ... gated repo``.  The
+# bootstrap surfaces that case with a clear error pointing at the application
+# page (see :func:`_svd_gated_error`) instead of a bare OSError.
 _SVD_REPO_ID = "stabilityai/stable-video-diffusion-img2vid-xt-1-1"
+# The HF web page where the license is accepted (used in error messages).
+_SVD_REPO_URL = f"https://huggingface.co/{_SVD_REPO_ID}"
 INREPO_SVD_DIR = REPO_ROOT / "models" / "svd-img2vid-xt-1-1"
+
+# Where huggingface_hub stores the login token on disk (used as a fallback when
+# the ``huggingface_hub`` package is importable but exposes no token helper, or
+# when the caller passes none).  Mirrors ``huggingface_hub.constants`` so we do
+# not hard-couple this setup script to the package's internals.
+_HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN")
 
 
 # ---------------------------------------------------------------------------
@@ -354,32 +379,106 @@ def _has_snapshot_files(model_dir: Path) -> bool:
     return any(child.is_file() for child in model_dir.iterdir())
 
 
+# ---------------------------------------------------------------------------
+# HF token + gated-repo handling (issue #150)
+# ---------------------------------------------------------------------------
+
+
+def _read_hf_token(explicit_token: str | None = None) -> str | None:
+    """Resolve the HF access token to pass to ``snapshot_download``.
+
+    Precedence: explicit arg (``--hf-token``) > the standard env vars
+    (``HF_TOKEN`` / ``HUGGING_FACE_HUB_TOKEN`` / ``HUGGINGFACE_TOKEN``) >
+    ``huggingface_hub``'s own stored token (``HfFolder.get_token()``).  The
+    ``huggingface_hub`` package is imported lazily so this stays importable
+    in CI (where it is not installed); in that case we still consult the env
+    vars as a fallback.  Returns ``None`` if no token is available.
+    """
+    if explicit_token:
+        return explicit_token
+
+    for var in _HF_TOKEN_ENV_VARS:
+        value = os.environ.get(var)
+        if value:
+            return value
+
+    try:
+        from huggingface_hub import HfFolder
+
+        return HfFolder.get_token()  # type: ignore[no-any-return]
+    except ImportError:
+        return None
+    except Exception:  # pragma: no cover — defensive: never let token lookup crash setup
+        return None
+
+
+def _is_gated_repo_error(exc: BaseException) -> bool:
+    """Return True if *exc* is the HF "gated repo" 401/403 access error.
+
+    ``huggingface_hub`` raises this as an ``OSError`` whose message contains
+    "gated repo" (e.g. ``OSError: You are trying to access a gated repo.``).
+    We match on the message rather than the exception type so this is robust
+    across ``huggingface_hub`` versions that may raise a subclass.
+    """
+    text = f"{exc}"
+    text_lower = text.lower()
+    if "gated repo" in text_lower or "restricted and you are not in the authorized list" in text_lower:
+        return True
+    # Bare HTTP 401/403 without the phrase — flag it if the text also mentions
+    # the specific gated model so we do not mislabel an unrelated 403.
+    return ("403" in text or "401" in text) and _SVD_REPO_ID in text_lower
+
+
+def _svd_gated_error(exc: BaseException) -> RuntimeError:
+    """Build the actionable error for the SVD gated-repo 403 (issue #150).
+
+    The raw ``OSError: ... gated repo ... 403`` tells the user nothing about
+    *why* or *what to do*.  This wraps it with the model page where the
+    license must be accepted and notes the token requirement, so the failure
+    is actionable on its face.
+    """
+    return RuntimeError(
+        f"The SVD base model {_SVD_REPO_ID!r} is a gated Hugging Face repo and "
+        f"the account behind the local HF token is not authorized to access it.\n"
+        f"  {exc}\n"
+        f"  → Open this page in a browser, sign in with the SAME Hugging Face "
+        f"account whose token is on this machine, and accept the license:\n"
+        f"      {_SVD_REPO_URL}\n"
+        f"  Approval is usually instant.  The token is already on disk "
+        f"(~/.cache/huggingface/token); after accepting, re-run this "
+        f"bootstrap — no token re-login needed.\n"
+        f"  To pass a token explicitly instead: --hf-token hf_xxx  "
+        f"(or set the {', '.join(_HF_TOKEN_ENV_VARS)} env var)."
+    )
+
+
 def download_svd_base(
     svd_dir: str | None,
     *,
+    skip_svd: bool = False,
+    hf_token: str | None = None,
     dry_run: bool,
     buffer: DryRunBuffer,
 ) -> None:
-    """Optionally pre-download the SVD base model (Stage 2 --pre_trained_path).
+    """Pre-download the SVD base model (Stage 2 --pre_trained_path) into *target*.
 
-    Skipped entirely unless ``--svd-dir`` is given (or the in-repo default
-    ``models/svd-img2vid-xt-1-1`` already exists, in which case a re-run just
-    confirms it).  When no local copy exists the pipeline passes the HF model
-    id to diffusers, which downloads ~10 GB on the first inference run — so
-    this step is purely an opt-in convenience to front-load that download.
+    Runs by default (issue #150): the SVD base is ~10 GB and the first
+    inference run would otherwise block on a slow diffusers auto-download —
+    and because it is a **gated** HF repo, that runtime download can fail with
+    a bare ``OSError: ... gated repo ... 403`` that says nothing actionable.
+    Front-loading the download here lets us read the local HF token, accept
+    the license up front, and surface a clear error (with the application
+    page) if the account is not yet authorized.
+
+    ``--svd-dir`` overrides the target directory; ``--skip-svd`` skips the
+    step entirely (the pipeline then passes the HF model id to diffusers,
+    which downloads it on the first run — the historical behaviour).
     """
-    if svd_dir is not None:
-        target = Path(svd_dir)
-    elif INREPO_SVD_DIR.is_dir():
-        target = INREPO_SVD_DIR
-    else:
-        log.info(
-            "SVD base not requested (--svd-dir) and not present at %s — skipping. "
-            "The pipeline will pass the HF id %r to diffusers, which downloads ~10 GB on first run.",
-            INREPO_SVD_DIR,
-            _SVD_REPO_ID,
-        )
+    if skip_svd:
+        log.info("--skip-svd: SVD base pre-download skipped")
         return
+
+    target = Path(svd_dir) if svd_dir is not None else INREPO_SVD_DIR
 
     label = f"snapshot_download {_SVD_REPO_ID} → {target}"
     if dry_run:
@@ -391,7 +490,7 @@ def download_svd_base(
         return
 
     target.mkdir(parents=True, exist_ok=True)
-    log.info("▶ %s (~10 GB — this can take a while)", label)
+    log.info("▶ %s (~10 GB — this can take a while; gated repo, needs HF token)", label)
 
     try:
         from huggingface_hub import snapshot_download
@@ -399,13 +498,31 @@ def download_svd_base(
         log.warning("huggingface_hub not installed in this environment. Install with: pip install huggingface_hub")
         return
 
+    token = _read_hf_token(hf_token)
+    if token is None:
+        log.warning(
+            "No HF token found (no --hf-token, no %s env var, no stored "
+            "huggingface_hub login).  The SVD base %r is a GATED repo — a "
+            "download without an authorized token will 403.  If you have not "
+            "done so, accept the license at %s and run "
+            "``huggingface-cli login`` (or pass --hf-token).",
+            " / ".join(_HF_TOKEN_ENV_VARS),
+            _SVD_REPO_ID,
+            _SVD_REPO_URL,
+        )
+
     try:
         snapshot_download(
             repo_id=_SVD_REPO_ID,
             local_dir=str(target),
             local_dir_use_symlinks=False,
+            token=token,
         )
     except Exception as exc:
+        if _is_gated_repo_error(exc):
+            # Gated repo: raise an actionable error naming the application page
+            # rather than letting the bare 403 OSError through (issue #150).
+            raise _svd_gated_error(exc) from exc
         log.warning("snapshot_download failed for %s: %s", _SVD_REPO_ID, exc)
         log.warning("You can try again later, or clone the HF repo manually into %s.", target)
 
@@ -502,22 +619,27 @@ def print_summary(explicit_repo_dir: str | None) -> None:
     node_dir = _effective_node_dir(explicit_repo_dir)
     python_exe = _venv_python_for(node_dir)
     model_dir = _model_dir_for(explicit_repo_dir)
+    svd_dir = INREPO_SVD_DIR
 
     log.info("")
     log.info("═" * 60)
     log.info("✓ StereoCrafter in-repo bootstrap complete.")
     log.info("═" * 60)
     log.info(
-        "  repo_dir  = %s",
+        "  repo_dir   = %s",
         node_dir,
     )
     log.info(
-        "  python    = %s",
+        "  python     = %s",
         python_exe,
     )
     log.info(
-        "  model_dir = %s",
+        "  model_dir  = %s",
         model_dir,
+    )
+    log.info(
+        "  svd_dir    = %s",
+        svd_dir,
     )
     log.info("")
     log.info(
@@ -529,6 +651,7 @@ def print_summary(explicit_repo_dir: str | None) -> None:
     log.info('  export STEREOCRAFTER_REPO_DIR="%s"', node_dir)
     log.info('  export STEREOCRAFTER_PYTHON="%s"', python_exe)
     log.info('  export STEREOCRAFTER_CKPT_DIR="%s"', model_dir)
+    log.info('  export STEREOCRAFTER_SVD_PATH="%s"', svd_dir)
     log.info('  #  Windows PowerShell: $env:STEREOCRAFTER_REPO_DIR="<...>"')
     log.info("")
     log.info("First inference run uses ~12 GB VRAM at the default resolution (512).")
@@ -574,11 +697,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--svd-dir",
         default=None,
         help=(
-            "Optionally pre-download the SVD base model "
-            f"({_SVD_REPO_ID}, ~10 GB) into this directory so the first "
-            "inference run does not have to.  If omitted and no local copy "
-            "exists, the pipeline passes the HF model id to diffusers, which "
-            "downloads it on first run."
+            "Override the SVD base model target directory.  Defaults to the "
+            f"in-repo models/svd-img2vid-xt-1-1.  The SVD base "
+            f"({_SVD_REPO_ID}, ~10 GB) is pre-downloaded by default (issue "
+            "#150) — it is a GATED HF repo, so the local HF token is read "
+            "automatically and the account must have accepted the license."
+        ),
+    )
+    parser.add_argument(
+        "--skip-svd",
+        action="store_true",
+        help=(
+            "Skip the SVD base pre-download.  The pipeline will then pass the "
+            "HF model id to diffusers, which downloads it on the first run "
+            "(the historical behaviour — but a gated-repo 403 at runtime is "
+            "less actionable than at bootstrap time)."
+        ),
+    )
+    parser.add_argument(
+        "--hf-token",
+        default=None,
+        help=(
+            "Explicit Hugging Face access token for the gated SVD repo.  If "
+            "omitted, the token is auto-read from the standard env vars "
+            f"({', '.join(_HF_TOKEN_ENV_VARS)}) or huggingface_hub's stored "
+            "login."
         ),
     )
     parser.add_argument(
@@ -617,20 +760,28 @@ def main(argv: list[str] | None = None) -> None:
         log.info("[dry-run] no side effects will be performed")
 
     try:
-        log.info("\n── Step 1/4: repo ──")
+        log.info("\n── Step 1/5: repo ──")
         ensure_node_repo(args.repo_dir, dry_run=args.dry_run, buffer=buffer)
 
-        log.info("\n── Step 2/4: dedicated venv + pip install ──")
+        log.info("\n── Step 2/5: dedicated venv + pip install ──")
         if args.skip_deps:
             log.info("--skip-deps: venv + pip install skipped")
         else:
             ensure_venv_and_deps(args.repo_dir, args.pip_mirror, dry_run=args.dry_run, buffer=buffer)
 
-        log.info("\n── Step 3/4: model weights ──")
+        log.info("\n── Step 3/5: StereoCrafter weights ──")
         download_models(args.repo_dir, args.skip_model, dry_run=args.dry_run, buffer=buffer)
-        download_svd_base(args.svd_dir, dry_run=args.dry_run, buffer=buffer)
 
-        log.info("\n── Step 4/4: self-check ──")
+        log.info("\n── Step 4/5: SVD base model (gated HF repo) ──")
+        download_svd_base(
+            args.svd_dir,
+            skip_svd=args.skip_svd,
+            hf_token=args.hf_token,
+            dry_run=args.dry_run,
+            buffer=buffer,
+        )
+
+        log.info("\n── Step 5/5: self-check ──")
         self_check(args.repo_dir, dry_run=args.dry_run, buffer=buffer)
     except (RuntimeError, subprocess.CalledProcessError) as exc:
         log.error("Bootstrap FAILED at: %s", exc)

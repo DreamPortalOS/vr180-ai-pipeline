@@ -66,17 +66,20 @@ def sandbox(monkeypatch, tmp_path):
     venv_dir = node_dir / ".venv"
     python_exe = venv_dir / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
     model_dir = repo_root / "models" / "StereoCrafter"
+    svd_dir = repo_root / "models" / "svd-img2vid-xt-1-1"
 
     monkeypatch.setattr(setup, "INREPO_NODE_DIR", node_dir, raising=True)
     monkeypatch.setattr(setup, "INREPO_VENV_DIR", venv_dir, raising=True)
     monkeypatch.setattr(setup, "INREPO_PYTHON", python_exe, raising=True)
     monkeypatch.setattr(setup, "INREPO_MODEL_DIR", model_dir, raising=True)
+    monkeypatch.setattr(setup, "INREPO_SVD_DIR", svd_dir, raising=True)
     return SimpleNamespace(
         repo_root=repo_root,
         node_dir=node_dir,
         venv_dir=venv_dir,
         python_exe=python_exe,
         model_dir=model_dir,
+        svd_dir=svd_dir,
     )
 
 
@@ -356,6 +359,271 @@ class TestDownloadModels:
         with patch.dict("sys.modules", {"huggingface_hub": None}):
             setup.download_models(None, skip_model=False, dry_run=False, buffer=setup.DryRunBuffer())
         assert any("huggingface_hub not installed" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Step 4: SVD base pre-download (default-on, HF token, gated-repo 403 error)
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadSvdBase:
+    """The SVD base is pre-downloaded by default into models/svd-img2vid-xt-1-1
+    (issue #150).  It is a GATED HF repo — the step reads the local HF token,
+    passes it to snapshot_download, and surfaces a 403 with an actionable
+    application-page error instead of a bare OSError."""
+
+    def test_dry_run_records_svd_step(self, sandbox):
+        """--dry-run records the SVD download step into the buffer."""
+        buf = setup.DryRunBuffer()
+        setup.download_svd_base(None, dry_run=True, buffer=buf)
+        assert any("snapshot_download" in s and setup._SVD_REPO_ID in s for s in buf.steps), buf.steps
+
+    def test_skip_svd_short_circuits(self, sandbox, caplog):
+        """--skip-svd skips the SVD pre-download and logs it."""
+        caplog.set_level("INFO", logger="setup-stereocrafter")
+        with patch("subprocess.check_call") as mock_cc:
+            setup.download_svd_base(None, skip_svd=True, dry_run=False, buffer=setup.DryRunBuffer())
+            mock_cc.assert_not_called()
+        assert any("skip-svd" in r.message.lower() for r in caplog.records)
+
+    def test_skips_existing_svd_snapshot(self, sandbox):
+        """A non-empty SVD dir is treated as already-downloaded and skipped."""
+        sandbox.svd_dir.mkdir(parents=True)
+        (sandbox.svd_dir / "unet.bin").write_text("weights")
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not be called"))
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            setup.download_svd_base(None, dry_run=False, buffer=setup.DryRunBuffer())
+            fake_hf.snapshot_download.assert_not_called()
+
+    def test_default_downloads_into_inrepo_svd_dir(self, sandbox):
+        """With no --svd-dir, the SVD base lands in the in-repo models/svd-img2vid-xt-1-1."""
+        captured = {}
+
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token):
+            captured["repo_id"] = repo_id
+            captured["local_dir"] = local_dir
+            captured["token"] = token
+            # Simulate the download writing a file so a re-run would skip.
+            Path(local_dir).mkdir(parents=True, exist_ok=True)
+            (Path(local_dir) / "svd.bin").write_text("fake")
+            return local_dir
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = fake_snapshot_download
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            setup.download_svd_base(
+                None,
+                skip_svd=False,
+                hf_token="hf_test_token",
+                dry_run=False,
+                buffer=setup.DryRunBuffer(),
+            )
+        assert captured["repo_id"] == setup._SVD_REPO_ID
+        assert captured["local_dir"] == str(sandbox.svd_dir)
+        assert captured["token"] == "hf_test_token"
+        assert (sandbox.svd_dir / "svd.bin").exists()
+
+    def test_svd_dir_override_used_as_target(self, sandbox, tmp_path):
+        """--svd-dir overrides the target directory."""
+        custom = tmp_path / "custom-svd"
+        captured = {}
+
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token):
+            captured["local_dir"] = local_dir
+            Path(local_dir).mkdir(parents=True, exist_ok=True)
+            (Path(local_dir) / "svd.bin").write_text("fake")
+            return local_dir
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = fake_snapshot_download
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            setup.download_svd_base(
+                str(custom),
+                skip_svd=False,
+                hf_token="hf_x",
+                dry_run=False,
+                buffer=setup.DryRunBuffer(),
+            )
+        assert captured["local_dir"] == str(custom)
+        assert (custom / "svd.bin").exists()
+
+    def test_hf_token_passed_to_snapshot_download(self, sandbox, monkeypatch):
+        """The resolved HF token is forwarded to snapshot_download (issue #150).
+
+        _read_hf_token precedence: explicit arg > env var > huggingface_hub stored.
+        We inject the token via the env var path (no --hf-token) to exercise the
+        auto-read, and assert snapshot_download received it.
+        """
+        monkeypatch.setenv(setup._HF_TOKEN_ENV_VARS[0], "hf_env_token")
+        # Ensure huggingface_hub's own get_token does not shadow the env var.
+        captured = {}
+
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token):
+            captured["token"] = token
+            Path(local_dir).mkdir(parents=True, exist_ok=True)
+            (Path(local_dir) / "svd.bin").write_text("fake")
+            return local_dir
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = fake_snapshot_download
+        fake_hf.HfFolder = MagicMock()
+        fake_hf.HfFolder.get_token = MagicMock(return_value=None)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            setup.download_svd_base(
+                None,
+                skip_svd=False,
+                hf_token=None,
+                dry_run=False,
+                buffer=setup.DryRunBuffer(),
+            )
+        assert captured["token"] == "hf_env_token"
+
+    def test_gated_repo_403_raises_actionable_error_with_link(self, sandbox):
+        """A 403 'gated repo' OSError must surface as a RuntimeError naming the
+        application page (issue #150) — not a bare OSError."""
+        gated_err = OSError(
+            "You are trying to access a gated repo. "
+            "Cannot access gated repo for url "
+            "https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1/resolve/main/config.json "
+            "403 Client Error. Access to model ... is restricted and you are not in the authorized list."
+        )
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = MagicMock(side_effect=gated_err)
+        fake_hf.HfFolder = MagicMock()
+        fake_hf.HfFolder.get_token = MagicMock(return_value="hf_present")
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_hf}),
+            pytest.raises(RuntimeError, match="gated Hugging Face repo") as exc_info,
+        ):
+            setup.download_svd_base(
+                None,
+                skip_svd=False,
+                hf_token="hf_present",
+                dry_run=False,
+                buffer=setup.DryRunBuffer(),
+            )
+        msg = str(exc_info.value)
+        # The error must contain the application page, not just a bare 403.
+        assert setup._SVD_REPO_URL in msg, msg
+        assert "403" in msg or "gated" in msg.lower(), msg
+
+    def test_non_gated_download_failure_warns_not_raises(self, sandbox, caplog):
+        """A generic (non-gated) download failure must warn and return, not raise."""
+        caplog.set_level("WARNING", logger="setup-stereocrafter")
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = MagicMock(side_effect=ConnectionError("connection timed out"))
+        fake_hf.HfFolder = MagicMock()
+        fake_hf.HfFolder.get_token = MagicMock(return_value="hf_present")
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            setup.download_svd_base(
+                None,
+                skip_svd=False,
+                hf_token="hf_present",
+                dry_run=False,
+                buffer=setup.DryRunBuffer(),
+            )
+        assert any("snapshot_download failed" in r.message.lower() for r in caplog.records)
+
+    def test_missing_token_warns_about_gated_repo(self, sandbox, monkeypatch, caplog):
+        """When no HF token is found, the step warns that the repo is gated (issue #150)."""
+        for var in setup._HF_TOKEN_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        caplog.set_level("WARNING", logger="setup-stereocrafter")
+
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token):
+            Path(local_dir).mkdir(parents=True, exist_ok=True)
+            (Path(local_dir) / "svd.bin").write_text("fake")
+            return local_dir
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = fake_snapshot_download
+        fake_hf.HfFolder = MagicMock()
+        fake_hf.HfFolder.get_token = MagicMock(return_value=None)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            setup.download_svd_base(
+                None,
+                skip_svd=False,
+                hf_token=None,
+                dry_run=False,
+                buffer=setup.DryRunBuffer(),
+            )
+        assert any("gated" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# HF token resolution (issue #150)
+# ---------------------------------------------------------------------------
+
+
+class TestReadHfToken:
+    """_read_hf_token precedence: explicit arg > env var > huggingface_hub stored."""
+
+    def test_explicit_token_wins(self, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "hf_env")
+        monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "hf_env2")
+        assert setup._read_hf_token("hf_explicit") == "hf_explicit"
+
+    def test_env_var_used_when_no_explicit(self, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "hf_env_primary")
+        monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+        monkeypatch.delenv("HUGGINGFACE_TOKEN", raising=False)
+        fake_hf = MagicMock()
+        fake_hf.HfFolder.get_token = MagicMock(return_value="hf_stored")
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            assert setup._read_hf_token(None) == "hf_env_primary"
+
+    def test_stored_token_when_no_env_no_explicit(self, monkeypatch):
+        for var in setup._HF_TOKEN_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        fake_hf = MagicMock()
+        fake_hf.HfFolder.get_token = MagicMock(return_value="hf_stored")
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            assert setup._read_hf_token(None) == "hf_stored"
+            fake_hf.HfFolder.get_token.assert_called_once()
+
+    def test_returns_none_when_nothing_available(self, monkeypatch):
+        for var in setup._HF_TOKEN_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        with patch.dict("sys.modules", {"huggingface_hub": None}):
+            assert setup._read_hf_token(None) is None
+
+    def test_hf_folder_lookup_failure_does_not_crash(self, monkeypatch):
+        """A broken huggingface_hub install must not crash token lookup."""
+        for var in setup._HF_TOKEN_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        fake_hf = MagicMock()
+        fake_hf.HfFolder.get_token = MagicMock(side_effect=RuntimeError("boom"))
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            # Must return None, not raise.
+            assert setup._read_hf_token(None) is None
+
+
+class TestIsGatedRepoError:
+    """The gated-repo detector must recognize HF's 401/403 gated-repo errors
+    and not mislabel generic failures (issue #150)."""
+
+    def test_real_hf_gated_message(self):
+        err = OSError(
+            "You are trying to access a gated repo. "
+            "Cannot access gated repo for url "
+            "https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1/resolve/main/x.json "
+            "403 Client Error."
+        )
+        assert setup._is_gated_repo_error(err) is True
+
+    def test_restricted_authorized_list_phrase(self):
+        err = OSError("Access to model is restricted and you are not in the authorized list.")
+        assert setup._is_gated_repo_error(err) is True
+
+    def test_generic_network_error_not_gated(self):
+        assert setup._is_gated_repo_error(ConnectionError("connection timed out")) is False
+
+    def test_unrelated_403_not_gated(self):
+        """A 403 that does not name the gated model must not be mislabelled."""
+        assert setup._is_gated_repo_error(OSError("some other 403 thing happened")) is False
 
 
 # ---------------------------------------------------------------------------

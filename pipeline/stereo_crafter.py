@@ -492,9 +492,13 @@ class CLIBackend(StereoCrafterBackend):
             self.pre_trained_path = SVD_HF_MODEL_ID
             log.info(
                 "StereoCrafter: SVD base not found locally — passing HF model id %r to diffusers; "
-                "the first run will download ~10 GB (same behaviour as DepthCrafter). "
-                "Pre-download with 'python scripts/setup_stereocrafter.py --svd-dir <dir>' or set "
-                "STEREOCRAFTER_SVD_PATH to skip the runtime download.",
+                "the first run will download ~10 GB (same behaviour as DepthCrafter).  Note: this "
+                "is a GATED HF repo — the HF account behind the local token must have accepted the "
+                "license at https://huggingface.co/%s or the runtime download will 403 (issue #150).  "
+                "Pre-download (recommended) by re-running the bootstrap "
+                "'python scripts/setup_stereocrafter.py' (it pre-downloads the SVD base by default), "
+                "or set STEREOCRAFTER_SVD_PATH to an existing local snapshot.",
+                SVD_HF_MODEL_ID,
                 SVD_HF_MODEL_ID,
             )
 
