@@ -95,32 +95,74 @@ def tmp_sbs_video(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _fake_depth_pipe(pil_img):
+    """Stand-in for the HuggingFace depth-estimation pipeline.
+
+    ``DepthEstimator.estimate`` feeds it a PIL image and pulls
+    ``result["depth"]`` out of the return value, then does
+    ``np.array(depth, dtype=np.float32)``.  A real Depth-Anything model
+    returns a 2-D depth map, so we collapse the channel axis to mirror
+    that contract exactly — keeping the downstream normalization / metric
+    calibration in ``estimate`` well-shaped and non-negative — **without**
+    ever touching HuggingFace (no download, no real inference).
+    """
+    return {"depth": np.array(pil_img, dtype=np.float32).mean(axis=2)}
+
+
+@pytest.fixture
+def fake_depth_model(monkeypatch):
+    """Inject a fake depth backend so no HF model is loaded (#177).
+
+    Replaces :meth:`DepthEstimator._load_model` with a stub that installs
+    :func:`_fake_depth_pipe` onto the instance.  Returns a one-element
+    list so tests can assert the lazy-load cache semantics (``_load_model``
+    is invoked exactly once per estimator).  This keeps the original
+    assertions (shape / dtype / non-negative) meaningful while honouring
+    the CLAUDE.md red line: tests must never download models.
+    """
+    from pipeline.depth_estimator import DepthEstimator
+
+    load_count = [0]
+
+    def _fake_load_model(self):
+        load_count[0] += 1
+        self._pipe = _fake_depth_pipe
+
+    monkeypatch.setattr(DepthEstimator, "_load_model", _fake_load_model)
+    return load_count
+
+
 class TestDepthEstimator:
     def test_import(self):
         from pipeline.depth_estimator import DepthEstimator
 
         assert DepthEstimator is not None
 
-    def test_estimate_returns_correct_shape(self, dummy_frame):
+    def test_estimate_returns_correct_shape(self, dummy_frame, fake_depth_model):
         from pipeline.depth_estimator import DepthEstimator
 
         estimator = DepthEstimator(model_size="small", device="cpu")
         depth = estimator.estimate(dummy_frame)
         assert depth.shape == dummy_frame.shape[:2]
         assert depth.dtype == np.float32
+        # Lazy load happens exactly once, not on construction.
+        assert fake_depth_model[0] == 1
 
-    def test_estimate_non_negative(self, dummy_frame):
+    def test_estimate_non_negative(self, dummy_frame, fake_depth_model):
         from pipeline.depth_estimator import DepthEstimator
 
         estimator = DepthEstimator(model_size="small", device="cpu")
         depth = estimator.estimate(dummy_frame)
         assert np.all(depth >= 0)
+        assert fake_depth_model[0] == 1
 
-    def test_estimate_sequence_chunked_matches_whole(self, monkeypatch):
+    def test_estimate_sequence_chunked_matches_whole(self, monkeypatch, fake_depth_model):
         """V-4 (#37): chunked depth == whole-sequence, all chunk sizes.
 
         Depth-Anything is per-frame (no temporal state) → bit-exact with
-        overlap=0.  ``estimate`` is stubbed so no model/transformers load.
+        overlap=0.  ``estimate`` is stubbed so no model/transformers load;
+        the ``fake_depth_model`` fixture guards the path in case the stub
+        is ever removed (#177).
         """
         from pipeline.depth_estimator import DepthEstimator
 
