@@ -335,6 +335,44 @@ def load_depth_npy_dir(depth_dir: str | Path) -> list[np.ndarray]:
     return frames
 
 
+def load_depth_meta(depth_dir: str | Path) -> dict | None:
+    """Read the ``meta.json`` written by the pipeline's depth stage (I-6, #121).
+
+    Returns ``None`` when no meta file exists (e.g. a pre-#121 depth cache, or
+    a hand-built npy dir) — the caller then prints a 'source unknown' notice so
+    an A/B comparison can never be silently mis-attributed.
+    """
+    meta_path = Path(depth_dir) / "meta.json"
+    if not meta_path.exists():
+        return None
+    with open(meta_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _format_source(meta: dict | None) -> list[str]:
+    """Human-readable provenance lines for the report header (I-6, #121).
+
+    When the depth dir carries ``meta.json`` (written by run_pipeline's depth
+    stage), the report leads with the model + key params so an A/B run is
+    self-attributing.  Without it, an explicit '来源未知' reminder is shown so
+    the operator cannot mistake one model's maps for another's.
+    """
+    if meta is None:
+        return [
+            "Source: 来源未知 (no meta.json found — depth dir may pre-date #121 "
+            "or be hand-built; A/B attribution is not guaranteed)",
+        ]
+    model = meta.get("depth_model", "?")
+    lines = [f"Source: depth_model={model}"]
+    params = {k: v for k, v in meta.items() if k not in ("depth_model", "timestamp")}
+    if params:
+        param_str = ", ".join(f"{k}={v}" for k, v in params.items())
+        lines.append(f"Params: {param_str}")
+    if meta.get("timestamp"):
+        lines.append(f"Generated: {meta['timestamp']}")
+    return lines
+
+
 def run_depth_stage(video: str, max_frames: int | None = None) -> list[np.ndarray]:
     """Run the existing pipeline depth stage on a video and return frames.
 
@@ -454,8 +492,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        meta: dict | None = None
         if args.depth_npy_dir:
             depths = load_depth_npy_dir(args.depth_npy_dir)
+            meta = load_depth_meta(args.depth_npy_dir)
         else:
             depths = run_depth_stage(args.input, max_frames=args.max_frames)
 
@@ -464,10 +504,20 @@ def main(argv: list[str] | None = None) -> int:
 
         report = compute_report(depths)
 
+        # I-6 (#121): print provenance (model + params from meta.json) at the
+        # top of the report so an A/B run is self-attributing; '来源未知' when
+        # there is no meta so the operator cannot silently mis-attribute.
+        source_lines = _format_source(meta)
+        for line in source_lines:
+            print(line)
+        print("")
+
         if args.json:
             out = Path(args.json)
             out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(json.dumps(_to_json(report), indent=2, ensure_ascii=False), encoding="utf-8")
+            payload = _to_json(report)
+            payload = {"source": meta if meta is not None else "来源未知", **payload}
+            out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
             log.info("Report written to %s", out)
 
         if args.print:
