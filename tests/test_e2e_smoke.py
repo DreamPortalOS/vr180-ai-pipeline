@@ -90,6 +90,17 @@ class TestBuildCommand:
         assert "--comfort safe" in joined
         assert "--quality high" in joined
 
+    def test_ci_profile_args_force_sbs_no_model(self) -> None:
+        cmd = build_pipeline_command("in.mp4", "out.mp4", "ci")
+        joined = " ".join(cmd)
+        # ci = --force-sbs: depth AND stereo stages skipped → zero model download
+        assert "--force-sbs" in cmd
+        assert "--quality preview" in joined
+        assert "--max-frames 8" in joined
+        assert "--output-width 256" in joined and "--output-height 256" in joined
+        # no heavy-model flags and no depth model flag
+        assert "--depth-model" not in cmd and "--stereo-model" not in cmd
+
     def test_copy_audio_from_appended(self) -> None:
         cmd = build_pipeline_command("in.mp4", "out.mp4", "full", copy_audio_from="src.mp4")
         assert "--copy-audio-from" in cmd and "src.mp4" in cmd
@@ -147,6 +158,19 @@ class TestOutputProbe:
         f.touch()
         c = check_output_probe(str(f), "high", probe={"streams": [], "format": {}})
         assert not c.ok and "0×0" in c.measured
+
+    def test_eye_size_override_matches(self, tmp_path: Path) -> None:
+        # ci profile passes --output-width/height 256 → 512×256 SBS
+        f = tmp_path / "o.mp4"
+        f.touch()
+        c = check_output_probe(str(f), "preview", probe=_probe(512, 256), eye_size=256)
+        assert c.ok and "512×256" in c.measured
+
+    def test_eye_size_override_mismatch_reports_want(self, tmp_path: Path) -> None:
+        f = tmp_path / "o.mp4"
+        f.touch()
+        c = check_output_probe(str(f), "preview", probe=_probe(3840, 1920), eye_size=256)
+        assert not c.ok and "512×256" in c.measured and c.hint
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +349,19 @@ class TestRunSmoke:
         backend_check = next(c for c in report.checks if c.name == "backend log assertion")
         assert not backend_check.ok and "depth-anything" in backend_check.measured
 
+    def test_ci_profile_passes_and_skips_backend_log(self, tmp_path: Path, monkeypatch) -> None:
+        out = str(tmp_path / "o.mp4")
+        # ci eye_size override = 256 → 512×256 SBS
+        monkeypatch.setattr(
+            "scripts.e2e_smoke._ffprobe_streams",
+            lambda path, ffprobe="ffprobe": _probe(512, 256),
+        )
+        runner = self._runner_ok(tmp_path, out, log_line="")
+        report = run_smoke("in.mp4", out, "ci", runner=runner)
+        assert report.ok, [(c.name, c.measured) for c in report.failed]
+        backend_check = next(c for c in report.checks if c.name == "backend log assertion")
+        assert backend_check.ok and "N/A" in backend_check.measured
+
     def test_pipeline_failure_propagates(self, tmp_path: Path, monkeypatch) -> None:
         out = str(tmp_path / "o.mp4")
         monkeypatch.setattr(
@@ -357,8 +394,14 @@ class TestCli:
         assert rc == 1
         assert "input not found" in capsys.readouterr().err
 
-    def test_profiles_table_has_fast_and_full(self) -> None:
-        assert set(PROFILES) == {"fast", "full"}
+    def test_profiles_table(self) -> None:
+        assert set(PROFILES) == {"fast", "ci", "full"}
         assert PROFILES["fast"]["expected_depth"] == "depth-anything"
         assert PROFILES["full"]["expected_depth"] == "depthcrafter"
         assert PROFILES["full"]["expected_stereo"] == "stereocrafter"
+        # ci = zero-model batch path: no backend log assertion, small eye override
+        assert PROFILES["ci"]["expected_depth"] is None
+        assert PROFILES["ci"]["skip_backend_log"] is True
+        assert PROFILES["ci"]["eye_size"] == 256
+        assert PROFILES["fast"]["skip_backend_log"] is True
+        assert PROFILES["full"]["skip_backend_log"] is False

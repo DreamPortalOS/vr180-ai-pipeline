@@ -42,6 +42,12 @@ Lead 写卡（GitHub Issue, stage:ready + model:cheap + agent-ok）
 3. 产物过 `scripts/vr180_qa.py`；视频类交付抽帧肉眼核对。
 4. 验收结论写进 WORKLOG（发现的缺陷 → 修复卡附字节级诊断）。
 
+> **CI 已覆盖实机接线冒烟（K-5.1, #152）**：CI 的 `e2e-smoke` job 合成极小宽幅测试源
+> （ffmpeg lavfi，不依赖 `video/`）并跑 `e2e_smoke --profile ci`——`--force-sbs` 把它当
+> 已立体 SBS，零模型下载地真实走 SBS 拆分/equirect 投影/ffmpeg 编码/sv3d/st3d 注入/sidecar。
+> 因此 lead 手工验收**只需跑 `full` 档**（DepthCrafter/StereoCrafter 重模型链路）；
+> fast/ci 档级别的接线缺陷 CI 已在 PR 阶段拦截，不必等 lead 手工验收。
+
 ## 监控机制（自动）
 
 - **cockpit lane**：常驻轮询派卡/评审/合并（重启：`D:\Github\_ops\start-vr180-lane.ps1`；

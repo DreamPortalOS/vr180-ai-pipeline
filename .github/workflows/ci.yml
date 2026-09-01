@@ -39,3 +39,24 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run tests
         run: pytest tests/ -m "not slow" --tb=short
+
+  # K-5.1 (#152): 把 e2e_smoke 的 ci 档接进 CI。fast 档要从 HF 拉 Depth-Anything
+  # 权重（缓存冷时不稳/可能超限），所以 CI 跑的是零模型下载的 ci 档 ——
+  # --force-sbs 把宽幅合成源当已立体 SBS，真实走 SBS 拆分/投影/ffmpeg/sv3d/st3d/sidecar。
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+      - name: Synthesize tiny SBS test source (no video/ dependency)
+        # 宽幅 2:1 源 = 左右眼并排（SBS），ci 档用 --force-sbs 跳过重模型。
+        run: ffmpeg -y -v error -f lavfi -i "testsrc2=size=512x256:rate=24:duration=1" -pix_fmt yuv420p ci_src.mp4
+      - name: Run e2e smoke (ci profile, no model download)
+        run: python scripts/e2e_smoke.py --input ci_src.mp4 --profile ci --output ci_out.mp4
