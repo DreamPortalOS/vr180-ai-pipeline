@@ -563,6 +563,62 @@ class TestSplatAssembly:
         with pytest.raises(RuntimeError, match="truncated"):
             _load_depth_maps(str(depth_dir), num_frames=5)
 
+    def test_load_depth_maps_from_depthcrafter_mp4(self, tmp_path):
+        """A ``<stem>_depth.mp4`` (DepthCrafter's real output) is decoded (issue #145).
+
+        Regression test for issue #145: DepthCrafter emits
+        ``<stem>_depth.mp4`` (8-bit grayscale video), not npy/png; the stereo
+        consumer side previously only looked for npy/png and wrongly died
+        with 'No depth maps found' on a populated dir — the exact same gap
+        fixed producer-side in issue #126.  The stereo side must reuse the
+        shared reader and decode the mp4 into N float32 frames.
+        """
+        import cv2
+
+        from pipeline.stereo_crafter import _load_depth_maps
+
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        # Mirror the real DepthCrafter products: the depth mp4 plus the two
+        # decoy sidecars (_input / _vis) that must NOT be picked up.
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(depth_dir / "src_720p_v2_depth.mp4"), fourcc, 24, (16, 12))
+        assert writer.isOpened()
+        import numpy as np
+
+        try:
+            frame = np.full((12, 16, 3), 128, dtype=np.uint8)
+            for _ in range(5):
+                writer.write(frame)
+        finally:
+            writer.release()
+        (depth_dir / "src_720p_v2_input.mp4").write_bytes(b"x")
+        (depth_dir / "src_720p_v2_vis.mp4").write_bytes(b"x")
+
+        depths = _load_depth_maps(str(depth_dir), num_frames=5)
+        assert len(depths) == 5
+        assert depths[0].ndim == 2
+        assert depths[0].dtype == np.float32
+        assert float(depths[0].min()) >= 0.0
+        assert float(depths[0].max()) <= 1.0
+
+    def test_load_depth_maps_missing_lists_dir_contents(self, tmp_path):
+        """The 'no depth maps' error lists what IS in the dir (issue #133/#145)."""
+        from pipeline.stereo_crafter import _load_depth_maps
+
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        # DepthCrafter products minus the depth video itself — a real "dir
+        # clearly has files but nothing recognized" scenario.
+        (depth_dir / "src_720p_v2_input.mp4").write_bytes(b"x")
+        (depth_dir / "src_720p_v2_vis.mp4").write_bytes(b"x")
+
+        with pytest.raises(RuntimeError, match="No depth maps found") as exc_info:
+            _load_depth_maps(str(depth_dir), num_frames=1)
+        msg = str(exc_info.value)
+        assert "src_720p_v2_input.mp4" in msg
+        assert "src_720p_v2_vis.mp4" in msg
+
 
 class TestCLIBackendInference:
     """Tests for the Stage-2 subprocess invocation (subprocess mocked).

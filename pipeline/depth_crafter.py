@@ -101,6 +101,87 @@ def _dir_listing_block(output_dir: str) -> str:
     return f"  Output dir contents:\n{listing}\n"
 
 
+def _find_depth_mp4(out_path: Path, stem: str | None = None) -> Path | None:
+    """Locate the depth video in *out_path* (exact stem match first)."""
+    if stem:
+        exact = out_path / f"{stem}_depth.mp4"
+        if exact.is_file():
+            return exact
+    matches = sorted(out_path.glob("*_depth.mp4"))
+    return matches[0] if matches else None
+
+
+def _load_depths_from_mp4(mp4_path: Path) -> list[np.ndarray]:
+    """Decode an 8-bit grayscale depth video into float32 [0, 1] frames."""
+    import cv2
+
+    cap = cv2.VideoCapture(str(mp4_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"DepthCrafter produced {mp4_path} but it could not be opened as a video.")
+    depths: list[np.ndarray] = []
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+            depths.append(gray.astype(np.float32) / 255.0)
+    finally:
+        cap.release()
+    if not depths:
+        raise RuntimeError(f"DepthCrafter produced {mp4_path} but no frames could be decoded from it.")
+    return depths
+
+
+def load_depth_maps_from_dir(depth_dir: str, stem: str | None = None) -> list[np.ndarray]:
+    """Load per-frame depth maps from *depth_dir*, mp4 first.
+
+    This is the single shared depth-product reader (issue #145): both the
+    DepthCrafter backend (producer side) and the StereoCrafter backend
+    (consumer side) go through this function, so the mp4-vs-npy/png gap of
+    issue #126 cannot be fixed on one side and forgotten on the other.
+
+    Preference order:
+      1. ``<stem>_depth.mp4`` (or any ``*_depth.mp4``) — DepthCrafter's real
+         upstream output: an 8-bit grayscale visualization video, decoded and
+         normalized to [0, 1] float32.
+      2. ``depth_*.npy`` / ``*.npy`` sequence (pipeline checkpoints / legacy).
+      3. ``depth_*.png`` / ``*.png`` sequence (legacy / alternate backends,
+         e.g. hand-seeded Depth-Anything visualisations).
+    Raises RuntimeError listing the actual dir contents if none are found.
+    """
+    out_path = Path(depth_dir)
+    depth_mp4 = _find_depth_mp4(out_path, stem)
+    if depth_mp4 is not None:
+        return _load_depths_from_mp4(depth_mp4)
+
+    npy_files = sorted(out_path.glob("depth_*.npy")) or sorted(out_path.glob("*.npy"))
+    if npy_files:
+        return [np.load(str(f)) for f in npy_files]
+
+    png_files = sorted(out_path.glob("depth_*.png")) or sorted(out_path.glob("*.png"))
+    if png_files:
+        import cv2
+
+        imgs: list[np.ndarray] = []
+        for f in png_files:
+            img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                imgs.append(img.astype(np.float32) / 255.0)
+        if imgs:
+            return imgs
+
+    # Nothing found — list the actual contents so the next person can
+    # see at a glance what the depth stage really produced (issue #133).
+    contents = sorted(p.name for p in out_path.iterdir()) or ["(empty)"]
+    listing = "\n".join(f"    - {name}" for name in contents)
+    raise RuntimeError(
+        f"No depth maps found in {depth_dir}.\n"
+        f"  Looked for: *_depth.mp4, *.npy, depth_*.png / *.png (stem={stem!r}).\n"
+        f"  Actual directory contents:\n{listing}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Abstract backend
 # ---------------------------------------------------------------------------
@@ -474,75 +555,17 @@ class CLIBackend(DepthCrafterBackend):
     def _load_depths(self, out_path: Path, stem: str) -> list[np.ndarray]:
         """Load per-frame depth maps from *out_path*, mp4 first.
 
-        Preference order:
-          1. ``<stem>_depth.mp4`` — upstream DepthCrafter's real output
-             (8-bit grayscale visualization video; decoded and normalized to
-             [0, 1] float32.  No histogram stretch — it is already a vis.)
-          2. ``*.npy`` sequence (legacy / alternate backends).
-          3. ``depth_*.png`` sequence (legacy / alternate backends).
-        Raises RuntimeError listing the dir contents if none are found.
+        Delegates to the shared :func:`load_depth_maps_from_dir` (issue #145:
+        the same reader is used by the StereoCrafter consumer side, so the
+        mp4-vs-npy/png gap of issue #126 cannot be fixed twice).
         """
-        depth_mp4 = self._find_depth_mp4(out_path, stem)
-        if depth_mp4 is not None:
-            return self._load_depths_from_mp4(depth_mp4)
-
-        npy_files = sorted(out_path.glob("*.npy"))
-        if npy_files:
-            return [np.load(str(f)) for f in npy_files]
-
-        png_files = sorted(out_path.glob("depth_*.png"))
-        if png_files:
-            import cv2
-
-            imgs: list[np.ndarray] = []
-            for f in png_files:
-                img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
-                if img is not None:
-                    imgs.append(img.astype(np.float32) / 255.0)
-            if imgs:
-                return imgs
-
-        # Nothing found — list the actual contents so the next person can
-        # see at a glance what the inference script really produced.
-        contents = sorted(p.name for p in out_path.iterdir()) or ["(empty)"]
-        listing = "\n".join(f"    - {name}" for name in contents)
-        raise RuntimeError(
-            f"DepthCrafter finished but no depth files found in {out_path}.\n"
-            f"  Looked for: <stem>_depth.mp4, *.npy, depth_*.png (stem={stem!r}).\n"
-            f"  Actual directory contents:\n{listing}\n"
-            f"  Check the inference script output format in docs/DEPTHCRAFTER_SETUP.md."
-        )
-
-    @staticmethod
-    def _find_depth_mp4(out_path: Path, stem: str) -> Path | None:
-        """Locate the depth video in *out_path* (exact stem match first)."""
-        exact = out_path / f"{stem}_depth.mp4"
-        if exact.is_file():
-            return exact
-        matches = sorted(out_path.glob("*_depth.mp4"))
-        return matches[0] if matches else None
-
-    @staticmethod
-    def _load_depths_from_mp4(mp4_path: Path) -> list[np.ndarray]:
-        """Decode an 8-bit grayscale depth video into float32 [0, 1] frames."""
-        import cv2
-
-        cap = cv2.VideoCapture(str(mp4_path))
-        if not cap.isOpened():
-            raise RuntimeError(f"DepthCrafter produced {mp4_path} but it could not be opened as a video.")
-        depths: list[np.ndarray] = []
         try:
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
-                depths.append(gray.astype(np.float32) / 255.0)
-        finally:
-            cap.release()
-        if not depths:
-            raise RuntimeError(f"DepthCrafter produced {mp4_path} but no frames could be decoded from it.")
-        return depths
+            return load_depth_maps_from_dir(str(out_path), stem=stem)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"DepthCrafter finished but {exc}\n"
+                f"  Check the inference script output format in docs/DEPTHCRAFTER_SETUP.md."
+            ) from None
 
     # ------------------------------------------------------------------
     # Resize back to source frame size (issue #130)

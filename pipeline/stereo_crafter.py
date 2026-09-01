@@ -126,34 +126,26 @@ def _load_video_frames_rgb(video_path: str) -> tuple[list, float]:
 def _load_depth_maps(depth_dir: str, num_frames: int) -> list:
     """Load per-frame depth maps from *depth_dir* as float32 arrays in [0, 1].
 
-    The pipeline's depth stage writes ``depth_XXXXXX.npy`` checkpoints; a
-    hand-seeded directory of ``*.png`` images (Depth-Anything visualisations)
-    is also accepted.  Each map is resized to the video frame size by the
-    caller.  Maps are min-max normalised per-frame to [0, 1] — the same
-    convention upstream Stage 1 applies to its DepthCrafter output.
+    Consumes whatever the pipeline's depth stage produced — DepthCrafter's
+    real ``*_depth.mp4`` grayscale video, ``depth_*.npy`` checkpoints, or
+    ``depth_*.png`` visualisations — via the **shared** reader
+    :func:`pipeline.depth_crafter.load_depth_maps_from_dir` (issue #145: the
+    mp4 consumer-side gap of issue #126 must be fixed in exactly one place).
+    Each map is resized to the video frame size by the caller.  Maps are
+    min-max normalised per-frame to [0, 1] — the same convention upstream
+    Stage 1 applies to its DepthCrafter output.
     """
-    import cv2
-    import numpy as np
+    from pipeline.depth_crafter import load_depth_maps_from_dir
 
-    directory = Path(depth_dir)
-    npy_files = sorted(directory.glob("depth_*.npy")) or sorted(directory.glob("*.npy"))
-    depths: list = []
-    if npy_files:
-        depths = [np.load(f) for f in npy_files]
-    else:
-        png_files = sorted(directory.glob("*.png"))
-        for f in png_files:
-            img = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE)
-            if img is not None:
-                depths.append(img.astype(np.float32))
-
-    if not depths:
+    try:
+        depths = load_depth_maps_from_dir(depth_dir)
+    except RuntimeError as exc:
         raise RuntimeError(
-            f"No depth maps found in {depth_dir}.\n"
-            f"  Expected depth_*.npy (pipeline depth stage) or *.png.\n"
+            f"{exc}\n"
             f"  Run the depth stage first (--stage depth, or drop --stereo-model stereocrafter\n"
             f"  so the default depth-shift renderer is used)."
-        )
+        ) from None
+
     if len(depths) < num_frames:
         raise RuntimeError(
             f"Depth dir {depth_dir} has {len(depths)} map(s) but the input video has "

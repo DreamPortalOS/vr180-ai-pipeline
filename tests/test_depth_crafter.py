@@ -198,7 +198,7 @@ def test_cli_backend_subprocess_command(
         mock_result.stderr = ""
         mock_run.return_value = mock_result
 
-        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="no depth files found"):
+        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="No depth maps found"):
             backend.estimate_video(
                 input_path=str(script_path),  # dummy path, just needs to exist
                 output_dir=outdir,
@@ -545,7 +545,7 @@ def test_cli_backend_passes_process_length_and_target_fps(
             target_fps=24,
         )
 
-        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="no depth files found"):
+        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="No depth maps found"):
             backend.estimate_video(input_path=str(Path(tmpdir) / "run.py"), output_dir=outdir)
 
         cmd = mock_run.call_args[0][0]
@@ -557,7 +557,7 @@ def test_cli_backend_passes_process_length_and_target_fps(
         # With the knobs unset, they must be absent from the command.
         mock_run.reset_mock()
         backend2 = CLIBackend(repo_dir=tmpdir, max_resolution=512)
-        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="no depth files found"):
+        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="No depth maps found"):
             backend2.estimate_video(input_path=str(Path(tmpdir) / "run.py"), output_dir=outdir)
         cmd2 = mock_run.call_args[0][0]
         assert "--process_length" not in cmd2
@@ -582,6 +582,43 @@ def _write_gray_mp4(path: Path, num_frames: int, w: int = 64, h: int = 48, value
             wr.write(frame)
     finally:
         wr.release()
+
+
+def test_shared_reader_loads_depth_mp4(tmp_path: Path) -> None:
+    """The shared ``load_depth_maps_from_dir`` decodes ``*_depth.mp4`` (issue #145).
+
+    Both the DepthCrafter producer side and the StereoCrafter consumer side
+    go through this one reader, so the mp4-vs-npy/png gap of issue #126
+    cannot be fixed on one side and forgotten on the other.
+    """
+    from pipeline.depth_crafter import load_depth_maps_from_dir
+
+    depth_dir = tmp_path / "depth"
+    depth_dir.mkdir()
+    _write_gray_mp4(depth_dir / "src_720p_v2_depth.mp4", num_frames=4)
+    (depth_dir / "src_720p_v2_input.mp4").write_bytes(b"x")  # decoy
+    (depth_dir / "src_720p_v2_vis.mp4").write_bytes(b"x")  # decoy
+
+    depths = load_depth_maps_from_dir(str(depth_dir))
+    assert len(depths) == 4
+    assert depths[0].ndim == 2
+    assert depths[0].dtype == np.float32
+
+
+def test_shared_reader_error_lists_dir_contents(tmp_path: Path) -> None:
+    """When nothing matches, the shared reader's error shows what IS in the dir."""
+    from pipeline.depth_crafter import load_depth_maps_from_dir
+
+    depth_dir = tmp_path / "depth"
+    depth_dir.mkdir()
+    (depth_dir / "src_720p_v2_input.mp4").write_bytes(b"x")
+    (depth_dir / "src_720p_v2_vis.mp4").write_bytes(b"x")
+
+    with pytest.raises(RuntimeError, match="No depth maps found") as excinfo:
+        load_depth_maps_from_dir(str(depth_dir))
+    msg = str(excinfo.value)
+    assert "src_720p_v2_input.mp4" in msg
+    assert "src_720p_v2_vis.mp4" in msg
 
 
 def _mock_success_with_products(mock_run: MagicMock, outdir_path: Path, stem: str, num_frames: int) -> None:
@@ -703,7 +740,7 @@ def test_cli_backend_error_lists_dir_contents(
         with pytest.raises(RuntimeError) as excinfo:
             backend.estimate_video(input_path=str(input_video), output_dir=str(outdir_path))
         msg = str(excinfo.value)
-        assert "no depth files found" in msg
+        assert "No depth maps found" in msg
         assert "src_720p_v2_input.mp4" in msg
         assert "src_720p_v2_vis.mp4" in msg
 
