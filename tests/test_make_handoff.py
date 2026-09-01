@@ -9,7 +9,7 @@ in-line sidecar JSON. Worklog idempotence is verified end-to-end on a temp file.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -98,16 +98,46 @@ def test_fetch_merged_prs_sorted_by_merged_at():
         {"number": 3, "title": "C", "mergedAt": "2026-09-01T09:00:00+00:00"},
     ]
     runner = _runner_for(prs=prs)
-    result = fetch_merged_prs(_now(), runner=runner.runner)
+    # Window starts before all of them so none are filtered out.
+    since = datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc)
+    result = fetch_merged_prs(since, runner=runner.runner)
     assert [p.number for p in result] == [1, 3, 2]
     assert result[0].title == "A"
 
 
-def test_fetch_merged_prs_passes_since_to_gh():
-    """Verify the ``--since`` ISO timestamp is propagated to gh.
+def test_fetch_merged_prs_filters_to_time_window():
+    """Only PRs with mergedAt >= since are kept, sorted ascending.
 
-    This is the time-window filter: gh server-side filters by mergedAt;
-    the handoff script must hand gh an ISO-8601 ``--since`` argument.
+    gh pr list returns a page of recent merges (no --since); the Python side
+    must slice the window. PRs straddling the boundary on both sides must be
+    partitioned correctly.
+    """
+    since = datetime(2026, 9, 1, 9, 0, 0, tzinfo=timezone.utc)
+    prs = [
+        # Before the window — must be dropped.
+        {"number": 170, "title": "old-pre-window", "mergedAt": "2026-09-01T06:00:00+00:00"},
+        {"number": 172, "title": "just-before", "mergedAt": "2026-09-01T08:59:59+00:00"},
+        # At/after the window — must be kept (boundary is inclusive).
+        {"number": 175, "title": "boundary-exact", "mergedAt": "2026-09-01T09:00:00+00:00"},
+        {"number": 178, "title": "inside-1", "mergedAt": "2026-09-01T11:00:00+00:00"},
+        {"number": 181, "title": "inside-2", "mergedAt": "2026-09-01T13:00:00+00:00"},
+        # Z-suffix timestamps (gh's real shape) must parse too.
+        {"number": 185, "title": "z-suffix", "mergedAt": "2026-09-01T15:00:00Z"},
+    ]
+    runner = _runner_for(prs=prs)
+    result = fetch_merged_prs(since, runner=runner.runner)
+
+    assert [p.number for p in result] == [175, 178, 181, 185]
+    # And the kept list is still sorted by mergedAt ascending.
+    assert [p.merged_at for p in result] == sorted(p.merged_at for p in result)
+
+
+def test_fetch_merged_prs_argv_has_no_since_and_uses_limit():
+    """Regression for issue #188: gh pr list has NO --since flag.
+
+    The fabricated --since was rejected by gh, _gh silently returned [], and
+    the digest showed "无合并 PR" while real merges piled up. The argv must
+    use the real --limit flag instead and must NOT contain --since at all.
     """
     captured: list[list[str]] = []
 
@@ -121,25 +151,63 @@ def test_fetch_merged_prs_passes_since_to_gh():
     assert len(captured) == 1
     cmd = captured[0]
     assert cmd[0] == "gh"
-    assert "--since" in cmd
-    since_idx = cmd.index("--since")
-    since_arg = cmd[since_idx + 1]
-    # Should be an ISO-8601 timestamp with timezone, equal to 2026-08-30T00:00:00.
-    assert datetime.fromisoformat(since_arg).replace(tzinfo=None) == datetime(2026, 8, 30, 0, 0, 0)
+    assert "--since" not in cmd  # the fabricated flag must never come back
+    assert "--limit" in cmd
+    limit_arg = cmd[cmd.index("--limit") + 1]
+    assert int(limit_arg) == 100  # default; large enough for a busy window
+    assert "--state" in cmd and "merged" in cmd
+    # --json takes a single comma-joined fields argument containing mergedAt.
+    assert "--json" in cmd
+    json_arg = cmd[cmd.index("--json") + 1]
+    assert "mergedAt" in json_arg and "number" in json_arg and "title" in json_arg
 
 
-def test_fetch_merged_prs_gh_failure_returns_empty():
-    """gh returning non-zero or garbage stdout is treated as no PRs."""
+def test_fetch_merged_prs_gh_failure_surfaces_error(capsys):
+    """gh returning non-zero must NOT be silently swallowed (issue #188 core).
+
+    The fabricated --since was rejected by gh, _gh returned [] with no output,
+    and the digest showed "无合并 PR" — the bug was silent. Now the stderr
+    must be surfaced, labeled with which query failed, so a future bad flag
+    can never hide the same way.
+    """
 
     def runner(cmd: list[str], **_: object) -> SimpleNamespace:
-        return SimpleNamespace(returncode=1, stdout="fatal: not a git repo", stderr="fail")
+        return SimpleNamespace(
+            returncode=1,
+            stdout="fatal: not a git repo",
+            stderr="unknown flag: --since",
+        )
 
     result = fetch_merged_prs(_now(), runner=runner)
     assert result == []
+    err = capsys.readouterr().err
+    # The failure is surfaced, labeled, and carries the gh stderr verbatim.
+    assert "[make_handoff]" in err
+    assert "gh pr list" in err
+    assert "failed" in err
+    assert "unknown flag: --since" in err
+
+
+def test_fetch_merged_prs_gh_garbage_stdout_surfaces_error(capsys):
+    """Non-JSON stdout is also surfaced rather than silently dropped."""
+
+    def runner(cmd: list[str], **_: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout="not json at all", stderr="")
+
+    result = fetch_merged_prs(_now(), runner=runner)
+    assert result == []
+    err = capsys.readouterr().err
+    assert "[make_handoff]" in err
+    assert "non-JSON" in err
 
 
 def test_build_handoff_since_window():
-    """build_handoff with an explicit --since resolves the window and passes it to gh."""
+    """build_handoff with an explicit --since slices the window in Python.
+
+    The window is no longer a gh flag (no --since on gh pr list); it is
+    applied client-side. The digest's ``since`` label still records it, and
+    the gh argv uses --limit not --since.
+    """
     fixed = "2026-08-29T00:00:00Z"
     captured: list[list[str]] = []
 
@@ -152,13 +220,25 @@ def test_build_handoff_since_window():
     # Both queries should have been issued (PR list then issue list).
     assert len(captured) == 2
     pr_cmd = captured[0]
-    assert "--since" in pr_cmd
-    since_arg = pr_cmd[pr_cmd.index("--since") + 1]
-    assert "2026-08-29T00:00:00" in since_arg
+    assert "--since" not in pr_cmd  # no fabricated flag
+    assert "--limit" in pr_cmd
+
+
+def test_build_handoff_since_window_filters_in_python():
+    """The --since window is applied on the Python side against mergedAt."""
+    fixed = "2026-08-29T00:00:00Z"
+    prs = [
+        {"number": 10, "title": "before window", "mergedAt": "2026-08-28T12:00:00Z"},
+        {"number": 11, "title": "in window", "mergedAt": "2026-08-29T06:00:00Z"},
+        {"number": 12, "title": "later", "mergedAt": "2026-08-30T06:00:00Z"},
+    ]
+    runner = _runner_for(prs=prs, issues=[])
+    data = build_handoff(since=fixed, runner=runner.runner, video_dir=Path("/nonexistent"))
+    assert [p.number for p in data.merged_prs] == [11, 12]
 
 
 def test_build_handoff_since_hours_default():
-    """Without --since, the default 12-hour window is used."""
+    """Without --since, the default 12-hour window is used to filter in Python."""
     captured: list[list[str]] = []
 
     def runner(cmd: list[str], **_: object) -> SimpleNamespace:
@@ -167,10 +247,8 @@ def test_build_handoff_since_hours_default():
 
     _ = build_handoff(since_hours=12, runner=runner, video_dir=Path("/nonexistent"))
     pr_cmd = captured[0]
-    since_arg = pr_cmd[pr_cmd.index("--since") + 1]
-    since_dt = datetime.fromisoformat(since_arg)
-    delta = datetime.now(timezone.utc) - since_dt.replace(tzinfo=timezone.utc)
-    assert timedelta(hours=10) <= delta <= timedelta(hours=14)
+    assert "--since" not in pr_cmd  # no fabricated flag
+    assert "--limit" in pr_cmd
 
 
 # ---------------------------------------------------------------------------
