@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import json
 import logging
 import os
@@ -556,6 +557,153 @@ def get_temp_dir(args, subdir=None):
     return str(path)
 
 
+# ---------------------------------------------------------------------------
+# I-6 (#121): model-scoped depth checkpoint dir + meta.json
+# ---------------------------------------------------------------------------
+
+#: Depth checkpoint meta file name written into ``get_depth_dir(args)``.
+DEPTH_META_NAME = "meta.json"
+
+
+def get_depth_dir(args) -> str:
+    """Depth checkpoint directory, scoped by depth model (I-6, #121).
+
+    Returns ``<temp>/depth/<depth_model>/`` so ``--depth-model depth-anything``
+    and ``--depth-model depthcrafter`` write to **non-overlapping** directories
+    and cannot silently clobber / cross-reuse each other's ``depth_XXXXXX.npy``.
+
+    Before #121 every model wrote into the shared ``<temp>/depth/`` directory,
+    so an A/B run or a resume could silently mix two models' depth products.
+    """
+    depth_model = getattr(args, "depth_model", "depth-anything")
+    return get_temp_dir(args, os.path.join("depth", depth_model))
+
+
+def _depth_meta_params(args, num_frames: int) -> dict[str, Any]:
+    """The parameter snapshot persisted as ``meta.json`` in the depth dir.
+
+    On resume this is compared to the *current* invocation's params: a mismatch
+    (different model / max_res / model_size / frame count) means the cached
+    depth maps are not the ones the operator is asking for — recompute, never
+    silently reuse (issue #121 resume-safety requirement).
+    """
+
+    def _safe(val: Any) -> Any:
+        # In tests ``args`` may be a MagicMock whose un-set attributes are
+        # auto-Mocks (not JSON-serialisable).  Only keep plain scalar values.
+        return val if isinstance(val, (str, int, float, bool)) or val is None else None
+
+    params: dict[str, Any] = {
+        "depth_model": _safe(getattr(args, "depth_model", "depth-anything")) or "depth-anything",
+        "num_frames": int(num_frames),
+        "model_size": _safe(getattr(args, "model_size", None)),
+        "max_res": _safe(getattr(args, "depthcrafter_max_res", None)),
+        "temporal_smoothing": _safe(getattr(args, "temporal_smoothing", 0.0)) or 0.0,
+    }
+    return params
+
+
+def save_depth_meta(args, num_frames: int, depth_dir: str | None = None) -> None:
+    """Write ``meta.json`` (model + key params + timestamp) into the depth dir.
+
+    Idempotent — every depth run overwrites it so the meta always reflects the
+    maps that are actually on disk.
+    """
+    depth_dir = depth_dir or get_depth_dir(args)
+    meta = _depth_meta_params(args, num_frames)
+    meta["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+    meta_path = os.path.join(depth_dir, DEPTH_META_NAME)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    log.info("💾 Depth meta saved: %s (model=%s, frames=%d)", meta_path, meta["depth_model"], num_frames)
+
+
+def load_depth_meta(depth_dir: str | Path) -> dict | None:
+    """Read ``meta.json`` from a depth dir; ``None`` if absent."""
+    meta_path = os.path.join(str(depth_dir), DEPTH_META_NAME)
+    if not os.path.exists(meta_path):
+        return None
+    with open(meta_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def depth_meta_matches(args, meta: dict | None) -> bool:
+    """True if *meta*'s model + params match the current invocation (I-6).
+
+    Compares the identity-relevant fields (model, depthcrafter max_res,
+    model_size, temporal smoothing).  ``meta=None`` (no meta file) is treated
+    as a mismatch so a pre-#121 cache is never silently reused.  ``num_frames``
+    is deliberately NOT compared here — it is checked against the actual npy
+    count on disk by :func:`load_depth_checkpoint` (a tampered meta that lies
+    about the frame count would otherwise pass by construction).
+    """
+    if not meta:
+        return False
+    want = _depth_meta_params(args, meta.get("num_frames", 0))
+    keys = ("depth_model", "model_size", "max_res", "temporal_smoothing")
+    return all(meta.get(k) == want.get(k) for k in keys)
+
+
+def load_depth_checkpoint(args, depth_dir: str | None = None) -> list[np.ndarray] | None:
+    """Load cached ``depth_*.npy`` maps with I-6 (#121) meta validation.
+
+    resume safety: when the depth dir's ``meta.json`` exists and its model /
+    params **do not match** the current invocation (operator switched
+    ``--depth-model``, changed ``--depthcrafter-max-res`` / ``--model-size`` /
+    temporal smoothing), the cache is stale — return ``None`` so the caller
+    **recomputes** fresh; we never silently reuse a different model's maps.
+
+    A dir **without** ``meta.json`` (a pre-#121 or hand-seeded cache, e.g. the
+    V-3 manifest flow's stubbed depth stage) cannot be validated — it is loaded
+    with a loud "source 未知" warning rather than silently trusted, preserving
+    pre-#121 resume behaviour while making the unknown provenance visible.
+    """
+    import glob
+
+    depth_dir = depth_dir or get_depth_dir(args)
+    meta = load_depth_meta(depth_dir)
+    depth_files = sorted(glob.glob(os.path.join(depth_dir, "depth_*.npy")))
+    # No cached maps at all is NOT a stale-cache signal — it just means the
+    # depth stage produced nothing (e.g. a V-3 manifest flow whose stubbed
+    # depth stage wrote no npy).  Return an empty list so the caller does not
+    # mistake it for the meta-mismatch "recompute" case below.
+    if not depth_files:
+        return []
+
+    if meta is None:
+        log.warning(
+            "⚠️  Depth checkpoint at %s has no meta.json (source 未知) — loading "
+            "without model/params validation; re-run --stage depth to attach provenance.",
+            depth_dir,
+        )
+        depths = [np.load(f) for f in depth_files]
+        log.info("📂 Loaded %d depth maps from checkpoint (source 未知)", len(depths))
+        return depths
+
+    if not depth_meta_matches(args, meta):
+        log.warning(
+            "⚠️  Depth checkpoint at %s is stale or from a different model/params "
+            "(meta: %s) — will recompute depth, not silently reuse.",
+            depth_dir,
+            meta,
+        )
+        return None
+    # A meta that lies about the frame count (or a truncated cache) is stale:
+    # require the npy count to agree with the meta's num_frames.
+    if meta.get("num_frames") is not None and int(meta["num_frames"]) != len(depth_files):
+        log.warning(
+            "⚠️  Depth checkpoint at %s has %d npy files but meta claims %d frames — "
+            "will recompute depth, not silently reuse.",
+            depth_dir,
+            len(depth_files),
+            meta["num_frames"],
+        )
+        return None
+    depths = [np.load(f) for f in depth_files]
+    log.info("📂 Loaded %d depth maps from checkpoint (model=%s)", len(depths), meta.get("depth_model"))
+    return depths
+
+
 def run_depth_stage(args, frames):
     """Stage 1: Estimate depth for all frames."""
     log.info("=== Stage 1: Depth Estimation ===")
@@ -563,7 +711,7 @@ def run_depth_stage(args, frames):
     # DepthCrafter mode — process entire video at once (temporally consistent)
     if args.depth_model == "depthcrafter":
         log.info("Using DepthCrafter for temporally-consistent video depth estimation")
-        out_dir = get_temp_dir(args, "depth")
+        out_dir = get_depth_dir(args)
         estimator = DepthCrafterEstimator(
             repo_dir=args.depthcrafter_repo_dir,
             python_exe=args.depthcrafter_python,
@@ -584,6 +732,7 @@ def run_depth_stage(args, frames):
             )
             np.save(os.path.join(out_dir, f"depth_{i:06d}.npy"), depth)
 
+        save_depth_meta(args, len(depths), out_dir)
         log.info(f"Depth maps (DepthCrafter) saved to {out_dir}/")
         return depths
 
@@ -594,7 +743,7 @@ def run_depth_stage(args, frames):
         calibrate=True,
     )
 
-    out_dir = get_temp_dir(args, "depth")
+    out_dir = get_depth_dir(args)
     depths = []
     prev_depth = None
     temporal_alpha = args.temporal_smoothing if args.temporal_smoothing > 0 else None
@@ -651,6 +800,7 @@ def run_depth_stage(args, frames):
         for i, frame in enumerate(tqdm(frames, desc="Estimating depth")):
             _emit_depth(i, frame)
 
+    save_depth_meta(args, len(depths), out_dir)
     log.info(f"Depth maps saved to {out_dir}/")
     return depths
 
@@ -710,7 +860,7 @@ def _run_stereocrafter_stage(args, frames, depths):
 
     # Save frames as a temp video so StereoCrafter can read them
     temp_dir = get_temp_dir(args)
-    depth_dir = get_temp_dir(args, "depth")
+    depth_dir = get_depth_dir(args)
 
     # Write frames to a temp video file for StereoCrafter input
     H, W = frames[0].shape[:2]
@@ -1484,7 +1634,7 @@ def _stage_artifacts(args, manifest_name):
             "upscale": args.upscale,
         }
     elif manifest_name == "depth":
-        outputs = [get_temp_dir(args, "depth")]
+        outputs = [get_depth_dir(args)]
         params = {"depth_model": args.depth_model, "model_size": args.model_size}
     elif manifest_name == "stereo":
         outputs = [get_temp_dir(args, "left"), get_temp_dir(args, "right")]
@@ -1798,14 +1948,15 @@ def main():
                 # re-materialised here (the lazy intake generator was consumed
                 # by the depth stage).  Peak RAM ∝ chunk_size, not clip length.
                 if depths is None:
-                    depth_dir = get_temp_dir(args, "depth")
-                    import glob
-
-                    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
-                    depths = [np.load(f) for f in depth_files]
-                    log.info(f"📂 Loaded {len(depths)} depth maps from checkpoint")
+                    depths = load_depth_checkpoint(args)
                 if frames is None or _chunked:
                     frames, _ = _intake_frames(args.input, args.max_frames, lazy=False)
+                if depths is None:
+                    # I-6 (#121): cached depth is stale / wrong-model — recompute
+                    # fresh rather than silently reuse (resume safety).
+                    log.warning("⚠️  Recomputing depth (stale checkpoint) before stereo.")
+                    depths = run_depth_stage(args, frames)
+                    save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
                 output = run_chunked_fused_stage(args, frames, depths)
                 save_checkpoint(temp_dir, "stereo", {"num_frames": len(depths)})
                 _record("stereo")
@@ -1818,19 +1969,22 @@ def main():
 
             elif stage == "stereo":
                 if depths is None:
-                    # Load depth maps from disk
-                    depth_dir = get_temp_dir(args, "depth")
-                    import glob
-
-                    depth_files = sorted(glob.glob(os.path.join(depth_dir, "*.npy")))
-                    depths = [np.load(f) for f in depth_files]
-                    log.info(f"📂 Loaded {len(depths)} depth maps from checkpoint")
+                    # Load depth maps from disk (meta-validated; see
+                    # load_depth_checkpoint — a stale/wrong-model cache is
+                    # never silently reused, #121).
+                    depths = load_depth_checkpoint(args)
                 if frames is None or _chunked:
                     # Stereo needs frames as a materialised list (zip over
                     # frames+depths).  When chunked, the intake generator was
                     # already consumed by the depth stage, so re-read here.
                     # (Full frame/depth buffer reuse is V-4.1b — out of scope.)
                     frames, _ = _intake_frames(args.input, args.max_frames, lazy=False)
+                if depths is None:
+                    # I-6 (#121): cached depth is stale / wrong-model — recompute
+                    # fresh rather than silently reuse (resume safety).
+                    log.warning("⚠️  Recomputing depth (stale checkpoint) before stereo.")
+                    depths = run_depth_stage(args, frames)
+                    save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
                 left_frames, right_frames = run_stereo_stage(args, frames, depths)
                 save_checkpoint(temp_dir, "stereo", {"num_frames": len(left_frames)})
                 _record("stereo")
@@ -1933,7 +2087,19 @@ def main():
     elif args.stage == "stereo":
         # Stereo needs frames as a materialised list; keep legacy intake.
         frames = list(read_frames(args.input, args.max_frames))
-        depth_dir = get_temp_dir(args, "depth")
+        depth_dir = get_depth_dir(args)
+        # I-6 (#121): warn if the cached depth came from a different model/
+        # params — this single-stage entry just loads the checkpoint, so it
+        # cannot recompute; the warning surfaces the mismatch to the operator.
+        meta = load_depth_meta(depth_dir)
+        if not depth_meta_matches(args, meta):
+            log.warning(
+                "⚠️  Depth checkpoint at %s does not match current model/params "
+                "(meta: %s) — loading anyway for --stage stereo (re-run --stage "
+                "depth to regenerate).",
+                depth_dir,
+                meta,
+            )
         depths = []
         for i in range(len(frames)):
             d = np.load(os.path.join(depth_dir, f"depth_{i:06d}.npy"))

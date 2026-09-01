@@ -485,12 +485,17 @@ class TestRunPipelineChunked:
         monkeypatch.setattr(run_pipeline.DepthEstimator, "estimate", fake_estimate)
         cargs = self._args(run_pipeline, tmp_path, chunk_size=4, overlap=0)
         run_pipeline.run_depth_stage(cargs, frames)
-        depth_dir = run_pipeline.get_temp_dir(cargs, "depth")
+        depth_dir = run_pipeline.get_depth_dir(cargs)
         npy = sorted(glob.glob(os.path.join(depth_dir, "depth_*.npy")))
         png = sorted(glob.glob(os.path.join(depth_dir, "depth_*.png")))
         assert len(npy) == 10 and len(png) == 10
         # Indices 0..9 present.
         assert {os.path.basename(p) for p in npy} == {f"depth_{i:06d}.npy" for i in range(10)}
+        # I-6 (#121): meta.json written into the model-scoped depth dir.
+        meta = run_pipeline.load_depth_meta(depth_dir)
+        assert meta is not None
+        assert meta["depth_model"] == "depth-anything"
+        assert meta["num_frames"] == 10
 
 
 # ---------------------------------------------------------------------------
