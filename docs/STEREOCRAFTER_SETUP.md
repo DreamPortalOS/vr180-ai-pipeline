@@ -83,6 +83,18 @@ python scripts/run_pipeline.py \
     --stereo-model stereocrafter
 ```
 
+> **Depth supply (streaming path, `--quality standard|high`):** StereoCrafter's
+> in-repo forward-splat consumes the pipeline's own per-frame depth maps
+> (issue #140). The streaming run feeds them like this (issue #143):
+>
+> * With `--depth-model depthcrafter` (recommended): the DepthCrafter stage's
+>   real output dir is handed straight to `render_video` — temporally stable,
+>   flicker-free depth.
+> * Without it: the streaming pipeline **auto-emits** per-frame depth maps
+>   with the per-frame estimator (Depth-Anything) into a temp dir and hands
+>   that over, logging a WARNING. Functional, but not flicker-free — prefer
+>   `--depth-model depthcrafter` for final renders.
+
 You can override any of the defaults explicitly:
 
 ```bash
@@ -229,7 +241,7 @@ dependencies (see `tests/test_stereo_crafter.py`).
 | `CUDA out of memory` | Resolution too high for your GPU | Lower `--stereocrafter-max-res` (e.g. 512 → 384) |
 | `No known inference script found` | Repo checkout missing `inpainting_inference.py` (the only recognized entry — a stray `run.py`/`inference.py`/`depth_splatting_inference.py` is NOT accepted) | Re-run the bootstrap; or clone `TencentARC/StereoCrafter` into `third_party/StereoCrafter/` |
 | `No module named 'dependency.DepthCrafter...'` | A Stage-1 (`depth_splatting_inference.py`) invocation — this repo **never** runs Stage 1 (issue #140). If you see this, you're on an old build or invoked the upstream script by hand | Pull the fix; run only via `--stereo-model stereocrafter`. Do **not** embed DepthCrafter into the StereoCrafter checkout |
-| `No depth maps found in <depth_dir>` | The pipeline's depth stage didn't run / wrote nothing — Stage-2 assembly needs the pipeline's own per-frame depth maps | Run the depth stage first (`--stage depth`), or use `--stereo-model default` |
+| `No depth maps found in <depth_dir>` | Batch path: the pipeline's depth stage didn't run / wrote nothing — Stage-2 assembly needs the pipeline's own per-frame depth maps. (Streaming path: not expected — since issue #143 the streaming run either hands StereoCrafter the DepthCrafter stage's real output dir, or auto-emits per-frame depth maps itself.) | Batch: run the depth stage first (`--stage depth`), or use `--stereo-model default`. Streaming: pass `--depth-model depthcrafter` (recommended — flicker-free), or rely on the auto-emitted per-frame fallback (logged as a WARNING) |
 | `No module named '...'` | Runtime dep missing from the dedicated venv | Add it to `RUNTIME_DEPS` in `scripts/setup_stereocrafter.py` and re-run |
 | `FileNotFoundError: python` | Wrong venv python path | The bootstrap writes it in-repo; run the bootstrap, or set `STEREOCRAFTER_PYTHON` |
 | Self-check fails | The inference entry point can't import | `python <venv>/python inpainting_inference.py --help` inside `third_party/StereoCrafter/` to see the real error |

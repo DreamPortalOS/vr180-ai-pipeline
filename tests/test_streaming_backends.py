@@ -262,10 +262,13 @@ class TestWholeClipStereoPrecompute(unittest.TestCase):
             stereo_renderer=stereo_backend,
             stereo_backend_name="stereocrafter",
         )
-        # Per-frame depth estimator (mocked) — must NOT be called, because the
-        # whole-clip stereo backend supersedes the depth stage (StereoCrafter
-        # runs its own internal DepthCrafter).
+        # Per-frame depth estimator (mocked).  I-7.2 (#143): since issue #140
+        # StereoCrafter consumes the pipeline's OWN depth maps (the in-repo
+        # forward-splat replaced the removed upstream Stage 1), so with no
+        # whole-clip depth backend injected the streaming path auto-emits
+        # per-frame depth maps via this estimator before the stereo call.
         p.depth_estimator = MagicMock(spec=["estimate"])
+        p.depth_estimator.estimate.return_value = np.zeros((8, 8), dtype=np.float32)
         p.eq_mapper.map_stereo_pair.return_value = np.zeros((50, 200, 3), dtype=np.uint8)
 
         cap = _fake_cap(num_frames=3)
@@ -289,9 +292,11 @@ class TestWholeClipStereoPrecompute(unittest.TestCase):
         self.assertEqual(len(stereo_backend.calls), 1)
         # eq_mapper was driven once per precomputed L/R pair.
         self.assertEqual(p.eq_mapper.map_stereo_pair.call_count, 3)
-        # The per-frame depth estimator was NOT invoked (stereo whole-clip
-        # supersedes depth — StereoCrafter runs its own internal DepthCrafter).
-        p.depth_estimator.estimate.assert_not_called()
+        # I-7.2 (#143): the per-frame depth estimator WAS invoked (once per
+        # source frame) to auto-emit the depth maps StereoCrafter's in-repo
+        # forward-splat consumes — it is NOT invoked inside the fuse loop
+        # itself (that loop reads the precomputed L/R frames).
+        self.assertEqual(p.depth_estimator.estimate.call_count, 3)
 
     def test_frames_read_back_from_returned_paths(self):
         """I-7 (#137): the precompute reads L/R frames back from the paths
@@ -310,6 +315,7 @@ class TestWholeClipStereoPrecompute(unittest.TestCase):
             stereo_backend_name="stereocrafter",
         )
         p.depth_estimator = MagicMock(spec=["estimate"])
+        p.depth_estimator.estimate.return_value = np.zeros((8, 8), dtype=np.float32)
         p.eq_mapper.map_stereo_pair.return_value = np.zeros((50, 200, 3), dtype=np.uint8)
 
         cap = _fake_cap(num_frames=2)
@@ -355,6 +361,7 @@ class TestWholeClipStereoLogging(unittest.TestCase):
             stereo_backend_name="stereocrafter",
         )
         p.depth_estimator = MagicMock(spec=["estimate"])
+        p.depth_estimator.estimate.return_value = np.zeros((8, 8), dtype=np.float32)
         p.eq_mapper.map_stereo_pair.return_value = np.zeros((50, 200, 3), dtype=np.uint8)
 
         cap = _fake_cap(num_frames=2)
@@ -381,6 +388,141 @@ class TestWholeClipStereoLogging(unittest.TestCase):
         self.assertIn("L/R frame pair(s)", joined)
         # The backend really ran once.
         self.assertEqual(len(stereo_backend.calls), 1)
+
+
+# ---------------------------------------------------------------------------
+# I-7.2 (#143): stereo backend receives the depth stage's REAL output dir
+# ---------------------------------------------------------------------------
+
+
+class FakeWholeClipDepthThatWrites(FakeWholeClipDepth):
+    """Whole-clip depth backend that actually checkpoints depth_*.npy files
+    into output_dir (like the real DepthCrafterEstimator), so the dir the
+    stereo stage receives can be verified to be populated."""
+
+    def estimate_video(self, input_path, output_dir):
+        super().estimate_video(input_path, output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        rng = np.random.default_rng(7)
+        for i in range(self.num_frames):
+            np.save(
+                os.path.join(output_dir, f"depth_{i:06d}.npy"),
+                rng.random((self.h, self.w)).astype(np.float32),
+            )
+        return [np.zeros((self.h, self.w), dtype=np.float32) for _ in range(self.num_frames)]
+
+
+class TestStereoReceivesRealDepthDir(unittest.TestCase):
+    """I-7.2 (#143): the pre-#143 streaming path created TWO independent temp
+    dirs — the depth stage wrote its maps into ``vr180-streaming-depth_XXXX``
+    while the stereo backend was handed a fresh, guaranteed-empty
+    ``vr180-streaming-stereo_YYYY/depth`` and crashed inside the splat assembly
+    ("No depth maps found in ...").  These tests assert ``render_video`` gets
+    the depth stage's REAL output dir, populated and still on disk."""
+
+    def _run(self, p, cap_frames=3):
+        cap = _fake_cap(num_frames=cap_frames)
+        proc = MagicMock()
+        proc.returncode = 0
+        left = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(cap_frames)]
+        right = [np.full((8, 8, 3), 255, dtype=np.uint8) for _ in range(cap_frames)]
+        with (
+            patch("pipeline.streaming_pipeline.cv2.VideoCapture", return_value=cap),
+            patch("pipeline.streaming_pipeline.subprocess.Popen", return_value=proc),
+            patch("pipeline.streaming_pipeline._load_video_frames", side_effect=[left, right]),
+        ):
+            p.process_stream("in.mp4", "out.mp4")
+
+    def test_depthcrafter_dir_is_handed_to_stereo(self):
+        """--depth-model depthcrafter + --stereo-model stereocrafter: the dir
+        passed to render_video is EXACTLY the one estimate_video wrote into
+        (this is the assertion that would have caught the defect)."""
+        depth_backend = FakeWholeClipDepthThatWrites(num_frames=3)
+        stereo_backend = FakeWholeClipStereo(num_frames=3)
+        p = _make_pipeline(
+            output_width=100,
+            output_height=50,
+            depth_estimator=depth_backend,
+            stereo_renderer=stereo_backend,
+            depth_backend_name="depthcrafter",
+            stereo_backend_name="stereocrafter",
+        )
+        p.eq_mapper.map_stereo_pair.return_value = np.zeros((50, 200, 3), dtype=np.uint8)
+
+        self._run(p)
+
+        # Both whole-clip backends ran exactly once.
+        self.assertEqual(len(depth_backend.calls), 1)
+        self.assertEqual(len(stereo_backend.calls), 1)
+        depth_out_dir = depth_backend.calls[0][1]
+        stereo_depth_dir = stereo_backend.calls[0][1]
+        # The stereo backend received the depth stage's real output dir.
+        self.assertEqual(stereo_depth_dir, depth_out_dir)
+        # …and it was populated + alive through the stereo call.
+        self.assertTrue(os.path.isdir(stereo_depth_dir))
+        self.assertEqual(len([f for f in os.listdir(stereo_depth_dir) if f.endswith(".npy")]), 3)
+
+    def test_depth_dir_alive_after_stereo_call(self):
+        """Lifetime: the depth dir must not be cleaned up before/during the
+        stereo stage — it is verified to still exist after process_stream."""
+        depth_backend = FakeWholeClipDepthThatWrites(num_frames=2)
+        stereo_backend = FakeWholeClipStereo(num_frames=2)
+
+        # Assert from inside the stereo call: the dir is populated AT CALL TIME.
+        seen = {}
+
+        original_render_video = stereo_backend.render_video
+
+        def spy_render_video(input_path, depth_dir, output_left, output_right):
+            seen["depth_dir"] = depth_dir
+            seen["npy_count_at_call"] = len([f for f in os.listdir(depth_dir) if f.endswith(".npy")])
+            return original_render_video(input_path, depth_dir, output_left, output_right)
+
+        stereo_backend.render_video = spy_render_video
+
+        p = _make_pipeline(
+            output_width=100,
+            output_height=50,
+            depth_estimator=depth_backend,
+            stereo_renderer=stereo_backend,
+            depth_backend_name="depthcrafter",
+            stereo_backend_name="stereocrafter",
+        )
+        p.eq_mapper.map_stereo_pair.return_value = np.zeros((50, 200, 3), dtype=np.uint8)
+
+        self._run(p, cap_frames=2)
+
+        self.assertIn("depth_dir", seen)
+        self.assertEqual(seen["npy_count_at_call"], 2)
+        # Still on disk after the whole run (not deleted at depth-stage exit).
+        self.assertTrue(os.path.isdir(seen["depth_dir"]))
+
+    def test_stereo_alone_auto_emits_perframe_depths(self):
+        """--stereo-model stereocrafter WITHOUT a whole-clip depth backend:
+        the streaming path must not hand StereoCrafter an empty dir (the
+        pre-#143 crash).  Instead it auto-emits per-frame depth maps with the
+        per-frame estimator and hands over THAT populated dir."""
+        stereo_backend = FakeWholeClipStereo(num_frames=3)
+        p = _make_pipeline(
+            output_width=100,
+            output_height=50,
+            stereo_renderer=stereo_backend,
+            stereo_backend_name="stereocrafter",
+        )
+        # Injected per-frame estimator (Depth-Anything stand-in).
+        p.depth_estimator = MagicMock(spec=["estimate"])
+        p.depth_estimator.estimate.return_value = np.full((8, 8), 0.5, dtype=np.float32)
+        p.eq_mapper.map_stereo_pair.return_value = np.zeros((50, 200, 3), dtype=np.uint8)
+
+        self._run(p)
+
+        self.assertEqual(len(stereo_backend.calls), 1)
+        stereo_depth_dir = stereo_backend.calls[0][1]
+        # The dir the stereo backend got is populated with per-frame maps.
+        self.assertTrue(os.path.isdir(stereo_depth_dir))
+        self.assertEqual(len([f for f in os.listdir(stereo_depth_dir) if f.endswith(".npy")]), 3)
+        # The per-frame estimator ran once per frame (the auto-emit path).
+        self.assertEqual(p.depth_estimator.estimate.call_count, 3)
 
 
 # ---------------------------------------------------------------------------

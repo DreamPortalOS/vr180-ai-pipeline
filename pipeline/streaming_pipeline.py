@@ -569,10 +569,12 @@ class StreamingPipeline:
 
         Returns ``(left_frames, right_frames)`` read back from the L/R output
         videos the backend wrote (the paths ``render_video`` *returns*, matching
-        the batch ``_run_stereocrafter_stage``).  StereoCrafter runs its own
-        internal DepthCrafter, so it does not consume the caller's external
-        depth maps; *depth_dir* is passed for interface compatibility and must
-        exist.
+        the batch ``_run_stereocrafter_stage``).  Since issue #140, StereoCrafter
+        consumes the pipeline's own per-frame depth maps via *depth_dir* (the
+        in-repo forward-splat replaces the removed upstream Stage 1); the
+        caller is responsible for pointing *depth_dir* at the depth stage's
+        real output directory (I-7.2, #143) — it must be non-empty before the
+        call.
         """
         log.info(
             "🎬 [Stereo] whole-clip backend (%s): running render_video on %s",
@@ -597,6 +599,56 @@ class StreamingPipeline:
             len(left_frames),
         )
         return left_frames, right_frames
+
+    def _emit_perframe_depths(
+        self,
+        cap: cv2.VideoCapture,
+        total: int,
+        depth_dir: str,
+    ) -> None:
+        """Auto-emit per-frame depth maps into *depth_dir* (I-7.2, #143).
+
+        Used when a whole-clip stereo backend (StereoCrafter) is in play but no
+        whole-clip depth backend (DepthCrafter) was injected: StereoCrafter
+        consumes the pipeline's own per-frame depth maps (issue #140), so the
+        per-frame estimator is run over the clip once here and each map is
+        checkpointed as ``depth_<idx:06d>.npy`` — the exact layout the stereo
+        backend's depth loader globs for.  This replaces the pre-fix behaviour
+        of handing StereoCrafter a guaranteed-empty dir and crashing deep
+        inside the splat assembly.
+
+        The frames are read from the already-open *cap*; the whole-clip stereo
+        branch never reads from ``cap`` again afterwards (its fuse loop
+        consumes the precomputed L/R frames instead), so consuming it here is
+        safe.
+
+        For temporally-stable depth the recommendation remains ``--depth-model
+        depthcrafter`` (whole-clip); this fallback is per-frame Depth-Anything
+        quality — functional, but not flicker-free.
+        """
+        log.warning(
+            "⚠️  --stereo-model stereocrafter without a whole-clip depth backend: "
+            "auto-emitting per-frame depth (%s) into %s for the stereo stage. "
+            "For flicker-free depth, pass --depth-model depthcrafter.",
+            self.depth_backend_name,
+            depth_dir,
+        )
+        emitted = 0
+        for idx in range(total):
+            ret, bgr = cap.read()
+            if not ret:
+                break
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            depth = self.depth_estimator.estimate(rgb)
+            np.save(os.path.join(depth_dir, f"depth_{idx:06d}.npy"), np.asarray(depth))
+            del depth, rgb, bgr
+            emitted = idx + 1
+        log.info(
+            "🎬 [Depth] %s emitted %d per-frame depth map(s) → %s",
+            self.depth_backend_name,
+            emitted,
+            depth_dir,
+        )
 
     def _write_sbs_frame(
         self,
@@ -689,11 +741,13 @@ class StreamingPipeline:
         log.info(f"Target output: {out_w}×{out_h} (SBS, {self.output_width}² per eye)")
 
         # I-5 (#120): detect whole-clip backends.  They cannot run in the per-
-        # frame fuse loop, so precompute their outputs up front.  A whole-clip
-        # stereo backend (StereoCrafter) supersedes the depth backend — it
-        # runs its own internal DepthCrafter and emits L/R directly, so the
-        # external depth precompute is skipped (matching the batch path's
-        # ``_run_stereocrafter_stage``, which accepts but ignores ``depths``).
+        # frame fuse loop, so precompute their outputs up front.
+        #
+        # I-7.2 (#143): StereoCrafter (#140) consumes the pipeline's own
+        # per-frame depth maps via ``depth_dir`` — the in-repo forward-splat
+        # replaced the removed upstream Stage 1.  The streaming path therefore
+        # has to hand the stereo backend the *depth stage's real output dir*
+        # (populated, alive through the stereo call), never a fresh empty one.
         stereo_wholeclip = self._is_wholeclip_stereo(self.stereo_renderer)
         depth_wholeclip = self._is_wholeclip_depth(self.depth_estimator)
         precomp_left: list[np.ndarray] | None = None
@@ -704,10 +758,26 @@ class StreamingPipeline:
             import tempfile
 
             work_dir = tempfile.mkdtemp(prefix="vr180-streaming-stereo_")
-            depth_dir = os.path.join(work_dir, "depth")
-            os.makedirs(depth_dir, exist_ok=True)
             left_path = os.path.join(work_dir, "_stereo_left.mp4")
             right_path = os.path.join(work_dir, "_stereo_right.mp4")
+
+            if depth_wholeclip:
+                # Whole-clip depth backend (DepthCrafter) injected: run it once
+                # into its own work dir and hand THAT dir to the stereo backend.
+                # The dir must outlive the stereo call, so it lives for the
+                # whole process_stream scope (never deleted here).
+                depth_dir = os.path.join(tempfile.mkdtemp(prefix="vr180-streaming-depth_"), "depth")
+                os.makedirs(depth_dir, exist_ok=True)
+                self._precompute_depths(input_path, total, depth_dir)
+            else:
+                # StereoCrafter needs per-frame depth maps to splat with, but no
+                # whole-clip depth backend is in play.  Emit them with the
+                # per-frame estimator so the stereo stage has something real to
+                # consume (rather than dying on an empty dir).
+                depth_dir = os.path.join(work_dir, "depth")
+                os.makedirs(depth_dir, exist_ok=True)
+                self._emit_perframe_depths(cap, total, depth_dir)
+
             precomp_left, precomp_right = self._precompute_stereo(input_path, depth_dir, left_path, right_path)
             # StereoCrafter may produce fewer frames than the source count;
             # bound the fuse loop to what was actually produced.
