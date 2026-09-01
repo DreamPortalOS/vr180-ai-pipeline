@@ -272,18 +272,28 @@ def _issue_sort_key(issue: OpenIssue) -> tuple[int, int, int]:
 
 
 def _audio_status(data: dict, qa: dict) -> str:
-    """Derive audio presence from sidecar qa block.
+    """Derive audio presence from the sidecar qa block.
 
-    Mirrors the shape written by pipeline.sidecar / scripts.vr180_qa: the qa
-    block carries a ``checks`` list of ``{name, status, detail}`` dicts and a
-    top-level ``audio_codec`` field.
+    Real sidecars (pipeline.sidecar / scripts.vr180_qa) carry qa.checks as a
+    dict keyed by check name, e.g.
+
+        {"qa": {"checks": {"audio stream": {"status": "pass", "detail": "..."}}}}
+
+    ``status == "pass"`` => audio present. Any non-pass status (most commonly
+    ``"warn"`` with a "no audio stream" detail) means silent. Missing /
+    non-dict fields degrade gracefully to "unknown" rather than raising.
     """
-    codec = data.get("audio_codec") or qa.get("audio_codec")
-    if codec:
+    checks = qa.get("checks") if isinstance(qa, dict) else None
+    if not isinstance(checks, dict):
+        return "unknown"
+    audio = checks.get("audio stream")
+    if not isinstance(audio, dict):
+        return "unknown"
+    status = audio.get("status")
+    if status == "pass":
         return "yes"
-    for check in qa.get("checks", []):
-        if check.get("name") == "audio stream":
-            return "no" if check.get("status") != "pass" else "yes"
+    if isinstance(status, str):
+        return "no"
     return "unknown"
 
 

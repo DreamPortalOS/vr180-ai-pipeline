@@ -344,7 +344,7 @@ def test_scan_artefacts_ordering_and_sidecar(tmp_path):
     (tmp_path / "newer.mp4").write_bytes(b"fake")
     sidecar_data = {
         "immersive": {"eye_resolution": [5760, 2880]},
-        "qa": {"verdict": "VR180 (180° 3D SBS)", "checks": [{"name": "audio stream", "status": "pass"}]},
+        "qa": {"verdict": "VR180 (180° 3D SBS)", "checks": {"audio stream": {"status": "pass"}}},
     }
     (tmp_path / "newer.json").write_text(json.dumps(sidecar_data), encoding="utf-8")
 
@@ -363,12 +363,26 @@ def test_scan_artefacts_no_audio_flag(tmp_path):
     sidecar_data = {
         "qa": {
             "verdict": "plain 2D",
-            "checks": [{"name": "audio stream", "status": "warn", "detail": "no audio stream"}],
+            "checks": {
+                "audio stream": {
+                    "status": "warn",
+                    "detail": "no audio stream — video will be silent",
+                }
+            },
         }
     }
     (tmp_path / "silent.json").write_text(json.dumps(sidecar_data), encoding="utf-8")
     result = scan_artefacts(tmp_path)
     assert result[0].has_audio == "no"
+
+
+def test_scan_artefacts_empty_qa_degrades(tmp_path):
+    """An empty qa dict (no checks) must degrade to unknown, not raise."""
+    (tmp_path / "bare.mp4").write_bytes(b"fake")
+    (tmp_path / "bare.json").write_text(json.dumps({"qa": {}}), encoding="utf-8")
+    result = scan_artefacts(tmp_path)
+    assert result[0].has_audio == "unknown"
+    assert result[0].qa_verdict == "unknown"
 
 
 def test_scan_artefacts_missing_video_dir():
