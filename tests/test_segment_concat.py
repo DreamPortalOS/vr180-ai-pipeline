@@ -8,6 +8,7 @@ no network) in the ``not slow`` suite. No real video files are produced.
 from __future__ import annotations
 
 import json
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import patch
 
@@ -332,6 +333,118 @@ class TestConcatDemux:
             sp.run = _fake_probe_run(_probe_streams())
             with pytest.raises(ConcatError, match="concat demux failed"):
                 concat_segments(segs, out, mode="demux", runner=_bad)
+
+    def test_list_file_uses_absolute_paths(self, tmp_path: Path):
+        """Every ``file`` entry written into the concat list must be absolute.
+
+        Regression for issue #180 (K-10): the concat list file lives in the
+        system temp dir, so ffmpeg's concat demuxer resolves any relative
+        entry inside it against the temp dir, not the caller's cwd. A
+        caller-relative path like ``.tmp_concat/a.mp4`` then becomes
+        ``TMPDIR/.tmp_concat/a.mp4`` and silently fails. The list writer
+        MUST absolutize each segment path before writing it.
+        """
+        segs = self._segs(tmp_path)
+        out = tmp_path / "out.mp4"
+        runner = _fake_runner()
+
+        captured: list[str] = []
+        original_write = sc._write_concat_list
+
+        def _spy(segments, list_path):
+            original_write(segments, list_path)
+            captured.append(list_path.read_text(encoding="utf-8"))
+
+        with patch.object(sc, "_write_concat_list", _spy), patch.object(sc, "subprocess") as sp:
+            sp.run = _fake_probe_run(_probe_streams())
+            concat_segments(segs, out, mode="demux", runner=runner)
+
+        content = captured[0]
+        for line in content.splitlines():
+            if not line.startswith("file"):
+                continue
+            # Strip the ``file '...'`` wrapper.
+            path_tok = line.split(maxsplit=1)[1].strip().strip("'")
+            assert Path(path_tok).is_absolute(), (
+                f"concat list contains a relative path '{path_tok}' — "
+                "demuxer will resolve it against TMPDIR: line={line!r}"
+            )
+            # Forward slashes throughout — concat demuxer accepts both, but
+            # forward slash is the portable cross-platform form.
+            assert "\\" not in path_tok, f"concat list path still uses backslashes: {path_tok!r}"
+
+    def test_relative_path_segments_are_absolutized_in_list(self, tmp_path: Path):
+        """Calling with caller-relative segment paths must not leak into the list.
+
+        The entry point accepts relative paths (for usability), but they must
+        be resolved before being written to the concat list. This test
+        constructs a segment from a pure relative string and verifies the
+        written list contains the absolute form, not the original relative one.
+        """
+        # Pure relative paths — do NOT pass them through tmp_path. These are
+        # relative to the caller's cwd, exactly the shape that triggered
+        # issue #180's real-run failure. Write them into a cwd subdirectory
+        # so .resolve() produces a real, existing file (proving the resolved
+        # path ffmpeg would open is valid).
+        rel_dir = Path(".tmp_concat").resolve()
+        rel_dir.mkdir(parents=True, exist_ok=True)
+        (rel_dir / "a.mp4").write_bytes(b"fake")
+        (rel_dir / "b.mp4").write_bytes(b"fake")
+
+        rel_segs = [ConcatSegment(Path(".tmp_concat/a.mp4")), ConcatSegment(Path(".tmp_concat/b.mp4"))]
+        out = tmp_path / "out.mp4"
+        runner = _fake_runner()
+
+        captured: list[str] = []
+        original_write = sc._write_concat_list
+
+        def _spy(segments, list_path):
+            original_write(segments, list_path)
+            captured.append(list_path.read_text(encoding="utf-8"))
+
+        with patch.object(sc, "_write_concat_list", _spy), patch.object(sc, "subprocess") as sp:
+            sp.run = _fake_probe_run(_probe_streams())
+            concat_segments(rel_segs, out, mode="demux", runner=runner)
+
+        content = captured[0]
+        # The original relative tokens must NOT appear in the list.
+        assert "file '.tmp_concat/a.mp4'" not in content
+        assert "file '.tmp_concat/b.mp4'" not in content
+        # Every ``file`` entry must be absolute AND point to an existing file
+        # (the demuxer resolves entries against TMPDIR; a real relative path
+        # would become TMPDIR/.tmp_concat/a.mp4, which does not exist).
+        for line in content.splitlines():
+            if line.startswith("file"):
+                path_tok = line.split(maxsplit=1)[1].strip().strip("'")
+                assert Path(path_tok).is_absolute()
+                assert Path(path_tok).exists(), f"resolved concat-list path does not exist: {path_tok}"
+
+        # Clean up the cwd-side helper dir so we don't pollute the working tree.
+        (rel_dir / "a.mp4").unlink(missing_ok=True)
+        (rel_dir / "b.mp4").unlink(missing_ok=True)
+        with suppress(OSError):
+            rel_dir.rmdir()
+
+    def test_output_path_is_absolutized(self, tmp_path: Path):
+        """The ffmpeg output argument must be absolute.
+
+        Same root cause as PR #75 / issue #180: a relative output would be
+        resolved against the cwd that the subprocess happens to run in. After
+        the fix, output_path is .resolve()-d before use.
+        """
+        segs = self._segs(tmp_path)
+        # Pass a caller-relative output path.
+        out_rel = Path(".tmp_concat/out.mp4")
+        out_rel.parent.mkdir(parents=True, exist_ok=True)
+        runner = _fake_runner()
+
+        with patch.object(sc, "subprocess") as sp:
+            sp.run = _fake_probe_run(_probe_streams())
+            concat_segments(segs, out_rel, mode="demux", runner=runner)
+
+        cmd = runner.calls[0]
+        output_arg = cmd[-1]
+        assert Path(output_arg).is_absolute(), f"output path passed to ffmpeg is not absolute: {output_arg}"
 
 
 # --------------------------------------------------------------------------- #
