@@ -699,23 +699,22 @@ class TestDownloadSvdBase:
         assert "*.bin" in ignore
 
     def test_redownloads_when_fp16_image_encoder_missing(self, sandbox):
-        """A dir that has SOME files but is missing the fp16 image_encoder
-        safetensors is NOT considered ready (issue #155) — the exact file the
-        upstream loader needs must be present, so the download re-runs."""
+        """A dir that has SOME files but is missing a required weight
+        component must NOT be silently treated as ready — per requirement 3 of
+        issue #186 it raises a clear, actionable RuntimeError naming the
+        missing component(s) rather than re-running the download hoping it
+        self-heals or crashing later in inference with an opaque error."""
         sandbox.svd_dir.mkdir(parents=True)
-        (sandbox.svd_dir / "model_index.json").write_text("{}")  # non-empty, but no fp16 weights
-
-        captured: dict = {}
-
-        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token, **kwargs):
-            captured["called"] = True
-            return local_dir
+        (sandbox.svd_dir / "model_index.json").write_text("{}")  # non-empty, but no weight files
 
         fake_hf = MagicMock()
-        fake_hf.snapshot_download = fake_snapshot_download
+        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not be called"))
         fake_hf.HfFolder = MagicMock()
         fake_hf.HfFolder.get_token = MagicMock(return_value="hf_present")
-        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_hf}),
+            pytest.raises(RuntimeError, match="INCOMPLETE"),
+        ):
             setup.download_svd_base(
                 None,
                 skip_svd=False,
@@ -723,7 +722,8 @@ class TestDownloadSvdBase:
                 dry_run=False,
                 buffer=setup.DryRunBuffer(),
             )
-        assert captured.get("called") is True
+        # The download must NOT have been attempted — we raise before it.
+        fake_hf.snapshot_download.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
