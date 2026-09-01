@@ -29,6 +29,7 @@ class TestGenerateCliImageMode:
 
         img = tmp_path / "x.png"
         img.write_bytes(b"\x89PNGfake")
+        out = tmp_path / "out.mp4"
 
         cmd = [
             sys.executable,
@@ -40,16 +41,15 @@ class TestGenerateCliImageMode:
             "mock",
             "--duration",
             "1",
+            "--output",
+            str(out),
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
         assert r.returncode == 0, f"CLI exited {r.returncode}; stdout={r.stdout}\nstderr={r.stderr}"
 
-        # The CLI prints the saved path; grab the produced mp4 from tmp_path.
-        mp4s = list(tmp_path.glob("**/*.mp4"))
-        assert mp4s, "No mp4 artifact produced under tmp_path"
-        produced = mp4s[0]
+        assert out.exists(), "No mp4 artifact produced at --output path"
         assert "Video saved to" in r.stdout
-        info = _probe(str(produced))
+        info = _probe(str(out))
         assert info.get("format")
         assert any(s.get("codec_type") == "video" for s in info.get("streams", []))
         assert r.stdout.find("Provider: mock") >= 0
@@ -60,6 +60,7 @@ class TestGenerateCliImageMode:
 
         img = tmp_path / "p.png"
         img.write_bytes(b"\x89PNGfake")
+        out = tmp_path / "out.mp4"
 
         cmd = [
             sys.executable,
@@ -71,6 +72,8 @@ class TestGenerateCliImageMode:
             "mock",
             "--duration",
             "1",
+            "--output",
+            str(out),
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
         assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
