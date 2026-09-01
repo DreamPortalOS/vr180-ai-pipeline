@@ -557,6 +557,103 @@ def get_temp_dir(args, subdir=None):
     return str(path)
 
 
+def build_depth_backend(args, *, fallback: bool = True):
+    """I-5 (#120): build the requested ``--depth-model`` backend for injection.
+
+    Returns ``(estimator, backend_name)``.  When ``--depth-model`` is the
+    default ``depth-anything`` this returns ``(None, "depth-anything")`` — the
+    caller falls through to the built-in Depth-Anything estimator (the
+    pre-I-5 default, so behaviour is unchanged without the flag).
+
+    When ``--depth-model depthcrafter`` is requested, a
+    :class:`DepthCrafterEstimator` is constructed and returned for injection
+    into either the batch depth stage or the streaming pipeline.  This factory
+    is the **single** place the DepthCrafter constructor argument assembly
+    lives — both :func:`run_depth_stage` (batch path) and the streaming branch
+    in :func:`main` call it, so the construction logic is never duplicated.
+
+    ``fallback`` selects the I-5 unavailable-backend policy:
+
+    * ``fallback=True`` (streaming path): if the backend cannot be constructed
+      (CUDA missing, repo not deployed), a loud WARNING is logged and the
+      pipeline **falls back to Depth-Anything** — a requested-but-unavailable
+      advanced backend never runs silently with the wrong model, it always
+      announces the fallback.  The stream still produces output.
+    * ``fallback=False`` (batch depth stage): the pre-I-5 hard-fail contract
+      is preserved — the constructor's RuntimeError propagates.  The batch
+      depth stage is a dedicated, explicitly-invoked step, so a silent degrade
+      would waste an operator's run; failing loudly is the accepted behaviour.
+    """
+    if getattr(args, "depth_model", "depth-anything") != "depthcrafter":
+        return None, "depth-anything"
+    try:
+        estimator = DepthCrafterEstimator(
+            repo_dir=args.depthcrafter_repo_dir,
+            python_exe=args.depthcrafter_python,
+            checkpoint_dir=args.depthcrafter_checkpoint_dir,
+            max_resolution=args.depthcrafter_max_res,
+        )
+    except (RuntimeError, OSError) as exc:
+        if not fallback:
+            raise
+        log.warning(
+            "⚠️  --depth-model depthcrafter requested but the DepthCrafter backend "
+            "is unavailable — FALLING BACK to depth-anything (per-frame). "
+            "The '治晕' temporal-consistency benefit will NOT apply this run.\n"
+            "  Reason: %s\n"
+            "  Deploy with: python scripts/setup_depthcrafter.py  (needs CUDA)",
+            exc,
+        )
+        return None, "depth-anything"
+    log.info("Using DepthCrafter for temporally-consistent video depth estimation")
+    return estimator, "depthcrafter"
+
+
+def build_stereo_backend(args, *, fallback: bool = True):
+    """I-5 (#120): build the requested ``--stereo-model`` backend for injection.
+
+    Returns ``(renderer, backend_name)``.  When ``--stereo-model`` is the
+    default ``default`` this returns ``(None, "default")`` — the caller falls
+    through to the built-in per-frame :class:`StereoRenderer` (the pre-I-5
+    default, so behaviour is unchanged without the flag).
+
+    When ``--stereo-model stereocrafter`` is requested, a
+    :class:`StereoCrafterRenderer` is constructed and returned for injection.
+    This factory is the **single** place the StereoCrafter constructor argument
+    assembly lives — both :func:`run_stereo_stage` (batch path) and the
+    streaming branch in :func:`main` call it, so the construction logic is
+    never duplicated.
+
+    ``fallback`` selects the I-5 unavailable-backend policy (see
+    :func:`build_depth_backend`): ``True`` (streaming) logs a WARNING and
+    falls back to the default StereoRenderer; ``False`` (batch stereo stage)
+    preserves the pre-I-5 hard-fail contract.
+    """
+    if getattr(args, "stereo_model", "default") != "stereocrafter":
+        return None, "default"
+    try:
+        renderer = StereoCrafterRenderer(
+            repo_dir=args.stereocrafter_repo_dir,
+            python_exe=args.stereocrafter_python,
+            checkpoint_dir=args.stereocrafter_checkpoint_dir,
+            max_resolution=args.stereocrafter_max_res,
+        )
+    except (RuntimeError, OSError) as exc:
+        if not fallback:
+            raise
+        log.warning(
+            "⚠️  --stereo-model stereocrafter requested but the StereoCrafter backend "
+            "is unavailable — FALLING BACK to the default depth-shift StereoRenderer. "
+            "The clean-disocclusion '治晕' benefit will NOT apply this run.\n"
+            "  Reason: %s\n"
+            "  Deploy with: python scripts/setup_stereocrafter.py  (needs CUDA)",
+            exc,
+        )
+        return None, "default"
+    log.info("Using StereoCrafter for depth-aware stereo with disocclusion inpainting")
+    return renderer, "stereocrafter"
+
+
 # ---------------------------------------------------------------------------
 # I-6 (#121): model-scoped depth checkpoint dir + meta.json
 # ---------------------------------------------------------------------------
@@ -710,14 +807,14 @@ def run_depth_stage(args, frames):
 
     # DepthCrafter mode — process entire video at once (temporally consistent)
     if args.depth_model == "depthcrafter":
-        log.info("Using DepthCrafter for temporally-consistent video depth estimation")
+        # I-5 (#120): construction is shared with the streaming path via
+        # build_depth_backend (no duplication).  The batch depth stage keeps
+        # the pre-I-5 hard-fail contract (fallback=False): it is a dedicated,
+        # explicitly-invoked step, so a silent degrade would waste a run.
+        # I-6 (#121): the output dir is model-scoped (get_depth_dir) so two
+        # depth models never share a checkpoint directory.
         out_dir = get_depth_dir(args)
-        estimator = DepthCrafterEstimator(
-            repo_dir=args.depthcrafter_repo_dir,
-            python_exe=args.depthcrafter_python,
-            checkpoint_dir=args.depthcrafter_checkpoint_dir,
-            max_resolution=args.depthcrafter_max_res,
-        )
+        estimator, _ = build_depth_backend(args, fallback=False)
         depths = estimator.estimate_video(
             input_path=args.input,
             output_dir=out_dir,
@@ -883,13 +980,10 @@ def _run_stereocrafter_stage(args, frames, depths):
     left_video = os.path.join(temp_dir, "_stereocrafter_left.mp4")
     right_video = os.path.join(temp_dir, "_stereocrafter_right.mp4")
 
-    # Run StereoCrafter
-    renderer = StereoCrafterRenderer(
-        repo_dir=args.stereocrafter_repo_dir,
-        python_exe=args.stereocrafter_python,
-        checkpoint_dir=args.stereocrafter_checkpoint_dir,
-        max_resolution=args.stereocrafter_max_res,
-    )
+    # Run StereoCrafter.  I-5 (#120): construction is shared with the streaming
+    # path via build_stereo_backend (no duplication); fallback=False keeps the
+    # batch stereo stage's pre-I-5 hard-fail contract.
+    renderer, _ = build_stereo_backend(args, fallback=False)
     result_left, result_right = renderer.render_video(
         input_path=temp_video,
         depth_dir=depth_dir,
@@ -1797,6 +1891,14 @@ def main():
     # --resume-from force the batch path.
     if args.streaming and args.stage == "all" and manifest_stages is None:
         log.info("🚀 Streaming pipeline mode (O(1) memory)")
+        # I-5 (#120): the streaming path previously hard-coded Depth-Anything +
+        # StereoRenderer and *silently ignored* --depth-model/--stereo-model.
+        # Build the requested backends via the shared factory (same construction
+        # as the batch stages) and inject them.  fallback=True → an unavailable
+        # DepthCrafter/StereoCrafter logs a loud WARNING and degrades to the
+        # default instead of running silently with the wrong model.
+        depth_backend, depth_backend_name = build_depth_backend(args, fallback=True)
+        stereo_backend, stereo_backend_name = build_stereo_backend(args, fallback=True)
         pipeline = StreamingPipeline(
             model_size=args.model_size,
             device=args.device,
@@ -1813,6 +1915,10 @@ def main():
             gop=getattr(args, "gop", None),
             force_idr=getattr(args, "_preset_force_idr", False),
             faststart=getattr(args, "_preset_faststart", None),
+            depth_estimator=depth_backend,
+            stereo_renderer=stereo_backend,
+            depth_backend_name=depth_backend_name,
+            stereo_backend_name=stereo_backend_name,
         )
         output = get_output_path(args)
         result = pipeline.process_stream(args.input, output, max_frames=args.max_frames)
