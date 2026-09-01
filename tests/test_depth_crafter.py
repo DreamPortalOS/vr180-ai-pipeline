@@ -233,20 +233,42 @@ def test_cli_backend_subprocess_failure(
     mock_run: MagicMock,
     mock_cuda: MagicMock,
 ) -> None:
-    """Non-zero returncode should raise RuntimeError with stderr."""
+    """Non-zero returncode should raise RuntimeError with the stderr tail.
+
+    Issue #127: stdout/stderr are drained to temp files (no PIPE), so the
+    mock writes the child's stderr into the file the backend hands to
+    ``subprocess.run``.  The exception must carry the stderr summary, the
+    command, the cwd, and the real contents of the output dir.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         script_path = Path(tmpdir) / "run.py"
         script_path.write_text("print('ok')")
 
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        mock_result.stdout = ""
-        mock_result.stderr = "CUDA out of memory"
-        mock_run.return_value = mock_result
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        def _fake_run(cmd, **kwargs):
+            # The child crashes after writing a partial product + an error.
+            outdir_path.mkdir(parents=True, exist_ok=True)
+            (outdir_path / "clip_input.mp4").write_bytes(b"x")
+            kwargs["stdout"].write(b"loading weights\n")
+            kwargs["stderr"].write(b"Traceback (most recent call last):\nCUDA out of memory\n")
+            return MagicMock(returncode=1)
+
+        mock_run.side_effect = _fake_run
 
         backend = CLIBackend(repo_dir=tmpdir)
-        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="CUDA out of memory"):
-            backend.estimate_video(input_path=str(script_path), output_dir=outdir)
+        with pytest.raises(RuntimeError) as excinfo:
+            backend.estimate_video(input_path=str(script_path), output_dir=str(outdir_path))
+
+        msg = str(excinfo.value)
+        assert "CUDA out of memory" in msg  # stderr tail folded in
+        assert "loading weights" in msg  # stdout tail folded in
+        assert "Command:" in msg and "run.py" in msg
+        assert f"cwd: {backend.repo_dir}" in msg
+        # Real output-dir contents are listed so the operator sees what the
+        # script actually produced before dying.
+        assert "clip_input.mp4" in msg
+        assert "Output dir contents:" in msg
 
 
 @patch("pipeline.depth_crafter._assert_cuda")
@@ -905,3 +927,153 @@ def test_estimator_forwards_target_size_to_backend(mock_cuda: MagicMock) -> None
         estimator.estimate_video(tmp.name, target_size=(720, 1280))
 
     assert mock_backend.last_target_size == (720, 1280)
+
+
+# ---------------------------------------------------------------------------
+# Issue #127 — subprocess stdout/stderr must never be swallowed
+# ---------------------------------------------------------------------------
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_drains_output_to_files_not_pipes(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """Deadlock guard: stdout/stderr are drained to files, never an undrained PIPE.
+
+    A PIPE whose 64 KB buffer fills without a reader deadlocks the pipeline
+    (see streaming_pipeline.py issues #21/#45/#49).  The backend must hand
+    ``subprocess.run`` real file objects and must not use ``capture_output``.
+    """
+    import subprocess as sp
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_repo(tmpdir)
+        input_video = Path(tmpdir) / "src.mp4"
+        input_video.write_bytes(b"fake")
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        captured: dict = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["capture_output"] = kwargs.get("capture_output")
+            stdout = kwargs.get("stdout")
+            stderr = kwargs.get("stderr")
+            # Real file objects — not PIPE, not DEVNULL.  Filenos are probed
+            # NOW, while the child is "running": the backend closes the temp
+            # files after subprocess.run returns, so a post-hoc fileno()
+            # would raise ValueError on the closed file.
+            captured["stdout_is_pipe_or_devnull"] = stdout in (sp.PIPE, sp.DEVNULL)
+            captured["stderr_is_pipe_or_devnull"] = stderr in (sp.PIPE, sp.DEVNULL)
+            captured["stdout_fileno"] = stdout.fileno() if stdout is not None else None
+            captured["stderr_fileno"] = stderr.fileno() if stderr is not None else None
+            outdir_path.mkdir(parents=True, exist_ok=True)
+            _write_gray_mp4(outdir_path / "src_depth.mp4", num_frames=2)
+            return MagicMock(returncode=0)
+
+        mock_run.side_effect = _fake_run
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        backend.estimate_video(
+            input_path=str(input_video),
+            output_dir=str(outdir_path),
+            target_size=(48, 64),
+        )
+
+        assert captured["capture_output"] in (None, False)
+        assert captured["stdout_is_pipe_or_devnull"] is False
+        assert captured["stderr_is_pipe_or_devnull"] is False
+        assert captured["stdout_fileno"] is not None and captured["stdout_fileno"] >= 0
+        assert captured["stderr_fileno"] is not None and captured["stderr_fileno"] >= 0
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_success_output_not_spammed_at_info(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Successful runs log the subprocess tail at DEBUG only (issue #127).
+
+    With the logger at INFO, none of the child's chatty stdout/stderr may
+    reach the log; at DEBUG the tail becomes visible for troubleshooting.
+    """
+    import logging
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_repo(tmpdir)
+        input_video = Path(tmpdir) / "src.mp4"
+        input_video.write_bytes(b"fake")
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        def _fake_run(cmd, **kwargs):
+            outdir_path.mkdir(parents=True, exist_ok=True)
+            _write_gray_mp4(outdir_path / "src_depth.mp4", num_frames=2)
+            kwargs["stdout"].write(b"noisy-child-stdout\n")
+            kwargs["stderr"].write(b"noisy-child-stderr\n")
+            return MagicMock(returncode=0)
+
+        mock_run.side_effect = _fake_run
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        with caplog.at_level(logging.INFO, logger="pipeline.depth_crafter"):
+            backend.estimate_video(
+                input_path=str(input_video),
+                output_dir=str(outdir_path),
+                target_size=(48, 64),
+            )
+        assert "noisy-child-stdout" not in caplog.text
+        assert "noisy-child-stderr" not in caplog.text
+        # The command line itself is still logged at INFO (existing behaviour).
+        assert "DepthCrafter CLIBackend command:" in caplog.text
+
+        # At DEBUG the tail IS available.
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="pipeline.depth_crafter"):
+            backend.estimate_video(
+                input_path=str(input_video),
+                output_dir=str(outdir_path),
+                target_size=(48, 64),
+            )
+        assert "noisy-child-stdout" in caplog.text
+        assert "noisy-child-stderr" in caplog.text
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_failure_logs_tail_at_error(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Failure logs the last ~40 lines of stdout/stderr at ERROR level."""
+    import logging
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_repo(tmpdir)
+        input_video = Path(tmpdir) / "src.mp4"
+        input_video.write_bytes(b"fake")
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        def _fake_run(cmd, **kwargs):
+            outdir_path.mkdir(parents=True, exist_ok=True)
+            kwargs["stdout"].write(b"out-line\n" * 100)
+            kwargs["stderr"].write(b"err-line\n" * 99 + b"fatal: boom\n")
+            return MagicMock(returncode=2)
+
+        mock_run.side_effect = _fake_run
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        with caplog.at_level(logging.ERROR, logger="pipeline.depth_crafter"), pytest.raises(RuntimeError):
+            backend.estimate_video(input_path=str(input_video), output_dir=str(outdir_path))
+
+        error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert error_records, "expected an ERROR-level record with the subprocess tail"
+        # The last stderr line must be in the ERROR log; lines beyond the
+        # 40-line tail window must NOT be (the log stays bounded).
+        assert any("fatal: boom" in r.message for r in error_records)
+        # 100 stdout lines emitted, tail is 40 → fewer than 60 out-lines logged.
+        out_lines_logged = caplog.text.count("out-line")
+        assert 0 < out_lines_logged <= 45

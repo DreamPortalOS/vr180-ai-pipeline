@@ -550,6 +550,74 @@ class TestCLIBackendInference:
         assert first_cmd[1].endswith("depth_splatting_inference.py")
         assert second_cmd[1].endswith("inpainting_inference.py")
 
+    def test_render_video_success_output_not_spammed_at_info(self, tmp_path, caplog):
+        """Successful runs log the subprocess tail at DEBUG only (issue #127).
+
+        With the logger at INFO, none of the child's chatty stdout/stderr may
+        reach the log; at DEBUG the tail becomes visible.
+        """
+        import logging
+
+        from pipeline.stereo_crafter import CLIBackend
+
+        repo = self._make_repo(tmp_path)
+        backend = CLIBackend(repo_dir=str(repo))
+
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        input_video = tmp_path / "input.mp4"
+        input_video.write_text("")
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        (work_dir / "splatting_results_inpainting_results_sbs.mp4").write_text("fake sbs")
+
+        def _fake_run(cmd, **kwargs):
+            kwargs["stdout"].write(b"noisy-child-stdout\n")
+            kwargs["stderr"].write(b"noisy-child-stderr\n")
+            return subprocess.CompletedProcess(args=cmd, returncode=0)
+
+        def _fake_split(sbs_path, left, right):
+            Path(left).write_text("data")
+            Path(right).write_text("data")
+
+        with (
+            patch("subprocess.run", side_effect=_fake_run),
+            patch.object(CLIBackend, "_split_sbs_video", side_effect=_fake_split),
+            patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
+            patch("pipeline.stereo_crafter.tempfile.mkdtemp", return_value=str(work_dir)),
+            caplog.at_level(logging.INFO, logger="pipeline.stereo_crafter"),
+        ):
+            backend.render_video(
+                input_path=str(input_video),
+                depth_dir=str(depth_dir),
+                output_left=str(tmp_path / "left.mp4"),
+                output_right=str(tmp_path / "right.mp4"),
+            )
+
+        text = caplog.text
+        assert "noisy-child-stdout" not in text
+        assert "noisy-child-stderr" not in text
+        # The command line itself is still logged at INFO (existing behaviour).
+        assert "StereoCrafter CLIBackend" in text
+
+        # At DEBUG the tail IS available for troubleshooting.
+        caplog.clear()
+        with (
+            patch("subprocess.run", side_effect=_fake_run),
+            patch.object(CLIBackend, "_split_sbs_video", side_effect=_fake_split),
+            patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
+            patch("pipeline.stereo_crafter.tempfile.mkdtemp", return_value=str(work_dir)),
+            caplog.at_level(logging.DEBUG, logger="pipeline.stereo_crafter"),
+        ):
+            backend.render_video(
+                input_path=str(input_video),
+                depth_dir=str(depth_dir),
+                output_left=str(tmp_path / "left.mp4"),
+                output_right=str(tmp_path / "right.mp4"),
+            )
+        assert "noisy-child-stdout" in caplog.text
+        assert "noisy-child-stderr" in caplog.text
+
     def test_render_video_command_uses_real_fire_flags(self, tmp_path):
         """Commands use the real upstream fire-style flags (not the old fictional ones)."""
         from pipeline.stereo_crafter import CLIBackend
@@ -616,7 +684,13 @@ class TestCLIBackendInference:
             assert call.kwargs.get("shell") in (None, False)
 
     def test_render_video_subprocess_failure(self, tmp_path):
-        """A non-zero exit in a stage raises a clear RuntimeError naming the stage."""
+        """A non-zero exit in a stage raises a clear RuntimeError naming the stage.
+
+        Issue #127: stdout/stderr are drained to temp files (no PIPE), so the
+        mock writes the child's stderr into the file the backend hands to
+        ``subprocess.run`` — the message must contain that stderr tail plus
+        the command, cwd, and output-dir contents.
+        """
         from pipeline.stereo_crafter import CLIBackend
 
         repo = self._make_repo(tmp_path)
@@ -627,21 +701,32 @@ class TestCLIBackendInference:
         input_video = tmp_path / "input.mp4"
         input_video.write_text("")
 
-        with patch("subprocess.run") as mock_run, patch("pipeline.stereo_crafter._assert_cuda", return_value=None):
-            mock_run.return_value = subprocess.CompletedProcess(
-                args=[], returncode=1, stdout="", stderr="CUDA OOM error"
-            )
+        def _fake_run(cmd, **kwargs):
+            # Simulate the child writing to its drained stderr/stdout files.
+            kwargs["stdout"].write(b"stage log line\n")
+            kwargs["stderr"].write(b"loading unet\nCUDA OOM error\n")
+            return subprocess.CompletedProcess(args=cmd, returncode=1)
 
-            with pytest.raises(RuntimeError) as exc_info:
-                backend.render_video(
-                    input_path=str(input_video),
-                    depth_dir=str(depth_dir),
-                    output_left=str(tmp_path / "left.mp4"),
-                    output_right=str(tmp_path / "right.mp4"),
-                )
+        with (
+            patch("subprocess.run", side_effect=_fake_run) as mock_run,
+            patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            backend.render_video(
+                input_path=str(input_video),
+                depth_dir=str(depth_dir),
+                output_left=str(tmp_path / "left.mp4"),
+                output_right=str(tmp_path / "right.mp4"),
+            )
         msg = str(exc_info.value)
         assert "failed" in msg
         assert "CUDA OOM" in msg
+        # Issue #127: command, cwd, and the real output-dir contents are in the message.
+        assert "Stage 1 (depth splatting)" in msg
+        assert "depth_splatting_inference.py" in msg
+        assert f"cwd: {backend.repo_dir}" in msg
+        assert "Output dir contents:" in msg
+        assert mock_run.call_count == 1  # stage 1 failed, stage 2 never ran
 
     def test_render_video_missing_sbs_output(self, tmp_path):
         """Both stages succeed but the SBS file is absent -> clear error."""
