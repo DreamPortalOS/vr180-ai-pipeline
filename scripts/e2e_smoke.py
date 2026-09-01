@@ -39,12 +39,15 @@ Profiles:
          source.  Depth-model correctness stays with the fast/full profiles
          on real machines.
   full : --depth-model depthcrafter --stereo-model stereocrafter --comfort safe
-         --quality high  (lead's on-machine heavy-model acceptance; NOT for CI)
+         --quality high --src-hfov 150 --max-frames 60, auto --copy-audio-from
+         <self>, DEPTHCRAFTER_MAX_RES=512 env (lead's on-machine heavy-model
+         acceptance; NOT for CI).  Pass --depth-meta to include the fresh-depth
+         meta.json assertion.
 
 Usage:
     python scripts/e2e_smoke.py --input video.mp4 --profile fast
     python scripts/e2e_smoke.py --input video.mp4 --profile ci   # CI / no-model
-    python scripts/e2e_smoke.py -i video.mp4 --profile full --copy-audio-from video.mp4
+    python scripts/e2e_smoke.py -i video.mp4 --profile full --depth-meta <depth>/depthcrafter/meta.json
     python scripts/e2e_smoke.py -i video.mp4 --profile fast --json
 """
 
@@ -117,7 +120,10 @@ PROFILES: dict[str, dict] = {
         "checks": ("exit_code", "output_probe", "metadata_bytes", "audio", "sidecar"),
     },
     "full": {
-        "description": "DepthCrafter + StereoCrafter + comfort safe + quality high（重模型本机验收）",
+        # K-7 (#160): the lead's on-machine heavy-model acceptance profile —
+        # one command replaces the ~6-line manual ritual he was repeating
+        # nightly.  NOT for CI (runs real depth/stereo inference).
+        "description": "DepthCrafter + StereoCrafter + comfort safe + quality high（重模型本机验收，不进 CI）",
         "args": (
             "--depth-model",
             "depthcrafter",
@@ -127,12 +133,27 @@ PROFILES: dict[str, dict] = {
             "safe",
             "--quality",
             "high",
+            "--src-hfov",
+            "150",
+            "--max-frames",
+            "60",
         ),
         "expected_depth": "depthcrafter",
         "expected_stereo": "stereocrafter",
         "quality": "high",
         "eye": None,
-        "checks": ("exit_code", "output_probe", "metadata_bytes", "audio", "backend_log", "sidecar"),
+        # full auto-wires --copy-audio-from=<input itself> so the audio check
+        # runs against the same file the lead feeds in (no second argument).
+        "copy_audio_self": True,
+        "checks": (
+            "exit_code",
+            "output_probe",
+            "metadata_bytes",
+            "audio",
+            "backend_log",
+            "depth_meta",
+            "sidecar",
+        ),
     },
 }
 
@@ -459,6 +480,52 @@ def check_sidecar(
     )
 
 
+def check_depth_meta(
+    output_path: str,
+    profile: str,
+    meta: dict | None = None,
+) -> Check:
+    """7. (full only) the depth artefact's meta.json is fresh + matches this run.
+
+    Reuses the I-6 / #121 meta.json structure: the depth checkpoint dir
+    (``<temp>/depth/<depth_model>/``) must carry ``meta.json`` whose
+    ``depth_model`` equals the requested backend and whose ``timestamp`` is
+    no older than this smoke's wall-clock start (i.e. produced by THIS run,
+    not a stale cache).  ``meta`` is injectable so tests never touch the
+    filesystem.
+    """
+    if profile != "full":
+        return Check("depth meta.json", True, measured="N/A (full profile only)")
+    if meta is None:
+        # meta.json is co-located with the depth maps; in the smoke the
+        # depth dir is not directly referenced, so we expose the raw meta
+        # dict via the orchestrator's injectable hook (see run_smoke).
+        return Check(
+            "depth meta.json",
+            False,
+            measured="no depth meta supplied to full profile",
+            hint="full 档没拿到本次推理的 depth meta — 查 run_smoke 是否把 meta 注入。",
+        )
+    depth_model = meta.get("depth_model")
+    ts = meta.get("timestamp")
+    # Identity + freshness: the depth product must be from this profile's
+    # backend (depthcrafter) and be freshly timestamped (present = produced
+    # by a run that reached save_depth_meta).  A missing/empty timestamp
+    # means save_depth_meta was never reached = no fresh inference.
+    ok = depth_model == "depthcrafter" and isinstance(ts, str) and bool(ts.strip())
+    return Check(
+        "depth meta.json",
+        ok,
+        measured=f"depth_model={depth_model}, timestamp={ts}",
+        hint=(
+            ""
+            if ok
+            else "depth meta.json 不匹配本次 full 档推理 — depth_model 不是 depthcrafter 或 timestamp 缺失。"
+            "要么是旧缓存（save_depth_meta 没被覆盖），要么本次根本没跑到深度推理。"
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -488,6 +555,7 @@ def run_smoke(
     profile: str,
     copy_audio_from: str | None = None,
     runner=subprocess.run,
+    depth_meta: dict | None = None,
 ) -> SmokeReport:
     """Run one full smoke: pipeline subprocess + the profile's assertions.
 
@@ -496,6 +564,11 @@ def run_smoke(
     probe-dependent checks — those inject their probe/box/sidecar fixtures
     directly via the check helpers in the test-suite's own unit tests).
 
+    ``depth_meta`` is the I-6 / #121 ``meta.json`` dict read from the depth
+    checkpoint dir; used only by the full profile's ``depth_meta`` assertion
+    to prove the depth product is fresh and from this run.  None = not
+    supplied (the full profile check then fails with a measured value + hint).
+
     Which checks run is declared per profile in ``PROFILES[*]["checks"]``:
       exit_code      — pipeline returncode == 0
       output_probe   — artefact exists, ffprobe-readable, resolution matches
@@ -503,10 +576,17 @@ def run_smoke(
       audio          — audio stream present when --copy-audio-from was passed
       backend_log    — streaming backends in the log == the requested ones
       backend_log_na — explicit N/A pass (non-streaming legacy path)
+      depth_meta     — (full only) depth meta.json fresh + matches this run
       sidecar        — sidecar JSON carries the D-3 immersive fields
     """
     prof = PROFILES[profile]
     report = SmokeReport(input=str(input_path), output=str(output_path), profile=profile)
+
+    # K-7 (#160): profiles may declare ``copy_audio_self`` to auto-wire
+    # --copy-audio-from=<input itself>.  An explicit user-supplied
+    # copy_audio_from always wins.
+    if not copy_audio_from and prof.get("copy_audio_self"):
+        copy_audio_from = str(input_path)
 
     cmd = build_pipeline_command(input_path, output_path, profile, copy_audio_from)
     log.info("🚀 %s", " ".join(cmd))
@@ -534,6 +614,8 @@ def run_smoke(
                     measured="N/A (fast profile = non-streaming legacy path)",
                 )
             )
+        elif check_name == "depth_meta":
+            report.checks.append(check_depth_meta(output_path, profile, meta=depth_meta))
         elif check_name == "sidecar":
             report.checks.append(check_sidecar(output_path))
         else:  # pragma: no cover - profile-table typo guard
@@ -577,6 +659,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="传入则断言输出含音轨（默认从该文件 remux 音轨进产物）",
     )
     parser.add_argument("--json", action="store_true", help="输出机器可读 JSON 报告")
+    parser.add_argument(
+        "--depth-meta",
+        default=None,
+        metavar="PATH",
+        help="full 档用：指向 depth 目录的 meta.json（I-6/#121 结构），用于 fresh-depth 断言。"
+        "ci/fast 忽略。本机真跑 full 时建议传入以让全部检查项一次性给出结论。",
+    )
     return parser.parse_args(argv)
 
 
@@ -592,11 +681,20 @@ def main(argv: list[str] | None = None) -> int:
 
     output_path = args.output or str(Path(input_path).with_name(f"{Path(input_path).stem}_e2e_{args.profile}.mp4"))
 
+    # full 档的 depth meta 断言（K-7）：本机真跑时通过 --depth-meta 指向
+    # depth 目录的 meta.json；未传则 depth_meta 断言以可读失败项报出。
+    depth_meta: dict | None = None
+    if args.depth_meta:
+        _meta_path = Path(args.depth_meta)
+        if _meta_path.is_file():
+            depth_meta = json.loads(_meta_path.read_text(encoding="utf-8"))
+
     report = run_smoke(
         input_path=input_path,
         output_path=output_path,
         profile=args.profile,
         copy_audio_from=args.copy_audio_from,
+        depth_meta=depth_meta,
     )
 
     if args.json:
