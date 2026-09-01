@@ -1941,6 +1941,16 @@ def main():
             raise
         os.replace(injected, result)
         log.info(f"✅ Streaming pipeline complete (sv3d/st3d injected) → {result}")
+        # H-1.2 (#132): audio passthrough for the streaming branch.  The
+        # batch path below remuxes --copy-audio-from (or the input's own
+        # audio) after metadata injection; the streaming branch previously
+        # returned before reaching it, silently producing a silent video.
+        # Reuse the same helpers — re_inject=True re-embeds sv3d/st3d after
+        # the remux (issue #91: ffmpeg -c copy drops the sample-entry boxes).
+        if getattr(args, "copy_audio_from", None):
+            _copy_audio_to_output(result, args.copy_audio_from, re_inject=True)
+        else:
+            _maybe_copy_audio_from_input(result, args.input, re_inject=True)
         # D-1: sidecar — one JSON per output artefact (see pipeline.sidecar).
         _write_sidecar_from_args(result, "vr180", args)
         return
