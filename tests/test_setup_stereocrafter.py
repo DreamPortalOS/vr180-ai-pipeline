@@ -699,32 +699,56 @@ class TestDownloadSvdBase:
         ignore = captured["ignore_patterns"]
         assert "*.bin" in ignore
 
-    def test_redownloads_when_fp16_image_encoder_missing(self, sandbox):
-        """A dir that has SOME files but is missing a required weight
-        component must NOT be silently treated as ready — per requirement 3 of
-        issue #186 it raises a clear, actionable RuntimeError naming the
-        missing component(s) rather than re-running the download hoping it
-        self-heals or crashing later in inference with an opaque error."""
+    def test_reuses_hf_cache_when_partial(self, sandbox, monkeypatch):
+        """Issue #190: a partial in-repo snapshot (missing weight components)
+        must NOT raise and block — it reuses the standard HF cache to fill
+        the gap (cached vae / image_encoder are NOT re-downloaded; only the
+        missing unet is fetched).  snapshot_download IS called, the broken
+        in-repo snapshot is wiped first, and the download proceeds cleanly.
+
+        This supersedes the #186 raise-on-partial behaviour: the whole point
+        of #190 is that the broken state is now the problem we FIX by
+        reusing the cache rather than the problem we refuse to touch.
+        """
         sandbox.svd_dir.mkdir(parents=True)
-        (sandbox.svd_dir / "model_index.json").write_text("{}")  # non-empty, but no weight files
+        unet = sandbox.svd_dir / "unet"
+        unet.mkdir()
+        (unet / "config.json").write_text("{}", encoding="utf-8")
+        # vae + image_encoder are present (as if the HF cache had them)
+        _write_weight(sandbox.svd_dir, "vae")
+        _write_weight(sandbox.svd_dir, "image_encoder")
 
         fake_hf = MagicMock()
-        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not be called"))
+
+        fake_dl = MagicMock()
+
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token, **kwargs):
+            fake_dl(
+                repo_id=repo_id,
+                local_dir=local_dir,
+                local_dir_use_symlinks=local_dir_use_symlinks,
+                token=token,
+            )
+            assert repo_id == setup._SVD_REPO_ID
+            assert local_dir == str(sandbox.svd_dir)
+            return local_dir
+
+        fake_hf.snapshot_download = fake_snapshot_download
         fake_hf.HfFolder = MagicMock()
         fake_hf.HfFolder.get_token = MagicMock(return_value="hf_present")
-        with (
-            patch.dict("sys.modules", {"huggingface_hub": fake_hf}),
-            pytest.raises(RuntimeError, match="INCOMPLETE"),
-        ):
-            setup.download_svd_base(
-                None,
-                skip_svd=False,
-                hf_token="hf_present",
-                dry_run=False,
-                buffer=setup.DryRunBuffer(),
-            )
-        # The download must NOT have been attempted — we raise before it.
-        fake_hf.snapshot_download.assert_not_called()
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+
+        # Must NOT raise — it reuses the cache and fills the missing unet.
+        setup.download_svd_base(
+            None,
+            skip_svd=False,
+            hf_token="hf_present",
+            dry_run=False,
+            buffer=setup.DryRunBuffer(),
+        )
+        # snapshot_download WAS called (this is the #190 reuse path).
+        fake_dl.assert_called_once()
+        assert fake_dl.call_args.kwargs["token"] == "hf_present"
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1111,8 @@ class TestVerifyOnly:
         fake_hf = MagicMock()
         fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not download"))
         monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+        # No HF cache copy — the report is purely about the in-repo dir.
+        monkeypatch.setattr(setup, "_hf_cache_snapshot_dir", lambda _r: None)
 
         with pytest.raises(SystemExit) as exc_info:
             setup.main(["--verify-only"])
@@ -1107,13 +1133,14 @@ class TestVerifyOnly:
         fake_hf = MagicMock()
         fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not download"))
         monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+        monkeypatch.setattr(setup, "_hf_cache_snapshot_dir", lambda _r: None)
 
         with pytest.raises(SystemExit) as exc_info:
             setup.main(["--verify-only"])
         assert exc_info.value.code == 1
         fake_hf.snapshot_download.assert_not_called()
 
-    def test_verify_only_reports_missing_unet_component(self, sandbox):
+    def test_verify_only_reports_missing_unet_component(self, sandbox, monkeypatch):
         """verify_svd_base() returns per-component lines; the config-only unet
         line must say MISSING."""
         sandbox.svd_dir.mkdir(parents=True)
@@ -1123,11 +1150,14 @@ class TestVerifyOnly:
         _write_weight(sandbox.svd_dir, "vae")
         _write_weight(sandbox.svd_dir, "image_encoder")
 
+        # Isolate the report to the in-repo dir only (no HF-cache fallback).
+        monkeypatch.setattr(setup, "_hf_cache_snapshot_dir", lambda _r: None)
+
         report = setup.verify_svd_base(sandbox.svd_dir)
-        unet_lines = [ln for ln in report if ln.startswith("[svd] unet")]
+        unet_lines = [ln for ln in report if "unet" in ln.lower()]
         assert unet_lines, report
-        assert "MISSING" in unet_lines[0], report
-        assert any("OK" in ln for ln in report if ln.startswith("[svd] vae")), report
+        assert any("MISSING" in ln for ln in unet_lines), report
+        assert any("OK" in ln and "vae" in ln for ln in report), report
 
     def test_verify_only_all_complete_exits_zero(self, sandbox, monkeypatch):
         """When every component has a real weight, --verify-only exits 0 and
@@ -1146,14 +1176,207 @@ class TestVerifyOnly:
         fake_hf.snapshot_download.assert_not_called()
 
     def test_verify_only_missing_svd_dir_exits_one(self, sandbox, monkeypatch, tmp_path):
-        """When the SVD dir does not exist at all, --verify-only exits 1 with a
-        clear 'nothing to verify' message rather than trying to download."""
+        """When the SVD dir does not exist AND there is no HF cache copy,
+        --verify-only exits 1 with a clear 'nothing to verify' message rather
+        than trying to download."""
         missing = tmp_path / "no-such-svd"
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not download"))
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+        # No HF cache copy available — exit 1.
+        monkeypatch.setattr(setup, "_hf_cache_snapshot_dir", lambda _r: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            setup.main(["--verify-only", "--svd-dir", str(missing)])
+        assert exc_info.value.code == 1
+        fake_hf.snapshot_download.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Issue #190: dual-path verify (in-repo + standard HF cache) + cache reuse
+# ---------------------------------------------------------------------------
+
+
+class TestHfCacheResolution:
+    """_hf_cache_snapshot_dir resolves the standard HF cache snapshot path via
+    huggingface_hub.try_to_load_from_cache (issue #190)."""
+
+    def test_returns_snapshot_dir_when_repo_cached(self, tmp_path):
+        """When try_to_load_from_cache resolves model_index.json to a real path,
+        the parent (snapshot dir) is returned."""
+        snapshot_dir = tmp_path / "snapshots" / "abc123"
+        snapshot_dir.mkdir(parents=True)
+        (snapshot_dir / "model_index.json").write_text("{}", encoding="utf-8")
+
+        def fake_try_to_load(repo_id, filename):
+            assert repo_id == "stabilityai/stable-video-diffusion-img2vid-xt-1-1"
+            assert filename == "model_index.json"
+            return str(snapshot_dir / "model_index.json")
+
+        with patch.dict("sys.modules", {"huggingface_hub": MagicMock(try_to_load_from_cache=fake_try_to_load)}):
+            result = setup._hf_cache_snapshot_dir("stabilityai/stable-video-diffusion-img2vid-xt-1-1")
+        assert result == snapshot_dir
+
+    def test_returns_none_when_not_cached(self, tmp_path):
+        """When try_to_load_from_cache returns None (file not in cache), the
+        resolver returns None."""
+
+        def fake_try_to_load(repo_id, filename):
+            return None
+
+        with patch.dict("sys.modules", {"huggingface_hub": MagicMock(try_to_load_from_cache=fake_try_to_load)}):
+            result = setup._hf_cache_snapshot_dir("stabilityai/stable-video-diffusion-img2vid-xt-1-1")
+        assert result is None
+
+    def test_returns_none_when_hf_hub_unavailable(self):
+        """When huggingface_hub is not importable, the resolver returns None
+        gracefully (CI-safe)."""
+        with patch.dict("sys.modules", {"huggingface_hub": None}):
+            result = setup._hf_cache_snapshot_dir("stabilityai/stable-video-diffusion-img2vid-xt-1-1")
+        assert result is None
+
+    def test_requests_model_index_json(self):
+        """The resolver specifically looks up model_index.json (present in every
+        diffusers model snapshot) — assert it never asks for a weight file."""
+
+        def fake_try_to_load(repo_id, filename):
+            assert filename == "model_index.json", f"unexpected filename: {filename}"
+            return "/nonexistent/snapshots/abc/model_index.json"
+
+        with patch.dict("sys.modules", {"huggingface_hub": MagicMock(try_to_load_from_cache=fake_try_to_load)}):
+            result = setup._hf_cache_snapshot_dir("stabilityai/stable-video-diffusion-img2vid-xt-1-1")
+        # The path does not exist on disk, so the resolver returns None even
+        # though try_to_load_from_cache returned a string — belt-and-braces.
+        assert result is None
+
+
+class TestVerifyOnlyDualPath:
+    """--verify-only recognises BOTH the in-repo SVD directory AND the standard
+    HF cache snapshot (issue #190 requirement 2).  Whichever is complete counts
+    as complete, and the output prints which path was inspected.
+    """
+
+    def test_inrepo_absent_hf_cache_complete_is_complete(self, sandbox, monkeypatch, tmp_path):
+        """When the in-repo SVD dir does not exist but the HF cache has a full
+        snapshot, --verify-only reports COMPLETE (exit 0) and points at the HF
+        cache path."""
+        # In-repo dir does NOT exist (the lead's exact state).
+        assert not sandbox.svd_dir.exists()
+
+        # Fake a complete HF cache snapshot.
+        hf_snap = tmp_path / "hf-cache" / "snapshots" / "abc123"
+        for name in setup._SVD_WEIGHT_COMPONENTS:
+            _write_weight(hf_snap, name)
+        (hf_snap / "model_index.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(
+            setup,
+            "_hf_cache_snapshot_dir",
+            lambda _r: hf_snap,
+        )
+
         fake_hf = MagicMock()
         fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not download"))
         monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
 
         with pytest.raises(SystemExit) as exc_info:
-            setup.main(["--verify-only", "--svd-dir", str(missing)])
-        assert exc_info.value.code == 1
+            setup.main(["--verify-only"])
+        assert exc_info.value.code == 0, "HF-cache-complete must count as complete"
+        fake_hf.snapshot_download.assert_not_called()
+
+    def test_hf_cache_config_only_unet_reports_missing_and_names_unet(self, sandbox, monkeypatch, tmp_path):
+        """When the HF cache snapshot has unet config-only (the real state of
+        the lead's cache), --verify-only reports MISSING and the text names
+        `unet` (issue #190 acceptance: '报错文本里出现 unet')."""
+        # In-repo absent; HF cache has vae + image_encoder but unet config-only.
+        assert not sandbox.svd_dir.exists()
+
+        hf_snap = tmp_path / "hf-cache" / "snapshots" / "abc123"
+        _write_weight(hf_snap, "vae")
+        _write_weight(hf_snap, "image_encoder")
+        unet = hf_snap / "unet"
+        unet.mkdir(parents=True)
+        (unet / "config.json").write_text("{}", encoding="utf-8")
+        (hf_snap / "model_index.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(
+            setup,
+            "_hf_cache_snapshot_dir",
+            lambda _r: hf_snap,
+        )
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not download"))
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+
+        with pytest.raises(SystemExit) as exc_info:
+            setup.main(["--verify-only"])
+        assert exc_info.value.code == 1  # unet missing → not complete
+        fake_hf.snapshot_download.assert_not_called()
+
+    def test_verify_report_names_missing_component(self, sandbox, monkeypatch, tmp_path, caplog):
+        """The verify report must explicitly name the missing component — e.g.
+        'unet  MISSING weights (only config found)' — not a blanket 'directory
+        does not exist' (issue #190 requirement 3)."""
+        caplog.set_level("INFO", logger="setup-stereocrafter")
+
+        # In-repo absent; HF cache has config-only unet.
+        hf_snap = tmp_path / "hf-cache" / "snapshots" / "abc123"
+        _write_weight(hf_snap, "vae")
+        _write_weight(hf_snap, "image_encoder")
+        (hf_snap / "unet" / "config.json").parent.mkdir(parents=True, exist_ok=True)
+        (hf_snap / "unet" / "config.json").write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(
+            setup,
+            "_hf_cache_snapshot_dir",
+            lambda _r: hf_snap,
+        )
+        monkeypatch.setitem(sys.modules, "huggingface_hub", MagicMock(snapshot_download=MagicMock()))
+
+        with pytest.raises(SystemExit):
+            setup.main(["--verify-only"])
+
+        joined = "\n".join(r.message for r in caplog.records)
+        # The component name must appear alongside MISSING.
+        assert "unet" in joined.lower(), joined
+        assert "MISSING" in joined, joined
+
+    def test_verify_output_contains_checked_path(self, sandbox, monkeypatch, tmp_path, caplog):
+        """The output must contain the path that was actually checked, so the
+        user can see exactly where the base lives (issue #190: '这次就是因为
+        看不出它在查哪儿，才没人发现基座压根没建')."""
+        caplog.set_level("INFO", logger="setup-stereocrafter")
+
+        # In-repo dir present (so the report names it explicitly).
+        sandbox.svd_dir.mkdir(parents=True)
+        for name in setup._SVD_WEIGHT_COMPONENTS:
+            _write_weight(sandbox.svd_dir, name)
+
+        monkeypatch.setattr(setup, "_hf_cache_snapshot_dir", lambda _r: None)
+        monkeypatch.setitem(sys.modules, "huggingface_hub", MagicMock(snapshot_download=MagicMock()))
+
+        with pytest.raises(SystemExit) as exc_info:
+            setup.main(["--verify-only"])
+        assert exc_info.value.code == 0
+
+        joined = "\n".join(r.message for r in caplog.records)
+        # The report must include the absolute path of the directory it checked.
+        assert str(sandbox.svd_dir) in joined, joined
+
+    def test_verify_only_never_downloads_from_hf_cache_lookup(self, sandbox, monkeypatch, tmp_path):
+        """--verify-only must not trigger snapshot_download — even when it
+        consults the HF cache, the lookup uses try_to_load_from_cache (a
+        filesystem check), NOT snapshot_download."""
+        sandbox.svd_dir.mkdir(parents=True)
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not download"))
+        fake_hf.try_to_load_from_cache = MagicMock(
+            return_value=str(tmp_path / "model_index.json"),
+        )
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+
+        with pytest.raises(SystemExit):
+            setup.main(["--verify-only"])
         fake_hf.snapshot_download.assert_not_called()
