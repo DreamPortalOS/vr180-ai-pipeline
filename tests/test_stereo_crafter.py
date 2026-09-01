@@ -728,6 +728,64 @@ class TestCLIBackendInference:
         assert "Output dir contents:" in msg
         assert mock_run.call_count == 1  # stage 1 failed, stage 2 never ran
 
+    def test_render_video_timeout(self, tmp_path, monkeypatch):
+        """A subprocess timeout raises with the same diagnostics as a failure.
+
+        Issue #134: the timeout branch must carry command, cwd, output tail,
+        and the output-dir listing (issue #127 only covered non-zero exits).
+        STEREOCRAFTER_TIMEOUT_SEC overrides the default 2-hour timeout.
+        """
+        from pipeline.stereo_crafter import CLIBackend
+
+        monkeypatch.setenv("STEREOCRAFTER_TIMEOUT_SEC", "60")
+        repo = self._make_repo(tmp_path)
+        backend = CLIBackend(repo_dir=str(repo))
+        assert backend.timeout_sec == 60
+
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        input_video = tmp_path / "input.mp4"
+        input_video.write_text("")
+
+        # Pin the work dir so the fake child can drop a partial product in it.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        def _fake_run(cmd, **kwargs):
+            # The child wrote a partial product + progress before being killed.
+            (work_dir / "splatting_results.mp4").write_bytes(b"x")
+            kwargs["stdout"].write(b"stage log line\n")
+            kwargs["stderr"].write(b"loading unet\nframe 10/500\n")
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+        with (
+            patch("subprocess.run", side_effect=_fake_run) as mock_run,
+            patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
+            patch("pipeline.stereo_crafter.tempfile.mkdtemp", return_value=str(work_dir)),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            backend.render_video(
+                input_path=str(input_video),
+                depth_dir=str(depth_dir),
+                output_left=str(tmp_path / "left.mp4"),
+                output_right=str(tmp_path / "right.mp4"),
+            )
+        msg = str(exc_info.value)
+        assert "timed out after 60 seconds" in msg  # env override took effect
+        assert "STEREOCRAFTER_TIMEOUT_SEC" in msg  # how to adjust it
+        assert "default 7200" in msg
+        # Command / cwd (symmetric with the failure-branch test above).
+        assert "Stage 1 (depth splatting)" in msg
+        assert "depth_splatting_inference.py" in msg
+        assert f"cwd: {backend.repo_dir}" in msg
+        # Output produced before the kill is surfaced.
+        assert "stage log line" in msg  # stdout tail
+        assert "loading unet" in msg  # stderr tail
+        # Real output-dir contents are listed.
+        assert "splatting_results.mp4" in msg
+        assert "Output dir contents:" in msg
+        assert mock_run.call_count == 1  # stage 1 timed out, stage 2 never ran
+
     def test_render_video_missing_sbs_output(self, tmp_path):
         """Both stages succeed but the SBS file is absent -> clear error."""
         from pipeline.stereo_crafter import CLIBackend
