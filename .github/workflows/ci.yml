@@ -39,3 +39,42 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run tests
         run: pytest tests/ -m "not slow" --tb=short
+
+  # K-5.1 (#152): run the e2e smoke's `ci` profile on every PR — a real
+  # no-model conversion that guards the wiring mock tests cannot (module
+  # imports, run_pipeline arg plumbing, equirect projection, sv3d/st3d
+  # injection, sidecar).  --force-sbs skips depth/stereo so NO model is
+  # downloaded and no GPU is needed; the run is seconds, not minutes.
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+      # Tiny synthetic source — NEVER touch video/ (git-ignored local assets).
+      # 1280×360 (ratio 3.56 ≥ 3.5) reads as SBS stereo, which is exactly what
+      # the ci profile's --force-sbs path expects; the sine track lets the
+      # audio-stream assertion run against a real remux.
+      - name: Synthesize test clip
+        run: |
+          ffmpeg -y -v error \
+            -f lavfi -i testsrc2=size=1280x360:rate=24:duration=1 \
+            -f lavfi -i sine=frequency=440:duration=1 \
+            -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest /tmp/e2e_ci_src.mp4
+      # All repo scripts need PYTHONPATH=. (same as README / other steps) —
+      # PR #153 failed CI precisely because this was missing.
+      - name: Run e2e smoke (ci profile, no model download)
+        env:
+          PYTHONPATH: .
+        run: >
+          python scripts/e2e_smoke.py
+          --input /tmp/e2e_ci_src.mp4
+          --output /tmp/e2e_ci_out.mp4
+          --profile ci
+          --copy-audio-from /tmp/e2e_ci_src.mp4

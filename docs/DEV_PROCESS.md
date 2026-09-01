@@ -39,6 +39,10 @@ Lead 写卡（GitHub Issue, stage:ready + model:cheap + agent-ok）
 1. `pytest -m "not slow"` + `ruff` 在**本机（CUDA）**全绿——CI 无 GPU，机器相关缺陷只有这里能抓。
 2. **实机跑真实路径**：真渲染/真文件/真 ffmpeg（历史教训：SBS 布局错乱、NVENC 驱动不符、
    元数据未注入，全部是 CI 绿但实机炸）。
+   - **CI 已覆盖 e2e 冒烟的 ci 档**（`e2e-smoke` job：`--force-sbs` 跳过深度/立体，不下载模型、
+     不要 GPU，验证投影+sv3d/st3d 元数据+sidecar+音频链路，秒级）——PR 红即接线已断，不必等 lead。
+     lead 实机只需跑 `full` 档（重模型 DepthCrafter+StereoCrafter 验收）；
+     `fast` 档（纯 Depth-Anything）按需本机跑。
 3. 产物过 `scripts/vr180_qa.py`；视频类交付抽帧肉眼核对。
 4. 验收结论写进 WORKLOG（发现的缺陷 → 修复卡附字节级诊断）。
 
