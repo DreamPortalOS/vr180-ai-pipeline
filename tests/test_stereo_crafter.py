@@ -495,21 +495,31 @@ class TestPreTrainedPathResolution:
         (repo / "inpainting_inference.py").write_text("# fake stage-2 entry")
         return repo
 
-    def test_default_is_hf_model_id_when_no_local_copy(self, repo, monkeypatch, tmp_path):
+    def test_default_is_hf_model_id_when_no_local_copy(self, repo, monkeypatch, tmp_path, caplog):
         """No local SVD dir → fall back to the HF model id, NOT a fictional
         ``<repo>/weights/...`` path (the exact regression of issue #147)."""
+        import logging
+
         from pipeline import stereo_crafter as sc
         from pipeline.stereo_crafter import CLIBackend
 
         absent_svd = tmp_path / "models" / "svd-img2vid-xt-1-1"
         monkeypatch.setattr(sc, "INREPO_SVD_DIR", absent_svd, raising=True)
 
-        with patch.dict(os.environ, {}, clear=True):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            caplog.at_level(logging.WARNING, logger="pipeline.stereo_crafter"),
+        ):
             backend = CLIBackend(repo_dir=str(repo))
         assert backend.pre_trained_path == "stabilityai/stable-video-diffusion-img2vid-xt-1-1"
         # Regression guard: the old broken default must never reappear.
         assert "weights" not in backend.pre_trained_path
         assert not backend.pre_trained_path.startswith(str(repo))
+        # Issue #155: the remote-resolution fallback is the path that tripped
+        # the safetensors/.bin load failure, so it must be a WARNING (not the
+        # old INFO nudge) and must name the issue so an operator can act.
+        assert any("155" in r.message for r in caplog.records), caplog.text
+        assert any("setup_stereocrafter.py" in r.message for r in caplog.records), caplog.text
 
     def test_inrepo_svd_dir_used_when_present(self, repo, monkeypatch, tmp_path):
         """A locally pre-downloaded SVD base (models/svd-img2vid-xt-1-1) wins

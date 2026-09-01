@@ -268,7 +268,10 @@ class TestEnsureVenvAndDeps:
         with patch("subprocess.check_call", side_effect=fake_check_call):
             setup.ensure_venv_and_deps(None, None, dry_run=False, buffer=setup.DryRunBuffer())
 
-        deps_calls = [c for c in calls if "diffusers" in c]
+        # Match the deps install by a substring on any token (transformers /
+        # diffusers are now version-pinned, e.g. 'diffusers==0.29.2', so a
+        # bare-equality list membership check would miss them — issue #155).
+        deps_calls = [c for c in calls if any("diffusers" in tok for tok in c)]
         assert deps_calls, f"no runtime-deps install call in {calls}"
         dc = deps_calls[0]
         for dep in setup.RUNTIME_DEPS:
@@ -305,7 +308,8 @@ class TestEnsureVenvAndDeps:
             setup.ensure_venv_and_deps(None, mirror, dry_run=False, buffer=setup.DryRunBuffer())
 
         torch_call = next(c for c in calls if any("torch==" in tok for tok in c))
-        deps_call = next(c for c in calls if "diffusers" in c)
+        # Substring match: diffusers is now version-pinned (issue #155).
+        deps_call = next(c for c in calls if any("diffusers" in tok for tok in c))
         assert "--index-url" in torch_call
         assert setup.TORCH_INDEX_URL in torch_call
         assert "-i" in deps_call
@@ -387,9 +391,16 @@ class TestDownloadSvdBase:
         assert any("skip-svd" in r.message.lower() for r in caplog.records)
 
     def test_skips_existing_svd_snapshot(self, sandbox):
-        """A non-empty SVD dir is treated as already-downloaded and skipped."""
+        """A dir that already has the three fp16 safetensors is treated as
+        ready and skipped (issue #155: the presence check keys on exactly the
+        files the Stage-2 local-folder resolver looks for)."""
         sandbox.svd_dir.mkdir(parents=True)
-        (sandbox.svd_dir / "unet.bin").write_text("weights")
+        (sandbox.svd_dir / "image_encoder").mkdir()
+        (sandbox.svd_dir / "unet").mkdir()
+        (sandbox.svd_dir / "vae").mkdir()
+        (sandbox.svd_dir / "image_encoder" / "model.fp16.safetensors").write_text("w")
+        (sandbox.svd_dir / "unet" / "diffusion_pytorch_model.fp16.safetensors").write_text("w")
+        (sandbox.svd_dir / "vae" / "diffusion_pytorch_model.fp16.safetensors").write_text("w")
 
         fake_hf = MagicMock()
         fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not be called"))
@@ -401,7 +412,7 @@ class TestDownloadSvdBase:
         """With no --svd-dir, the SVD base lands in the in-repo models/svd-img2vid-xt-1-1."""
         captured = {}
 
-        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token):
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token, **kwargs):
             captured["repo_id"] = repo_id
             captured["local_dir"] = local_dir
             captured["token"] = token
@@ -430,7 +441,7 @@ class TestDownloadSvdBase:
         custom = tmp_path / "custom-svd"
         captured = {}
 
-        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token):
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token, **kwargs):
             captured["local_dir"] = local_dir
             Path(local_dir).mkdir(parents=True, exist_ok=True)
             (Path(local_dir) / "svd.bin").write_text("fake")
@@ -460,7 +471,7 @@ class TestDownloadSvdBase:
         # Ensure huggingface_hub's own get_token does not shadow the env var.
         captured = {}
 
-        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token):
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token, **kwargs):
             captured["token"] = token
             Path(local_dir).mkdir(parents=True, exist_ok=True)
             (Path(local_dir) / "svd.bin").write_text("fake")
@@ -533,7 +544,7 @@ class TestDownloadSvdBase:
             monkeypatch.delenv(var, raising=False)
         caplog.set_level("WARNING", logger="setup-stereocrafter")
 
-        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token):
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token, **kwargs):
             Path(local_dir).mkdir(parents=True, exist_ok=True)
             (Path(local_dir) / "svd.bin").write_text("fake")
             return local_dir
@@ -552,8 +563,119 @@ class TestDownloadSvdBase:
             )
         assert any("gated" in r.message.lower() for r in caplog.records)
 
+    def test_fetches_only_fp16_safetensors(self, sandbox):
+        """Issue #155: the snapshot uses allow_patterns restricted to fp16
+        safetensors + configs (≈5 GB, not the full ~10 GB repo) and ignores
+        .bin entirely — the repo ships only safetensors and we want exactly
+        the files the Stage-2 local-folder resolver looks for."""
+        captured: dict = {}
+
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token, **kwargs):
+            captured["allow_patterns"] = kwargs.get("allow_patterns")
+            captured["ignore_patterns"] = kwargs.get("ignore_patterns")
+            Path(local_dir).mkdir(parents=True, exist_ok=True)
+            (Path(local_dir) / "svd.bin").write_text("fake")
+            return local_dir
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = fake_snapshot_download
+        fake_hf.HfFolder = MagicMock()
+        fake_hf.HfFolder.get_token = MagicMock(return_value="hf_present")
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            setup.download_svd_base(
+                None,
+                skip_svd=False,
+                hf_token="hf_present",
+                dry_run=False,
+                buffer=setup.DryRunBuffer(),
+            )
+
+        allow = captured["allow_patterns"]
+        assert allow is not None
+        # The three fp16 safetensors the Stage-2 loaders resolve locally must
+        # be in the allow list.
+        assert "image_encoder/model.fp16.safetensors" in allow
+        assert "unet/diffusion_pytorch_model.fp16.safetensors" in allow
+        assert "vae/diffusion_pytorch_model.fp16.safetensors" in allow
+        # The fp32 variants are NOT requested.
+        assert "image_encoder/model.safetensors" not in allow
+        assert "unet/diffusion_pytorch_model.safetensors" not in allow
+        # .bin is never fetched even if it appeared upstream.
+        ignore = captured["ignore_patterns"]
+        assert "*.bin" in ignore
+
+    def test_redownloads_when_fp16_image_encoder_missing(self, sandbox):
+        """A dir that has SOME files but is missing the fp16 image_encoder
+        safetensors is NOT considered ready (issue #155) — the exact file the
+        upstream loader needs must be present, so the download re-runs."""
+        sandbox.svd_dir.mkdir(parents=True)
+        (sandbox.svd_dir / "model_index.json").write_text("{}")  # non-empty, but no fp16 weights
+
+        captured: dict = {}
+
+        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token, **kwargs):
+            captured["called"] = True
+            return local_dir
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = fake_snapshot_download
+        fake_hf.HfFolder = MagicMock()
+        fake_hf.HfFolder.get_token = MagicMock(return_value="hf_present")
+        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+            setup.download_svd_base(
+                None,
+                skip_svd=False,
+                hf_token="hf_present",
+                dry_run=False,
+                buffer=setup.DryRunBuffer(),
+            )
+        assert captured.get("called") is True
+
 
 # ---------------------------------------------------------------------------
+# Runtime dep version pins (issue #155 — the safetensors load fix)
+# ---------------------------------------------------------------------------
+
+
+class TestRuntimeDepPins:
+    """Issue #155: transformers/diffusers must be PINNED to the combo upstream
+    tested, so the local-folder safetensors-first resolution path is the one
+    upstream validated (an unpinned transformers could drift to a 5.x that
+    breaks the vendored SVD inpainting pipeline, or an older line that
+    defaults to .bin).
+    """
+
+    def test_transformers_pinned_to_upstream_tested_version(self):
+        """transformers==4.42.3 (the exact pin in upstream
+        TencentARC/StereoCrafter/requirements.txt)."""
+        pins = [d for d in setup.RUNTIME_DEPS if d.startswith("transformers")]
+        assert pins, f"transformers missing from RUNTIME_DEPS: {setup.RUNTIME_DEPS}"
+        assert "4.42.3" in pins[0], f"transformers not pinned to 4.42.3: {pins[0]}"
+        # Must be a hard pin (==), not a bare name or a loose >= that could drift.
+        assert pins[0].startswith("transformers=="), pins[0]
+
+    def test_diffusers_pinned_to_upstream_tested_version(self):
+        """diffusers==0.29.2 (the exact pin in upstream requirements.txt)."""
+        pins = [d for d in setup.RUNTIME_DEPS if d.startswith("diffusers")]
+        assert pins, f"diffusers missing from RUNTIME_DEPS: {setup.RUNTIME_DEPS}"
+        assert "0.29.2" in pins[0], f"diffusers not pinned to 0.29.2: {pins[0]}"
+        assert pins[0].startswith("diffusers=="), pins[0]
+
+    def test_no_bare_transformers_or_diffusers(self):
+        """A bare (unpinned) 'transformers'/'diffusers' element must NOT be in
+        RUNTIME_DEPS — that would let pip drift to an untested version
+        (the regression of issue #155)."""
+        assert "transformers" not in setup.RUNTIME_DEPS, setup.RUNTIME_DEPS
+        assert "diffusers" not in setup.RUNTIME_DEPS, setup.RUNTIME_DEPS
+
+    def test_torch_not_in_runtime_deps(self):
+        """torch/torchvision are pinned separately in Step 2 (cu124 index) so a
+        transitive dep can never bump them — they must NOT be in RUNTIME_DEPS."""
+        for tok in setup.RUNTIME_DEPS:
+            assert not tok.startswith("torch=="), f"torch leaked into RUNTIME_DEPS: {tok}"
+            assert not tok.startswith("torchvision=="), f"torchvision leaked: {tok}"
+
+
 # HF token resolution (issue #150)
 # ---------------------------------------------------------------------------
 
