@@ -67,12 +67,14 @@ class DepthCrafterBackend(ABC):
         self,
         input_path: str,
         output_dir: str,
+        target_size: tuple[int, int] | None = None,
     ) -> list[np.ndarray]:
         """Run depth estimation on *input_path* and return depth maps.
 
-        Returns a list of (H, W) float32 depth maps, one per frame.
-        The backend is responsible for saving intermediate results to
-        *output_dir* as needed.
+        Returns a list of (H, W) float32 depth maps, one per frame, resized to
+        the source frame size (``target_size`` if given, else probed from
+        *input_path*).  The backend is responsible for saving intermediate
+        results to *output_dir* as needed.
         """
         ...
 
@@ -231,6 +233,7 @@ class CLIBackend(DepthCrafterBackend):
         self,
         input_path: str,
         output_dir: str,
+        target_size: tuple[int, int] | None = None,
     ) -> list[np.ndarray]:
         _assert_cuda()
 
@@ -305,6 +308,14 @@ class CLIBackend(DepthCrafterBackend):
         # fallbacks.
         stem = Path(input_path).stem
         depths = self._load_depths(out_path, stem)
+
+        # Issue #130: DepthCrafter down-samples the input to ``--max_res``
+        # (short side) before inference, so the decoded depth maps come back
+        # at the *model* resolution (e.g. 256×512 for a 720×1280 source).
+        # Downstream stages (stereo render / EMA smoothing) operate at the
+        # source frame size, so resize back now — mirroring the Depth-Anything
+        # path in pipeline/depth_estimator.py.
+        depths = self._resize_depths_to_source(depths, input_path, target_size)
 
         log.info("DepthCrafter: loaded %d depth maps from %s", len(depths), output_dir)
         return depths
@@ -403,6 +414,85 @@ class CLIBackend(DepthCrafterBackend):
             raise RuntimeError(f"DepthCrafter produced {mp4_path} but no frames could be decoded from it.")
         return depths
 
+    # ------------------------------------------------------------------
+    # Resize back to source frame size (issue #130)
+    # ------------------------------------------------------------------
+    def _resize_depths_to_source(
+        self,
+        depths: list[np.ndarray],
+        input_path: str,
+        target_size: tuple[int, int] | None,
+    ) -> list[np.ndarray]:
+        """Resize each depth map to the source frame size ``(h, w)``.
+
+        ``target_size`` (caller-provided) wins; when absent the size is probed
+        from *input_path* with cv2.  If both are available but disagree, the
+        caller's value is used and one line is logged.
+        """
+        if not depths:
+            return depths
+
+        probed = self._probe_video_size(input_path)
+        if target_size is not None:
+            if probed is not None and probed != target_size:
+                log.warning(
+                    "DepthCrafter: target_size %s disagrees with probed source size %s — using target_size",
+                    target_size,
+                    probed,
+                )
+            h, w = target_size
+        elif probed is not None:
+            h, w = probed
+        else:
+            log.warning(
+                "DepthCrafter: no target_size given and source size could not be probed "
+                "from %s — returning model-resolution depths (%s)",
+                input_path,
+                depths[0].shape,
+            )
+            return depths
+
+        import cv2
+
+        resized: list[np.ndarray] = []
+        for d in depths:
+            if d.shape[:2] == (h, w):
+                resized.append(d)
+            else:
+                # Depth is a continuous quantity — INTER_LINEAR, not NEAREST.
+                resized.append(cv2.resize(d, (w, h), interpolation=cv2.INTER_LINEAR))
+        if resized and resized[0].shape[:2] != depths[0].shape[:2]:
+            log.info(
+                "DepthCrafter: resized %d depth maps from %s to (%d, %d) (source frame size)",
+                len(resized),
+                depths[0].shape[:2],
+                h,
+                w,
+            )
+        return resized
+
+    @staticmethod
+    def _probe_video_size(input_path: str) -> tuple[int, int] | None:
+        """Return ``(h, w)`` of *input_path* via cv2, or None if unprobeable."""
+        try:
+            import cv2
+        except ImportError:
+            return None
+        try:
+            cap = cv2.VideoCapture(str(input_path))
+            if not cap.isOpened():
+                return None
+            try:
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            finally:
+                cap.release()
+        except Exception:  # pragma: no cover - defensive, never mask inference result
+            return None
+        if h <= 0 or w <= 0:
+            return None
+        return (h, w)
+
 
 # ---------------------------------------------------------------------------
 # DepthCrafterEstimator (front-facing class)
@@ -443,6 +533,7 @@ class DepthCrafterEstimator:
         self,
         input_path: str,
         output_dir: str | None = None,
+        target_size: tuple[int, int] | None = None,
     ) -> list[np.ndarray]:
         """Estimate temporally-consistent depth for an entire video.
 
@@ -450,9 +541,14 @@ class DepthCrafterEstimator:
             input_path: Path to input video file.
             output_dir: Directory to save intermediate depth outputs.
                 If None, a temporary directory is created.
+            target_size: Optional ``(h, w)`` of the source frames.  Depth maps
+                are resized to this before being returned (issue #130); when
+                None the backend probes the input video for its size.
 
         Returns:
-            List of (H, W) float32 depth maps, one per frame.
+            List of (H, W) float32 depth maps, one per frame, at the source
+            frame size, normalized to [0, 1] (same convention as the
+            Depth-Anything backend in ``pipeline/depth_estimator.py``).
         """
         import tempfile
 
@@ -470,4 +566,5 @@ class DepthCrafterEstimator:
         return self.backend.estimate_video(
             input_path=input_path,
             output_dir=resolved_output,
+            target_size=target_size,
         )
