@@ -27,12 +27,18 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# How many lines of subprocess output to surface on success (DEBUG) /
+# failure (ERROR + exception summary) — issue #127.
+_OUTPUT_TAIL_SUCCESS_LINES = 20
+_OUTPUT_TAIL_FAILURE_LINES = 40
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +58,47 @@ def _assert_cuda() -> None:
             "This depth estimator requires an NVIDIA GPU with CUDA support.\n"
             "See docs/DEPTHCRAFTER_SETUP.md for setup instructions."
         )
+
+
+# ---------------------------------------------------------------------------
+# Subprocess output helpers (issue #127)
+# ---------------------------------------------------------------------------
+
+
+def _read_tail_lines(fileobj, max_lines: int) -> str:
+    """Read back the whole capture file and return its last *max_lines* lines.
+
+    The file is binary (it received raw subprocess bytes); decode leniently.
+    Returns a parenthesized placeholder when nothing was captured, so logs
+    and exception messages never show a confusing blank block.
+    """
+    try:
+        fileobj.flush()
+        fileobj.seek(0)
+        text = fileobj.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return "(output unreadable)"
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return "(no output)"
+    return "\n".join(lines[-max_lines:])
+
+
+def _indent(text: str, prefix: str = "    ") -> str:
+    """Indent every line of *text* (for readable exception blocks)."""
+    return "\n".join(prefix + ln for ln in text.splitlines())
+
+
+def _dir_listing_block(output_dir: str) -> str:
+    """Format the real contents of *output_dir* for an error message."""
+    try:
+        entries = sorted(p.name for p in Path(output_dir).iterdir())
+    except OSError:
+        entries = ["(directory unreadable)"]
+    if not entries:
+        entries = ["(empty)"]
+    listing = "\n".join(f"      - {name}" for name in entries)
+    return f"  Output dir contents:\n{listing}\n"
 
 
 # ---------------------------------------------------------------------------
@@ -271,35 +318,7 @@ class CLIBackend(DepthCrafterBackend):
         if self.target_fps is not None:
             cmd.extend(["--target_fps", str(self.target_fps)])
 
-        log.info("DepthCrafter CLIBackend command: %s", " ".join(cmd))
-        log.info("DepthCrafter CLIBackend cwd: %s", self.repo_dir)
-
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=self.repo_dir,
-                capture_output=True,
-                text=True,
-                timeout=7200,  # 2 hours max
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Python executable not found: {self.python_exe}. "
-                f"Set DEPTHCRAFTER_PYTHON or --depthcrafter-python to the correct path."
-            ) from exc
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                "DepthCrafter inference timed out after 2 hours. The video may be too long or the GPU too slow."
-            ) from None
-
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            raise RuntimeError(
-                f"DepthCrafter inference failed (exit code {result.returncode}):\n"
-                f"  {stderr}\n"
-                f"  Command: {' '.join(cmd)}\n"
-                f"  See docs/DEPTHCRAFTER_SETUP.md for troubleshooting."
-            )
+        self._run_subprocess(cmd, output_dir=output_dir)
 
         # Load depth maps from output dir.  The real upstream run.py emits
         # ``<stem>_depth.mp4`` (an 8-bit grayscale video of the depth maps),
@@ -319,6 +338,89 @@ class CLIBackend(DepthCrafterBackend):
 
         log.info("DepthCrafter: loaded %d depth maps from %s", len(depths), output_dir)
         return depths
+
+    # ------------------------------------------------------------------
+    # Subprocess invocation (issue #127: never swallow stdout/stderr)
+    # ------------------------------------------------------------------
+    def _run_subprocess(self, cmd: list[str], *, output_dir: str) -> None:
+        """Run the DepthCrafter inference script, surfacing its output.
+
+        stdout/stderr go to temp files (the same drained-file pattern used
+        for ffmpeg in ``pipeline/streaming_pipeline.py``): an undrained PIPE
+        deadlocks once its 64 KB buffer fills, and DEVNULL hides the very
+        error the operator needs.  On success the last few lines are logged
+        at DEBUG (no INFO-level spam); on failure the tail is logged at
+        ERROR and folded into the raised exception together with the
+        command, cwd, and the real contents of *output_dir*.
+        """
+        log.info("DepthCrafter CLIBackend command: %s", " ".join(cmd))
+        log.info("DepthCrafter CLIBackend cwd: %s", self.repo_dir)
+
+        # Temp files are OS-drained at no cost — no PIPE, no deadlock.
+        # Closed below, not at this scope's exit, hence no `with`.
+        out_file = tempfile.TemporaryFile(prefix="depthcrafter-stdout-")  # noqa: SIM115
+        err_file = tempfile.TemporaryFile(prefix="depthcrafter-stderr-")  # noqa: SIM115
+        try:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    cwd=self.repo_dir,
+                    stdout=out_file,
+                    stderr=err_file,
+                    timeout=7200,  # 2 hours max
+                    check=False,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"Python executable not found: {self.python_exe}. "
+                    f"Set DEPTHCRAFTER_PYTHON or --depthcrafter-python to the correct path."
+                ) from exc
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    "DepthCrafter inference timed out after 2 hours. The video may be too long or the GPU too slow."
+                ) from None
+
+            returncode = result.returncode
+            stdout_tail = _read_tail_lines(out_file, _OUTPUT_TAIL_FAILURE_LINES)
+            stderr_tail = _read_tail_lines(err_file, _OUTPUT_TAIL_FAILURE_LINES)
+
+            if returncode != 0:
+                log.error(
+                    "DepthCrafter inference failed (exit code %s).\n"
+                    "--- stdout (last %d lines) ---\n%s\n"
+                    "--- stderr (last %d lines) ---\n%s",
+                    returncode,
+                    _OUTPUT_TAIL_FAILURE_LINES,
+                    stdout_tail,
+                    _OUTPUT_TAIL_FAILURE_LINES,
+                    stderr_tail,
+                )
+                raise RuntimeError(
+                    f"DepthCrafter inference failed (exit code {returncode}).\n"
+                    f"  Command: {' '.join(cmd)}\n"
+                    f"  cwd: {self.repo_dir}\n"
+                    f"  Output dir: {output_dir}\n"
+                    f"{_dir_listing_block(output_dir)}"
+                    f"  --- stdout (last {_OUTPUT_TAIL_FAILURE_LINES} lines) ---\n"
+                    f"{_indent(stdout_tail)}\n"
+                    f"  --- stderr (last {_OUTPUT_TAIL_FAILURE_LINES} lines) ---\n"
+                    f"{_indent(stderr_tail)}\n"
+                    f"  See docs/DEPTHCRAFTER_SETUP.md for troubleshooting."
+                )
+
+            # Success: tail at DEBUG so the default INFO level stays quiet.
+            log.debug(
+                "DepthCrafter subprocess finished.\n"
+                "--- stdout (last %d lines) ---\n%s\n"
+                "--- stderr (last %d lines) ---\n%s",
+                _OUTPUT_TAIL_SUCCESS_LINES,
+                _read_tail_lines(out_file, _OUTPUT_TAIL_SUCCESS_LINES),
+                _OUTPUT_TAIL_SUCCESS_LINES,
+                _read_tail_lines(err_file, _OUTPUT_TAIL_SUCCESS_LINES),
+            )
+        finally:
+            out_file.close()
+            err_file.close()
 
     # ------------------------------------------------------------------
     # Output-dir hygiene
