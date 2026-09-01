@@ -17,6 +17,18 @@ These tests cover the I-5 fix:
   - The run_pipeline factory falls back with a loud WARNING when a requested
     backend is unavailable (CUDA missing / not deployed) — never silent.
 
+Issue #137 (I-7) closes the verification gap for the StereoCrafter side
+specifically:
+
+  - The streaming whole-clip stereo path logs BOTH the startup
+    ``stereo=stereocrafter`` line AND the ``🎬 [Stereo]`` real-call line in the
+    same run (the pre-#137 logging test mocked the stereo renderer as
+    per-frame, so it never exercised the whole-clip stereo path's logging).
+  - The streaming CLI branch calls ``build_stereo_backend(args, fallback=True)``
+    — the unavailable→WARNING→default policy the card requires.
+  - The whole-clip stereo precompute reads frames back from the paths the
+    backend *returns* (not the assumed ones), matching the batch stage.
+
 All tests are CPU-only; cv2 capture / ffmpeg / model stages are mocked or
 faked.  No real model download, no real inference, no real API calls.
 """
@@ -281,6 +293,95 @@ class TestWholeClipStereoPrecompute(unittest.TestCase):
         # supersedes depth — StereoCrafter runs its own internal DepthCrafter).
         p.depth_estimator.estimate.assert_not_called()
 
+    def test_frames_read_back_from_returned_paths(self):
+        """I-7 (#137): the precompute reads L/R frames back from the paths
+        ``render_video`` *returns*, not the assumed ``out_left``/``out_right``.
+
+        A backend (or a StereoCrafterRenderer with default-resolved outputs)
+        may write to different paths than the caller proposed; the streaming
+        path must follow the return value, exactly like the batch
+        ``_run_stereocrafter_stage``.
+        """
+        stereo_backend = FakeWholeClipStereo(num_frames=2)
+        p = _make_pipeline(
+            output_width=100,
+            output_height=50,
+            stereo_renderer=stereo_backend,
+            stereo_backend_name="stereocrafter",
+        )
+        p.depth_estimator = MagicMock(spec=["estimate"])
+        p.eq_mapper.map_stereo_pair.return_value = np.zeros((50, 200, 3), dtype=np.uint8)
+
+        cap = _fake_cap(num_frames=2)
+        proc = MagicMock()
+        proc.returncode = 0
+
+        # Return DIFFERENT paths than the caller passed; if the pipeline reads
+        # from the returned ones, _load_video_frames sees the returned paths.
+        returned_left, returned_right = "actual_left.mp4", "actual_right.mp4"
+        stereo_backend.render_video = MagicMock(return_value=(returned_left, returned_right))
+        left = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(2)]
+        right = [np.full((8, 8, 3), 255, dtype=np.uint8) for _ in range(2)]
+
+        with (
+            patch("pipeline.streaming_pipeline.cv2.VideoCapture", return_value=cap),
+            patch("pipeline.streaming_pipeline.subprocess.Popen", return_value=proc),
+            patch("pipeline.streaming_pipeline._load_video_frames", side_effect=[left, right]) as mock_load,
+        ):
+            p.process_stream("in.mp4", "out.mp4")
+
+        # _load_video_frames was called with the RETURNED paths, in order.
+        loaded_paths = [c.args[0] for c in mock_load.call_args_list]
+        self.assertEqual(loaded_paths, [returned_left, returned_right])
+
+
+class TestWholeClipStereoLogging(unittest.TestCase):
+    """I-7 (#137) acceptance: the streaming whole-clip stereo path logs BOTH
+    the startup ``stereo=stereocrafter`` line AND the ``🎬 [Stereo]`` real-call
+    line in the SAME run — the self-proof the lead greps for.
+
+    The pre-#137 ``TestBackendNameLogging`` mocked the stereo renderer as
+    *per-frame* (spec=["render"]), so it never drove the whole-clip stereo
+    path and never saw the ``🎬 [Stereo]`` line.  This test injects a real
+    whole-clip stereo backend so the actual StereoCrafter branch runs.
+    """
+
+    def test_startup_and_real_call_lines_logged_for_wholeclip_stereo(self):
+        stereo_backend = FakeWholeClipStereo(num_frames=2)
+        p = _make_pipeline(
+            output_width=100,
+            output_height=50,
+            stereo_renderer=stereo_backend,
+            stereo_backend_name="stereocrafter",
+        )
+        p.depth_estimator = MagicMock(spec=["estimate"])
+        p.eq_mapper.map_stereo_pair.return_value = np.zeros((50, 200, 3), dtype=np.uint8)
+
+        cap = _fake_cap(num_frames=2)
+        proc = MagicMock()
+        proc.returncode = 0
+        left = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(2)]
+        right = [np.full((8, 8, 3), 255, dtype=np.uint8) for _ in range(2)]
+
+        with (
+            patch("pipeline.streaming_pipeline.cv2.VideoCapture", return_value=cap),
+            patch("pipeline.streaming_pipeline.subprocess.Popen", return_value=proc),
+            patch("pipeline.streaming_pipeline._load_video_frames", side_effect=[left, right]),
+            self.assertLogs("vr180-streaming", level="INFO") as cm,
+        ):
+            p.process_stream("in.mp4", "out.mp4")
+
+        joined = "\n".join(cm.output)
+        # Startup line names the stereo backend.
+        self.assertIn("stereo=stereocrafter", joined)
+        # Real-call trace (mirrors the depth side's "🎬 [Depth] ...").
+        self.assertIn("🎬 [Stereo]", joined)
+        self.assertIn("render_video", joined)
+        # Frame-count confirmation line.
+        self.assertIn("L/R frame pair(s)", joined)
+        # The backend really ran once.
+        self.assertEqual(len(stereo_backend.calls), 1)
+
 
 # ---------------------------------------------------------------------------
 # Startup backend-name logging
@@ -520,7 +621,9 @@ class TestStreamingBranchInjection(unittest.TestCase):
                 patch.object(run_pipeline, "parse_args", return_value=args),
                 patch.object(run_pipeline, "apply_quality_preset"),
                 patch.object(run_pipeline, "build_depth_backend", return_value=(fake_depth, "depthcrafter")),
-                patch.object(run_pipeline, "build_stereo_backend", return_value=(fake_stereo, "stereocrafter")),
+                patch.object(
+                    run_pipeline, "build_stereo_backend", return_value=(fake_stereo, "stereocrafter")
+                ) as mock_stereo_factory,
                 patch.object(run_pipeline, "StreamingPipeline", side_effect=fake_pipeline_ctor),
                 # H-1.2 (#132): the streaming branch now remuxes audio after
                 # sv3d/st3d injection.  Stub the passthrough helpers so no
@@ -533,7 +636,7 @@ class TestStreamingBranchInjection(unittest.TestCase):
                 patch("os.replace"),
             ):
                 run_pipeline.main()
-            return captured
+            return captured, mock_stereo_factory
         finally:
             import contextlib
 
@@ -542,13 +645,23 @@ class TestStreamingBranchInjection(unittest.TestCase):
             sys.modules.pop("run_pipeline", None)
 
     def test_streaming_branch_injects_factory_backends(self):
-        captured = self._run_main()
+        captured, _ = self._run_main()
         # StreamingPipeline must have been constructed with the injected
         # backends + their names — this is the exact wiring that was missing.
         self.assertIn("depth_estimator", captured)
         self.assertIn("stereo_renderer", captured)
         self.assertEqual(captured.get("depth_backend_name"), "depthcrafter")
         self.assertEqual(captured.get("stereo_backend_name"), "stereocrafter")
+
+    def test_streaming_branch_uses_fallback_policy_for_stereo(self):
+        """I-7 (#137) acceptance: the streaming branch builds the stereo backend
+        with ``fallback=True`` — an unavailable StereoCrafter degrades to the
+        default renderer with a loud WARNING, never a silent wrong-model run and
+        never a hard crash of the whole streaming job."""
+        _, mock_stereo_factory = self._run_main()
+        mock_stereo_factory.assert_called_once()
+        _, kwargs = mock_stereo_factory.call_args
+        self.assertEqual(kwargs.get("fallback"), True)
 
 
 # ---------------------------------------------------------------------------
