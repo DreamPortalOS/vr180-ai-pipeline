@@ -43,3 +43,16 @@ ruff check . && ruff format --check . && pytest tests/ -m "not slow" -q
 - Conventional Commits（`feat(scope): …` / `fix: …` / `test: …` / `docs: …`）。
 - 一张卡 = 一个 PR；PR 描述里写清对应 issue 编号（`Closes #N`）与验收核对清单。
 - PR 由自动评审（CI 绿 + AI 评审 APPROVE）squash 合并；评审要求改的照改，不争论。
+
+### 增量提交纪律（防会话中途被切断，血泪教训）
+
+网关会间歇性 `Connection closed mid-response` 把会话拦腰切断。已有多张卡因此**一行都没落地**，
+最终报 `GraphQL: No commits between main and agent/issue-N`，白跑一整轮。因此：
+
+- **写完一个文件就立刻 commit 一次**，不要攒到最后统一提交。会话随时可能断，
+  只有已 commit 的部分保得住；重试时能接着做，而不是从零开始。
+- commit 前**自己**先跑到全绿，不要指望 pre-commit 钩子替你修：
+  `ruff check --fix . && ruff format . && ruff check . && ruff format --check .`
+- push 前自检 `git log --oneline origin/main..HEAD`：**输出为空就不要建 PR**，
+  先回头查为什么 commit 没落地。
+- 如果发现自己「已经写了很多代码但一次都没 commit」，**立刻停下来先提交**。
