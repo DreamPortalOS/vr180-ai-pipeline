@@ -26,12 +26,141 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# How many tail lines of captured subprocess output to log on success/failure.
+# Issue #127: the CLI's own output is the only clue to the real failure cause
+# (e.g. the CLI wrote an .mp4 where the pipeline expected .npy), so keep enough
+# tail lines to show it — but not the full multi-hour log.
+_SUCCESS_LOG_LINES = 20
+_FAILURE_LOG_LINES = 40
+
+
+def _tail_lines(fh, max_lines: int) -> list[str]:
+    """Return the last *max_lines* non-empty lines of a captured-output handle.
+
+    Reads at most the last 256 KB so a multi-GB stdout does not get loaded
+    into memory; unreadable handles produce a placeholder line instead of
+    raising (the caller is already on an error path).
+    """
+    try:
+        fh.flush()
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - 256 * 1024))
+        text = fh.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError, AttributeError):
+        return ["(captured output unreadable)"]
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    return lines[-max_lines:] if lines else ["(no output captured)"]
+
+
+def _combined_output(fh, proc, max_lines: int) -> list[str]:
+    """Tail lines of the capture file, falling back to the CompletedProcess.
+
+    Real runs write into the capture file; mocked ``subprocess.run`` never
+    does, so when the file is empty use the ``stdout``/``stderr`` attributes
+    the mock populated instead (keeps existing tests meaningful).
+    """
+    lines = _tail_lines(fh, max_lines)
+    if lines != ["(no output captured)"]:
+        return lines
+    parts: list[str] = []
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(proc, stream_name, None)
+        if isinstance(stream, str) and stream.strip():
+            parts.extend(ln.rstrip() for ln in stream.splitlines() if ln.strip())
+    return parts[-max_lines:] if parts else lines
+
+
+def _dir_listing(dir_path: str) -> str:
+    """One-line-per-entry listing of *dir_path* for failure diagnostics.
+
+    Issue #127: when the CLI "succeeds" but writes the wrong artifact (mp4
+    instead of npy), the pipeline's generic error gives no hint — the actual
+    directory contents are the fastest way to see what really landed there.
+    """
+    try:
+        entries = sorted(os.listdir(dir_path))
+    except OSError as exc:
+        return f"    (cannot list directory: {exc})"
+    if not entries:
+        return "    (empty)"
+    return "\n".join(f"    {e}" for e in entries[:50]) + ("\n    ..." if len(entries) > 50 else "")
+
+
+def _run_subprocess_captured(
+    cmd: list[str],
+    *,
+    cwd: str,
+    timeout: int,
+    label: str,
+    output_dir: str | None = None,
+) -> None:
+    """Run *cmd* with stdout+stderr captured to a temp file; raise on failure.
+
+    stdout/stderr go to an OS-drained temp file (the same pattern
+    ``pipeline/streaming_pipeline.py`` uses for ffmpeg): an undrained
+    ``PIPE`` fills its 64 KB buffer and deadlocks a chatty inference CLI,
+    while ``DEVNULL`` would hide the very output this helper exists to show.
+
+    On success the last ~20 combined lines are logged at DEBUG (no INFO spam).
+    On failure the last ~40 lines are logged at ERROR and summarized into the
+    raised ``RuntimeError`` along with the command, cwd, and the actual
+    contents of *output_dir*.
+    """
+    log.info("%s command: %s", label, " ".join(cmd))
+    log.info("%s cwd: %s", label, cwd)
+
+    with tempfile.TemporaryFile(prefix="vr180-cli-capture-") as capture:
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=cwd,
+                stdout=capture,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Python executable not found: {cmd[0]}. "
+                f"Set the appropriate env var / CLI flag to the correct path.\n"
+                f"  Command: {' '.join(cmd)}\n"
+                f"  cwd: {cwd}"
+            ) from exc
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"{label} timed out after {timeout // 3600} hours. "
+                f"The video may be too long or the GPU too slow.\n"
+                f"  Command: {' '.join(cmd)}\n"
+                f"  cwd: {cwd}"
+            ) from None
+
+        if proc.returncode == 0:
+            for line in _combined_output(capture, proc, _SUCCESS_LOG_LINES):
+                log.debug("%s | %s", label, line)
+            return
+
+        tail = _combined_output(capture, proc, _FAILURE_LOG_LINES)
+        for line in tail:
+            log.error("%s | %s", label, line)
+        summary = "\n".join(f"  {ln}" for ln in tail[-10:])
+        msg = (
+            f"{label} failed (exit code {proc.returncode}):\n"
+            f"  --- subprocess output (tail) ---\n"
+            f"{summary}\n"
+            f"  Command: {' '.join(cmd)}\n"
+            f"  cwd: {cwd}"
+        )
+        if output_dir is not None:
+            msg += f"\n  Output dir: {output_dir}\n  Contents:\n{_dir_listing(output_dir)}"
+        raise RuntimeError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -264,35 +393,13 @@ class CLIBackend(DepthCrafterBackend):
         if self.target_fps is not None:
             cmd.extend(["--target_fps", str(self.target_fps)])
 
-        log.info("DepthCrafter CLIBackend command: %s", " ".join(cmd))
-        log.info("DepthCrafter CLIBackend cwd: %s", self.repo_dir)
-
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=self.repo_dir,
-                capture_output=True,
-                text=True,
-                timeout=7200,  # 2 hours max
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Python executable not found: {self.python_exe}. "
-                f"Set DEPTHCRAFTER_PYTHON or --depthcrafter-python to the correct path."
-            ) from exc
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                "DepthCrafter inference timed out after 2 hours. The video may be too long or the GPU too slow."
-            ) from None
-
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            raise RuntimeError(
-                f"DepthCrafter inference failed (exit code {result.returncode}):\n"
-                f"  {stderr}\n"
-                f"  Command: {' '.join(cmd)}\n"
-                f"  See docs/DEPTHCRAFTER_SETUP.md for troubleshooting."
-            )
+        _run_subprocess_captured(
+            cmd,
+            cwd=self.repo_dir,
+            timeout=7200,  # 2 hours max
+            label="DepthCrafter CLIBackend",
+            output_dir=output_dir,
+        )
 
         # Load depth maps from output dir
         depths: list[np.ndarray] = []
@@ -312,6 +419,8 @@ class CLIBackend(DepthCrafterBackend):
         else:
             raise RuntimeError(
                 f"DepthCrafter finished but no depth files found in {output_dir}.\n"
+                f"  Contents of the output dir:\n{_dir_listing(output_dir)}\n"
+                f"  The CLI exited 0 — re-run with logging at DEBUG to see its captured output tail.\n"
                 f"  Check the inference script output format in docs/DEPTHCRAFTER_SETUP.md."
             )
 

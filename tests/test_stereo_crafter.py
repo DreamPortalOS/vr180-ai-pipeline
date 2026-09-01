@@ -667,3 +667,195 @@ class TestCLIBackendInference:
                 )
         msg = str(exc_info.value)
         assert "SBS output not found" in msg
+
+
+class TestCLIBackendOutputCapture:
+    """Subprocess stdout/stderr capture behavior (issue #127).
+
+    The inference CLIs' own output is the only clue to the real failure
+    cause — it must end up in the error message and the log, must not spam
+    INFO on success, and must never go through an undrained PIPE.
+    """
+
+    @staticmethod
+    def _make_repo(tmp_path):
+        repo = tmp_path / "stereocrafter"
+        repo.mkdir()
+        (repo / "inpainting_inference.py").write_text("# stage 2")
+        (repo / "depth_splatting_inference.py").write_text("# stage 1")
+        return repo
+
+    def test_failure_error_contains_output_summary_and_dir_listing(self, tmp_path):
+        """Non-zero stage exit → RuntimeError with the subprocess output tail,
+        command, cwd, and the real output-dir contents (issue #127)."""
+        import logging
+
+        from pipeline.stereo_crafter import CLIBackend
+
+        repo = self._make_repo(tmp_path)
+        backend = CLIBackend(repo_dir=str(repo))
+
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        input_video = tmp_path / "input.mp4"
+        input_video.write_text("")
+
+        caplog_records = []
+        handler = logging.Handler()
+        handler.emit = lambda record: caplog_records.append(record)  # type: ignore[method-assign]
+        sc_log = logging.getLogger("pipeline.stereo_crafter")
+        old_level = sc_log.level
+        sc_log.setLevel(logging.DEBUG)
+        sc_log.addHandler(handler)
+        try:
+            with patch("subprocess.run") as mock_run, patch("pipeline.stereo_crafter._assert_cuda", return_value=None):
+                mock_run.return_value = subprocess.CompletedProcess(
+                    args=[], returncode=1, stdout="stage1: splatting frames", stderr="boom: unet weights missing"
+                )
+                with pytest.raises(RuntimeError) as exc_info:
+                    backend.render_video(
+                        input_path=str(input_video),
+                        depth_dir=str(depth_dir),
+                        output_left=str(tmp_path / "left.mp4"),
+                        output_right=str(tmp_path / "right.mp4"),
+                    )
+        finally:
+            sc_log.removeHandler(handler)
+            sc_log.setLevel(old_level)
+
+        msg = str(exc_info.value)
+        assert "unet weights missing" in msg  # stderr summary included
+        assert "Command:" in msg
+        assert "cwd:" in msg
+        assert "Output dir:" in msg
+        # Failure tail must be logged at ERROR.
+        error_msgs = [r.getMessage() for r in caplog_records if r.levelno == logging.ERROR]
+        assert any("unet weights missing" in m for m in error_msgs)
+        assert any("splatting frames" in m for m in error_msgs)
+
+    def test_success_logs_tail_at_debug_not_info(self, tmp_path):
+        """Successful stages → output tail at DEBUG only; INFO must stay clean."""
+        import logging
+
+        from pipeline.stereo_crafter import CLIBackend
+
+        def _run_once(level):
+            repo = tmp_path / "stereocrafter"
+            repo.mkdir(exist_ok=True)
+            (repo / "inpainting_inference.py").write_text("# stage 2")
+            (repo / "depth_splatting_inference.py").write_text("# stage 1")
+            backend = CLIBackend(repo_dir=str(repo))
+
+            depth_dir = tmp_path / "depth"
+            depth_dir.mkdir(exist_ok=True)
+            input_video = tmp_path / "input.mp4"
+            input_video.write_text("")
+
+            work_dir = tmp_path / f"work_{level}"
+            work_dir.mkdir()
+            (work_dir / "splatting_results_inpainting_results_sbs.mp4").write_text("fake sbs")
+
+            records = []
+            handler = logging.Handler()
+            handler.emit = lambda record: records.append(record)  # type: ignore[method-assign]
+            sc_log = logging.getLogger("pipeline.stereo_crafter")
+            old_level = sc_log.level
+            sc_log.setLevel(level)
+            sc_log.addHandler(handler)
+            try:
+                with (
+                    patch("subprocess.run") as mock_run,
+                    patch.object(CLIBackend, "_split_sbs_video") as mock_split,
+                    patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
+                    patch("pipeline.stereo_crafter.tempfile.mkdtemp", return_value=str(work_dir)),
+                ):
+                    mock_run.return_value = subprocess.CompletedProcess(
+                        args=[], returncode=0, stdout="denoising chunk 3/7", stderr=""
+                    )
+
+                    def _fake_split(sbs_path, left, right):
+                        Path(left).write_text("data")
+                        Path(right).write_text("data")
+
+                    mock_split.side_effect = _fake_split
+                    backend.render_video(
+                        input_path=str(input_video),
+                        depth_dir=str(depth_dir),
+                        output_left=str(tmp_path / f"left_{level}.mp4"),
+                        output_right=str(tmp_path / f"right_{level}.mp4"),
+                    )
+            finally:
+                sc_log.removeHandler(handler)
+                sc_log.setLevel(old_level)
+            return records
+
+        # Default INFO gate: no emitted record may carry the CLI chatter.
+        info_records = _run_once(logging.INFO)
+        assert not any("denoising chunk 3/7" in r.getMessage() for r in info_records)
+
+        # Opt into DEBUG: the captured tail becomes available for troubleshooting.
+        debug_records = _run_once(logging.DEBUG)
+        debug_msgs = [r.getMessage() for r in debug_records if r.levelno == logging.DEBUG]
+        assert any("denoising chunk 3/7" in m for m in debug_msgs)
+
+    def test_no_undrained_pipe(self, tmp_path):
+        """stdout/stderr go to a drained temp file, never an undrained PIPE
+        (a 64 KB PIPE buffer deadlocks chatty inference CLIs — issue #127)."""
+        from pipeline.stereo_crafter import CLIBackend
+
+        repo = self._make_repo(tmp_path)
+        backend = CLIBackend(repo_dir=str(repo))
+
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        input_video = tmp_path / "input.mp4"
+        input_video.write_text("")
+
+        with patch("subprocess.run") as mock_run, patch("pipeline.stereo_crafter._assert_cuda", return_value=None):
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="x")
+            with pytest.raises(RuntimeError):
+                backend.render_video(
+                    input_path=str(input_video),
+                    depth_dir=str(depth_dir),
+                    output_left=str(tmp_path / "left.mp4"),
+                    output_right=str(tmp_path / "right.mp4"),
+                )
+
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("stdout") is not subprocess.PIPE
+        assert kwargs.get("stderr") is not subprocess.PIPE
+        assert kwargs.get("stdout") is not None  # drained file handle
+        assert kwargs.get("stderr") is subprocess.STDOUT  # merged into same file
+
+    def test_missing_sbs_error_lists_dir_contents(self, tmp_path):
+        """Both stages exit 0 but no SBS file → error shows what actually landed."""
+        from pipeline.stereo_crafter import CLIBackend
+
+        repo = self._make_repo(tmp_path)
+        backend = CLIBackend(repo_dir=str(repo))
+
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        input_video = tmp_path / "input.mp4"
+        input_video.write_text("")
+
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        (work_dir / "unexpected_artifact.mp4").write_text("x")  # wrong artifact
+
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
+            patch("pipeline.stereo_crafter.tempfile.mkdtemp", return_value=str(work_dir)),
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            with pytest.raises(RuntimeError) as exc_info:
+                backend.render_video(
+                    input_path=str(input_video),
+                    depth_dir=str(depth_dir),
+                    output_left=str(tmp_path / "left.mp4"),
+                    output_right=str(tmp_path / "right.mp4"),
+                )
+        msg = str(exc_info.value)
+        assert "SBS output not found" in msg
+        assert "unexpected_artifact.mp4" in msg

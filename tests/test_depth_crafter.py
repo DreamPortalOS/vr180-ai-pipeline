@@ -5,6 +5,7 @@ All tests are mock-based — no CUDA, no real model required.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -244,6 +245,167 @@ def test_cli_backend_subprocess_failure(
         backend = CLIBackend(repo_dir=tmpdir)
         with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="CUDA out of memory"):
             backend.estimate_video(input_path=str(script_path), output_dir=outdir)
+
+
+# ---------------------------------------------------------------------------
+# CLIBackend — subprocess output capture (issue #127)
+# ---------------------------------------------------------------------------
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_failure_error_contains_output_and_dir_listing(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """Non-zero exit → RuntimeError with the subprocess output summary, command,
+    cwd, and the real output-dir contents (issue #127)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "run.py").write_text("print('ok')")
+
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        mock_result.stderr = "depthcrafter exploded: unexpected kwarg --max_res"
+        mock_run.return_value = mock_result
+
+        backend = CLIBackend(repo_dir=tmpdir)
+        with tempfile.TemporaryDirectory() as outdir:
+            # Plant a stray artifact so the listing proves it shows real contents.
+            (Path(outdir) / "leftover.mp4").write_text("x")
+            with pytest.raises(RuntimeError) as exc_info:
+                backend.estimate_video(input_path=str(Path(tmpdir) / "run.py"), output_dir=outdir)
+        msg = str(exc_info.value)
+        assert "unexpected kwarg --max_res" in msg  # stderr summary included
+        assert "Command:" in msg
+        assert "cwd:" in msg
+        assert "leftover.mp4" in msg  # actual output-dir contents listed
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_failure_logs_tail_at_error(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Failed subprocess → its output tail is logged at ERROR (issue #127)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "run.py").write_text("print('ok')")
+
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = "loading weights done"
+        mock_result.stderr = "boom: CUDA device-side assert"
+        mock_run.return_value = mock_result
+
+        backend = CLIBackend(repo_dir=tmpdir)
+        with (
+            tempfile.TemporaryDirectory() as outdir,
+            caplog.at_level(logging.DEBUG, logger="pipeline.depth_crafter"),
+            pytest.raises(RuntimeError),
+        ):
+            backend.estimate_video(input_path=str(Path(tmpdir) / "run.py"), output_dir=outdir)
+
+    error_lines = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("CUDA device-side assert" in m for m in error_lines)
+    assert any("loading weights done" in m for m in error_lines)
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_success_logs_tail_at_debug_not_info(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Successful subprocess → output tail logged at DEBUG only; default INFO
+    logging must NOT be flooded with CLI output (issue #127)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "run.py").write_text("print('ok')")
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "processing frame 42/100"
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        backend = CLIBackend(repo_dir=tmpdir)
+
+        # INFO level: CLI chatter must not appear in any record.
+        outdir = Path(tmpdir) / "depth_output"
+        outdir.mkdir()
+        np.save(str(outdir / "depth_000000.npy"), np.zeros((4, 4), dtype=np.float32))
+        with caplog.at_level(logging.INFO, logger="pipeline.depth_crafter"):
+            backend.estimate_video(input_path=str(Path(tmpdir) / "run.py"), output_dir=str(outdir))
+        assert not any("processing frame 42/100" in r.getMessage() for r in caplog.records)
+
+        # DEBUG level: the captured tail IS available for troubleshooting.
+        caplog.clear()
+        outdir2 = Path(tmpdir) / "depth_output2"
+        outdir2.mkdir()
+        np.save(str(outdir2 / "depth_000000.npy"), np.zeros((4, 4), dtype=np.float32))
+        with caplog.at_level(logging.DEBUG, logger="pipeline.depth_crafter"):
+            backend.estimate_video(input_path=str(Path(tmpdir) / "run.py"), output_dir=str(outdir2))
+        debug_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any("processing frame 42/100" in m for m in debug_msgs)
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_no_undrained_pipe(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """stdout/stderr must go to a drained temp file, never an undrained PIPE
+    (a 64 KB PIPE buffer deadlocks chatty inference CLIs — issue #127)."""
+    import subprocess as sp
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "run.py").write_text("print('ok')")
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        backend = CLIBackend(repo_dir=tmpdir)
+        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="no depth files found"):
+            backend.estimate_video(input_path=str(Path(tmpdir) / "run.py"), output_dir=outdir)
+
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("stdout") is not sp.PIPE
+        assert kwargs.get("stderr") is not sp.PIPE
+        assert kwargs.get("stdout") is not None  # drained file handle
+        assert kwargs.get("stderr") is sp.STDOUT  # merged into the same file
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_missing_depth_error_lists_dir_contents(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """'no depth files' error now shows what the CLI actually wrote (issue #127 —
+    this was the exact dead-end the lead hit while triaging #126)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "run.py").write_text("print('ok')")
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        backend = CLIBackend(repo_dir=tmpdir)
+        with tempfile.TemporaryDirectory() as outdir:
+            (Path(outdir) / "video_depth.mp4").write_text("x")  # CLI wrote an mp4
+            with pytest.raises(RuntimeError) as exc_info:
+                backend.estimate_video(input_path=str(Path(tmpdir) / "run.py"), output_dir=outdir)
+        msg = str(exc_info.value)
+        assert "no depth files found" in msg
+        assert "video_depth.mp4" in msg
 
 
 @patch("pipeline.depth_crafter._assert_cuda")

@@ -45,6 +45,61 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# How many tail lines of captured subprocess output to log on success/failure.
+# Issue #127: the CLI's own output is the only clue to the real failure cause,
+# so keep enough tail lines to show it — but not the full multi-hour log.
+_SUCCESS_LOG_LINES = 20
+_FAILURE_LOG_LINES = 40
+
+
+def _tail_lines(fh, max_lines: int) -> list[str]:
+    """Return the last *max_lines* non-empty lines of a captured-output handle.
+
+    Reads at most the last 256 KB so a multi-GB stdout does not get loaded
+    into memory; unreadable handles produce a placeholder line instead of
+    raising (the caller is already on an error path).
+    """
+    try:
+        fh.flush()
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - 256 * 1024))
+        text = fh.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError, AttributeError):
+        return ["(captured output unreadable)"]
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    return lines[-max_lines:] if lines else ["(no output captured)"]
+
+
+def _combined_output(fh, proc, max_lines: int) -> list[str]:
+    """Tail lines of the capture file, falling back to the CompletedProcess.
+
+    Real runs write into the capture file; mocked ``subprocess.run`` never
+    does, so when the file is empty use the ``stdout``/``stderr`` attributes
+    the mock populated instead (keeps existing tests meaningful).
+    """
+    lines = _tail_lines(fh, max_lines)
+    if lines != ["(no output captured)"]:
+        return lines
+    parts: list[str] = []
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(proc, stream_name, None)
+        if isinstance(stream, str) and stream.strip():
+            parts.extend(ln.rstrip() for ln in stream.splitlines() if ln.strip())
+    return parts[-max_lines:] if parts else lines
+
+
+def _dir_listing(dir_path: str) -> str:
+    """One-line-per-entry listing of *dir_path* for failure diagnostics."""
+    try:
+        entries = sorted(os.listdir(dir_path))
+    except OSError as exc:
+        return f"    (cannot list directory: {exc})"
+    if not entries:
+        return "    (empty)"
+    return "\n".join(f"    {e}" for e in entries[:50]) + ("\n    ..." if len(entries) > 50 else "")
+
+
 # ---------------------------------------------------------------------------
 # In-repo default paths (managed by scripts/setup_stereocrafter.py)
 # ---------------------------------------------------------------------------
@@ -362,7 +417,7 @@ class CLIBackend(StereoCrafterBackend):
             "--output_video_path",
             splat_video,
         ]
-        self._run_subprocess(cmd1, label="Stage 1 (depth splatting)")
+        self._run_subprocess(cmd1, label="Stage 1 (depth splatting)", output_dir=str(work_dir))
 
         # --- Stage 2: disocclusion inpainting -----------------------------
         stage2_script = self._find_inference_script(INFERENCE_SCRIPT_STAGE2)
@@ -378,7 +433,7 @@ class CLIBackend(StereoCrafterBackend):
             "--save_dir",
             sbs_dir,
         ]
-        self._run_subprocess(cmd2, label="Stage 2 (disocclusion inpainting)")
+        self._run_subprocess(cmd2, label="Stage 2 (disocclusion inpainting)", output_dir=sbs_dir)
 
         # --- Split the SBS output into separate L/R videos ---------------
         # inpainting_inference.py writes <video_name>_sbs.mp4 in save_dir, where
@@ -392,6 +447,8 @@ class CLIBackend(StereoCrafterBackend):
             raise RuntimeError(
                 f"StereoCrafter finished but SBS output not found:\n"
                 f"  {sbs_path}\n"
+                f"  Contents of the output dir {sbs_dir}:\n{_dir_listing(sbs_dir)}\n"
+                f"  Both stages exited 0 — re-run with logging at DEBUG to see their captured output tails.\n"
                 f"  Check the inpainting_inference.py output format "
                 f"in docs/STEREOCRAFTER_SETUP.md."
             )
@@ -408,42 +465,70 @@ class CLIBackend(StereoCrafterBackend):
     # ------------------------------------------------------------------
     # Subprocess helpers
     # ------------------------------------------------------------------
-    def _run_subprocess(self, cmd: list[str], *, label: str) -> None:
+    def _run_subprocess(self, cmd: list[str], *, label: str, output_dir: str | None = None) -> None:
         """Run a StereoCrafter subprocess stage, raising on failure.
 
         The command is always a list (never ``shell=True``).  *label* names
-        the stage for error messages.
+        the stage for error messages; *output_dir* (if given) is listed in the
+        failure message so the real on-disk artifacts are visible.
+
+        stdout/stderr are captured to an OS-drained temp file (issue #127, the
+        same pattern ``pipeline/streaming_pipeline.py`` uses for ffmpeg): an
+        undrained ``PIPE`` fills its 64 KB buffer and deadlocks a chatty
+        inference CLI, while ``DEVNULL`` hides the failure cause.  On success
+        the last ~20 combined lines are logged at DEBUG (no INFO spam); on
+        failure the last ~40 lines are logged at ERROR and summarized into the
+        raised ``RuntimeError`` together with the command and cwd.
         """
-        log.info("StereoCrafter CLIBackend %s command: %s", label, " ".join(cmd))
-        log.info("StereoCrafter CLIBackend cwd: %s", self.repo_dir)
+        full_label = f"StereoCrafter CLIBackend {label}"
+        log.info("%s command: %s", full_label, " ".join(cmd))
+        log.info("%s cwd: %s", full_label, self.repo_dir)
 
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=self.repo_dir,
-                capture_output=True,
-                text=True,
-                timeout=7200,  # 2 hours max
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Python executable not found: {self.python_exe}. "
-                f"Set STEREOCRAFTER_PYTHON or --stereocrafter-python "
-                f"to the correct path."
-            ) from exc
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                "StereoCrafter inference timed out after 2 hours. The video may be too long or the GPU too slow."
-            ) from None
+        with tempfile.TemporaryFile(prefix="vr180-cli-capture-") as capture:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=self.repo_dir,
+                    stdout=capture,
+                    stderr=subprocess.STDOUT,
+                    timeout=7200,  # 2 hours max
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"Python executable not found: {self.python_exe}. "
+                    f"Set STEREOCRAFTER_PYTHON or --stereocrafter-python "
+                    f"to the correct path.\n"
+                    f"  Command: {' '.join(cmd)}\n"
+                    f"  cwd: {self.repo_dir}"
+                ) from exc
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    "StereoCrafter inference timed out after 2 hours. "
+                    "The video may be too long or the GPU too slow.\n"
+                    f"  Command: {' '.join(cmd)}\n"
+                    f"  cwd: {self.repo_dir}"
+                ) from None
 
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            raise RuntimeError(
-                f"StereoCrafter {label} failed (exit code {result.returncode}):\n"
-                f"  {stderr}\n"
+            if proc.returncode == 0:
+                for line in _combined_output(capture, proc, _SUCCESS_LOG_LINES):
+                    log.debug("%s | %s", full_label, line)
+                return
+
+            tail = _combined_output(capture, proc, _FAILURE_LOG_LINES)
+            for line in tail:
+                log.error("%s | %s", full_label, line)
+            summary = "\n".join(f"  {ln}" for ln in tail[-10:])
+            msg = (
+                f"StereoCrafter {label} failed (exit code {proc.returncode}):\n"
+                f"  --- subprocess output (tail) ---\n"
+                f"{summary}\n"
                 f"  Command: {' '.join(cmd)}\n"
-                f"  See docs/STEREOCRAFTER_SETUP.md for troubleshooting."
+                f"  cwd: {self.repo_dir}"
             )
+            if output_dir is not None:
+                msg += f"\n  Output dir: {output_dir}\n  Contents:\n{_dir_listing(output_dir)}"
+            msg += "\n  See docs/STEREOCRAFTER_SETUP.md for troubleshooting."
+            raise RuntimeError(msg)
 
     def _split_sbs_video(self, sbs_path: str, output_left: str, output_right: str) -> None:
         """Split a StereoCrafter SBS video into separate left/right files.
