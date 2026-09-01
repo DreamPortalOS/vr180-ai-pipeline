@@ -167,12 +167,25 @@ def _parse_float(value: str | float | int | None) -> float | None:
 def check_compatible(
     segments: Sequence[ConcatSegment],
     ffprobe: str = _FFPROBE_BIN,
+    warnings: list[str] | None = None,
 ) -> None:
     """Verify all segments share the same resolution and fps.
 
     Raises :class:`ConcatError` when any segment disagrees, with a message
     that lists each offending segment's actual width/height/fps so the
     caller can pinpoint which clip is the odd one out.
+
+    Audio-track presence is *not* a hard error: a concat set that is
+    uniformly audio-bearing or uniformly silent is fine. But a **mixed** set
+    (some segments have an audio track, some don't) silently drops audio
+    from the whole output — segment_concat deliberately emits no audio in
+    that case (issue #173) rather than padding the silent clips. That is a
+    "fails quietly" footgun: an owner splicing 10 clips where one happens to
+    have no audio track gets a 20-minute silent film and only discovers it
+    on the headset. So when the set is mixed we surface it: if *warnings* is
+    a list, a human-readable note naming the audio-less segments is appended
+    to it. The caller that doesn't pass *warnings* (the default) is
+    unaffected — the check still returns without raising.
     """
     if len(segments) < 1:
         raise ConcatError("concat requires at least one segment")
@@ -199,6 +212,37 @@ def check_compatible(
             "incompatible segment resolution/fps for concat:\n"
             f"  reference {ref_path}: {ref_label}\n" + "\n".join(mismatches)
         )
+
+    # Audio-track consistency. A mixed set is not a hard error, but the caller
+    # asked to be told (issue #196): when audio is dropped the output goes
+    # silent, which is easy to miss until playback. Surface it via *warnings*.
+    if warnings is not None:
+        audio_mismatch = _audio_mismatch_warning(probes)
+        if audio_mismatch is not None:
+            warnings.append(audio_mismatch)
+
+
+def _audio_mismatch_warning(probes: list[tuple[Path, dict]]) -> str | None:
+    """Build a warning string for a mixed-audio concat set, or ``None``.
+
+    Returns ``None`` when the set is uniform (all have audio, or none do) —
+    those are silent-but-fine. When the set is mixed, names each audio-less
+    segment by 1-based index and filename and explains the consequence.
+    """
+    has_audio_flags = [meta["has_audio"] for _, meta in probes]
+    # Uniform set (all True or all False) → nothing to warn about.
+    if all(has_audio_flags) or not any(has_audio_flags):
+        return None
+
+    silent_idx = [i for i, has in enumerate(has_audio_flags) if not has]
+    parts = [f"segment {i + 1} ({probes[i][0].name})" for i in silent_idx]
+    listed = ", ".join(parts)
+    return (
+        f"audio track mismatch: {listed} have no audio track — "
+        "concat output will have NO audio track. Re-encode the silent "
+        "segments with an audio track (or strip audio from all) to keep "
+        "audio in the output."
+    )
 
 
 def _describe(meta: dict) -> str:
@@ -268,7 +312,10 @@ def concat_segments(
     # the list, and absolutize output_path for the same reason.
     output_path = Path(output_path).resolve()
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    check_compatible(segments)
+    warnings: list[str] = []
+    check_compatible(segments, warnings=warnings)
+    for w in warnings:
+        log.warning("⚠️ %s", w)
 
     runner = runner or subprocess.run
 

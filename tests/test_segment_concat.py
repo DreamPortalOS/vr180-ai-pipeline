@@ -225,6 +225,89 @@ class TestCheckCompatible:
         with pytest.raises(ConcatError, match="at least one segment"):
             check_compatible([])
 
+    # --- audio-track consistency (issue #196) ------------------------------- #
+
+    def test_all_have_audio_no_warning(self):
+        segs = [ConcatSegment(Path(f"{i}.mp4")) for i in range(3)]
+        warnings: list[str] = []
+        with patch.object(sc, "subprocess") as sp:
+            sp.run = _fake_probe_run(_probe_streams(has_audio=True))
+            check_compatible(segs, warnings=warnings)
+        assert warnings == []
+
+    def test_none_have_audio_no_warning(self):
+        segs = [ConcatSegment(Path(f"{i}.mp4")) for i in range(3)]
+        warnings: list[str] = []
+        with patch.object(sc, "subprocess") as sp:
+            sp.run = _fake_probe_run(_probe_streams(has_audio=False))
+            check_compatible(segs, warnings=warnings)
+        assert warnings == []
+
+    def test_mixed_audio_appends_warning_with_filenames(self):
+        """Mixed-audio set must warn, naming the audio-less segment's file.
+
+        Issue #196: a concat set where some clips have audio and some don't
+        silently drops audio from the whole output. check_compatible must
+        surface this via the *warnings* out-param, naming each audio-less
+        segment by index and filename so the owner can see what's happening.
+        """
+        # Segment 0 (a.mp4) and 2 (c.mp4) have audio; segment 1 (b.mp4) and
+        # 3 (d.mp4) do not.
+        segs = [
+            ConcatSegment(Path("a.mp4")),
+            ConcatSegment(Path("b.mp4")),
+            ConcatSegment(Path("c.mp4")),
+            ConcatSegment(Path("d.mp4")),
+        ]
+
+        def _run(cmd, **kw):
+            idx = _run.calls  # type: ignore[attr-defined]
+            _run.calls = idx + 1  # type: ignore[attr-defined]
+            has_audio = idx in (0, 2)
+            stdout = _probe_streams(has_audio=has_audio)
+            return type("r", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+        _run.calls = 0  # type: ignore[attr-defined]
+        warnings: list[str] = []
+        with patch.object(sc, "subprocess") as sp:
+            sp.run = _run
+            check_compatible(segs, warnings=warnings)
+
+        assert len(warnings) == 1
+        msg = warnings[0]
+        # Both audio-less filenames must appear (asserting concrete content,
+        # not just "a warning exists").
+        assert "b.mp4" in msg
+        assert "d.mp4" in msg
+        # Audio-bearing segments must NOT be listed.
+        assert "a.mp4" not in msg
+        assert "c.mp4" not in msg
+        # 1-based indices of the audio-less segments.
+        assert "segment 2" in msg
+        assert "segment 4" in msg
+        # Consequence spelled out.
+        assert "NO audio" in msg
+
+    def test_mixed_audio_default_param_no_warning_collected(self):
+        """Not passing *warnings* must not change behavior (issue #168 guard).
+
+        The new param has a default of ``None``; a caller that doesn't pass it
+        must keep working exactly as before — no error, no side effect.
+        """
+        segs = [ConcatSegment(Path("a.mp4")), ConcatSegment(Path("b.mp4"))]
+
+        def _run(cmd, **kw):
+            idx = _run.calls  # type: ignore[attr-defined]
+            _run.calls = idx + 1  # type: ignore[attr-defined]
+            stdout = _probe_streams(has_audio=idx == 0)
+            return type("r", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+        _run.calls = 0  # type: ignore[attr-defined]
+        with patch.object(sc, "subprocess") as sp:
+            sp.run = _run
+            # Default call: no warnings kwarg, must not raise.
+            check_compatible(segs)
+
 
 # --------------------------------------------------------------------------- #
 # concat_segments — demux mode
@@ -628,3 +711,86 @@ class TestConcatMisc:
             sp.run = _fake_probe_run(_probe_streams())
             concat_segments(segs, out, mode="demux", runner=_run)
         assert all(s is not True for s in seen_shells)
+
+
+# --------------------------------------------------------------------------- #
+# concat_segments — mixed-audio warning (issue #196)
+# --------------------------------------------------------------------------- #
+
+
+class TestConcatMixedAudioWarning:
+    """concat_segments must log a warning when the set is audio-mixed.
+
+    Issue #196: a mixed-audio concat set silently produces a silent output.
+    concat_segments surfaces this via logging.warning naming the audio-less
+    segments, so the owner sees it before the clip lands on a headset.
+    """
+
+    def _segs(self, tmp_path: Path, n=2):
+        segs = []
+        for i in range(n):
+            p = tmp_path / f"seg{i}.mp4"
+            p.write_bytes(b"fake")
+            segs.append(ConcatSegment(p))
+        return segs
+
+    def test_mixed_audio_logs_warning_with_filename(self, tmp_path: Path, caplog):
+        """caplog assertion that a warning is recorded naming the silent clip."""
+        segs = self._segs(tmp_path, n=2)  # seg0.mp4 (audio), seg1.mp4 (no audio)
+        out = tmp_path / "out.mp4"
+        runner = _fake_runner()
+
+        def _run(cmd, **kw):
+            idx = _run.calls  # type: ignore[attr-defined]
+            _run.calls = idx + 1  # type: ignore[attr-defined]
+            stdout = _probe_streams(has_audio=idx == 0)
+            return type("r", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+        _run.calls = 0  # type: ignore[attr-defined]
+        with patch.object(sc, "subprocess") as sp:
+            sp.run = _run
+            import logging
+
+            with caplog.at_level(logging.WARNING, logger="segment-concat"):
+                concat_segments(segs, out, mode="demux", runner=runner)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings, "expected a WARNING-level log record for mixed audio"
+        msg = warnings[0].getMessage()
+        # The audio-less segment's filename must be in the warning text.
+        assert "seg1.mp4" in msg
+        assert "NO audio" in msg
+        # The audio-bearing segment must NOT be flagged.
+        assert "seg0.mp4" not in msg
+
+    def test_uniform_audio_no_warning_logged(self, tmp_path: Path, caplog):
+        """All-audio set must record no warning through concat_segments."""
+        segs = self._segs(tmp_path, n=2)
+        out = tmp_path / "out.mp4"
+        runner = _fake_runner()
+
+        with patch.object(sc, "subprocess") as sp:
+            sp.run = _fake_probe_run(_probe_streams(has_audio=True))
+            import logging
+
+            with caplog.at_level(logging.WARNING, logger="segment-concat"):
+                concat_segments(segs, out, mode="demux", runner=runner)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert not warnings
+
+    def test_uniform_silent_no_warning_logged(self, tmp_path: Path, caplog):
+        """All-silent set must record no warning through concat_segments."""
+        segs = self._segs(tmp_path, n=2)
+        out = tmp_path / "out.mp4"
+        runner = _fake_runner()
+
+        with patch.object(sc, "subprocess") as sp:
+            sp.run = _fake_probe_run(_probe_streams(has_audio=False))
+            import logging
+
+            with caplog.at_level(logging.WARNING, logger="segment-concat"):
+                concat_segments(segs, out, mode="demux", runner=runner)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert not warnings
