@@ -565,26 +565,32 @@ class StreamingPipeline:
         out_left: str,
         out_right: str,
     ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-        """Run the injected whole-clip stereo backend once (I-5, #120).
+        """Run the injected whole-clip stereo backend once (I-5, #120; I-7, #137).
 
         Returns ``(left_frames, right_frames)`` read back from the L/R output
-        videos the backend wrote.  StereoCrafter runs its own internal
-        DepthCrafter, so it does not consume the caller's external depth maps;
-        *depth_dir* is passed for interface compatibility and must exist.
+        videos the backend wrote (the paths ``render_video`` *returns*, matching
+        the batch ``_run_stereocrafter_stage``).  StereoCrafter runs its own
+        internal DepthCrafter, so it does not consume the caller's external
+        depth maps; *depth_dir* is passed for interface compatibility and must
+        exist.
         """
         log.info(
             "🎬 [Stereo] whole-clip backend (%s): running render_video on %s",
             self.stereo_backend_name,
             input_path,
         )
-        self.stereo_renderer.render_video(
+        # Use the paths the backend actually wrote (its return value), not the
+        # assumed ones — the batch ``_run_stereocrafter_stage`` does the same.
+        # A backend that resolves outputs elsewhere would otherwise have its
+        # frames read back from the wrong location.
+        result_left, result_right = self.stereo_renderer.render_video(
             input_path=input_path,
             depth_dir=depth_dir,
             output_left=out_left,
             output_right=out_right,
         )
-        left_frames = _load_video_frames(out_left)
-        right_frames = _load_video_frames(out_right)
+        left_frames = _load_video_frames(result_left)
+        right_frames = _load_video_frames(result_right)
         log.info(
             "🎬 [Stereo] %s produced %d L/R frame pair(s)",
             self.stereo_backend_name,
