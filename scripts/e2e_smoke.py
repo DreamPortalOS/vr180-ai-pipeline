@@ -27,13 +27,23 @@ for a future CI hook.
 
 Profiles:
   fast : --quality preview --max-frames 8, pure Depth-Anything, NO heavy models
-         (seconds; for CI/daily).  NOTE: preview is the non-streaming legacy
-         path, so the streaming-backends log assertion is skipped for it.
+         (seconds; for daily on-machine checks).  NOTE: preview is the
+         non-streaming legacy path, so the streaming-backends log assertion
+         is skipped for it.
+  ci   : --force-sbs SBS-split path (skips depth/stereo entirely) at a tiny
+         256²/eye (--output-width/--output-height override) — NO HuggingFace
+         model download, NO GPU, CPU-only, ~seconds.  Runs in GitHub Actions
+         (K-5.1, #152): it guards the real wiring that mock tests cannot
+         (module imports, run_pipeline arg plumbing, equirect projection,
+         sv3d/st3d injection, sidecar).  Feed it a wide (≥3.5:1) synthetic
+         source.  Depth-model correctness stays with the fast/full profiles
+         on real machines.
   full : --depth-model depthcrafter --stereo-model stereocrafter --comfort safe
          --quality high  (lead's on-machine heavy-model acceptance; NOT for CI)
 
 Usage:
     python scripts/e2e_smoke.py --input video.mp4 --profile fast
+    python scripts/e2e_smoke.py --input video.mp4 --profile ci   # CI / no-model
     python scripts/e2e_smoke.py -i video.mp4 --profile full --copy-audio-from video.mp4
     python scripts/e2e_smoke.py -i video.mp4 --profile fast --json
 """
@@ -68,6 +78,43 @@ PROFILES: dict[str, dict] = {
         "expected_depth": "depth-anything",
         "expected_stereo": "default",
         "quality": "preview",
+        # Per-eye square size override → the resolution check asserts this
+        # instead of the tier default.  None = use QUALITY_PRESETS[quality].
+        "eye": None,
+        # Which of the six assertions this profile runs (see run_smoke).
+        "checks": ("exit_code", "output_probe", "metadata_bytes", "audio", "backend_log_na", "sidecar"),
+    },
+    "ci": {
+        # K-5.1 (#152): the CI-runnable profile — "--profile ci：跳过深度、只验证
+        # 投影+元数据+sidecar 链路" per the task card.  --force-sbs makes the batch
+        # pipeline take the SBS stage order (upscale/equirect/outpaint/metadata),
+        # so the Depth-Anything estimator is NEVER constructed → NO HuggingFace
+        # download, NO GPU, CPU-only, ~seconds.  256²/eye keeps CPU projection +
+        # encode tiny; --no-ffmpeg-v360 forces the deterministic OpenCV remap so
+        # the smoke does not depend on the runner's ffmpeg build shipping the
+        # v360 filter (the sv3d/st3d injector's own ffmpeg remux still exercises
+        # the real ffmpeg wiring).  Pair it with a wide (≥3.5:1) synthetic source.
+        "description": "CI 档：--force-sbs 跳过深度/立体（不下载模型、不要 GPU），只验证投影+元数据+sidecar 链路",
+        "args": (
+            "--quality",
+            "preview",
+            "--max-frames",
+            "4",
+            "--output-width",
+            "256",
+            "--output-height",
+            "256",
+            "--no-ffmpeg-v360",
+            "--force-sbs",
+        ),
+        "expected_depth": "depth-anything",
+        "expected_stereo": "default",
+        "quality": "preview",
+        "eye": 256,
+        # SBS path runs neither the depth estimator nor the streaming pipeline,
+        # so there is no backend line to assert — that check stays with the
+        # fast/full profiles on real machines.
+        "checks": ("exit_code", "output_probe", "metadata_bytes", "audio", "sidecar"),
     },
     "full": {
         "description": "DepthCrafter + StereoCrafter + comfort safe + quality high（重模型本机验收）",
@@ -84,6 +131,8 @@ PROFILES: dict[str, dict] = {
         "expected_depth": "depthcrafter",
         "expected_stereo": "stereocrafter",
         "quality": "high",
+        "eye": None,
+        "checks": ("exit_code", "output_probe", "metadata_bytes", "audio", "backend_log", "sidecar"),
     },
 }
 
@@ -195,11 +244,14 @@ def check_output_probe(
     output_path: str,
     quality: str,
     probe: dict | None = None,
+    eye: int | None = None,
 ) -> Check:
     """2. product exists + ffprobe-readable + resolution matches the quality tier.
 
     ``probe`` is injectable so tests never shell out to ffprobe.  Expected
-    frame = (2×eye) × eye for the SBS equirect output.
+    frame = (2×eye) × eye for the SBS equirect output, where ``eye`` is the
+    per-eye square size — the QUALITY_PRESETS tier default unless the profile
+    overrode it via --output-width/--output-height (the ci profile's 256²).
     """
     p = Path(output_path)
     if not p.is_file():
@@ -225,8 +277,8 @@ def check_output_probe(
             width = int(s.get("width", 0))
             height = int(s.get("height", 0))
             break
-    eye = QUALITY_PRESETS[quality]
-    want_w, want_h = eye * 2, eye
+    eye_size = eye if eye is not None else QUALITY_PRESETS[quality]
+    want_w, want_h = eye_size * 2, eye_size
     ok = (width, height) == (want_w, want_h)
     return Check(
         "output exists + ffprobe",
@@ -235,7 +287,7 @@ def check_output_probe(
         hint=(
             ""
             if ok
-            else f"分辨率对不上 --quality {quality}（{QUALITY_PRESETS[quality]}²/眼）。"
+            else f"分辨率对不上 --quality {quality}（{eye_size}²/眼）。"
             "查 output_width/output_height 是否被 --output-width 覆盖或 preset 没生效。"
         ),
     )
@@ -437,12 +489,21 @@ def run_smoke(
     copy_audio_from: str | None = None,
     runner=subprocess.run,
 ) -> SmokeReport:
-    """Run one full smoke: pipeline subprocess + all six assertions.
+    """Run one full smoke: pipeline subprocess + the profile's assertions.
 
     ``runner`` is injectable so tests drive the assertion logic with a fake
     subprocess result (no real conversion, no ffprobe shell-out for the
     probe-dependent checks — those inject their probe/box/sidecar fixtures
     directly via the check helpers in the test-suite's own unit tests).
+
+    Which checks run is declared per profile in ``PROFILES[*]["checks"]``:
+      exit_code      — pipeline returncode == 0
+      output_probe   — artefact exists, ffprobe-readable, resolution matches
+      metadata_bytes — sv3d/st3d byte-scan (st3d mode == left-right)
+      audio          — audio stream present when --copy-audio-from was passed
+      backend_log    — streaming backends in the log == the requested ones
+      backend_log_na — explicit N/A pass (non-streaming legacy path)
+      sidecar        — sidecar JSON carries the D-3 immersive fields
     """
     prof = PROFILES[profile]
     report = SmokeReport(input=str(input_path), output=str(output_path), profile=profile)
@@ -452,24 +513,31 @@ def run_smoke(
     proc = runner(cmd, capture_output=True, text=True)  # list argv, no shell
     combined_log = (proc.stdout or "") + "\n" + (proc.stderr or "")
 
-    report.checks.append(check_exit_code(proc.returncode))
-    report.checks.append(check_output_probe(output_path, prof["quality"]))
-    report.checks.append(check_metadata_bytes(output_path))
-    report.checks.append(check_audio_stream(output_path, copy_audio_from))
-    # preview (fast) is the NON-streaming legacy path — the streaming-backends
-    # log line is only emitted by StreamingPipeline, so only assert it for the
-    # streaming (full) profile.  Skip with an explicit N/A pass for fast.
-    if profile == "fast":
-        report.checks.append(
-            Check(
-                "backend log assertion",
-                True,
-                measured="N/A (fast profile = non-streaming legacy path)",
+    for check_name in prof["checks"]:
+        if check_name == "exit_code":
+            report.checks.append(check_exit_code(proc.returncode))
+        elif check_name == "output_probe":
+            report.checks.append(check_output_probe(output_path, prof["quality"], eye=prof.get("eye")))
+        elif check_name == "metadata_bytes":
+            report.checks.append(check_metadata_bytes(output_path))
+        elif check_name == "audio":
+            report.checks.append(check_audio_stream(output_path, copy_audio_from))
+        elif check_name == "backend_log":
+            report.checks.append(check_backend_log(combined_log, prof["expected_depth"], prof["expected_stereo"]))
+        elif check_name == "backend_log_na":
+            # preview (fast) is the NON-streaming legacy path — the
+            # streaming-backends log line is only emitted by StreamingPipeline.
+            report.checks.append(
+                Check(
+                    "backend log assertion",
+                    True,
+                    measured="N/A (fast profile = non-streaming legacy path)",
+                )
             )
-        )
-    else:
-        report.checks.append(check_backend_log(combined_log, prof["expected_depth"], prof["expected_stereo"]))
-    report.checks.append(check_sidecar(output_path))
+        elif check_name == "sidecar":
+            report.checks.append(check_sidecar(output_path))
+        else:  # pragma: no cover - profile-table typo guard
+            raise ValueError(f"unknown check {check_name!r} in profile {profile!r}")
     return report
 
 
@@ -493,7 +561,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--profile",
         choices=sorted(PROFILES),
         default="fast",
-        help="fast = preview+8帧+纯Depth-Anything（秒级，日常/CI）；full = DepthCrafter+StereoCrafter 重模型（本机验收）",
+        help="fast = preview+8帧+纯Depth-Anything（秒级，日常）；ci = --force-sbs 跳过深度/立体（不下载模型，CI 用）；"
+        "full = DepthCrafter+StereoCrafter 重模型（本机验收）",
     )
     parser.add_argument(
         "--output",

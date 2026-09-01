@@ -94,6 +94,20 @@ class TestBuildCommand:
         cmd = build_pipeline_command("in.mp4", "out.mp4", "full", copy_audio_from="src.mp4")
         assert "--copy-audio-from" in cmd and "src.mp4" in cmd
 
+    def test_ci_profile_args(self) -> None:
+        cmd = build_pipeline_command("in.mp4", "out.mp4", "ci")
+        joined = " ".join(cmd)
+        assert "--quality preview" in joined
+        assert "--max-frames 4" in joined
+        # Tiny 256²/eye override keeps CPU projection + encode at seconds.
+        assert "--output-width 256" in joined and "--output-height 256" in joined
+        # --force-sbs skips depth/stereo entirely → no model is ever downloaded.
+        assert "--force-sbs" in cmd
+        # Deterministic OpenCV remap — no dependence on ffmpeg shipping v360.
+        assert "--no-ffmpeg-v360" in cmd
+        # ci = no model flags at all (nothing to download).
+        assert "--depth-model" not in cmd and "--stereo-model" not in cmd
+
     def test_unknown_profile_rejected(self) -> None:
         with pytest.raises(ValueError, match="unknown profile"):
             build_pipeline_command("in.mp4", "out.mp4", "turbo")
@@ -147,6 +161,19 @@ class TestOutputProbe:
         f.touch()
         c = check_output_probe(str(f), "high", probe={"streams": [], "format": {}})
         assert not c.ok and "0×0" in c.measured
+
+    def test_eye_override_used(self, tmp_path: Path) -> None:
+        f = tmp_path / "o.mp4"
+        f.touch()
+        # ci profile: preview tier + explicit 256²/eye → 512×256 SBS.
+        c = check_output_probe(str(f), "preview", probe=_probe(512, 256), eye=256)
+        assert c.ok and "512×256" in c.measured
+
+    def test_eye_override_mismatch_reports_override(self, tmp_path: Path) -> None:
+        f = tmp_path / "o.mp4"
+        f.touch()
+        c = check_output_probe(str(f), "preview", probe=_probe(3840, 1920), eye=256)
+        assert not c.ok and "512×256" in c.measured and c.hint
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +364,30 @@ class TestRunSmoke:
         exit_check = next(c for c in report.checks if c.name == "pipeline exit code")
         assert not exit_check.ok and "exit=1" in exit_check.measured
 
+    def test_ci_profile_passes(self, tmp_path: Path, monkeypatch) -> None:
+        out = str(tmp_path / "o.mp4")
+        # ci = preview tier + 256²/eye override → 512×256 SBS.
+        monkeypatch.setattr(
+            "scripts.e2e_smoke._ffprobe_streams",
+            lambda path, ffprobe="ffprobe": _probe(512, 256),
+        )
+        runner = self._runner_ok(tmp_path, out, log_line="")
+        report = run_smoke("in.mp4", out, "ci", runner=runner)
+        assert report.ok, [(c.name, c.measured) for c in report.failed]
+
+    def test_ci_profile_skips_backend_log_check(self, tmp_path: Path, monkeypatch) -> None:
+        out = str(tmp_path / "o.mp4")
+        monkeypatch.setattr(
+            "scripts.e2e_smoke._ffprobe_streams",
+            lambda path, ffprobe="ffprobe": _probe(512, 256),
+        )
+        runner = self._runner_ok(tmp_path, out, log_line="")
+        report = run_smoke("in.mp4", out, "ci", runner=runner)
+        # The SBS path never constructs a depth/stereo backend, so the
+        # streaming-backends assertion is intentionally absent (not an N/A
+        # pass — it simply does not apply to this profile).
+        assert "backend log assertion" not in [c.name for c in report.checks]
+
 
 # ---------------------------------------------------------------------------
 # CLI wiring (argparse + main exit code, pipeline mocked)
@@ -357,8 +408,13 @@ class TestCli:
         assert rc == 1
         assert "input not found" in capsys.readouterr().err
 
-    def test_profiles_table_has_fast_and_full(self) -> None:
-        assert set(PROFILES) == {"fast", "full"}
+    def test_profiles_table_has_fast_ci_and_full(self) -> None:
+        assert set(PROFILES) == {"fast", "ci", "full"}
         assert PROFILES["fast"]["expected_depth"] == "depth-anything"
         assert PROFILES["full"]["expected_depth"] == "depthcrafter"
         assert PROFILES["full"]["expected_stereo"] == "stereocrafter"
+        # ci: 256²/eye override + no backend-log check (SBS path, no backends).
+        assert PROFILES["ci"]["eye"] == 256
+        assert PROFILES["fast"]["eye"] is None and PROFILES["full"]["eye"] is None
+        assert "backend_log" not in PROFILES["ci"]["checks"]
+        assert "backend_log_na" not in PROFILES["ci"]["checks"]
