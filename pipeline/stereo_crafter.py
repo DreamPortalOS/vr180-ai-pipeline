@@ -478,10 +478,23 @@ class CLIBackend(StereoCrafterBackend):
 
         # pre_trained_path (SVD base model, --pre_trained_path for Stage 2):
         #   explicit > env > in-repo models/svd-img2vid-xt-1-1 (if exists) >
-        #   HF model id (diffusers auto-downloads on first run).
+        #   HF model id (remote resolution on first run — NOT the recommended path).
+        #
         # Issue #147: NEVER default to a nonexistent local path — diffusers /
         # transformers would treat the path string as an HF repo id and crash
         # with "Repo id must use alphanumeric chars".
+        #
+        # Issue #150: the SVD repo is GATED — the HF account behind the local
+        # token must have accepted the license or any download 403s.
+        #
+        # Issue #155: prefer a LOCAL dir.  The repo ships ONLY safetensors
+        # (no .bin); loading the HF id resolves the weight file remotely via
+        # transformers' ``cached_file``, which wraps any non-OSError (auth /
+        # network glitch) as the misleading "make sure ...
+        # pytorch_model.fp16.bin" error.  A local snapshot lets the
+        # local-folder branch resolve ``model.fp16.safetensors`` via
+        # ``os.path.isfile``.  The bootstrap pre-downloads that local
+        # snapshot (fp16 safetensors only) by default.
         if pre_trained_path:
             self.pre_trained_path = str(Path(pre_trained_path).resolve())
         elif os.environ.get("STEREOCRAFTER_SVD_PATH"):
@@ -490,14 +503,17 @@ class CLIBackend(StereoCrafterBackend):
             self.pre_trained_path = str(INREPO_SVD_DIR)
         else:
             self.pre_trained_path = SVD_HF_MODEL_ID
-            log.info(
-                "StereoCrafter: SVD base not found locally — passing HF model id %r to diffusers; "
-                "the first run will download ~10 GB (same behaviour as DepthCrafter).  Note: this "
-                "is a GATED HF repo — the HF account behind the local token must have accepted the "
-                "license at https://huggingface.co/%s or the runtime download will 403 (issue #150).  "
-                "Pre-download (recommended) by re-running the bootstrap "
-                "'python scripts/setup_stereocrafter.py' (it pre-downloads the SVD base by default), "
-                "or set STEREOCRAFTER_SVD_PATH to an existing local snapshot.",
+            log.warning(
+                "StereoCrafter: SVD base not found locally at %s — falling back to HF model id %r "
+                "for remote resolution on first run.  THIS PATH TRIPPED ISSUE #155 (the misleading "
+                "'pytorch_model.fp16.bin' safetensors load failure: the repo ships ONLY safetensors, "
+                "no .bin, so the remote cached_file fallback raises that error), AND it is a GATED "
+                "repo — the HF account behind the local token must have accepted the license at "
+                "https://huggingface.co/%s or the runtime download will 403 (issue #150).  A LOCAL "
+                "snapshot is strongly preferred.  Pre-download it (fp16 safetensors only, ≈5 GB) by "
+                "re-running 'python scripts/setup_stereocrafter.py' (it pre-downloads the SVD base "
+                "by default), or set STEREOCRAFTER_SVD_PATH to an existing local snapshot.",
+                INREPO_SVD_DIR,
                 SVD_HF_MODEL_ID,
                 SVD_HF_MODEL_ID,
             )

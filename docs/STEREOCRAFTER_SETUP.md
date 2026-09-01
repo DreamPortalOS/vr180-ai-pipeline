@@ -29,19 +29,24 @@ The script is **idempotent** — re-running it only fills missing pieces.  It:
    - `torch==2.6.0` + `torchvision==0.21.0` from the stable **cu124**
      index (NOT nightly).
    - A curated subset of runtime deps that the inference entry point
-     actually imports.  (We deliberately do **not** run `pip install -e .`
-     against the upstream pyproject — it would bump the torch pins or add
-     demo-only deps.)
+     actually imports.  `transformers`/`diffusers` are **pinned** to the
+     combo upstream tested (`transformers==4.42.3` / `diffusers==0.29.2`) —
+     this is the safetensors load fix; see §6.  (We deliberately do **not**
+     run `pip install -e .` against the upstream pyproject — it would bump
+     the torch pins or add demo-only deps.)
 3. Downloads `TencentARC/StereoCrafter` weights into
    `models/StereoCrafter/` via `huggingface_hub.snapshot_download`
    (skipped if already present).
 4. Pre-downloads the **SVD base model**
-   (`stabilityai/stable-video-diffusion-img2vid-xt-1-1`, ~10 GB) into
-   `models/svd-img2vid-xt-1-1/`.  This is a **gated** HF repo — the local
-   HF token is read automatically and the account must have **accepted
-   the license** (see §2.1).  If the account is not yet authorized, the
-   step fails with a clear error naming the application page rather than
-   a bare `403 OSError`.  Skip with `--skip-svd`.
+   (`stabilityai/stable-video-diffusion-img2vid-xt-1-1`) into
+   `models/svd-img2vid-xt-1-1/`, **fp16 safetensors only (~5 GB, not the
+   full ~10 GB repo)**.  This is a **gated** HF repo — the local HF token
+   is read automatically and the account must have **accepted the license**
+   (see §2.1).  If the account is not yet authorized, the step fails with a
+   clear error naming the application page rather than a bare `403 OSError`.
+   Loading the SVD base from this **local** dir is also what fixes the
+   `pytorch_model.fp16.bin` load failure (§6, issue #155).  Skip with
+   `--skip-svd` (NOT recommended — see §6).
 5. Runs a self-check (`<inference_entry_point> --help`) so a broken env
    is caught early.
 
@@ -50,7 +55,7 @@ Created layout (everything is gitignored):
 ```
 third_party/StereoCrafter/      ← TencentARC/StereoCrafter checkout (+ its own .venv)
 models/StereoCrafter/           ← TencentARC/StereoCrafter weights
-models/svd-img2vid-xt-1-1/      ← SVD base model (gated HF repo, ~10 GB)
+models/svd-img2vid-xt-1-1/      ← SVD base (fp16 safetensors, gated HF repo, ~5 GB)
 ```
 
 ### Bootstrap options
@@ -76,7 +81,7 @@ python scripts/setup_stereocrafter.py --dry-run                     # print plan
 | CUDA      | CUDA 12.4 (torch is pinned to the cu124 wheel index) |
 | OS        | Windows / Linux / macOS are all supported by the bootstrap; **inference is CUDA-only** |
 | Python    | 3.10+ (the dedicated venv is created by the bootstrap) |
-| Disk      | ~20 GB (checkout + weights + venv) **+ ~10 GB for the SVD base** — pre-downloaded by the bootstrap; skip with `--skip-svd` to defer to the first inference run |
+| Disk      | ~20 GB (checkout + weights + venv) **+ ~5 GB for the SVD base** — pre-downloaded (fp16 safetensors only) by the bootstrap into `models/svd-img2vid-xt-1-1/`; a **local** snapshot is the issue #155 safetensors load fix (§6); skip with `--skip-svd` to defer to the first inference run (NOT recommended) |
 | HF access | An Hugging Face account token with **accepted license** for the gated SVD repo [`stabilityai/stable-video-diffusion-img2vid-xt-1-1`](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1) (see §2.1) |
 | Network   | git + HF download (one-time); the bootstrap prints proxy hints if `git clone` fails |
 
@@ -112,9 +117,10 @@ OSError: You are trying to access a gated repo.
    The bootstrap now reads your local HF token automatically
    (`HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` env var, or
    `~/.cache/huggingface/token` / `huggingface-cli login`), passes it to
-   `snapshot_download`, and pre-downloads the ~10 GB SVD base into
-   `models/svd-img2vid-xt-1-1/`.  **No re-login is needed** — the token is
-   already on disk; only the license acceptance is required.
+   `snapshot_download`, and pre-downloads the SVD base (fp16 safetensors
+   only, ~5 GB) into `models/svd-img2vid-xt-1-1/`.  **No re-login is
+   needed** — the token is already on disk; only the license acceptance is
+   required.
 3. If you pass a token explicitly:
    ```bash
    python scripts/setup_stereocrafter.py --hf-token hf_xxx
@@ -193,20 +199,22 @@ backend raises and points at `scripts/setup_stereocrafter.py`.
 | `repo_dir`              | `STEREOCRAFTER_REPO_DIR`       | `third_party/StereoCrafter` *(if exists)* |
 | `python_exe`            | `STEREOCRAFTER_PYTHON`         | in-repo venv python *(if exists)*, else `python` |
 | `checkpoint_dir`        | `STEREOCRAFTER_CKPT_DIR`       | `models/StereoCrafter` *(if exists)*, else `(<repo>)/checkpoints` — Stage 2 `--unet_path` |
-| `pre_trained_path`      | `STEREOCRAFTER_SVD_PATH`       | `models/svd-img2vid-xt-1-1` *(if exists)*, else the HF id `stabilityai/stable-video-diffusion-img2vid-xt-1-1` — SVD base (Stage 2 `--pre_trained_path`) |
+| `pre_trained_path`      | `STEREOCRAFTER_SVD_PATH`       | `models/svd-img2vid-xt-1-1` *(if exists)* — SVD base (Stage 2 `--pre_trained_path`); else the HF id `stabilityai/stable-video-diffusion-img2vid-xt-1-1` (remote resolution — NOT recommended, see §6) |
 
-> **SVD base model (~10 GB) — pre-downloaded by the bootstrap.**  The
-> bootstrap pre-downloads the SVD base into `models/svd-img2vid-xt-1-1/`
+> **SVD base (~5 GB, fp16 safetensors) — pre-downloaded by the bootstrap.**
+> The bootstrap pre-downloads the SVD base into `models/svd-img2vid-xt-1-1/`
 > by default (it is a **gated** HF repo — see §2.1 for the one-time
-> license-acceptance step).  If you ran the bootstrap with `--skip-svd` and
-> no local copy exists, the backend falls back to passing the HF model id
-> straight to diffusers, which downloads ~10 GB into the HF cache on the
-> **first inference run** (same behaviour as DepthCrafter's auto-pull).  To
-> front-load that download later, re-run
-> `python scripts/setup_stereocrafter.py` (the SVD step is idempotent), or
-> set `STEREOCRAFTER_SVD_PATH` to an existing local snapshot.  A nonexistent
-> local path is never passed — diffusers would treat it as an HF repo id and
-> crash (issue #147).
+> license-acceptance step).  Loading the base from that **local** dir is the
+> fix for issue #155 (the `pytorch_model.fp16.bin` safetensors load failure —
+> see §6): a local path lets transformers resolve `model.fp16.safetensors`
+> via `os.path.isfile` instead of the error-prone remote `cached_file`.  If
+> you ran the bootstrap with `--skip-svd` and no local copy exists, the
+> backend falls back to the HF model id (remote resolution on the first
+> inference run) and logs a WARNING.  To front-load the local copy later,
+> re-run `python scripts/setup_stereocrafter.py` (the SVD step is idempotent),
+> or set `STEREOCRAFTER_SVD_PATH` to an existing local snapshot.  A
+> nonexistent local path is never passed — diffusers would treat it as an HF
+> repo id and crash (issue #147).
 | `max_resolution`        | `STEREOCRAFTER_MAX_RES`        | `512` |
 | `max_disp`              | `STEREOCRAFTER_MAX_DISP`       | `20.0` — stereo baseline for the in-repo forward-splat |
 
@@ -327,8 +335,59 @@ dependencies (see `tests/test_stereo_crafter.py`).
 | `snapshot_download` fails (StereoCrafter weights) | HF access / network | Re-run the bootstrap; or clone `https://huggingface.co/TencentARC/StereoCrafter` into `models/StereoCrafter/` manually |
 | SVD download fails with `gated repo` / `403` / "not in the authorized list" | The HF account behind the local token has **not accepted the SVD model's license** — it is a gated repo (issue #150). The bootstrap prints the application page and steps automatically | Open <https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1>, sign in with the same HF account, accept the license (usually instant), then re-run `python scripts/setup_stereocrafter.py`. See §2.1 |
 | SVD download fails, no token found | No HF token on disk (`~/.cache/huggingface/token`) and no `HF_TOKEN` env var | Run `huggingface-cli login` once, or pass `--hf-token hf_xxx` (see §2.1) |
+| `Can't load the model ... pytorch_model.fp16.bin` (Stage 2 startup) | The SVD base is being resolved **remotely** (HF id), and the remote `cached_file` path tripped issue #155 — the repo ships ONLY safetensors, no `.bin`, so the remote-resolution fallback raises the misleading `.bin` error. **Not** an auth problem (that is the 403/gated row above). | Confirm the local snapshot exists at `models/svd-img2vid-xt-1-1/image_encoder/model.fp16.safetensors`; if not, re-run `python scripts/setup_stereocrafter.py` so the fp16 safetensors are pre-downloaded and the backend loads the local dir (it logs a WARNING if it falls back to the HF id).  If the snapshot is present but it still fails, the dedicated venv has an older `transformers` — re-run the bootstrap with `--skip-model --skip-svd` to reinstall the pinned `transformers==4.42.3`.  See §6a below. |
 | Subprocess non-zero exit | StereoCrafter internal error | Run `inpainting_inference.py` directly inside `third_party/StereoCrafter/` to isolate the failure; check its stderr |
 | `SBS output not found` | Stage 2 succeeded but did not write `<name>_sbs.mp4` where expected | Confirm `--save_dir` is writable and the inpainting step completed; check stderr of Stage 2 |
+
+### 6a. The SVD base must load from a local directory (issue #155)
+
+**Symptom:** Stage 2 startup dies with
+
+```
+OSError: Can't load the model for 'stabilityai/stable-video-diffusion-img2vid-xt-1-1'.
+  ... make sure ... is the correct path to a directory containing a file named pytorch_model.fp16.bin.
+  (raised from transformers/modeling_utils.py::_get_resolved_checkpoint_files)
+```
+
+**Root cause (lead-verified):** the HF repo ships **only safetensors**
+(`image_encoder/model.fp16.safetensors`, `unet/diffusion_pytorch_model.fp16.safetensors`,
+`vae/...`) — there is no `.bin` at all.  But `inpainting_inference.py` loads the
+image_encoder / VAE with `variant="fp16"` and **no** `use_safetensors=True` flag.
+When the path is an **HF repo id**, transformers resolves the weight file
+remotely via `cached_file`; any non-`OSError` raised inside that call (a
+transient auth / network glitch) gets re-wrapped as the generic "make sure
+... pytorch_model.fp16.bin" error — a misleading tail that names `WEIGHTS_NAME`
+(`pytorch_model.bin`) even though the loader actually tried `model.fp16.safetensors`
+first.  So the error is a **load-path / version** problem, **not** an auth
+problem (the 403 was already resolved in issue #150).
+
+**The fix (two layers, both shipped here):**
+
+1. **Local snapshot (the real fix).**  When `--pre_trained_path` points at a
+   **local directory**, transformers' `_get_resolved_checkpoint_files` takes the
+   local-folder branch, which checks `os.path.isfile(.../model.fp16.safetensors)`
+   **first** (whenever `use_safetensors is not False`, the default `None`) — no
+   `cached_file`, no remote resolution, no misleading wrap.  The bootstrap now
+   **pre-downloads** that local snapshot by default (fp16 safetensors + configs
+   only, ≈5 GB instead of the full ~10 GB repo) into
+   `models/svd-img2vid-xt-1-1/`, and `pipeline.stereo_crafter` picks that local
+   dir up automatically (issue #147 precedence: existing local dir > HF id).
+2. **Pinned loader versions (defence-in-depth).**  `RUNTIME_DEPS` pins
+   `transformers==4.42.3` / `diffusers==0.29.2` — the exact pair upstream
+   `TencentARC/StereoCrafter`'s `requirements.txt` tested against.  This
+   guarantees the local-folder safetensors-first resolution path is the one
+   upstream validated; an unpinned `transformers` could drift to a 5.x whose API
+   changes break the vendored `StableVideoDiffusionInpaintingPipeline`, or
+   (older) a line that defaulted to `.bin`.  Re-run the bootstrap to pick up the
+   pins (the venv is re-created/updated in Step 2).
+
+**If you still hit it:** confirm
+`models/svd-img2vid-xt-1-1/image_encoder/model.fp16.safetensors` exists (the
+bootstrap's "already present" check keys on exactly those three fp16 safetensors).
+If it does but Stage 2 still fails, the dedicated venv has an older `transformers`
+— re-run the bootstrap with `--skip-model --skip-svd` (it reinstalls the pinned
+`transformers==4.42.3`).  Do **not** answer this with `--skip-svd`: the local path
+*is* the answer.
 
 ### If the bootstrap is not run / paths missing
 

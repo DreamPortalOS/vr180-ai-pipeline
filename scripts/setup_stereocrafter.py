@@ -100,9 +100,27 @@ TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
 #                                   torchvision.io, diffusers, fire, decord
 #                                   (+ vendored dependency/ & Forward_Warp)
 # → both import ``decord``; numpy ships transitively via torch/diffusers.
+#
+# Pinned versions of the model loaders, matched to the combo upstream
+# TencentARC/StereoCrafter tested against (its requirements.txt pins
+# transformers==4.42.3 / diffusers==0.29.2).  WHY pinning matters here
+# (issue #155): the SVD base repo ships ONLY safetensors (no .bin at all),
+# and inpainting_inference.py loads the image_encoder / vae with
+# ``variant="fp16"`` but WITHOUT ``use_safetensors=True``.  Whether the loader
+# then picks ``model.fp16.safetensors`` over ``pytorch_model.fp16.bin`` is
+# governed by the local-folder branch of transformers'
+# _get_resolved_checkpoint_files — which prefers safetensors when
+# ``use_safetensors is not False`` (the default, None) in 4.42.3+.  An
+# unpinned ``transformers`` could resolve to a 5.x that changed the vendored
+# pipeline's API surface, or an older line that defaulted to .bin; pinning to
+# the upstream-tested pair guarantees the safetensors-first path is exactly
+# the one upstream validated.  See docs/STEREOCRAFTER_SETUP.md §6.
+TRANSFORMERS_PIN = "==4.42.3"
+DIFFUSERS_PIN = "==0.29.2"
+
 RUNTIME_DEPS: tuple[str, ...] = (
-    "diffusers",  # SD/SVD-based video diffusion backbone used for inpainting
-    "transformers",  # pulled by diffusers models
+    f"diffusers{DIFFUSERS_PIN}",  # SD/SVD-based video diffusion backbone used for inpainting
+    f"transformers{TRANSFORMERS_PIN}",  # pulled by diffusers models — pinned (issue #155, safetensors)
     "accelerate",  # used by diffusers model loaders
     "huggingface-hub",  # weight download / caching
     "opencv-python",  # video I/O (cv2)
@@ -135,6 +153,51 @@ INREPO_SVD_DIR = REPO_ROOT / "models" / "svd-img2vid-xt-1-1"
 # when the caller passes none).  Mirrors ``huggingface_hub.constants`` so we do
 # not hard-couple this setup script to the package's internals.
 _HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN")
+
+# Selective snapshot patterns for the SVD base (issue #155).  The repo ships
+# ONLY safetensors (no .bin); we fetch just the **fp16** safetensors + the
+# configs every Stage-2 loader (CLIPVisionModelWithProjection / VAE / the
+# vendored SVD pipeline) resolves, skipping the fp32 variants + the unused
+# full-pipeline aggregate weight.  This cuts the download from ~10 GB to ~5 GB
+# AND guarantees the local snapshot has exactly the files the local-folder
+# resolver looks for (see :func:`_has_svd_fp16_safetensors`).
+_SVD_FP16_ALLOW_PATTERNS: tuple[str, ...] = (
+    "*.json",  # model_index.json + every subfolder's config.json
+    "image_encoder/model.fp16.safetensors",
+    "unet/diffusion_pytorch_model.fp16.safetensors",
+    "vae/diffusion_pytorch_model.fp16.safetensors",
+    "scheduler/scheduler_config.json",
+    "feature_extractor/preprocessor_config.json",  # pipeline __init__ reads it
+)
+# Belt-and-braces: never fetch .bin (there are none upstream, but the intent
+# stays legible if the allow list is loosened later).  Also exclude the fp32
+# safetensors variants explicitly — only fp16 is wanted.
+_SVD_IGNORE_PATTERNS: tuple[str, ...] = (
+    "*.bin",
+    "image_encoder/model.safetensors",  # fp32 variant — not needed
+    "unet/diffusion_pytorch_model.safetensors",  # fp32 variant
+    "vae/diffusion_pytorch_model.safetensors",  # fp32 variant
+    "svd_xt_1_1.safetensors",  # full-pipeline aggregate (we load subfolders)
+)
+
+
+def _has_svd_fp16_safetensors(model_dir: Path) -> bool:
+    """Return True if *model_dir* has the fp16 safetensors the Stage-2 loaders
+    resolve on the local-folder branch (issue #155).
+
+    Mirrors what transformers' ``_get_resolved_checkpoint_files`` looks for
+    with ``variant="fp16"`` and ``use_safetensors`` left at its default
+    (None → "is not False"): ``<subfolder>/model.fp16.safetensors`` (image_encoder)
+    and ``<subfolder>/diffusion_pytorch_model.fp16.safetensors`` (unet / vae).
+    A dir missing the fp16 image_encoder safetensors is NOT considered ready —
+    that is exactly the file the upstream loaders need.
+    """
+    needed = (
+        model_dir / "image_encoder" / "model.fp16.safetensors",
+        model_dir / "unet" / "diffusion_pytorch_model.fp16.safetensors",
+        model_dir / "vae" / "diffusion_pytorch_model.fp16.safetensors",
+    )
+    return all(p.is_file() for p in needed)
 
 
 # ---------------------------------------------------------------------------
@@ -460,19 +523,33 @@ def download_svd_base(
     dry_run: bool,
     buffer: DryRunBuffer,
 ) -> None:
-    """Pre-download the SVD base model (Stage 2 --pre_trained_path) into *target*.
+    """Pre-download the SVD base model (Stage 2 ``--pre_trained_path``) into *target*.
 
-    Runs by default (issue #150): the SVD base is ~10 GB and the first
-    inference run would otherwise block on a slow diffusers auto-download —
-    and because it is a **gated** HF repo, that runtime download can fail with
-    a bare ``OSError: ... gated repo ... 403`` that says nothing actionable.
+    Runs by default (issue #150): the SVD base is a **gated** HF repo, so the
+    first inference run's diffusers auto-download can fail with a bare
+    ``OSError: ... gated repo ... 403`` that says nothing actionable.
     Front-loading the download here lets us read the local HF token, accept
     the license up front, and surface a clear error (with the application
     page) if the account is not yet authorized.
 
+    It is ALSO the fix for issue #155 (the safetensors load failure).  The
+    repo ships **only safetensors** (no ``.bin``); ``inpainting_inference.py``
+    loads the image_encoder/vae with ``variant="fp16"`` and NO
+    ``use_safetensors`` flag.  When the path is an HF repo *id*, transformers
+    resolves the weight file remotely via ``cached_file`` — any non-``OSError``
+    raised inside that call (auth glitch, transient network) gets re-wrapped
+    as the misleading "make sure ... pytorch_model.fp16.bin" error.  A
+    **local directory** dodges that: the local-folder branch of the resolver
+    checks ``os.path.isfile(.../model.fp16.safetensors)`` first (when
+    ``use_safetensors is not False``, the default), so a local snapshot loads
+    cleanly.  That is why this step fetches the **fp16 safetensors only**
+    (≈5 GB, not the full ~10 GB repo) into ``models/svd-img2vid-xt-1-1`` — and
+    the pipeline picks that local dir up automatically (issue #147
+    precedence), never relying on the remote ``cached_file`` path.
+
     ``--svd-dir`` overrides the target directory; ``--skip-svd`` skips the
     step entirely (the pipeline then passes the HF model id to diffusers,
-    which downloads it on the first run — the historical behaviour).
+    which downloads it on the first run — NOT recommended, see issue #155).
     """
     if skip_svd:
         log.info("--skip-svd: SVD base pre-download skipped")
@@ -480,17 +557,17 @@ def download_svd_base(
 
     target = Path(svd_dir) if svd_dir is not None else INREPO_SVD_DIR
 
-    label = f"snapshot_download {_SVD_REPO_ID} → {target}"
+    label = f"snapshot_download {_SVD_REPO_ID} → {target} (fp16 safetensors only, ≈5 GB)"
     if dry_run:
         buffer.record(label)
         return
 
-    if target.is_dir() and _has_snapshot_files(target):
-        log.info("SVD base snapshot already present at %s — skipping.", target)
+    if target.is_dir() and _has_svd_fp16_safetensors(target):
+        log.info("SVD base (fp16 safetensors) already present at %s — skipping.", target)
         return
 
     target.mkdir(parents=True, exist_ok=True)
-    log.info("▶ %s (~10 GB — this can take a while; gated repo, needs HF token)", label)
+    log.info("▶ %s (gated repo, needs HF token; fp16 safetensors only, ≈5 GB)", label)
 
     try:
         from huggingface_hub import snapshot_download
@@ -517,6 +594,8 @@ def download_svd_base(
             local_dir=str(target),
             local_dir_use_symlinks=False,
             token=token,
+            allow_patterns=_SVD_FP16_ALLOW_PATTERNS,
+            ignore_patterns=_SVD_IGNORE_PATTERNS,
         )
     except Exception as exc:
         if _is_gated_repo_error(exc):
