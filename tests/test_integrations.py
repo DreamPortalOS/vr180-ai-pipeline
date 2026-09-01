@@ -7,6 +7,7 @@ method.  No live API calls are made — all HTTP responses are mocked.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -1074,6 +1075,43 @@ class TestMockProvider:
         info = _probe(result.video_url)
         assert info.get("format")
         assert any(s.get("codec_type") == "video" for s in info.get("streams", []))
+
+    def test_mock_provider_does_not_pollute_video_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Issue #161: without an explicit output dir the mock provider must
+        write to the OS temp directory, NEVER into the repo ``video/`` folder.
+
+        ``video/`` is the lead's local-media / deliverable directory (git-
+        ignored) — automation leaking into it produces hundreds of
+        ``mock_*.mp4`` clutter files that force manual cleanup.  This test
+        asserts the zero-leak contract: after a bare generate call the
+        ``video/`` directory has no new files.
+        """
+        import tempfile
+
+        from integrations.mock_provider import MockProvider
+
+        # Ensure the env var is UNSET for this test (some callers set it
+        # explicitly; the default path must still go to a tempfile).
+        monkeypatch.delenv("MOCK_PROVIDER_OUTPUT_DIR", raising=False)
+
+        video_dir = tmp_path / "video"  # a synthetic video/ dir to watch
+        video_dir.mkdir()
+        (video_dir / "deliverable.mp4").touch()
+        (video_dir / "notes.json").write_text("{}")
+        before = {p.name for p in video_dir.iterdir()}
+
+        provider = MockProvider()
+        result = provider.generate("clean me", duration=1)
+
+        # The produced file must live under the OS temp directory, NOT in
+        # the watched video/ dir.
+        assert result.video_url.startswith(tempfile.gettempdir())
+        produced = {Path(result.video_url).name}
+        assert produced.isdisjoint(before)
+
+        # video/ must be byte-for-byte unchanged (no mock_*.mp4 leaked in).
+        after = {p.name for p in video_dir.iterdir()}
+        assert after == before
 
 
 # ══════════════════════════════════════════════════════════════════════════════

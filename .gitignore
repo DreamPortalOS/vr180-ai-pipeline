@@ -54,6 +54,9 @@ htmlcov/
 # Video experiment artifacts (should not be tracked)
 video/*.md
 video/*.json
+# Mock-provider leakage — double-gate so test/CI artifacts never re-appear
+# if the provider's tempdir default is ever regressed (issue #161).
+video/mock_*.mp4
 
 # Model weights (too large for git)
 models/

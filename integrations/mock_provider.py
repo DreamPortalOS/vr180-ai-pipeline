@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import tempfile
 import time
 import uuid
 from typing import Any
@@ -179,15 +180,23 @@ class MockProvider(VideoGenProvider):
 
     @staticmethod
     def _out_path(prefix: str) -> str:
-        """Build a unique output path under the configured output dir.
+        """Build a unique output path inside the provider's output directory.
 
-        The output directory defaults to the repo ``video/`` dir but can be
-        overridden via the ``MOCK_PROVIDER_OUTPUT_DIR`` env var (used by
-        tests to keep artifacts inside a ``tmp_path``).
+        The output directory can be set explicitly by the caller via the
+        ``MOCK_PROVIDER_OUTPUT_DIR`` env var (``image_to_vr180`` / the
+        ``--image`` CLI and all tests pass it, so artifacts land in
+        ``tmp_path`` / the job workdir).
+
+        **Important:** if no directory is configured we fall back to the OS
+        temp directory (`tempfile.mkdtemp`), **never** the repo ``video/``
+        folder.  ``video/`` is the lead's local-media / deliverable directory
+        (git-ignored) — automation must never write into it.  A bare
+        ``generate(...)`` call with no env var therefore produces a
+        non-persistent tempfile that does not pollute the workspace.
         """
-        video_dir = os.environ.get("MOCK_PROVIDER_OUTPUT_DIR") or os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "video"
-        )
+        video_dir = os.environ.get("MOCK_PROVIDER_OUTPUT_DIR")
+        if not video_dir:
+            video_dir = tempfile.mkdtemp(prefix="mock_provider_")
         os.makedirs(video_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         unique = uuid.uuid4().hex[:6]
