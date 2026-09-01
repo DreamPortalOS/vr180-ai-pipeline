@@ -7,6 +7,7 @@ No frame buffers accumulate in RAM.
 
 import contextlib
 import logging
+import os
 import subprocess
 import tempfile
 
@@ -282,6 +283,26 @@ def scaled_bitrate_mbps(
     return bitrate
 
 
+def _load_video_frames(video_path: str) -> list[np.ndarray]:
+    """Load all frames from a video file as RGB ndarrays (I-5, #120).
+
+    Used by the streaming whole-clip-stereo path to read back the L/R output
+    videos a StereoCrafter backend writes, so each frame can be fed into the
+    per-frame equirect→encode fuse loop.  Mirrors the same-named helper in
+    ``scripts/run_pipeline.py`` (kept here so the streaming module is
+    self-contained for injected whole-clip stereo backends).
+    """
+    cap = cv2.VideoCapture(video_path)
+    frames: list[np.ndarray] = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    return frames
+
+
 class StreamingPipeline:
     """Stream-based VR180 conversion with O(1) memory footprint.
 
@@ -313,6 +334,17 @@ class StreamingPipeline:
         gop: int | None = None,
         force_idr: bool = False,
         faststart: bool | None = None,
+        # I-5 (#120): injectable depth/stereo backends.  When None the defaults
+        # (Depth-Anything V2 per-frame + StereoRenderer depth-shift) are used,
+        # so pre-I-5 behaviour is bit-exact.  The CLI streaming branch injects
+        # the --depth-model / --stereo-model backend here so the streaming path
+        # no longer silently ignores those flags.  ``depth_backend_name`` /
+        # ``stereo_backend_name`` are logged at stream startup for one-glance
+        # acceptance verification.
+        depth_estimator=None,
+        stereo_renderer=None,
+        depth_backend_name: str | None = None,
+        stereo_backend_name: str | None = None,
     ):
         self.model_size = model_size
         self.device = resolve_device(device)
@@ -342,16 +374,34 @@ class StreamingPipeline:
             hw_encoder,
         )
 
-        # Initialise pipeline stages
-        self.depth_estimator = DepthEstimator(
+        # Initialise pipeline stages.  I-5 (#120): the depth estimator and
+        # stereo renderer are injectable so the streaming path can honour
+        # ``--depth-model depthcrafter`` / ``--stereo-model stereocrafter``
+        # instead of always using the per-frame Depth-Anything + StereoRenderer
+        # defaults.  Injected whole-clip backends (DepthCrafter's
+        # ``estimate_video``, StereoCrafter's ``render_video``) are detected in
+        # ``process_stream`` and run once for the whole clip; their per-frame
+        # outputs then feed the same O(1) equirect→encode fuse loop.
+        #
+        # The whole-clip detection keys off *explicit injection*: only a backend
+        # the caller passed in is ever treated as whole-clip.  The built-in
+        # DepthEstimator / StereoRenderer defaults are always per-frame.  This
+        # keeps detection robust against attribute-happy test doubles (a bare
+        # MagicMock auto-creates ``estimate_video``/``render_video`` and would
+        # otherwise be misdetected as whole-clip).
+        self._depth_injected = depth_estimator is not None
+        self._stereo_injected = stereo_renderer is not None
+        self.depth_estimator = depth_estimator or DepthEstimator(
             model_size=model_size,
             device=self.device,
             calibrate=True,
         )
-        self.stereo_renderer = StereoRenderer(
+        self.stereo_renderer = stereo_renderer or StereoRenderer(
             ipd=ipd,
             max_disparity=max_disparity,
         )
+        self.depth_backend_name = depth_backend_name or "depth-anything"
+        self.stereo_backend_name = stereo_backend_name or "default"
         self.eq_mapper = EquirectangularMapper(
             output_width=output_width,
             output_height=output_height,
@@ -449,6 +499,130 @@ class StreamingPipeline:
             with contextlib.suppress(OSError):
                 stderr_file.close()
 
+    def _is_wholeclip_depth(self, backend) -> bool:
+        """True if *backend* is a whole-clip depth estimator (I-5, #120).
+
+        Whole-clip backends (e.g. :class:`DepthCrafterEstimator`) expose
+        ``estimate_video(input_path, output_dir)`` instead of the per-frame
+        ``estimate(rgb)`` contract — DepthCrafter is a temporal model that needs
+        the whole clip for flicker-free depth.  Such a backend cannot be called
+        inside the per-frame fuse loop; ``process_stream`` runs it once for the
+        whole clip up front and then feeds the precomputed depths per frame.
+
+        Detection is gated on explicit injection (``self._depth_injected``):
+        the built-in DepthEstimator default is always per-frame, and a bare
+        test double that merely *auto-creates* ``estimate_video`` is not
+        mistaken for a real whole-clip backend.
+        """
+        return self._depth_injected and callable(getattr(backend, "estimate_video", None))
+
+    def _is_wholeclip_stereo(self, backend) -> bool:
+        """True if *backend* is a whole-clip stereo renderer (I-5, #120).
+
+        Whole-clip stereo backends (e.g. :class:`StereoCrafterRenderer`) expose
+        ``render_video(input_path, depth_dir, output_left, output_right)`` —
+        they run their own diffusion-based inference over the whole clip and
+        emit L/R videos.  ``process_stream`` runs them once up front and then
+        reads the L/R frames back per-frame into the equirect→encode fuse.
+
+        Detection is gated on explicit injection (``self._stereo_injected``),
+        matching :meth:`_is_wholeclip_depth`.
+        """
+        return self._stereo_injected and callable(getattr(backend, "render_video", None))
+
+    def _precompute_depths(
+        self,
+        input_path: str,
+        total: int,
+        out_dir: str,
+    ) -> list[np.ndarray]:
+        """Run the injected whole-clip depth backend once (I-5, #120).
+
+        Returns the per-frame depth maps (length ``total`` or fewer — the
+        backend may produce fewer frames than ``total`` if the source is
+        truncated).  The fuse loop bounds itself to whatever this returns.
+        """
+        log.info(
+            "🎬 [Depth] whole-clip backend (%s): running estimate_video on %s",
+            self.depth_backend_name,
+            input_path,
+        )
+        depths = self.depth_estimator.estimate_video(
+            input_path=input_path,
+            output_dir=out_dir,
+        )
+        log.info(
+            "🎬 [Depth] %s produced %d depth map(s)",
+            self.depth_backend_name,
+            len(depths),
+        )
+        return list(depths)
+
+    def _precompute_stereo(
+        self,
+        input_path: str,
+        depth_dir: str,
+        out_left: str,
+        out_right: str,
+    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        """Run the injected whole-clip stereo backend once (I-5, #120).
+
+        Returns ``(left_frames, right_frames)`` read back from the L/R output
+        videos the backend wrote.  StereoCrafter runs its own internal
+        DepthCrafter, so it does not consume the caller's external depth maps;
+        *depth_dir* is passed for interface compatibility and must exist.
+        """
+        log.info(
+            "🎬 [Stereo] whole-clip backend (%s): running render_video on %s",
+            self.stereo_backend_name,
+            input_path,
+        )
+        self.stereo_renderer.render_video(
+            input_path=input_path,
+            depth_dir=depth_dir,
+            output_left=out_left,
+            output_right=out_right,
+        )
+        left_frames = _load_video_frames(out_left)
+        right_frames = _load_video_frames(out_right)
+        log.info(
+            "🎬 [Stereo] %s produced %d L/R frame pair(s)",
+            self.stereo_backend_name,
+            len(left_frames),
+        )
+        return left_frames, right_frames
+
+    def _write_sbs_frame(
+        self,
+        proc: subprocess.Popen,
+        sbs: np.ndarray,
+        frame_idx: int,
+        out_w: int,
+        out_h: int,
+    ) -> None:
+        """Write one SBS frame's raw RGB to the ffmpeg pipe (I-5, #120).
+
+        Factored out of :meth:`process_stream` so both the per-frame fuse path
+        and the whole-clip-precompute path share the identical write + pipe-
+        death diagnostics (issue #49: BrokenPipeError / Windows EINVAL/EPIPE).
+        """
+        try:
+            proc.stdin.write(sbs.tobytes())
+        except BrokenPipeError:
+            raise RuntimeError(
+                f"ffmpeg encoder died after {frame_idx} frames — "
+                "check encoder availability/limits for this resolution "
+                f"({out_w}×{out_h}). ffmpeg stderr: {self._ffmpeg_stderr_summary(proc)}"
+            ) from None
+        except OSError as e:
+            if e.errno in (22, 32):  # EINVAL (Windows broken pipe) / EPIPE
+                raise RuntimeError(
+                    f"ffmpeg encoder died after {frame_idx} frames "
+                    f"(pipe write failed, errno={e.errno}; exit code "
+                    f"{proc.poll()}). ffmpeg stderr: {self._ffmpeg_stderr_summary(proc)}"
+                ) from None
+            raise
+
     def process_stream(
         self,
         input_path: str,
@@ -456,6 +630,16 @@ class StreamingPipeline:
         max_frames: int | None = None,
     ) -> str:
         """Process video frame-by-frame, writing directly to ffmpeg pipe.
+
+        I-5 (#120): honours the injected depth/stereo backends.  When the
+        default per-frame Depth-Anything + StereoRenderer are in use (no
+        ``--depth-model`` / ``--stereo-model`` override) the per-frame fuse
+        loop is bit-exact with pre-I-5.  When a whole-clip backend
+        (DepthCrafter ``estimate_video`` / StereoCrafter ``render_video``) is
+        injected, it is run **once for the whole clip** up front (it cannot be
+        called per-frame — it needs the whole clip for temporal consistency),
+        and the precomputed depth / L-R maps then feed the same O(1)
+        equirect→encode fuse loop.
 
         Args:
             input_path: Path to input 2D video.
@@ -468,6 +652,15 @@ class StreamingPipeline:
         Raises:
             RuntimeError: If input video cannot be opened.
         """
+        # I-5 (#120): log the effective depth/stereo backend at stream startup
+        # so acceptance can confirm DepthCrafter/StereoCrafter is actually in
+        # play (not silently swapped for Depth-Anything).
+        log.info(
+            "🎚️  Streaming backends: depth=%s, stereo=%s",
+            self.depth_backend_name,
+            self.stereo_backend_name,
+        )
+
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {input_path}")
@@ -489,54 +682,91 @@ class StreamingPipeline:
         out_h = self.output_height
         log.info(f"Target output: {out_w}×{out_h} (SBS, {self.output_width}² per eye)")
 
+        # I-5 (#120): detect whole-clip backends.  They cannot run in the per-
+        # frame fuse loop, so precompute their outputs up front.  A whole-clip
+        # stereo backend (StereoCrafter) supersedes the depth backend — it
+        # runs its own internal DepthCrafter and emits L/R directly, so the
+        # external depth precompute is skipped (matching the batch path's
+        # ``_run_stereocrafter_stage``, which accepts but ignores ``depths``).
+        stereo_wholeclip = self._is_wholeclip_stereo(self.stereo_renderer)
+        depth_wholeclip = self._is_wholeclip_depth(self.depth_estimator)
+        precomp_left: list[np.ndarray] | None = None
+        precomp_right: list[np.ndarray] | None = None
+        precomp_depths: list[np.ndarray] | None = None
+
+        if stereo_wholeclip:
+            import tempfile
+
+            work_dir = tempfile.mkdtemp(prefix="vr180-streaming-stereo_")
+            depth_dir = os.path.join(work_dir, "depth")
+            os.makedirs(depth_dir, exist_ok=True)
+            left_path = os.path.join(work_dir, "_stereo_left.mp4")
+            right_path = os.path.join(work_dir, "_stereo_right.mp4")
+            precomp_left, precomp_right = self._precompute_stereo(input_path, depth_dir, left_path, right_path)
+            # StereoCrafter may produce fewer frames than the source count;
+            # bound the fuse loop to what was actually produced.
+            if precomp_left:
+                total = min(total, len(precomp_left))
+        elif depth_wholeclip:
+            import tempfile
+
+            depth_dir = os.path.join(tempfile.mkdtemp(prefix="vr180-streaming-depth_"), "depth")
+            os.makedirs(depth_dir, exist_ok=True)
+            precomp_depths = self._precompute_depths(input_path, total, depth_dir)
+            if precomp_depths:
+                total = min(total, len(precomp_depths))
+
         proc = self._open_ffmpeg_writer(output_path, out_w, out_h)
 
         try:
             frame_idx = 0
             try:
-                while frame_idx < total:
-                    ret, bgr = cap.read()
-                    if not ret:
-                        break
+                # I-5 (#120): branch on whole-clip precompute.  Each branch
+                # produces the SBS frame for ``_write_sbs_frame`` identically;
+                # only the source of (depth, L/R) differs.
+                if precomp_left is not None:
+                    # Whole-clip stereo (StereoCrafter): L/R precomputed, skip
+                    # depth + stereo-render; just map → encode per frame.
+                    for left, right in zip(precomp_left, precomp_right, strict=False):
+                        sbs = self.eq_mapper.map_stereo_pair(left, right)
+                        self._write_sbs_frame(proc, sbs, frame_idx, out_w, out_h)
+                        del sbs
+                        frame_idx += 1
+                        if frame_idx % 10 == 0:
+                            log.info(f"  [{frame_idx}/{total}] frames processed")
+                        if max_frames and frame_idx >= max_frames:
+                            break
+                else:
+                    while frame_idx < total:
+                        ret, bgr = cap.read()
+                        if not ret:
+                            break
 
-                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-                    # --- Stage 1: Depth estimation ---
-                    depth = self.depth_estimator.estimate(rgb)
+                        # --- Stage 1: Depth estimation ---
+                        # I-5 (#120): whole-clip depth (DepthCrafter) was
+                        # precomputed; index into it.  Otherwise call the
+                        # per-frame estimator (Depth-Anything) inline.
+                        if precomp_depths is not None:
+                            depth = precomp_depths[frame_idx]
+                        else:
+                            depth = self.depth_estimator.estimate(rgb)
 
-                    # --- Stage 2: Stereo rendering ---
-                    left, right = self.stereo_renderer.render(rgb, depth)
+                        # --- Stage 2: Stereo rendering ---
+                        left, right = self.stereo_renderer.render(rgb, depth)
 
-                    # --- Stage 3: Equirectangular mapping ---
-                    sbs = self.eq_mapper.map_stereo_pair(left, right)
+                        # --- Stage 3: Equirectangular mapping ---
+                        sbs = self.eq_mapper.map_stereo_pair(left, right)
 
-                    # Write raw RGB to ffmpeg pipe. Issue #49: on Windows a dead
-                    # ffmpeg (e.g. NVENC failed to open) surfaces as
-                    # OSError(errno=22) from stdin.write, not BrokenPipeError —
-                    # catch both, and report ffmpeg's stderr tail + exit code.
-                    try:
-                        proc.stdin.write(sbs.tobytes())
-                    except BrokenPipeError:
-                        raise RuntimeError(
-                            f"ffmpeg encoder died after {frame_idx} frames — "
-                            "check encoder availability/limits for this resolution "
-                            f"({out_w}×{out_h}). ffmpeg stderr: {self._ffmpeg_stderr_summary(proc)}"
-                        ) from None
-                    except OSError as e:
-                        if e.errno in (22, 32):  # EINVAL (Windows broken pipe) / EPIPE
-                            raise RuntimeError(
-                                f"ffmpeg encoder died after {frame_idx} frames "
-                                f"(pipe write failed, errno={e.errno}; exit code "
-                                f"{proc.poll()}). ffmpeg stderr: {self._ffmpeg_stderr_summary(proc)}"
-                            ) from None
-                        raise
+                        self._write_sbs_frame(proc, sbs, frame_idx, out_w, out_h)
 
-                    # Release intermediates to keep memory O(1)
-                    del depth, left, right, sbs, rgb, bgr
+                        # Release intermediates to keep memory O(1)
+                        del depth, left, right, sbs, rgb, bgr
 
-                    frame_idx += 1
-                    if frame_idx % 10 == 0:
-                        log.info(f"  [{frame_idx}/{total}] frames processed")
+                        frame_idx += 1
+                        if frame_idx % 10 == 0:
+                            log.info(f"  [{frame_idx}/{total}] frames processed")
 
             finally:
                 cap.release()
@@ -751,6 +981,12 @@ def run_streaming_pipeline(
     max_frames: int | None = None,
     bitrate: str | None = None,
     hw_encoder: bool | str | None = None,
+    # I-5 (#120): injectable backends — pass through to StreamingPipeline so the
+    # --depth-model / --stereo-model streaming path can be exercised with fakes.
+    depth_estimator=None,
+    stereo_renderer=None,
+    depth_backend_name: str | None = None,
+    stereo_backend_name: str | None = None,
 ) -> str:
     """Convenience function to run the streaming pipeline in one call.
 
@@ -769,6 +1005,10 @@ def run_streaming_pipeline(
         fps: Output frame rate.
         flip_vertical: Flip for VR headset compatibility.
         max_frames: Optional frame cap (for testing).
+        depth_estimator: I-5 (#120) injected depth backend (None = Depth-Anything default).
+        stereo_renderer: I-5 (#120) injected stereo backend (None = StereoRenderer default).
+        depth_backend_name: I-5 (#120) label logged at startup for acceptance.
+        stereo_backend_name: I-5 (#120) label logged at startup for acceptance.
 
     Returns:
         Path to the output video.
@@ -787,5 +1027,9 @@ def run_streaming_pipeline(
         flip_vertical=flip_vertical,
         bitrate=bitrate,
         hw_encoder=hw_encoder,
+        depth_estimator=depth_estimator,
+        stereo_renderer=stereo_renderer,
+        depth_backend_name=depth_backend_name,
+        stereo_backend_name=stereo_backend_name,
     )
     return pipeline.process_stream(input_path, output_path, max_frames=max_frames)
