@@ -34,14 +34,17 @@ class MockBackend(DepthCrafterBackend):
         self.w = w
         self.last_input_path: str | None = None
         self.last_output_dir: str | None = None
+        self.last_target_size: tuple[int, int] | None = None
 
     def estimate_video(
         self,
         input_path: str,
         output_dir: str,
+        target_size: tuple[int, int] | None = None,
     ) -> list[np.ndarray]:
         self.last_input_path = input_path
         self.last_output_dir = output_dir
+        self.last_target_size = target_size
         rng = np.random.default_rng(42)
         return [rng.random((self.h, self.w)).astype(np.float32) for _ in range(self.num_frames)]
 
@@ -621,3 +624,284 @@ def test_cli_backend_error_lists_dir_contents(
         assert "no depth files found" in msg
         assert "src_720p_v2_input.mp4" in msg
         assert "src_720p_v2_vis.mp4" in msg
+
+
+# ---------------------------------------------------------------------------
+# Issue #130 — depth maps must be resized back to the SOURCE frame size
+# ---------------------------------------------------------------------------
+# DepthCrafter internally down-samples to ``--max_res`` (short side), so its
+# decoded depth maps come back at the *model* resolution (e.g. 256×512) while
+# the source frames are 720×1280.  Downstream stages operate at source size,
+# so CLIBackend must resize before returning.
+
+
+def _write_color_mp4(path: Path, num_frames: int, w: int, h: int) -> None:
+    """Synthesize a small colour mp4 to stand in for the SOURCE video (probe target)."""
+    import cv2
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    wr = cv2.VideoWriter(str(path), fourcc, 24, (w, h))
+    assert wr.isOpened(), f"cv2.VideoWriter could not create {path}"
+    try:
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        for _ in range(num_frames):
+            wr.write(frame)
+    finally:
+        wr.release()
+
+
+def _mock_run_with_small_depth_mp4(mock_run: MagicMock, outdir_path: Path, stem: str, num_frames: int) -> None:
+    """Simulate a successful run whose *_depth.mp4 is at MODEL resolution (256×512)."""
+
+    def _fake_run(cmd, **kwargs):
+        outdir_path.mkdir(parents=True, exist_ok=True)
+        # Model-resolution depth product: 256×512 (the issue-#130 case).
+        _write_gray_mp4(outdir_path / f"{stem}_depth.mp4", num_frames=num_frames, w=512, h=256)
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = ""
+        result.stderr = ""
+        return result
+
+    mock_run.side_effect = _fake_run
+
+
+def _make_repo(tmpdir: str) -> Path:
+    repo_dir = Path(tmpdir) / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "run.py").write_text("print('ok')")
+    return repo_dir
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_resizes_depths_to_caller_target_size(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """121 model-res (256×512) depths + declared source 720×1280 → all (720, 1280).
+
+    Regression test for issue #130: without the resize, the stereo/EMA stage
+    died with ``operands could not be broadcast together with shapes
+    (720,1280) (256,512)``.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_repo(tmpdir)
+        input_video = Path(tmpdir) / "src_720p.mp4"
+        input_video.write_bytes(b"fake")  # probe will fail; target_size must win
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        _mock_run_with_small_depth_mp4(mock_run, outdir_path, stem="src_720p", num_frames=121)
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        depths = backend.estimate_video(
+            input_path=str(input_video),
+            output_dir=str(outdir_path),
+            target_size=(720, 1280),
+        )
+
+        assert len(depths) == 121
+        for d in depths:
+            assert d.shape == (720, 1280)
+            assert d.dtype == np.float32
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_resizes_depths_to_probed_source_size(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """Without target_size, the source size is probed from the input video (cv2)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_repo(tmpdir)
+        input_video = Path(tmpdir) / "real_src.mp4"
+        # Source video is 720×1280 (w=1280, h=720) — probeable.
+        _write_color_mp4(input_video, num_frames=2, w=1280, h=720)
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        _mock_run_with_small_depth_mp4(mock_run, outdir_path, stem="real_src", num_frames=4)
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        depths = backend.estimate_video(input_path=str(input_video), output_dir=str(outdir_path))
+
+        assert len(depths) == 4
+        for d in depths:
+            assert d.shape == (720, 1280)
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_target_size_wins_over_probe_with_log(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When caller size and probed size disagree, the caller's wins and a line is logged."""
+    import logging
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_repo(tmpdir)
+        input_video = Path(tmpdir) / "real_src.mp4"
+        _write_color_mp4(input_video, num_frames=2, w=1280, h=720)  # probe → (720, 1280)
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        _mock_run_with_small_depth_mp4(mock_run, outdir_path, stem="real_src", num_frames=3)
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        with caplog.at_level(logging.WARNING, logger="pipeline.depth_crafter"):
+            depths = backend.estimate_video(
+                input_path=str(input_video),
+                output_dir=str(outdir_path),
+                target_size=(360, 640),  # disagrees with the probe on purpose
+            )
+
+        for d in depths:
+            assert d.shape == (360, 640)
+        assert any("disagrees with probed source size" in r.message for r in caplog.records)
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_resize_is_linear_not_nearest(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """Depth is continuous — resizing must INTERPOLATE, not quantize to source levels."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_repo(tmpdir)
+        input_video = Path(tmpdir) / "src.mp4"
+        input_video.write_bytes(b"fake")
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        # 2×2 gradient depth video at model res; upsample 4× to 8×8.  With
+        # NEAREST the output would contain only the 4 source values; LINEAR
+        # must introduce intermediate values.
+        def _fake_run(cmd, **kwargs):
+            outdir_path.mkdir(parents=True, exist_ok=True)
+            import cv2
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            wr = cv2.VideoWriter(str(outdir_path / "src_depth.mp4"), fourcc, 24, (2, 2))
+            assert wr.isOpened()
+            # 2×2: values 0, 85, 170, 255 (all channels equal → grayscale).
+            frame = np.array([[[0, 0, 0], [85, 85, 85]], [[170, 170, 170], [255, 255, 255]]], dtype=np.uint8)
+            wr.write(frame)
+            wr.release()
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        mock_run.side_effect = _fake_run
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        depths = backend.estimate_video(
+            input_path=str(input_video),
+            output_dir=str(outdir_path),
+            target_size=(8, 8),
+        )
+
+        assert depths[0].shape == (8, 8)
+        unique = np.unique(depths[0])
+        # NEAREST would yield ≤4 unique values; LINEAR interpolation yields more.
+        assert unique.size > 4, f"expected interpolated values, got only {unique}"
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_depth_value_range_matches_depth_anything(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """Returned depths are float32 normalized to [0, 1] — the Depth-Anything convention.
+
+    Depth-Anything normalizes to [0, 1] (pipeline/depth_estimator.py), so
+    DepthCrafter's mp4 path (8-bit gray → /255) and .npy fallback must both
+    land in the same range, or a single --comfort preset would mean two
+    different things on the two backends.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_repo(tmpdir)
+        input_video = Path(tmpdir) / "src.mp4"
+        input_video.write_bytes(b"fake")
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        def _fake_run(cmd, **kwargs):
+            outdir_path.mkdir(parents=True, exist_ok=True)
+            _write_gray_mp4(outdir_path / "src_depth.mp4", num_frames=3, w=64, h=48)
+            # Alternate-backend product form: raw .npy already in [0, 1].
+            rng = np.random.default_rng(7)
+            np.save(str(outdir_path / "alt_depth.npy"), rng.random((48, 64)).astype(np.float32))
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        mock_run.side_effect = _fake_run
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        depths = backend.estimate_video(
+            input_path=str(input_video),
+            output_dir=str(outdir_path),
+            target_size=(720, 1280),
+        )
+
+        for d in depths:
+            assert d.dtype == np.float32
+            assert float(d.min()) >= 0.0
+            assert float(d.max()) <= 1.0
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_npy_fallback_also_resized(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+) -> None:
+    """The resize applies to every product form, not just the mp4 path."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_repo(tmpdir)
+        input_video = Path(tmpdir) / "src.mp4"
+        input_video.write_bytes(b"fake")
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        def _fake_run(cmd, **kwargs):
+            outdir_path.mkdir(parents=True, exist_ok=True)
+            rng = np.random.default_rng(42)
+            for i in range(3):
+                np.save(str(outdir_path / f"depth_{i:06d}.npy"), rng.random((256, 512)).astype(np.float32))
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        mock_run.side_effect = _fake_run
+
+        backend = CLIBackend(repo_dir=str(repo_dir))
+        depths = backend.estimate_video(
+            input_path=str(input_video),
+            output_dir=str(outdir_path),
+            target_size=(720, 1280),
+        )
+
+        assert len(depths) == 3
+        for d in depths:
+            assert d.shape == (720, 1280)
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+def test_estimator_forwards_target_size_to_backend(mock_cuda: MagicMock) -> None:
+    """DepthCrafterEstimator must forward target_size to the injected backend."""
+    mock_backend = MockBackend(num_frames=2, h=256, w=512)
+    estimator = DepthCrafterEstimator(backend=mock_backend)
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
+        tmp.write(b"fake video content")
+        tmp.flush()
+        estimator.estimate_video(tmp.name, target_size=(720, 1280))
+
+    assert mock_backend.last_target_size == (720, 1280)

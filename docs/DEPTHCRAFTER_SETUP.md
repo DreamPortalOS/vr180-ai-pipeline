@@ -176,6 +176,22 @@ backends, and the output directory is **wiped before every run** so stale
 files from an earlier invocation can never be mistaken for the current
 run's product (the "fake success" bug from issue #126).
 
+### Returned size & value range (issue #130)
+
+DepthCrafter down-samples the input to `--max_res` (short side) before
+inference, so the decoded depth maps come back at the **model** resolution
+(e.g. 256×512 for a 720×1280 source).  `estimate_video` therefore **resizes
+every depth map back to the source frame size** (`cv2.resize` with
+`INTER_LINEAR` — depth is a continuous quantity, never `NEAREST`) before
+returning.  The caller may pass the expected `(h, w)` via the `target_size`
+parameter (it wins); otherwise the size is probed from the input video with
+cv2, and a disagreement between the two is logged.
+
+The returned depth maps are **float32 normalized to `[0, 1]`** — the same
+convention as the Depth-Anything backend
+(`pipeline/depth_estimator.py::DepthEstimator.estimate`), so a single
+`--comfort` preset means the same thing on both depth backends.
+
 ---
 
 ## Existing external checkout (`D:/DepthCrafter`)
