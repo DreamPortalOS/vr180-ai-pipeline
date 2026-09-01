@@ -185,6 +185,128 @@ class TestEnsureNodeRepo:
 # ---------------------------------------------------------------------------
 
 
+class TestPipTimeout:
+    """Issue #166 (mirroring #165): pip install timeout must be 3600s by
+    default, overridable via --pip-timeout (CLI) and SETUP_PIP_TIMEOUT (env
+    var), with CLI > env > default precedence.  Every pip command must also
+    carry --timeout 120 (pip's own single-connection timeout).
+    """
+
+    def test_default_timeout_is_3600(self):
+        assert setup.DEFAULT_PIP_TIMEOUT == 3600
+
+    def test_pip_connect_timeout_is_120(self):
+        assert setup.PIP_CONNECT_TIMEOUT == 120
+
+    def test_resolve_default_when_no_cli_no_env(self, monkeypatch):
+        monkeypatch.delenv("SETUP_PIP_TIMEOUT", raising=False)
+        assert setup._resolve_pip_timeout(None) == 3600
+
+    def test_resolve_env_var_when_no_cli(self, monkeypatch):
+        monkeypatch.setenv("SETUP_PIP_TIMEOUT", "4800")
+        assert setup._resolve_pip_timeout(None) == 4800
+
+    def test_resolve_cli_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("SETUP_PIP_TIMEOUT", "4800")
+        assert setup._resolve_pip_timeout(7200) == 7200
+
+    def test_resolve_bad_env_falls_back_to_default(self, monkeypatch, caplog):
+        caplog.set_level("WARNING", logger="setup-depthcrafter")
+        monkeypatch.setenv("SETUP_PIP_TIMEOUT", "not-a-number")
+        assert setup._resolve_pip_timeout(None) == 3600
+        assert any("not a valid integer" in r.message.lower() for r in caplog.records)
+
+    def test_ensure_venv_uses_default_timeout_when_not_passed(self, sandbox):
+        """The old call signature (no pip_timeout kwarg) must still work and
+        use the default 3600s — mirrors the PR #168 regression guard on #165.
+        """
+        sandbox.venv_dir.mkdir(parents=True)
+        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
+        sandbox.python_exe.write_text("# fake")
+
+        captured_timeouts: list[int] = []
+
+        def fake_check_call(cmd, *args, **kwargs):
+            if "timeout" in kwargs:
+                captured_timeouts.append(kwargs["timeout"])
+
+        with patch("subprocess.check_call", side_effect=fake_check_call):
+            setup.ensure_venv_and_deps(None, None, dry_run=False, buffer=setup.DryRunBuffer())
+        assert captured_timeouts == [3600, 3600], captured_timeouts
+
+    def test_ensure_venv_uses_explicit_pip_timeout(self, sandbox):
+        sandbox.venv_dir.mkdir(parents=True)
+        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
+        sandbox.python_exe.write_text("# fake")
+
+        captured_timeouts: list[int] = []
+
+        def fake_check_call(cmd, *args, **kwargs):
+            if "timeout" in kwargs:
+                captured_timeouts.append(kwargs["timeout"])
+
+        with patch("subprocess.check_call", side_effect=fake_check_call):
+            setup.ensure_venv_and_deps(
+                None,
+                None,
+                dry_run=False,
+                buffer=setup.DryRunBuffer(),
+                pip_timeout=999,
+            )
+        assert captured_timeouts == [999, 999], captured_timeouts
+
+    def test_pip_command_includes_timeout_120(self, sandbox):
+        """Every pip install command (torch and deps) must carry --timeout 120
+        (pip's single-connection timeout, issue #166 mirroring #165)."""
+        sandbox.venv_dir.mkdir(parents=True)
+        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
+        sandbox.python_exe.write_text("# fake")
+
+        calls: list[list[str]] = []
+
+        def fake_check_call(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+
+        with patch("subprocess.check_call", side_effect=fake_check_call):
+            setup.ensure_venv_and_deps(None, None, dry_run=False, buffer=setup.DryRunBuffer())
+
+        pip_calls = [c for c in calls if "-m" in c and "pip" in c]
+        assert len(pip_calls) == 2, f"expected 2 pip calls, got {len(pip_calls)}: {pip_calls}"
+        for pc in pip_calls:
+            assert "--timeout" in pc, f"--timeout missing from {pc}"
+            idx = pc.index("--timeout")
+            assert pc[idx + 1] == "120", f"--timeout value not 120: {pc}"
+
+    def test_timeout_expired_prints_mirror_rerun_hint(self, sandbox, caplog):
+        """A pip subprocess timeout surfaces the mirror/re-run hint (issue
+        #166): the hint mentions --pip-mirror and that re-running skips done
+        steps (idempotent), then exits non-zero."""
+        caplog.set_level("WARNING", logger="setup-depthcrafter")
+        sandbox.node_dir.mkdir(parents=True)
+        (sandbox.node_dir / ".git").mkdir()
+        sandbox.venv_dir.mkdir(parents=True)
+        sandbox.python_exe.parent.mkdir(parents=True, exist_ok=True)
+        sandbox.python_exe.write_text("# fake")
+        (sandbox.node_dir / "run.py").write_text("# fake")
+
+        fake_hf = MagicMock()
+        with (
+            patch(
+                "subprocess.check_call",
+                side_effect=subprocess.TimeoutExpired(cmd=["pip"], timeout=3600),
+            ),
+            patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")),
+            patch.dict("sys.modules", {"huggingface_hub": fake_hf}),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            setup.main([])
+        assert exc_info.value.code == 1
+        msgs = "\n".join(r.message for r in caplog.records)
+        assert "--pip-mirror" in msgs
+        assert "重跑" in msgs
+        assert "已完成步骤会跳过" in msgs
+
+
 class TestEnsureVenvAndDeps:
     def _run_venv_step(self, sandbox, pip_mirror=None):
         """Set up a fake venv and capture check_call invocations for the dep step."""
