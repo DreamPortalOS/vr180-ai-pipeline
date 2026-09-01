@@ -282,6 +282,52 @@ def _weight_size_gb(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
+# ---------------------------------------------------------------------------
+# Standard HF cache resolution (issue #190)
+#
+# The SVD base is normally downloaded into the in-repo models/svd-img2vid-xt-1-1
+# directory (a LOCAL copy the Stage-2 loaders resolve via the local-folder
+# branch).  But huggingface_hub ALSO keeps its own standard cache at
+# ~/.cache/huggingface/hub/models--stabilityai--stable-video-diffusion-img2vid-xt-1-1/
+# and snapshot_download reuses the blobs there — so a previous (possibly
+# aborted) download may have left vae + image_encoder complete in the HF cache
+# while the in-repo copy is empty.  The verify path must recognise BOTH
+# locations: whichever is complete counts as complete (issue #190 requirement 2).
+# ---------------------------------------------------------------------------
+
+
+def _hf_cache_snapshot_dir(repo_id: str) -> Path | None:
+    """Best-effort resolution of the standard HF cache snapshot dir for *repo_id*.
+
+    Returns the ``.../models--<org>--<name>/snapshots/<hash>`` directory if the
+    repo is present in the standard HF cache, else ``None``.  Uses
+    :func:`huggingface_hub.try_to_load_from_cache` on ``model_index.json``
+    (present in every diffusers model snapshot) and takes its parent — this
+    follows symlinks correctly and needs no knowledge of the commit hash.
+
+    Lazy-imports ``huggingface_hub`` so the setup script stays importable in CI
+    (where the package is absent).  Returns ``None`` on any failure (package
+    missing, repo not cached, corrupted cache) — callers treat None as "no HF
+    cache copy available" and fall back to the in-repo path.
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ImportError:
+        return None
+    try:
+        resolved = try_to_load_from_cache(repo_id, "model_index.json")
+    except Exception:  # pragma: no cover — defensive: cache scan must never crash verify
+        return None
+    # try_to_load_from_cache returns the path string when cached, the sentinel
+    # _CACHED_NO_EXIST (a non-string) when the file is known-absent, or None.
+    if not isinstance(resolved, str):
+        return None
+    snapshot_dir = Path(resolved).parent
+    if snapshot_dir.is_dir():
+        return snapshot_dir
+    return None
+
+
 def verify_svd_base(model_dir: Path | None = None) -> list[str]:
     """Print and return a per-component completeness report for the SVD base.
 
@@ -295,23 +341,60 @@ def verify_svd_base(model_dir: Path | None = None) -> list[str]:
 
     *model_dir* defaults to :data:`INREPO_SVD_DIR`.  This performs **no**
     download or network I/O — it only inspects the filesystem.
+
+    Issue #190: the report also checks the **standard HF cache** as a fallback
+    when the in-repo directory is absent or incomplete.  Whichever location is
+    complete counts as complete, and the path actually inspected is printed
+    (this is the diagnostic that would have caught "the base was never built").
     """
     target = Path(model_dir) if model_dir is not None else INREPO_SVD_DIR
     lines: list[str] = []
+    complete = _verify_svd_location(target, "[in-repo]", lines)
+    total = len(_SVD_WEIGHT_COMPONENTS)
+
+    # Issue #190: if the in-repo copy is not complete, also consult the standard
+    # HF cache — a previous download may have left vae + image_encoder cached
+    # there while the in-repo copy is empty (the exact state the lead hit: the
+    # base "not a single byte landed in-repo" but the HF cache held half of it).
+    if complete < total:
+        hf_snapshot = _hf_cache_snapshot_dir(_SVD_REPO_ID)
+        if hf_snapshot is not None and hf_snapshot != target:
+            log.info("[svd] also checking standard HF cache: %s", hf_snapshot)
+            hf_complete = _verify_svd_location(hf_snapshot, "[hf-cache]", lines)
+            # A complete HF cache copy satisfies the gate — the in-repo copy
+            # will be filled from it on the next non-verify run (snapshot_download
+            # reuses the cached blobs, fetching only what's missing).
+            if hf_complete == total:
+                complete = total
+
+    _print_svd_verify_summary(target, lines, complete, total)
+    return lines
+
+
+def _verify_svd_location(target: Path, tag: str, lines: list[str]) -> int:
+    """Append per-component status lines for *target* and return the count complete.
+
+    *tag* (``"[in-repo]"`` / ``"[hf-cache]"``) prefixes each line so the user
+    can see which location each status line refers to.  Missing-component
+    lines name the component explicitly (issue #190 requirement 3) rather than
+    a blanket "directory does not exist".
+    """
+    if not target.is_dir():
+        lines.append(f"{tag} SVD base directory missing: {target}")
+        return 0
     complete = 0
     for name in _SVD_WEIGHT_COMPONENTS:
         if _svd_component_has_weight(target, name):
             wp = _svd_component_weight_path(target, name)
             size_str = _weight_size_gb(wp.stat().st_size) if wp is not None else "?"
-            lines.append(f"[svd] {name:<14} OK ({size_str})")
+            lines.append(f"{tag} {name:<14} OK ({size_str})")
             complete += 1
         else:
             reason = "(only config found)"
             if not (target / name).is_dir():
                 reason = "(subfolder missing)"
-            lines.append(f"[svd] {name:<14} MISSING weights {reason}")
-    _print_svd_verify_summary(target, lines, complete, len(_SVD_WEIGHT_COMPONENTS))
-    return lines
+            lines.append(f"{tag} {name:<14} MISSING weights {reason}")
+    return complete
 
 
 def _print_svd_verify_summary(target: Path, lines: list[str], complete: int, total: int) -> None:
@@ -713,35 +796,47 @@ def download_svd_base(
         log.info("SVD base (fp16 safetensors) already present at %s — skipping.", target)
         return
 
-    # Requirement 3 (issue #186): if the dir exists but is missing one or more
-    # weight components, do NOT silently re-run the whole download hoping it
-    # self-heals — surface a clear, per-component error.  This is the exact
-    # trap the lead hit (config present, unet weights absent, Stage 2 crashes
-    # later with an opaque error).  The download is still attempted AFTER this
-    # check only when the dir is genuinely absent; when partial, we require the
-    # user to either delete the broken snapshot or run --verify-only to see
-    # exactly what's missing and re-run, so the failure is never opaque.
+    # Issue #190: if the dir exists but is missing one or more weight
+    # components (the classic "config only, weights absent" cache trap),
+    # reuse the standard HF cache to fill the gap rather than raising and
+    # requiring the user to delete + re-run manually.  snapshot_download
+    # reuses the cached blobs in ~/.cache/huggingface/hub (so vae /
+    # image_encoder already cached there are NOT re-downloaded) and fetches
+    # only what's missing (typically the unet weight).  We wipe the broken
+    # in-repo snapshot first so snapshot_download produces a clean, complete
+    # local copy — the Stage-2 local-folder resolver needs every weight
+    # present in ONE directory.
     if target.is_dir():
         missing = [name for name in _SVD_WEIGHT_COMPONENTS if not _svd_component_has_weight(target, name)]
         if missing:
             present = [name for name in _SVD_WEIGHT_COMPONENTS if name not in missing]
             parts = ", ".join(missing)
-            raise RuntimeError(
-                f"SVD base at {target} is INCOMPLETE — weight components missing: {parts}."
-                + (f" Present: {', '.join(present)}." if present else "")
-                + "\n"
-                f"  The snapshot dir exists but does not have the weight files the "
-                f"Stage-2 inpainting loaders need.  This is the classic 'config "
-                f"only, weights absent' cache trap (issue #186).  Either:\n"
-                f"    • delete {target} and re-run this bootstrap (it will "
-                f"re-download cleanly), or\n"
-                f"    • run with --verify-only to confirm the exact missing "
-                f"components, then re-run to fetch them.\n"
-                f"  Refusing to continue with a half-download: inference would "
-                f"crash on the missing weights with a far less helpful error."
+            present_str = f" Present: {', '.join(present)}." if present else " Present: (none)."
+            log.warning(
+                "SVD base at %s is INCOMPLETE — missing weight components: %s%s\n"
+                "  Reusing the standard HF cache to fill the missing pieces "
+                "(cached blobs will NOT be re-downloaded; only %s is fetched).\n"
+                "  Wiping the broken in-repo snapshot and re-running the download...",
+                target,
+                parts,
+                present_str,
+                parts,
             )
+            import shutil
+
+            shutil.rmtree(target)
+    else:
+        missing = []
 
     target.mkdir(parents=True, exist_ok=True)
+    # Also let the user know the HF cache snapshot if it's the source of reuse,
+    # so the download log is legible when most of the work is "already cached".
+    hf_snapshot = _hf_cache_snapshot_dir(_SVD_REPO_ID)
+    if hf_snapshot is not None and missing:
+        log.info(
+            "  → standard HF cache snapshot found at %s — will reuse cached vae / image_encoder from there.",
+            hf_snapshot,
+        )
     log.info("▶ %s (gated repo, needs HF token; fp16 safetensors only, ≈5 GB)", label)
 
     try:
@@ -995,9 +1090,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Only check whether the SVD base snapshot is complete — inspect "
             "each required weight component (image_encoder / unet / vae) for a "
             "real, non-empty, symlink-resolved weight file and print a clear "
-            "missing-components report.  Does NOT download anything.  This is "
-            "the diagnostic that catches the 'config present, weights absent' "
-            "cache trap (issue #186)."
+            "missing-components report.  Checks the in-repo SVD directory "
+            "first, then the standard HF cache as a fallback (whichever is "
+            "complete counts as complete, and the path actually inspected is "
+            "printed).  Does NOT download anything.  This is the diagnostic "
+            "that catches the 'config present, weights absent' cache trap "
+            "(issue #186) and the 'in-repo copy never built but HF cache has "
+            "half of it' state (issue #190)."
         ),
     )
     parser.add_argument(
@@ -1058,22 +1157,32 @@ def main(argv: list[str] | None = None) -> None:
 
     log.info("StereoCrafter in-repo bootstrap (repo=%s)", REPO_ROOT)
 
-    # --verify-only (issue #186): pure filesystem inspection, no download, no
-    # clone, no venv, no self-check.  Resolves the SVD target the same way
-    # download_svd_base does (--svd-dir > default), so the report points at
-    # the same directory the bootstrap would fill.
+    # --verify-only (issues #186, #190): pure filesystem inspection, no download,
+    # no clone, no venv, no self-check.  Resolves the SVD target the same way
+    # download_svd_base does (--svd-dir > default), then checks the standard
+    # HF cache as a fallback.  Whichever location is complete counts as complete
+    # (the lead's base was entirely absent in-repo while the HF cache held half
+    # of it — this is the diagnostic that catches that state).
     if args.verify_only:
         log.info("[verify-only] checking SVD base completeness — no downloads")
         target = Path(args.svd_dir) if args.svd_dir is not None else INREPO_SVD_DIR
-        if not target.is_dir():
-            log.error(
-                "SVD base directory %s does not exist — nothing to verify. Run without --verify-only to create it.",
-                target,
-            )
+        if target.is_dir():
+            log.info("[verify-only] checking in-repo path: %s", target)
+        elif target.exists():
+            log.error("SVD base path %s exists but is not a directory.", target)
             sys.exit(1)
+        else:
+            log.info("[verify-only] in-repo path %s does not exist — will also check HF cache", target)
         verify_svd_base(target)
-        missing = [name for name in _SVD_WEIGHT_COMPONENTS if not _svd_component_has_weight(target, name)]
-        sys.exit(1 if missing else 0)
+        # Exit 0 if EITHER the in-repo target or the HF cache snapshot is fully
+        # complete — the verify report above already printed which path was
+        # inspected and the per-component status.
+        inrepo_complete = target.is_dir() and _has_svd_fp16_safetensors(target)
+        if inrepo_complete:
+            sys.exit(0)
+        hf_snapshot = _hf_cache_snapshot_dir(_SVD_REPO_ID)
+        hf_complete = hf_snapshot is not None and _has_svd_fp16_safetensors(hf_snapshot)
+        sys.exit(0 if hf_complete else 1)
 
     if args.dry_run:
         log.info("[dry-run] no side effects will be performed")
