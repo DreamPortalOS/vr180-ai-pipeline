@@ -44,6 +44,7 @@ Usage::
     python scripts/setup_stereocrafter.py --svd-dir D:/svd              # custom SVD target dir
     python scripts/setup_stereocrafter.py --hf-token hf_...             # explicit HF token (else auto-read)
     python scripts/setup_stereocrafter.py --pip-mirror https://pypi.tuna.tsinghua.edu.cn/simple
+    python scripts/setup_stereocrafter.py --pip-timeout 7200            # raise the per-pip wall-clock cap
     python scripts/setup_stereocrafter.py --dry-run                     # print planned steps, no side effects
 """
 
@@ -77,6 +78,34 @@ INREPO_PYTHON = INREPO_VENV_DIR / (Path("Scripts") / "python.exe" if os.name == 
 TORCH_VERSION = "2.6.0"
 TORCHVISION_VERSION = "0.21.0"
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
+
+# ---------------------------------------------------------------------------
+# pip subprocess timeouts (issue #162).
+#
+# The bootstrap used to hard-code a 1200s (20 min) wall-clock cap on the two
+# pip installs in Step 2.  That is too tight when pip has to *downgrade*
+# (e.g. transformers 5.16 → 4.42.3 from issue #155) on a slow/unstable network
+# (common from mainland China): 20 min is not enough to re-resolve the dep
+# tree + re-download, the subprocess hits ``TimeoutExpired`` and the whole
+# bootstrap dies mid-install — leaving the env half-installed and blocking the
+# idempotent re-run that is the only way to recover.
+#
+# The cap is now configurable and looser by default.  ``--pip-timeout`` (CLI)
+# overrides the env var; the env var overrides the default.  We also pass pip
+# its own per-connection ``--timeout`` so a single stalled TCP read does not
+# silently hang for the full wall-clock allowance.
+# ---------------------------------------------------------------------------
+# Default wall-clock cap for a single ``pip install`` subprocess (seconds).
+DEFAULT_PIP_TIMEOUT = 3600  # 1 hour — covers a downgrade + re-download on slow links
+# pip's own per-connection socket timeout (seconds).  ``--timeout`` is a pip
+# flag (NOT a subprocess kwarg) — it bounds each individual HTTP read so a
+# stalled mirror connection fails fast instead of burning the full allowance.
+PIP_CONNECT_TIMEOUT = 120
+# Environment variable that overrides DEFAULT_PIP_TIMEOUT without touching the
+# CLI.  Shared across all three setup scripts so the operator can set it once.
+# The ``SETUP_`` prefix avoids colliding with pip's own ``PIP_TIMEOUT`` env var
+# (which controls pip's per-connection timeout and would be double-counted).
+PIP_TIMEOUT_ENV_VAR = "SETUP_PIP_TIMEOUT"
 
 # Curated runtime deps for the StereoCrafter inference entry point.
 #
@@ -181,6 +210,41 @@ _SVD_IGNORE_PATTERNS: tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# pip-timeout resolver (issue #162).
+#
+# Precedence: explicit CLI value (--pip-timeout) > env var (SETUP_PIP_TIMEOUT)
+# > DEFAULT_PIP_TIMEOUT (3600s).  An explicit CLI value wins even if the env
+# var is also set, so a one-off ``--pip-timeout 7200`` on the command line is
+# never silently overridden by a stale env var the operator forgot about.
+# ---------------------------------------------------------------------------
+
+
+def resolve_pip_timeout(cli_value: int | None = None) -> int:
+    """Resolve the wall-clock timeout (seconds) for a single pip subprocess.
+
+    *cli_value* is the ``--pip-timeout`` argument (``None`` if absent on the
+    CLI).  Falls back to :data:`PIP_TIMEOUT_ENV_VAR`, then
+    :data:`DEFAULT_PIP_TIMEOUT`.  A non-integer env value is ignored with a
+    warning rather than crashing the bootstrap (it is a convenience override,
+    not a hard requirement).
+    """
+    if cli_value is not None:
+        return cli_value
+    env_val = os.environ.get(PIP_TIMEOUT_ENV_VAR)
+    if env_val:
+        try:
+            return int(env_val)
+        except ValueError:
+            log.warning(
+                "Ignoring non-integer %s=%r — falling back to default %ss.",
+                PIP_TIMEOUT_ENV_VAR,
+                env_val,
+                DEFAULT_PIP_TIMEOUT,
+            )
+    return DEFAULT_PIP_TIMEOUT
+
+
 def _has_svd_fp16_safetensors(model_dir: Path) -> bool:
     """Return True if *model_dir* has the fp16 safetensors the Stage-2 loaders
     resolve on the local-folder branch (issue #155).
@@ -224,13 +288,55 @@ def run_step(
     buffer: DryRunBuffer,
     label: str | None = None,
 ) -> None:
-    """Print *cmd*, then either record it (dry-run) or execute it."""
+    """Print *cmd*, then either record it (dry-run) or execute it.
+
+    A ``subprocess.TimeoutExpired`` is caught and re-raised as a
+    :class:`RuntimeError` carrying an actionable hint (issue #162) — pip's
+    wall-clock timeout must NOT be a bare, uncaught traceback that kills the
+    bootstrap with no guidance.  The hint tells the operator to re-run
+    (idempotent — completed steps are skipped) or raise the allowance, and
+    mentions ``--pip-mirror`` for the slow-network (mainland China) case.
+    """
     label = label or " ".join(cmd)
     if dry_run:
         buffer.record(label)
         return
     log.info("▶ %s", label)
-    subprocess.check_call(cmd, cwd=cwd, timeout=timeout)
+    try:
+        subprocess.check_call(cmd, cwd=cwd, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise _pip_timeout_error(exc, timeout=timeout, label=label) from exc
+
+
+def _pip_timeout_error(
+    exc: subprocess.TimeoutExpired,
+    *,
+    timeout: int | None,
+    label: str,
+) -> RuntimeError:
+    """Wrap a pip ``TimeoutExpired`` with an actionable hint (issue #162).
+
+    The raw ``TimeoutExpired`` traceback says only "timed out after N seconds"
+    and exits the whole bootstrap — the operator is left with a half-installed
+    venv and no idea what to do next.  This surfaces three concrete recovery
+    moves (idempotent re-run, ``--pip-mirror``, raise ``--pip-timeout``) so the
+    failure is recoverable on its face.
+    """
+    secs = timeout if timeout is not None else DEFAULT_PIP_TIMEOUT
+    return RuntimeError(
+        f"{label} timed out after {secs}s — this is almost always a "
+        "slow or unstable network connection (common from mainland China).\n"
+        "  Recovery (the bootstrap is idempotent — completed steps are skipped):\n"
+        "    1. Just re-run the same command.  pip resumes from its cache and\n"
+        "       the venv is not recreated, so a slow install finishes across\n"
+        "       two runs instead of dying on one.\n"
+        "    2. If you have not already, route pip through a mirror:\n"
+        "         python scripts/setup_stereocrafter.py --pip-mirror "
+        "https://pypi.tuna.tsinghua.edu.cn/simple\n"
+        f"    3. Raise the wall-clock allowance (e.g. --pip-timeout 7200, or\n"
+        f"       set the {PIP_TIMEOUT_ENV_VAR} env var).\n"
+        f"  Underlying error: {exc}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -338,10 +444,18 @@ def ensure_venv_and_deps(
     explicit_repo_dir: str | None,
     pip_mirror: str | None,
     *,
+    pip_timeout: int,
     dry_run: bool,
     buffer: DryRunBuffer,
 ) -> None:
-    """Create the dedicated venv and install torch (cu124) + the repo's deps."""
+    """Create the dedicated venv and install torch (cu124) + the repo's deps.
+
+    *pip_timeout* is the wall-clock cap (seconds) for each pip subprocess
+    (issue #162 — ``--pip-timeout`` / ``SETUP_PIP_TIMEOUT``; default 3600s).
+    Both pip commands also get pip's own per-connection ``--timeout
+    {PIP_CONNECT_TIMEOUT}`` so a stalled connection fails fast instead of
+    hanging for the full wall-clock allowance.
+    """
     node_dir = _effective_node_dir(explicit_repo_dir)
     venv_dir = node_dir / ".venv"
     python_exe = _venv_python_for(node_dir)
@@ -369,19 +483,30 @@ def ensure_venv_and_deps(
         "install",
         "--retries",
         "10",
+        "--timeout",
+        str(PIP_CONNECT_TIMEOUT),
         f"torch=={TORCH_VERSION}",
         f"torchvision=={TORCHVISION_VERSION}",
         "--index-url",
         TORCH_INDEX_URL,
         *_pip_mirror_args(pip_mirror),
     ]
-    run_step(cmd_torch, dry_run=dry_run, buffer=buffer, timeout=1200)
+    run_step(cmd_torch, dry_run=dry_run, buffer=buffer, timeout=pip_timeout)
 
-    base_cmd = [str(python_exe), "-m", "pip", "install", "--retries", "10"]
+    base_cmd = [
+        str(python_exe),
+        "-m",
+        "pip",
+        "install",
+        "--retries",
+        "10",
+        "--timeout",
+        str(PIP_CONNECT_TIMEOUT),
+    ]
     mirror_args = _pip_mirror_args(pip_mirror)
     cmd_node = [*base_cmd, *RUNTIME_DEPS, *mirror_args]
     label_node = f"pip install {' '.join(RUNTIME_DEPS)}"
-    run_step(cmd_node, dry_run=dry_run, buffer=buffer, timeout=1200, label=label_node)
+    run_step(cmd_node, dry_run=dry_run, buffer=buffer, timeout=pip_timeout, label=label_node)
 
 
 # ---------------------------------------------------------------------------
@@ -822,6 +947,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "torch is ALWAYS installed from the official cu124 index."
         ),
     )
+    parser.add_argument(
+        "--pip-timeout",
+        type=int,
+        default=None,
+        help=(
+            "Wall-clock timeout (seconds) for each pip install subprocess. "
+            f"Default {DEFAULT_PIP_TIMEOUT}s ({DEFAULT_PIP_TIMEOUT // 60} min) — "
+            "a downgrade + re-download on a slow network can exceed the old "
+            "20-min cap (issue #162).  The {PIP_TIMEOUT_ENV_VAR} env var "
+            "overrides the default; the CLI overrides the env var."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -846,7 +983,13 @@ def main(argv: list[str] | None = None) -> None:
         if args.skip_deps:
             log.info("--skip-deps: venv + pip install skipped")
         else:
-            ensure_venv_and_deps(args.repo_dir, args.pip_mirror, dry_run=args.dry_run, buffer=buffer)
+            ensure_venv_and_deps(
+                args.repo_dir,
+                args.pip_mirror,
+                pip_timeout=resolve_pip_timeout(args.pip_timeout),
+                dry_run=args.dry_run,
+                buffer=buffer,
+            )
 
         log.info("\n── Step 3/5: StereoCrafter weights ──")
         download_models(args.repo_dir, args.skip_model, dry_run=args.dry_run, buffer=buffer)
