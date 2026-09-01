@@ -105,6 +105,12 @@ RUNTIME_DEPS: tuple[str, ...] = (
 # HuggingFace repo for the StereoCrafter weights.
 _MODEL_REPO_ID = "TencentARC/StereoCrafter"
 
+# SVD base model (Stage 2 --pre_trained_path).  NOT downloaded by default —
+# when absent, pipeline.stereo_crafter passes this HF id straight to diffusers,
+# which downloads it (~10 GB) on the first inference run (issue #147).
+_SVD_REPO_ID = "stabilityai/stable-video-diffusion-img2vid-xt-1-1"
+INREPO_SVD_DIR = REPO_ROOT / "models" / "svd-img2vid-xt-1-1"
+
 
 # ---------------------------------------------------------------------------
 # Runner: either records steps (dry-run) or executes them.
@@ -348,6 +354,62 @@ def _has_snapshot_files(model_dir: Path) -> bool:
     return any(child.is_file() for child in model_dir.iterdir())
 
 
+def download_svd_base(
+    svd_dir: str | None,
+    *,
+    dry_run: bool,
+    buffer: DryRunBuffer,
+) -> None:
+    """Optionally pre-download the SVD base model (Stage 2 --pre_trained_path).
+
+    Skipped entirely unless ``--svd-dir`` is given (or the in-repo default
+    ``models/svd-img2vid-xt-1-1`` already exists, in which case a re-run just
+    confirms it).  When no local copy exists the pipeline passes the HF model
+    id to diffusers, which downloads ~10 GB on the first inference run — so
+    this step is purely an opt-in convenience to front-load that download.
+    """
+    if svd_dir is not None:
+        target = Path(svd_dir)
+    elif INREPO_SVD_DIR.is_dir():
+        target = INREPO_SVD_DIR
+    else:
+        log.info(
+            "SVD base not requested (--svd-dir) and not present at %s — skipping. "
+            "The pipeline will pass the HF id %r to diffusers, which downloads ~10 GB on first run.",
+            INREPO_SVD_DIR,
+            _SVD_REPO_ID,
+        )
+        return
+
+    label = f"snapshot_download {_SVD_REPO_ID} → {target}"
+    if dry_run:
+        buffer.record(label)
+        return
+
+    if target.is_dir() and _has_snapshot_files(target):
+        log.info("SVD base snapshot already present at %s — skipping.", target)
+        return
+
+    target.mkdir(parents=True, exist_ok=True)
+    log.info("▶ %s (~10 GB — this can take a while)", label)
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        log.warning("huggingface_hub not installed in this environment. Install with: pip install huggingface_hub")
+        return
+
+    try:
+        snapshot_download(
+            repo_id=_SVD_REPO_ID,
+            local_dir=str(target),
+            local_dir_use_symlinks=False,
+        )
+    except Exception as exc:
+        log.warning("snapshot_download failed for %s: %s", _SVD_REPO_ID, exc)
+        log.warning("You can try again later, or clone the HF repo manually into %s.", target)
+
+
 # ---------------------------------------------------------------------------
 # Step 4: self-check
 # ---------------------------------------------------------------------------
@@ -509,6 +571,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip model weight download (already downloaded).",
     )
     parser.add_argument(
+        "--svd-dir",
+        default=None,
+        help=(
+            "Optionally pre-download the SVD base model "
+            f"({_SVD_REPO_ID}, ~10 GB) into this directory so the first "
+            "inference run does not have to.  If omitted and no local copy "
+            "exists, the pipeline passes the HF model id to diffusers, which "
+            "downloads it on first run."
+        ),
+    )
+    parser.add_argument(
         "--skip-deps",
         action="store_true",
         help="Skip venv creation and pip install (already set up).",
@@ -555,6 +628,7 @@ def main(argv: list[str] | None = None) -> None:
 
         log.info("\n── Step 3/4: model weights ──")
         download_models(args.repo_dir, args.skip_model, dry_run=args.dry_run, buffer=buffer)
+        download_svd_base(args.svd_dir, dry_run=args.dry_run, buffer=buffer)
 
         log.info("\n── Step 4/4: self-check ──")
         self_check(args.repo_dir, dry_run=args.dry_run, buffer=buffer)

@@ -65,7 +65,7 @@ python scripts/setup_stereocrafter.py --dry-run                     # print plan
 | CUDA      | CUDA 12.4 (torch is pinned to the cu124 wheel index) |
 | OS        | Windows / Linux / macOS are all supported by the bootstrap; **inference is CUDA-only** |
 | Python    | 3.10+ (the dedicated venv is created by the bootstrap) |
-| Disk      | ~20 GB (checkout + weights + venv) |
+| Disk      | ~20 GB (checkout + weights + venv) **+ ~10 GB for the SVD base** — auto-downloaded by diffusers on the first inference run, or pre-downloaded via `--svd-dir` |
 | Network   | git + HF download (one-time); the bootstrap prints proxy hints if `git clone` fails |
 
 ---
@@ -128,7 +128,16 @@ backend raises and points at `scripts/setup_stereocrafter.py`.
 | `repo_dir`              | `STEREOCRAFTER_REPO_DIR`       | `third_party/StereoCrafter` *(if exists)* |
 | `python_exe`            | `STEREOCRAFTER_PYTHON`         | in-repo venv python *(if exists)*, else `python` |
 | `checkpoint_dir`        | `STEREOCRAFTER_CKPT_DIR`       | `models/StereoCrafter` *(if exists)*, else `(<repo>)/checkpoints` — Stage 2 `--unet_path` |
-| `pre_trained_path`      | `STEREOCRAFTER_SVD_PATH`       | `(<repo>)/weights/stable-video-diffusion-img2vid-xt-1-1` — SVD base (Stage 2 `--pre_trained_path`) |
+| `pre_trained_path`      | `STEREOCRAFTER_SVD_PATH`       | `models/svd-img2vid-xt-1-1` *(if exists)*, else the HF id `stabilityai/stable-video-diffusion-img2vid-xt-1-1` — SVD base (Stage 2 `--pre_trained_path`) |
+
+> **SVD base model (~10 GB) — first-run download.**  If no local copy of the
+> SVD base exists, the backend passes the HF model id straight to diffusers,
+> which downloads ~10 GB into the HF cache on the **first inference run**
+> (same behaviour as DepthCrafter's auto-pull).  To front-load the download
+> instead, run `python scripts/setup_stereocrafter.py --svd-dir models/svd-img2vid-xt-1-1`
+> once, or set `STEREOCRAFTER_SVD_PATH` to an existing local snapshot.  A
+> nonexistent local path is never passed — diffusers would treat it as an HF
+> repo id and crash (issue #147).
 | `max_resolution`        | `STEREOCRAFTER_MAX_RES`        | `512` |
 | `max_disp`              | `STEREOCRAFTER_MAX_DISP`       | `20.0` — stereo baseline for the in-repo forward-splat |
 
