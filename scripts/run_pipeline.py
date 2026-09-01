@@ -48,6 +48,11 @@ from pipeline.playback_presets import (
     PLAYBACK_PRESETS,
     resolve_playback,
 )
+from pipeline.segment_concat import (
+    ConcatError,
+    ConcatSegment,
+    concat_segments,
+)
 from pipeline.stereo_crafter import StereoCrafterRenderer
 from pipeline.stereo_renderer import StereoRenderer
 from pipeline.streaming_pipeline import (
@@ -70,7 +75,46 @@ log = logging.getLogger("vr180-pipeline")
 def parse_args(argv: list[str] | None = None):
     """Parse CLI arguments.  Accept optional *argv* for testing."""
     parser = argparse.ArgumentParser(description="2D AI Video → VR180 Conversion Pipeline")
-    parser.add_argument("--input", "-i", required=True, help="Input video file (MP4, MOV, etc.)")
+
+    # C-1b (#191): single input vs multi-segment concat are mutually exclusive
+    # entry modes.  Exactly one must be provided — the mutual-exclusion group
+    # enforces that ``--input`` and ``--inputs`` are not both given; the "at
+    # least one" check lives in main() so the error message can name both
+    # flags rather than argparse's terse per-group message.
+    _input_group = parser.add_mutually_exclusive_group()
+    _input_group.add_argument(
+        "--input",
+        "-i",
+        required=False,
+        help="Input video file (MP4, MOV, etc.). Mutually exclusive with --inputs.",
+    )
+    _input_group.add_argument(
+        "--inputs",
+        nargs="+",
+        default=None,
+        help=(
+            "C-1b: one or more pre-generated flat (pre-VR180) clips, given in "
+            "the order they should appear.  They are concatenated into a single "
+            "intermediate file (see --temp-dir) and that intermediate is fed to "
+            "the existing VR180 pipeline unchanged.  Mutually exclusive with --input/-i."
+        ),
+    )
+    # --concat-crossfade / --concat-mode configure the concat pre-stage; they
+    # are NOT entry-mode selectors, so they must NOT be in the mutual-exclusion
+    # group (they must be passable alongside --inputs).  They are no-ops when
+    # --inputs is not given.
+    parser.add_argument(
+        "--concat-crossfade",
+        type=float,
+        default=0.0,
+        help="C-1b: xfade transition length in seconds between concatenated segments (default 0.0 = hard cut).",
+    )
+    parser.add_argument(
+        "--concat-mode",
+        choices=["demux", "filter"],
+        default="demux",
+        help="C-1b: concat engine (demux = lossless -c copy, filter = re-encode; default demux).",
+    )
     parser.add_argument("--output", "-o", default=None, help="Output VR180 video path")
     parser.add_argument(
         "--stage",
@@ -1749,6 +1793,77 @@ def _stage_artifacts(args, manifest_name):
     return [], outputs, params
 
 
+# ---------------------------------------------------------------------------
+# C-1b (#191): multi-segment concat pre-stage
+# ---------------------------------------------------------------------------
+
+
+def _concat_segments_preprocess(args) -> Path:
+    """Concatenate ``args.inputs`` into one intermediate file under --temp-dir.
+
+    Called from :func:`main` when ``--inputs`` is given.  Returns the absolute
+    path to the intermediate clip.  The intermediate lives under ``--temp-dir``
+    (or the default temp dir next to the *first* input when --temp-dir is
+    omitted) so it never lands under ``video/``.
+
+    Raises :class:`ConcatError` if the segments are incompatible (its message
+    names the offending segment, which main() prints verbatim).
+    """
+    segments = [ConcatSegment(Path(p)) for p in args.inputs]
+
+    # Resolve the concat output path under the temp dir.  The intermediate
+    # filename is stable so a retry/resume does not leave stray artefacts.
+    concat_dir = get_temp_dir(args, "concat")
+    concat_output = Path(concat_dir) / "_concat_intermediate.mp4"
+
+    log.info(
+        "🧩 Concatenating %d segment(s) → %s (mode=%s, crossfade=%.3fs)",
+        len(segments),
+        concat_output,
+        args.concat_mode,
+        args.concat_crossfade,
+    )
+
+    result = concat_segments(
+        segments,
+        concat_output,
+        mode=args.concat_mode,
+        crossfade=args.concat_crossfade,
+    )
+
+    # Estimate total duration by probing the intermediate so the log line
+    # can report a concrete "total X seconds".  ffprobe duration may be None
+    # for some codecs; fall back to the segment-count phrasing in that case.
+    from pipeline.segment_concat import probe_segment as _probe_segment
+
+    try:
+        meta = _probe_segment(result)
+        dur = meta.get("duration")
+        if dur is not None:
+            log.info(
+                "🧩 已将 %d 段拼接为 %s（总时长 %.2f 秒）",
+                len(segments),
+                result,
+                dur,
+            )
+        else:
+            log.info(
+                "🧩 已将 %d 段拼接为 %s（总时长未知）",
+                len(segments),
+                result,
+            )
+    except ConcatError:
+        # Probe failure (e.g. duration unreadable) must not abort the pipeline;
+        # the concat itself succeeded.  Log a weaker confirmation line.
+        log.info(
+            "🧩 已将 %d 段拼接为 %s（时长探测失败，不阻塞管线）",
+            len(segments),
+            result,
+        )
+
+    return Path(result).resolve()
+
+
 def _manifest_record_stage(manifest, args, manifest_name):
     """Record one completed stage into the manifest (hashes file outputs)."""
     from pipeline.job_manifest import mark_stage_done
@@ -1837,6 +1952,41 @@ def _manifest_prepare(args):
 
 def main():
     args = parse_args()
+
+    # C-1b (#191): enforce "exactly one" of --input / --inputs.  The argparse
+    # mutually-exclusive group above already errors when both are given; this
+    # covers the other case (neither given) with a message that names both
+    # flags, matching the operator-facing tone of the other entry checks.
+    # args.inputs is ``None`` or a real ``list[str]`` when parsed by argparse.
+    # Some callers (existing streaming-backend tests) construct ``args`` as a
+    # bare MagicMock where every unset attribute is a truthy Mock; treat any
+    # non-list value as "no --inputs" so those tests keep working unchanged.
+    # Normalise args.inputs in place so the concat pre-stage (which reads it)
+    # and every downstream consumer see the same canonical value.
+    args.inputs = args.inputs if isinstance(getattr(args, "inputs", None), list) else None
+    if args.input is None and args.inputs is None:
+        err = "❌ either --input/-i or --inputs is required"
+        log.error(err)
+        print(err, file=sys.stderr)
+        sys.exit(2)
+
+    # C-1b (#191): when --inputs is given, concatenate the segments into a
+    # single intermediate under --temp-dir and feed that intermediate into the
+    # existing pipeline by replacing args.input.  Everything downstream (fps
+    # inheritance, SBS detection, stage loop, audio remux, sidecar) sees a
+    # single "input" and is otherwise unchanged.
+    if args.inputs is not None:
+        try:
+            args.input = str(_concat_segments_preprocess(args))
+        except ConcatError as exc:
+            # ConcatError messages already name the offending segment with its
+            # actual values — surface them verbatim so the operator can spot
+            # which clip is the odd one out (acceptance criterion).
+            msg = f"❌ Segment compatibility check failed:\n{exc}"
+            log.error(msg)
+            print(msg, file=sys.stderr)
+            sys.exit(2)
+
     apply_quality_preset(args)
     _apply_comfort_preset(args)
     # D-2 (#79): the playback preset is resolved after fps inheritance below
