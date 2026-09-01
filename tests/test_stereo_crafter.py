@@ -481,6 +481,118 @@ class TestCLIBackendInRepoFallback:
         assert backend.max_resolution == 384
 
 
+class TestPreTrainedPathResolution:
+    """Issue #147: --pre_trained_path (SVD base) must never be a nonexistent
+    local path (diffusers/transformers would treat it as an HF repo id and
+    crash with "Repo id must use alphanumeric chars").  It must be either an
+    existing local dir or a valid HF model id.
+    """
+
+    @pytest.fixture
+    def repo(self, tmp_path):
+        repo = tmp_path / "stereocrafter"
+        repo.mkdir()
+        (repo / "inpainting_inference.py").write_text("# fake stage-2 entry")
+        return repo
+
+    def test_default_is_hf_model_id_when_no_local_copy(self, repo, monkeypatch, tmp_path):
+        """No local SVD dir → fall back to the HF model id, NOT a fictional
+        ``<repo>/weights/...`` path (the exact regression of issue #147)."""
+        from pipeline import stereo_crafter as sc
+        from pipeline.stereo_crafter import CLIBackend
+
+        absent_svd = tmp_path / "models" / "svd-img2vid-xt-1-1"
+        monkeypatch.setattr(sc, "INREPO_SVD_DIR", absent_svd, raising=True)
+
+        with patch.dict(os.environ, {}, clear=True):
+            backend = CLIBackend(repo_dir=str(repo))
+        assert backend.pre_trained_path == "stabilityai/stable-video-diffusion-img2vid-xt-1-1"
+        # Regression guard: the old broken default must never reappear.
+        assert "weights" not in backend.pre_trained_path
+        assert not backend.pre_trained_path.startswith(str(repo))
+
+    def test_inrepo_svd_dir_used_when_present(self, repo, monkeypatch, tmp_path):
+        """A locally pre-downloaded SVD base (models/svd-img2vid-xt-1-1) wins
+        over the HF id."""
+        from pipeline import stereo_crafter as sc
+        from pipeline.stereo_crafter import CLIBackend
+
+        svd_dir = tmp_path / "models" / "svd-img2vid-xt-1-1"
+        svd_dir.mkdir(parents=True)
+        (svd_dir / "model_index.json").write_text("{}")
+        monkeypatch.setattr(sc, "INREPO_SVD_DIR", svd_dir, raising=True)
+
+        with patch.dict(os.environ, {}, clear=True):
+            backend = CLIBackend(repo_dir=str(repo))
+        assert backend.pre_trained_path == str(svd_dir)
+        assert Path(backend.pre_trained_path).is_dir()
+
+    def test_env_var_overrides_default(self, repo):
+        """STEREOCRAFTER_SVD_PATH wins over both the in-repo dir and the HF id."""
+        from pipeline.stereo_crafter import CLIBackend
+
+        with patch.dict(os.environ, {"STEREOCRAFTER_SVD_PATH": "/custom/svd"}, clear=True):
+            backend = CLIBackend(repo_dir=str(repo))
+        assert backend.pre_trained_path == str(Path("/custom/svd").resolve())
+
+    def test_render_command_unet_points_at_inrepo_weights(self, repo, monkeypatch, tmp_path):
+        """End-to-end command assertion (issue #147 acceptance): the built
+        Stage-2 command passes --unet_path <in-repo models/StereoCrafter> and
+        --pre_trained_path that is either an existing local dir or a valid HF
+        model id — never a nonexistent local path."""
+        from pipeline import stereo_crafter as sc
+        from pipeline.stereo_crafter import CLIBackend
+
+        ckpt_dir = tmp_path / "models" / "StereoCrafter"
+        ckpt_dir.mkdir(parents=True)
+        (ckpt_dir / "diffusion_pytorch_model.safetensors").write_text("w")
+        monkeypatch.setattr(sc, "INREPO_CKPT_DIR", ckpt_dir, raising=True)
+        monkeypatch.setattr(sc, "INREPO_SVD_DIR", tmp_path / "no-svd-here", raising=True)
+
+        with patch.dict(os.environ, {}, clear=True):
+            backend = CLIBackend(repo_dir=str(repo))
+
+        depth_dir = tmp_path / "depth"
+        depth_dir.mkdir()
+        input_video = tmp_path / "input.mp4"
+        input_video.write_text("")
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        (work_dir / "splatting_results_inpainting_results_sbs.mp4").write_text("fake sbs")
+
+        with (
+            patch("subprocess.run") as mock_run,
+            patch.object(CLIBackend, "_split_sbs_video", return_value=None),
+            patch("pipeline.stereo_crafter._assert_cuda", return_value=None),
+            patch("pipeline.stereo_crafter.tempfile.mkdtemp", return_value=str(work_dir)),
+            patch("pipeline.stereo_crafter._write_splatting_grid_video", return_value=None),
+        ):
+            mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            backend.render_video(
+                input_path=str(input_video),
+                depth_dir=str(depth_dir),
+                output_left=str(tmp_path / "left.mp4"),
+                output_right=str(tmp_path / "right.mp4"),
+            )
+
+        cmd = mock_run.call_args_list[0].args[0]
+        unet_path = cmd[cmd.index("--unet_path") + 1]
+        svd_path = cmd[cmd.index("--pre_trained_path") + 1]
+
+        # --unet_path must point at the real in-repo weights dir — never at
+        # third_party/.../weights (which does not exist upstream; issue #147).
+        assert Path(unet_path) == ckpt_dir
+        assert Path(unet_path).is_dir()
+        assert "third_party" not in unet_path
+
+        # --pre_trained_path: existing local dir OR a valid HF repo id —
+        # never a nonexistent local path.
+        if not Path(svd_path).is_dir():
+            assert "/" in svd_path, f"not a local dir and not a repo id: {svd_path}"
+            assert not Path(svd_path).is_absolute(), f"nonexistent local path: {svd_path}"
+            assert "\\" not in svd_path  # Windows path leaking in as a fake repo id
+
+
 class TestSplatAssembly:
     """Unit tests for the in-repo Stage-2 input assembly (issue #140).
 

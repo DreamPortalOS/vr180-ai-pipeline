@@ -297,6 +297,13 @@ INREPO_PYTHON_EXE = (
 )
 # Model weights under models/StereoCrafter (models/ is gitignored).
 INREPO_CKPT_DIR = _REPO_ROOT / "models" / "StereoCrafter"
+# Optional locally pre-downloaded SVD base (Stage 2 --pre_trained_path).
+INREPO_SVD_DIR = _REPO_ROOT / "models" / "svd-img2vid-xt-1-1"
+# HF model id for the SVD base — passed through to diffusers (which downloads
+# it on first run) when no local copy exists.  Never pass a *nonexistent*
+# local path here: diffusers/transformers would treat the path string as a
+# repo id and crash with "Repo id must use alphanumeric chars" (issue #147).
+SVD_HF_MODEL_ID = "stabilityai/stable-video-diffusion-img2vid-xt-1-1"
 
 # 12 GB VRAM (RTX 4070 SUPER) safe defaults.  512 short-side is the sweet spot;
 # bump to 768/1024 on larger GPUs via --stereocrafter-max-res or the env var.
@@ -414,7 +421,7 @@ class CLIBackend(StereoCrafterBackend):
     ``repo_dir``          ``STEREOCRAFTER_REPO_DIR``      in-repo ``third_party/StereoCrafter`` *(if exists)*
     ``python_exe``        ``STEREOCRAFTER_PYTHON``        in-repo venv python *(if exists)*, else ``python``
     ``checkpoint_dir``    ``STEREOCRAFTER_CKPT_DIR``      in-repo ``models/StereoCrafter`` *(if exists)*, else ``(repo_dir)/checkpoints``
-    ``pre_trained_path``  ``STEREOCRAFTER_SVD_PATH``      ``(repo_dir)/weights/stable-video-diffusion-img2vid-xt-1-1``
+    ``pre_trained_path``  ``STEREOCRAFTER_SVD_PATH``      in-repo ``models/svd-img2vid-xt-1-1`` *(if exists)*, else the HF id ``stabilityai/stable-video-diffusion-img2vid-xt-1-1`` (diffusers downloads on first run)
     ``max_resolution``    ``STEREOCRAFTER_MAX_RES``       ``512`` (12 GB VRAM safe)
     ``max_disp``          ``STEREOCRAFTER_MAX_DISP``      ``20.0`` (stereo baseline, upstream Stage-1 default)
     (stage timeout)       ``STEREOCRAFTER_TIMEOUT_SEC``   ``7200`` (2 hours)
@@ -470,13 +477,26 @@ class CLIBackend(StereoCrafterBackend):
             self.checkpoint_dir = str(Path(self.repo_dir) / "checkpoints")
 
         # pre_trained_path (SVD base model, --pre_trained_path for Stage 2):
-        #   explicit > env > (repo_dir)/weights/stable-video-diffusion-img2vid-xt-1-1
+        #   explicit > env > in-repo models/svd-img2vid-xt-1-1 (if exists) >
+        #   HF model id (diffusers auto-downloads on first run).
+        # Issue #147: NEVER default to a nonexistent local path — diffusers /
+        # transformers would treat the path string as an HF repo id and crash
+        # with "Repo id must use alphanumeric chars".
         if pre_trained_path:
             self.pre_trained_path = str(Path(pre_trained_path).resolve())
         elif os.environ.get("STEREOCRAFTER_SVD_PATH"):
             self.pre_trained_path = str(Path(os.environ["STEREOCRAFTER_SVD_PATH"]).resolve())
+        elif INREPO_SVD_DIR.is_dir():
+            self.pre_trained_path = str(INREPO_SVD_DIR)
         else:
-            self.pre_trained_path = str(Path(self.repo_dir) / "weights" / "stable-video-diffusion-img2vid-xt-1-1")
+            self.pre_trained_path = SVD_HF_MODEL_ID
+            log.info(
+                "StereoCrafter: SVD base not found locally — passing HF model id %r to diffusers; "
+                "the first run will download ~10 GB (same behaviour as DepthCrafter). "
+                "Pre-download with 'python scripts/setup_stereocrafter.py --svd-dir <dir>' or set "
+                "STEREOCRAFTER_SVD_PATH to skip the runtime download.",
+                SVD_HF_MODEL_ID,
+            )
 
         # max resolution for inference (short side); 512 is the 12 GB VRAM safe default.
         self.max_resolution = max_resolution or int(
