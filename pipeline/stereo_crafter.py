@@ -110,6 +110,10 @@ INREPO_CKPT_DIR = _REPO_ROOT / "models" / "StereoCrafter"
 # bump to 768/1024 on larger GPUs via --stereocrafter-max-res or the env var.
 DEFAULT_MAX_RESOLUTION = 512
 
+# Default subprocess timeout per stage (seconds) — the historical hard-coded
+# 2 hours.  Override via STEREOCRAFTER_TIMEOUT_SEC (issue #134).
+DEFAULT_TIMEOUT_SEC = 7200
+
 # Upstream TencentARC/StereoCrafter has NO ``run.py``.  Its root-level fire-style
 # entry scripts (verified against the actual checkout, 2026-09-01) are:
 #
@@ -215,6 +219,7 @@ class CLIBackend(StereoCrafterBackend):
     ``pre_trained_path``       ``STEREOCRAFTER_SVD_PATH``      ``(repo_dir)/weights/stable-video-diffusion-img2vid-xt-1-1``
     ``depthcrafter_unet_path`` ``STEREOCRAFTER_DC_UNET_PATH``  ``(repo_dir)/weights/DepthCrafter``
     ``max_resolution``         ``STEREOCRAFTER_MAX_RES``       ``512`` (12 GB VRAM safe)
+    (stage timeout)            ``STEREOCRAFTER_TIMEOUT_SEC``   ``7200`` (2 hours per stage)
     ========================== =============================== =============================================
 
     ``checkpoint_dir`` is the StereoCrafter UNet dir (Stage 2 ``--unet_path``);
@@ -287,6 +292,9 @@ class CLIBackend(StereoCrafterBackend):
         self.max_resolution = max_resolution or int(
             os.environ.get("STEREOCRAFTER_MAX_RES", str(DEFAULT_MAX_RESOLUTION))
         )
+
+        # Per-stage subprocess timeout in seconds (issue #134: was a hard-coded 2 hours).
+        self.timeout_sec: int = int(os.environ.get("STEREOCRAFTER_TIMEOUT_SEC", str(DEFAULT_TIMEOUT_SEC)))
 
         # Verify paths
         self._validate_paths()
@@ -483,7 +491,7 @@ class CLIBackend(StereoCrafterBackend):
                     cwd=self.repo_dir,
                     stdout=out_file,
                     stderr=err_file,
-                    timeout=7200,  # 2 hours max
+                    timeout=self.timeout_sec,
                     check=False,
                 )
             except FileNotFoundError as exc:
@@ -493,8 +501,26 @@ class CLIBackend(StereoCrafterBackend):
                     f"to the correct path."
                 ) from exc
             except subprocess.TimeoutExpired:
+                # Issue #134: the timeout branch must carry the same diagnostic
+                # context as the non-zero-exit branch (issue #127) — command,
+                # cwd, key params, the output tail produced before the kill,
+                # and the real contents of the output dir.
+                stdout_tail = _read_tail_lines(out_file, _OUTPUT_TAIL_FAILURE_LINES)
+                stderr_tail = _read_tail_lines(err_file, _OUTPUT_TAIL_FAILURE_LINES)
                 raise RuntimeError(
-                    "StereoCrafter inference timed out after 2 hours. The video may be too long or the GPU too slow."
+                    f"StereoCrafter {label} timed out after {self.timeout_sec} seconds "
+                    f"(configured via STEREOCRAFTER_TIMEOUT_SEC; default {DEFAULT_TIMEOUT_SEC}).\n"
+                    f"  The video may be too long or the GPU too slow — raise the timeout or\n"
+                    f"  lower the workload (e.g. STEREOCRAFTER_MAX_RES, currently {self.max_resolution}).\n"
+                    f"  Command: {' '.join(cmd)}\n"
+                    f"  cwd: {self.repo_dir}\n"
+                    f"  Output dir: {output_dir}\n"
+                    f"{_dir_listing_block(output_dir)}"
+                    f"  --- stdout (last {_OUTPUT_TAIL_FAILURE_LINES} lines before timeout) ---\n"
+                    f"{_indent(stdout_tail)}\n"
+                    f"  --- stderr (last {_OUTPUT_TAIL_FAILURE_LINES} lines before timeout) ---\n"
+                    f"{_indent(stderr_tail)}\n"
+                    f"  See docs/STEREOCRAFTER_SETUP.md for troubleshooting."
                 ) from None
 
             if result.returncode != 0:

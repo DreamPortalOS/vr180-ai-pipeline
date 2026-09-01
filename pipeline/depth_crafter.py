@@ -142,6 +142,10 @@ INREPO_MODEL_DIR = _REPO_ROOT / "models" / "DepthCrafter"
 # 512 is the lead-verified safe floor.  Tune via DEPTHCRAFTER_MAX_RES.
 _DEFAULT_MAX_RES = 512
 
+# Default subprocess timeout (seconds) — the historical hard-coded 2 hours.
+# Override via DEPTHCRAFTER_TIMEOUT_SEC (issue #134).
+_DEFAULT_TIMEOUT_SEC = 7200
+
 
 def _inrepo_env_hint() -> str:
     """Text appended to errors when no DepthCrafter paths were configured/found."""
@@ -177,6 +181,7 @@ class CLIBackend(DepthCrafterBackend):
     ``max_resolution``         ``DEPTHCRAFTER_MAX_RES``       ``512`` (12 GB VRAM-safe)
     ``process_length``         ``DEPTHCRAFTER_PROCESS_LENGTH`` unset (let the model decide)
     ``target_fps``             ``DEPTHCRAFTER_TARGET_FPS``     unset (source FPS)
+    (subprocess timeout)       ``DEPTHCRAFTER_TIMEOUT_SEC``    ``7200`` (2 hours)
     ========================== =============================== ===========================
 
     The underlying ``run.py`` CLI shape (lead-verified 2026-08-31) is
@@ -241,6 +246,9 @@ class CLIBackend(DepthCrafterBackend):
         self.process_length: int | None = _pl
         _tfps = target_fps or int(os.environ.get("DEPTHCRAFTER_TARGET_FPS", "0")) or None
         self.target_fps: int | None = _tfps
+
+        # Subprocess timeout in seconds (issue #134: was a hard-coded 2 hours).
+        self.timeout_sec: int = int(os.environ.get("DEPTHCRAFTER_TIMEOUT_SEC", str(_DEFAULT_TIMEOUT_SEC)))
 
         # Verify paths
         self._validate_paths()
@@ -367,7 +375,7 @@ class CLIBackend(DepthCrafterBackend):
                     cwd=self.repo_dir,
                     stdout=out_file,
                     stderr=err_file,
-                    timeout=7200,  # 2 hours max
+                    timeout=self.timeout_sec,
                     check=False,
                 )
             except FileNotFoundError as exc:
@@ -376,8 +384,28 @@ class CLIBackend(DepthCrafterBackend):
                     f"Set DEPTHCRAFTER_PYTHON or --depthcrafter-python to the correct path."
                 ) from exc
             except subprocess.TimeoutExpired:
+                # Issue #134: the timeout branch must carry the same diagnostic
+                # context as the non-zero-exit branch (issue #127) — command,
+                # cwd, key params, the output tail produced before the kill,
+                # and the real contents of the output dir.
+                stdout_tail = _read_tail_lines(out_file, _OUTPUT_TAIL_FAILURE_LINES)
+                stderr_tail = _read_tail_lines(err_file, _OUTPUT_TAIL_FAILURE_LINES)
                 raise RuntimeError(
-                    "DepthCrafter inference timed out after 2 hours. The video may be too long or the GPU too slow."
+                    f"DepthCrafter inference timed out after {self.timeout_sec} seconds "
+                    f"(configured via DEPTHCRAFTER_TIMEOUT_SEC; default {_DEFAULT_TIMEOUT_SEC}).\n"
+                    f"  The video may be too long or the GPU too slow — raise the timeout or\n"
+                    f"  lower the workload (e.g. DEPTHCRAFTER_MAX_RES, currently {self.max_resolution}).\n"
+                    f"  Command: {' '.join(cmd)}\n"
+                    f"  cwd: {self.repo_dir}\n"
+                    f"  max_res: {self.max_resolution} | process_length: {self.process_length} | "
+                    f"target_fps: {self.target_fps}\n"
+                    f"  Output dir: {output_dir}\n"
+                    f"{_dir_listing_block(output_dir)}"
+                    f"  --- stdout (last {_OUTPUT_TAIL_FAILURE_LINES} lines before timeout) ---\n"
+                    f"{_indent(stdout_tail)}\n"
+                    f"  --- stderr (last {_OUTPUT_TAIL_FAILURE_LINES} lines before timeout) ---\n"
+                    f"{_indent(stderr_tail)}\n"
+                    f"  See docs/DEPTHCRAFTER_SETUP.md for troubleshooting."
                 ) from None
 
             returncode = result.returncode

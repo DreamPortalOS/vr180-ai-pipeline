@@ -333,18 +333,78 @@ def test_cli_backend_timeout(
     mock_run: MagicMock,
     mock_cuda: MagicMock,
 ) -> None:
-    """subprocess.TimeoutExpired should be caught and re-raised."""
+    """subprocess.TimeoutExpired should be caught and re-raised with full diagnostics.
+
+    Issue #134: the timeout branch must carry the same context as the
+    non-zero-exit branch (issue #127) — command, cwd, key params, the
+    stdout/stderr tail produced before the kill, and the output-dir listing.
+    """
     import subprocess as sp
 
     with tempfile.TemporaryDirectory() as tmpdir:
         script_path = Path(tmpdir) / "run.py"
         script_path.write_text("print('ok')")
 
-        mock_run.side_effect = sp.TimeoutExpired(cmd="test", timeout=7200)
+        outdir_path = Path(tmpdir) / "depth_out"
+
+        def _fake_run(cmd, **kwargs):
+            # The child wrote a partial product + progress before being killed.
+            outdir_path.mkdir(parents=True, exist_ok=True)
+            (outdir_path / "clip_input.mp4").write_bytes(b"x")
+            kwargs["stdout"].write(b"loading weights\nframe 10/500\n")
+            kwargs["stderr"].write(b"tqdm: 2%| | 10/500 [2:00:00<...]\n")
+            raise sp.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+        mock_run.side_effect = _fake_run
 
         backend = CLIBackend(repo_dir=tmpdir)
-        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError, match="timed out after 2 hours"):
+        with pytest.raises(RuntimeError) as excinfo:
+            backend.estimate_video(input_path=str(script_path), output_dir=str(outdir_path))
+
+        msg = str(excinfo.value)
+        assert "timed out after 7200 seconds" in msg  # default unchanged
+        assert "DEPTHCRAFTER_TIMEOUT_SEC" in msg  # how to adjust it
+        # Command / cwd / params (symmetric with the failure-branch test).
+        assert "Command:" in msg and "run.py" in msg
+        assert f"cwd: {backend.repo_dir}" in msg
+        assert "max_res: 512" in msg
+        # Output produced before the kill is surfaced.
+        assert "loading weights" in msg  # stdout tail
+        assert "tqdm: 2%" in msg  # stderr tail
+        # Real output-dir contents are listed.
+        assert "clip_input.mp4" in msg
+        assert "Output dir contents:" in msg
+
+
+@patch("pipeline.depth_crafter._assert_cuda")
+@patch("pipeline.depth_crafter.subprocess.run")
+def test_cli_backend_timeout_configurable_via_env(
+    mock_run: MagicMock,
+    mock_cuda: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DEPTHCRAFTER_TIMEOUT_SEC overrides the default 2-hour timeout (issue #134)."""
+    import subprocess as sp
+
+    monkeypatch.setenv("DEPTHCRAFTER_TIMEOUT_SEC", "60")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        script_path = Path(tmpdir) / "run.py"
+        script_path.write_text("print('ok')")
+
+        mock_run.side_effect = sp.TimeoutExpired(cmd="test", timeout=60)
+
+        backend = CLIBackend(repo_dir=tmpdir)
+        assert backend.timeout_sec == 60
+
+        with tempfile.TemporaryDirectory() as outdir, pytest.raises(RuntimeError) as excinfo:
             backend.estimate_video(input_path=str(script_path), output_dir=outdir)
+
+        msg = str(excinfo.value)
+        assert "timed out after 60 seconds" in msg
+        assert "default 7200" in msg
+        # The effective timeout is what gets handed to subprocess.run.
+        assert mock_run.call_args.kwargs.get("timeout") == 60
 
 
 # ---------------------------------------------------------------------------
