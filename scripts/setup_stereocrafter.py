@@ -194,24 +194,138 @@ _SVD_IGNORE_PATTERNS: tuple[str, ...] = (
     "svd_xt_1_1.safetensors",  # full-pipeline aggregate (we load subfolders)
 )
 
+# Required weight subfolders of the SVD base (issue #186).  These are exactly
+# the three components the Stage-2 inpainting loaders resolve from the local
+# snapshot (image_encoder / unet / vae).  The completeness check in
+# _svd_component_has_weight scans each of these subfolders for a real,
+# non-empty, symlink-followed weight file — so a config-only unet (the #186
+# bug) is correctly flagged as MISSING rather than "already present".
+_SVD_WEIGHT_COMPONENTS: tuple[str, ...] = (
+    "image_encoder",
+    "unet",
+    "vae",
+)
+
 
 def _has_svd_fp16_safetensors(model_dir: Path) -> bool:
-    """Return True if *model_dir* has the fp16 safetensors the Stage-2 loaders
-    resolve on the local-folder branch (issue #155).
+    """Return True if *model_dir* has all SVD weight components complete
+    (issue #155, #186).
 
     Mirrors what transformers' ``_get_resolved_checkpoint_files`` looks for
     with ``variant="fp16"`` and ``use_safetensors`` left at its default
     (None → "is not False"): ``<subfolder>/model.fp16.safetensors`` (image_encoder)
     and ``<subfolder>/diffusion_pytorch_model.fp16.safetensors`` (unet / vae).
-    A dir missing the fp16 image_encoder safetensors is NOT considered ready —
-    that is exactly the file the upstream loaders need.
+    A dir missing any one of these is NOT considered ready — the Stage-2
+    inpainting loaders will crash at runtime on the missing component (issue
+    #186: the unet weights were silently absent while the config was present).
+
+    This is the **shared** completeness predicate used by both the download
+    skip-check and :func:`verify_svd_base` (issue #186) — see also
+    :func:`_svd_weight_components` for the per-component breakdown.
     """
-    needed = (
-        model_dir / "image_encoder" / "model.fp16.safetensors",
-        model_dir / "unet" / "diffusion_pytorch_model.fp16.safetensors",
-        model_dir / "vae" / "diffusion_pytorch_model.fp16.safetensors",
-    )
-    return all(p.is_file() for p in needed)
+    return all(_svd_component_has_weight(model_dir, name) for name in _SVD_WEIGHT_COMPONENTS)
+
+
+def _svd_component_has_weight(model_dir: Path, name: str) -> bool:
+    """Return True if the SVD *component* subfolder has a non-empty weight file
+    (``*.safetensors`` / ``*.bin``) that exists after resolving symlinks.
+
+    This is the unit of the completeness check (issue #186). A component dir
+    that only has ``config.json`` — or whose weight file is a symlink pointing
+    at a non-existent ``blobs/`` target (the HF-cache trap that caused the
+    original unet gap) — is **not** complete. ``config.json`` is excluded from
+    the weight-file scan so a config-only dir never passes.
+    """
+    comp_dir = model_dir / name
+    if not comp_dir.is_dir():
+        return False
+    for entry in comp_dir.iterdir():
+        if not entry.is_file():
+            continue
+        suffix = entry.name.lower()
+        if not (suffix.endswith(".safetensors") or suffix.endswith(".bin")):
+            continue
+        # Follow symlinks (HF cache points at blobs/) and verify the final
+        # target is a real, non-empty file. is_file() follows symlinks by
+        # default, so a broken symlink returns False here.
+        if entry.is_file() and entry.stat().st_size > 0:
+            return True
+    return False
+
+
+def _svd_component_weight_path(model_dir: Path, name: str) -> Path | None:
+    """Return the first weight-file path in the *component* subfolder, or None.
+
+    Used to size components in the --verify-only report so the user can see
+    "unet MISSING (only config found)" vs "unet OK (1.4 GB)".
+    """
+    comp_dir = model_dir / name
+    if not comp_dir.is_dir():
+        return None
+    for entry in comp_dir.iterdir():
+        suffix = entry.name.lower()
+        if (
+            entry.is_file()
+            and entry.stat().st_size > 0
+            and (suffix.endswith(".safetensors") or suffix.endswith(".bin"))
+        ):
+            return entry
+    return None
+
+
+def _weight_size_gb(size_bytes: int) -> str:
+    """Format a byte count as a human-readable size."""
+    if size_bytes >= 1024**3:
+        return f"{size_bytes / 1024**3:.1f} GB"
+    if size_bytes >= 1024**2:
+        return f"{size_bytes / 1024**2:.1f} MB"
+    return f"{size_bytes} B"
+
+
+def verify_svd_base(model_dir: Path | None = None) -> list[str]:
+    """Print and return a per-component completeness report for the SVD base.
+
+    Returns a list of status lines (one per required component).  Each line
+    is either ``[svd] <component>  OK (<size>)`` or
+    ``[svd] <component>  MISSING weights (only config found)``.  After the
+    per-component lines the caller appends a summary
+    ``→ X/3 components complete; run without --verify-only to fetch the rest``
+    (done in :func:`_print_svd_verify_summary`, not here, so the return value
+    stays stable for assertions).
+
+    *model_dir* defaults to :data:`INREPO_SVD_DIR`.  This performs **no**
+    download or network I/O — it only inspects the filesystem.
+    """
+    target = Path(model_dir) if model_dir is not None else INREPO_SVD_DIR
+    lines: list[str] = []
+    complete = 0
+    for name in _SVD_WEIGHT_COMPONENTS:
+        if _svd_component_has_weight(target, name):
+            wp = _svd_component_weight_path(target, name)
+            size_str = _weight_size_gb(wp.stat().st_size) if wp is not None else "?"
+            lines.append(f"[svd] {name:<14} OK ({size_str})")
+            complete += 1
+        else:
+            reason = "(only config found)"
+            if not (target / name).is_dir():
+                reason = "(subfolder missing)"
+            lines.append(f"[svd] {name:<14} MISSING weights {reason}")
+    _print_svd_verify_summary(target, lines, complete, len(_SVD_WEIGHT_COMPONENTS))
+    return lines
+
+
+def _print_svd_verify_summary(target: Path, lines: list[str], complete: int, total: int) -> None:
+    """Print the per-component lines and a completion summary."""
+    for line in lines:
+        log.info(line)
+    if complete == total:
+        log.info("→ %d/%d components complete — SVD base is ready.", complete, total)
+    else:
+        log.info(
+            "→ %d/%d components complete; run without --verify-only to fetch the rest",
+            complete,
+            total,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +713,34 @@ def download_svd_base(
         log.info("SVD base (fp16 safetensors) already present at %s — skipping.", target)
         return
 
+    # Requirement 3 (issue #186): if the dir exists but is missing one or more
+    # weight components, do NOT silently re-run the whole download hoping it
+    # self-heals — surface a clear, per-component error.  This is the exact
+    # trap the lead hit (config present, unet weights absent, Stage 2 crashes
+    # later with an opaque error).  The download is still attempted AFTER this
+    # check only when the dir is genuinely absent; when partial, we require the
+    # user to either delete the broken snapshot or run --verify-only to see
+    # exactly what's missing and re-run, so the failure is never opaque.
+    if target.is_dir():
+        missing = [name for name in _SVD_WEIGHT_COMPONENTS if not _svd_component_has_weight(target, name)]
+        if missing:
+            present = [name for name in _SVD_WEIGHT_COMPONENTS if name not in missing]
+            parts = ", ".join(missing)
+            raise RuntimeError(
+                f"SVD base at {target} is INCOMPLETE — weight components missing: {parts}."
+                + (f" Present: {', '.join(present)}." if present else "")
+                + "\n"
+                f"  The snapshot dir exists but does not have the weight files the "
+                f"Stage-2 inpainting loaders need.  This is the classic 'config "
+                f"only, weights absent' cache trap (issue #186).  Either:\n"
+                f"    • delete {target} and re-run this bootstrap (it will "
+                f"re-download cleanly), or\n"
+                f"    • run with --verify-only to confirm the exact missing "
+                f"components, then re-run to fetch them.\n"
+                f"  Refusing to continue with a half-download: inference would "
+                f"crash on the missing weights with a far less helpful error."
+            )
+
     target.mkdir(parents=True, exist_ok=True)
     log.info("▶ %s (gated repo, needs HF token; fp16 safetensors only, ≈5 GB)", label)
 
@@ -847,6 +989,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Print the steps that would be executed and exit 0. Performs NO I/O.",
     )
     parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help=(
+            "Only check whether the SVD base snapshot is complete — inspect "
+            "each required weight component (image_encoder / unet / vae) for a "
+            "real, non-empty, symlink-resolved weight file and print a clear "
+            "missing-components report.  Does NOT download anything.  This is "
+            "the diagnostic that catches the 'config present, weights absent' "
+            "cache trap (issue #186)."
+        ),
+    )
+    parser.add_argument(
         "--pip-mirror",
         default=None,
         help=(
@@ -903,6 +1057,24 @@ def main(argv: list[str] | None = None) -> None:
     pip_timeout = _resolve_pip_timeout(args.pip_timeout)
 
     log.info("StereoCrafter in-repo bootstrap (repo=%s)", REPO_ROOT)
+
+    # --verify-only (issue #186): pure filesystem inspection, no download, no
+    # clone, no venv, no self-check.  Resolves the SVD target the same way
+    # download_svd_base does (--svd-dir > default), so the report points at
+    # the same directory the bootstrap would fill.
+    if args.verify_only:
+        log.info("[verify-only] checking SVD base completeness — no downloads")
+        target = Path(args.svd_dir) if args.svd_dir is not None else INREPO_SVD_DIR
+        if not target.is_dir():
+            log.error(
+                "SVD base directory %s does not exist — nothing to verify. Run without --verify-only to create it.",
+                target,
+            )
+            sys.exit(1)
+        verify_svd_base(target)
+        missing = [name for name in _SVD_WEIGHT_COMPONENTS if not _svd_component_has_weight(target, name)]
+        sys.exit(1 if missing else 0)
+
     if args.dry_run:
         log.info("[dry-run] no side effects will be performed")
 

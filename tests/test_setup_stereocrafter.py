@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -699,23 +700,22 @@ class TestDownloadSvdBase:
         assert "*.bin" in ignore
 
     def test_redownloads_when_fp16_image_encoder_missing(self, sandbox):
-        """A dir that has SOME files but is missing the fp16 image_encoder
-        safetensors is NOT considered ready (issue #155) — the exact file the
-        upstream loader needs must be present, so the download re-runs."""
+        """A dir that has SOME files but is missing a required weight
+        component must NOT be silently treated as ready — per requirement 3 of
+        issue #186 it raises a clear, actionable RuntimeError naming the
+        missing component(s) rather than re-running the download hoping it
+        self-heals or crashing later in inference with an opaque error."""
         sandbox.svd_dir.mkdir(parents=True)
-        (sandbox.svd_dir / "model_index.json").write_text("{}")  # non-empty, but no fp16 weights
-
-        captured: dict = {}
-
-        def fake_snapshot_download(repo_id, local_dir, local_dir_use_symlinks, token, **kwargs):
-            captured["called"] = True
-            return local_dir
+        (sandbox.svd_dir / "model_index.json").write_text("{}")  # non-empty, but no weight files
 
         fake_hf = MagicMock()
-        fake_hf.snapshot_download = fake_snapshot_download
+        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not be called"))
         fake_hf.HfFolder = MagicMock()
         fake_hf.HfFolder.get_token = MagicMock(return_value="hf_present")
-        with patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_hf}),
+            pytest.raises(RuntimeError, match="INCOMPLETE"),
+        ):
             setup.download_svd_base(
                 None,
                 skip_svd=False,
@@ -723,7 +723,8 @@ class TestDownloadSvdBase:
                 dry_run=False,
                 buffer=setup.DryRunBuffer(),
             )
-        assert captured.get("called") is True
+        # The download must NOT have been attempted — we raise before it.
+        fake_hf.snapshot_download.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -976,3 +977,183 @@ class TestMain:
             setup.main(["--skip-deps", "--skip-model"])
             cmds = [c[0][0] for c in mock_cc.call_args_list]
             assert all(cmd[:2] == ["git", "pull"] for cmd in cmds) or not cmds
+
+
+# ---------------------------------------------------------------------------
+# --verify-only + per-component SVD weight completeness (issue #186)
+# ---------------------------------------------------------------------------
+
+
+def _write_weight(model_dir: Path, name: str) -> Path:
+    """Create a non-empty safetensors weight file for an SVD component."""
+    comp = model_dir / name
+    comp.mkdir(parents=True, exist_ok=True)
+    weight = comp / (
+        "model.fp16.safetensors" if name == "image_encoder" else "diffusion_pytorch_model.fp16.safetensors"
+    )
+    weight.write_bytes(b"\x00" * 1024)
+    return weight
+
+
+class TestSvdComponentCompleteness:
+    """Issue #186: the completeness check must inspect WEIGHT files per
+    component — following symlinks — and must NOT be fooled by a config-only
+    directory (the exact unet bug that blocked the disocclusion gate).
+    """
+
+    def test_config_only_is_missing(self, sandbox):
+        """A component that only has config.json (no weight file) is MISSING —
+        this is the direct regression test for the #186 bug where the unet
+        subfolder held only a config blob yet was treated as 'already
+        downloaded'."""
+        sandbox.svd_dir.mkdir(parents=True)
+        unet = sandbox.svd_dir / "unet"
+        unet.mkdir()
+        (unet / "config.json").write_text('{"sample_size": 64}')  # config only
+
+        assert setup._svd_component_has_weight(sandbox.svd_dir, "unet") is False
+        # config.json must not count as a weight file.
+        assert setup._svd_component_weight_path(sandbox.svd_dir, "unet") is None
+
+    def test_broken_symlink_weight_is_missing(self, sandbox):
+        """A weight file that is a symlink pointing at a non-existent blobs/
+        target must be treated as MISSING.  Path.is_file() follows symlinks, so
+        a dangling symlink returns False — the check must rely on that, not on
+        the directory entry existing (issue #186: the HF cache trap)."""
+        sandbox.svd_dir.mkdir(parents=True)
+        unet = sandbox.svd_dir / "unet"
+        unet.mkdir()
+        target = unet / "ghost.weights"  # does not exist
+        link = unet / "diffusion_pytorch_model.fp16.safetensors"
+        link.symlink_to(target)
+
+        assert link.is_symlink()  # the directory entry exists — must not fool us
+        assert setup._svd_component_has_weight(sandbox.svd_dir, "unet") is False
+        assert setup._svd_component_weight_path(sandbox.svd_dir, "unet") is None
+
+    def test_valid_nonempty_weight_is_complete(self, sandbox):
+        """A real, non-empty weight file (safetensors or .bin) makes the
+        component complete."""
+        sandbox.svd_dir.mkdir(parents=True)
+        _write_weight(sandbox.svd_dir, "unet")
+        _write_weight(sandbox.svd_dir, "vae")
+        _write_weight(sandbox.svd_dir, "image_encoder")
+
+        for name in setup._SVD_WEIGHT_COMPONENTS:
+            assert setup._svd_component_has_weight(sandbox.svd_dir, name) is True
+        assert setup._has_svd_fp16_safetensors(sandbox.svd_dir) is True
+
+    def test_empty_weight_file_is_missing(self, sandbox):
+        """A weight file that exists but is zero bytes is MISSING — the check
+        requires size > 0 so a truncated / never-finished download can't pass."""
+        sandbox.svd_dir.mkdir(parents=True)
+        unet = sandbox.svd_dir / "unet"
+        unet.mkdir()
+        (unet / "diffusion_pytorch_model.fp16.safetensors").write_bytes(b"")
+
+        assert setup._svd_component_has_weight(sandbox.svd_dir, "unet") is False
+
+    def test_missing_subfolder_is_missing(self, sandbox):
+        """When the component subfolder itself does not exist, the component is
+        MISSING."""
+        sandbox.svd_dir.mkdir(parents=True)
+        assert setup._svd_component_has_weight(sandbox.svd_dir, "unet") is False
+
+    def test_bin_weights_also_count(self, sandbox):
+        """Both *.safetensors and *.bin are accepted as weight files
+        (safetensors is the SVD reality, .bin is accepted for forward
+        compatibility)."""
+        sandbox.svd_dir.mkdir(parents=True)
+        vae = sandbox.svd_dir / "vae"
+        vae.mkdir()
+        (vae / "diffusion_pytorch_model.fp16.bin").write_bytes(b"\x00" * 100)
+        assert setup._svd_component_has_weight(sandbox.svd_dir, "vae") is True
+
+
+class TestVerifyOnly:
+    """--verify-only: pure filesystem inspection (no download) that prints a
+    per-component report and exits non-zero if anything is missing (issue #186).
+    """
+
+    def test_verify_only_does_not_download(self, sandbox, monkeypatch):
+        """--verify-only must NOT trigger snapshot_download — it is read-only.
+        A config-only unet forces the report to be non-trivial so we can also
+        assert it surfaces the missing component."""
+        sandbox.svd_dir.mkdir(parents=True)
+        vae = sandbox.svd_dir / "vae"
+        vae.mkdir()
+        (vae / "config.json").write_text("{}")  # config only — missing weight
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not download"))
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+
+        with pytest.raises(SystemExit) as exc_info:
+            setup.main(["--verify-only"])
+        assert exc_info.value.code == 1  # non-zero: something is missing
+        fake_hf.snapshot_download.assert_not_called()
+
+    def test_verify_only_reports_missing_unet_and_exits_nonzero(self, sandbox, monkeypatch):
+        """Regression for the exact #186 scenario: unet has config only, vae +
+        image_encoder are fine.  The verify report must name unet as MISSING
+        and exit 1 (no download)."""
+        sandbox.svd_dir.mkdir(parents=True)
+        unet = sandbox.svd_dir / "unet"
+        unet.mkdir()
+        (unet / "config.json").write_text("{}")
+        _write_weight(sandbox.svd_dir, "vae")
+        _write_weight(sandbox.svd_dir, "image_encoder")
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not download"))
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+
+        with pytest.raises(SystemExit) as exc_info:
+            setup.main(["--verify-only"])
+        assert exc_info.value.code == 1
+        fake_hf.snapshot_download.assert_not_called()
+
+    def test_verify_only_reports_missing_unet_component(self, sandbox):
+        """verify_svd_base() returns per-component lines; the config-only unet
+        line must say MISSING."""
+        sandbox.svd_dir.mkdir(parents=True)
+        unet = sandbox.svd_dir / "unet"
+        unet.mkdir()
+        (unet / "config.json").write_text("{}")
+        _write_weight(sandbox.svd_dir, "vae")
+        _write_weight(sandbox.svd_dir, "image_encoder")
+
+        report = setup.verify_svd_base(sandbox.svd_dir)
+        unet_lines = [ln for ln in report if ln.startswith("[svd] unet")]
+        assert unet_lines, report
+        assert "MISSING" in unet_lines[0], report
+        assert any("OK" in ln for ln in report if ln.startswith("[svd] vae")), report
+
+    def test_verify_only_all_complete_exits_zero(self, sandbox, monkeypatch):
+        """When every component has a real weight, --verify-only exits 0 and
+        still performs no download."""
+        sandbox.svd_dir.mkdir(parents=True)
+        for name in setup._SVD_WEIGHT_COMPONENTS:
+            _write_weight(sandbox.svd_dir, name)
+
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not download"))
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+
+        with pytest.raises(SystemExit) as exc_info:
+            setup.main(["--verify-only"])
+        assert exc_info.value.code == 0
+        fake_hf.snapshot_download.assert_not_called()
+
+    def test_verify_only_missing_svd_dir_exits_one(self, sandbox, monkeypatch, tmp_path):
+        """When the SVD dir does not exist at all, --verify-only exits 1 with a
+        clear 'nothing to verify' message rather than trying to download."""
+        missing = tmp_path / "no-such-svd"
+        fake_hf = MagicMock()
+        fake_hf.snapshot_download = MagicMock(side_effect=RuntimeError("must not download"))
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+
+        with pytest.raises(SystemExit) as exc_info:
+            setup.main(["--verify-only", "--svd-dir", str(missing)])
+        assert exc_info.value.code == 1
+        fake_hf.snapshot_download.assert_not_called()
