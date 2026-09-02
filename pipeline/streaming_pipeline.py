@@ -21,7 +21,7 @@ from pipeline.stereo_renderer import StereoRenderer
 
 log = logging.getLogger("vr180-streaming")
 
-
+# Reference eye resolution for bitrate scaling (the legacy default).
 REFERENCE_EYE_SIZE = 1920
 # Baseline bitrate (Mbps) that produced acceptable quality at 1920²/eye.
 BASELINE_BITRATE_MBPS = 20.0
