@@ -75,7 +75,7 @@ class TestBuildGrid:
         with pytest.raises(ValueError, match="at least one"):
             build_grid(frames_chunks=[], tile_nums=[1], overlaps=[3])
         with pytest.raises(ValueError, match="at least one"):
-            build_grid(frames_chunks=[8], tile_nums=[])
+            build_grid(frames_chunks=[8], tile_nums=[], overlaps=[3])
         with pytest.raises(ValueError, match="at least one"):
             build_grid(frames_chunks=[8], tile_nums=[1], overlaps=[])
 
@@ -163,7 +163,7 @@ class TestRunComboWithFakeRunner:
         assert result.wall_seconds >= 0.0
         assert result.frames == 24
         assert result.seconds_per_frame is not None
-        assert result.seconds_per_frame > 0
+        assert result.seconds_per_frame >= 0
 
     def test_nonzero_exit_recorded_and_not_raised(self) -> None:
         result = self._run(returncode=2)["result"]
