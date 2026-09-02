@@ -21,9 +21,23 @@ Verdicts:
 Usage:
     python scripts/vr180_qa.py video.mp4
     python scripts/vr180_qa.py video.mp4 --json
+    python scripts/vr180_qa.py video.mp4 --strict
 
-Exit code is non-zero if any check fails (❌). Read-only: the input file is
-never modified.
+Exit codes (K-20, issue #213):
+    0  — all checks pass (no FAIL, no WARN)
+    1  — at least one check FAILED (this is the default behavior regardless of
+         --strict; WARNs alone never trigger this)
+    2  — no FAIL but at least one WARN, AND --strict is set. Without
+         --strict a WARN-only run still exits 0 (unchanged default behavior).
+
+By default (no --strict) a clean pass and a pass-with-WARN are both exit 0,
+so scripts that only need "did anything fail?" keep working unchanged. Pass
+--strict to also fail the run on WARNs, e.g. so a sub-standard per-eye
+resolution surfaces in CI / batch gating instead of being silently accepted.
+
+The --json output carries a top-level ``summary`` object with
+{pass, warn, fail, overall} so callers need not parse the human-readable
+text. Read-only: the input file is never modified.
 """
 
 from __future__ import annotations
@@ -83,6 +97,26 @@ class QAReport:
     @property
     def failed(self) -> bool:
         return any(c.status == "fail" for c in self.checks)
+
+    @property
+    def warned(self) -> bool:
+        return any(c.status == "warn" for c in self.checks)
+
+    @property
+    def summary(self) -> dict:
+        """Machine-readable pass/warn/fail counts + overall verdict (K-20 #213).
+
+        Lets a caller decide pass/fail without parsing the human-readable text:
+        ``overall`` is ``"pass"`` only when there are no WARNs and no FAILs;
+        ``"warn"`` when there are WARNs but no FAILs; ``"fail"`` when there is
+        any FAIL. The field is mirrored under the ``summary`` key of the
+        ``--json`` output.
+        """
+        counts = {"pass": 0, "warn": 0, "fail": 0}
+        for check in self.checks:
+            counts[check.status] = counts.get(check.status, 0) + 1
+        overall = "fail" if self.failed else ("warn" if self.warned else "pass")
+        return {"pass": counts["pass"], "warn": counts["warn"], "fail": counts["fail"], "overall": overall}
 
 
 def _probe(path: str, ffprobe: str = "ffprobe") -> dict:
@@ -292,16 +326,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("video", help="Path to the video file to validate (read-only)")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
     parser.add_argument("--ffprobe", default="ffprobe", help="Path to ffprobe binary")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero on WARN as well as FAIL (see exit codes in the module "
+        "docstring). Without this flag a WARN-only run still exits 0.",
+    )
     args = parser.parse_args(argv)
 
     report = run_qa(args.video, ffprobe=args.ffprobe)
 
+    payload = asdict(report)
+    # K-20 (#213): top-level summary so callers need not parse human text.
+    payload["summary"] = report.summary
+
     if args.json:
-        print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(format_human(report))
 
-    return 1 if report.failed else 0
+    # Exit-code semantics (K-20 #213):
+    #   1 = FAIL present (default behavior, unchanged by --strict)
+    #   2 = no FAIL but WARN present, only when --strict is set
+    #   0 = otherwise (clean pass; or WARN-only without --strict)
+    if report.failed:
+        return 1
+    if args.strict and report.warned:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
