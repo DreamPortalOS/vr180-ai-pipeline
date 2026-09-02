@@ -331,83 +331,111 @@ def _hf_cache_snapshot_dir(repo_id: str) -> Path | None:
 def verify_svd_base(model_dir: Path | None = None) -> list[str]:
     """Print and return a per-component completeness report for the SVD base.
 
-    Returns a list of status lines (one per required component).  Each line
-    is either ``[svd] <component>  OK (<size>)`` or
-    ``[svd] <component>  MISSING weights (only config found)``.  After the
-    per-component lines the caller appends a summary
-    ``→ X/3 components complete; run without --verify-only to fetch the rest``
-    (done in :func:`_print_svd_verify_summary`, not here, so the return value
-    stays stable for assertions).
+    Returns a list of status lines (one per required component per inspected
+    location).  Each line is either ``[in-repo]/[hf-cache] <component> OK (<size>)``
+    or ``… MISSING weights …``.  After the per-component lines the caller
+    appends a summary ``→ X/3 components complete [(missing: a, b)]; …`` (done
+    in :func:`_print_svd_verify_summary`, not here, so the return value stays
+    stable for assertions).
 
     *model_dir* defaults to :data:`INREPO_SVD_DIR`.  This performs **no**
     download or network I/O — it only inspects the filesystem.
 
     Issue #190: the report also checks the **standard HF cache** as a fallback
-    when the in-repo directory is absent or incomplete.  Whichever location is
-    complete counts as complete, and the path actually inspected is printed
-    (this is the diagnostic that would have caught "the base was never built").
+    when the in-repo directory is absent or incomplete.  A component that is
+    OK in EITHER location counts as OK, and the path actually inspected is
+    printed (this is the diagnostic that would have caught "the base was never
+    built").
+
+    Issue #201: the summary count ``X/3`` is the number of distinct components
+    OK in at least one inspected location — it is always consistent with the
+    per-line verdicts.  When the count is partial, the summary also names the
+    missing components (e.g. ``2/3 (missing: unet)``) so the user does not
+    re-download several GB when only one piece is actually absent.
     """
     target = Path(model_dir) if model_dir is not None else INREPO_SVD_DIR
     lines: list[str] = []
-    complete = _verify_svd_location(target, "[in-repo]", lines)
     total = len(_SVD_WEIGHT_COMPONENTS)
+
+    # The summary count must match the per-line verdicts: a component is "OK"
+    # if it has a real weight in ANY inspected location (in-repo OR HF cache).
+    # Issue #201: the old code only promoted the HF-cache count to the summary
+    # when it was *fully* complete (== total), so a 2/3 HF cache copy was
+    # reported as 0/3 — contradicting its own "OK" lines above and sending the
+    # user to re-download several GB when only the unet was actually missing.
+    # We instead build the OK set directly from the shared _svd_component_has_weight
+    # predicate, so the summary is always consistent with the printed lines.
+    ok_names: set[str] = set()
+    _verify_svd_location(target, "[in-repo]", lines, ok_names)
+    checked: list[Path] = [target]
 
     # Issue #190: if the in-repo copy is not complete, also consult the standard
     # HF cache — a previous download may have left vae + image_encoder cached
     # there while the in-repo copy is empty (the exact state the lead hit: the
     # base "not a single byte landed in-repo" but the HF cache held half of it).
-    if complete < total:
+    if len(ok_names) < total:
         hf_snapshot = _hf_cache_snapshot_dir(_SVD_REPO_ID)
-        if hf_snapshot is not None and hf_snapshot != target:
+        if hf_snapshot is not None and hf_snapshot not in checked:
             log.info("[svd] also checking standard HF cache: %s", hf_snapshot)
-            hf_complete = _verify_svd_location(hf_snapshot, "[hf-cache]", lines)
-            # A complete HF cache copy satisfies the gate — the in-repo copy
-            # will be filled from it on the next non-verify run (snapshot_download
-            # reuses the cached blobs, fetching only what's missing).
-            if hf_complete == total:
-                complete = total
+            _verify_svd_location(hf_snapshot, "[hf-cache]", lines, ok_names)
+            checked.append(hf_snapshot)
 
-    _print_svd_verify_summary(target, lines, complete, total)
+    _print_svd_verify_summary(target, lines, ok_names, total)
     return lines
 
 
-def _verify_svd_location(target: Path, tag: str, lines: list[str]) -> int:
-    """Append per-component status lines for *target* and return the count complete.
+def _verify_svd_location(target: Path, tag: str, lines: list[str], ok_names: set[str]) -> None:
+    """Append per-component status lines for *target* and record OK components.
 
     *tag* (``"[in-repo]"`` / ``"[hf-cache]"``) prefixes each line so the user
     can see which location each status line refers to.  Missing-component
     lines name the component explicitly (issue #190 requirement 3) rather than
     a blanket "directory does not exist".
+
+    *ok_names* accumulates the set of component names that have a real weight at
+    ANY inspected location — this is the single source of truth the summary
+    count is built from (issue #201: the count must match the per-line
+    verdicts, so it is derived from the same predicate rather than tracked as
+    a separate per-location integer that can drift out of sync).
     """
     if not target.is_dir():
         lines.append(f"{tag} SVD base directory missing: {target}")
-        return 0
-    complete = 0
+        return
     for name in _SVD_WEIGHT_COMPONENTS:
         if _svd_component_has_weight(target, name):
             wp = _svd_component_weight_path(target, name)
             size_str = _weight_size_gb(wp.stat().st_size) if wp is not None else "?"
             lines.append(f"{tag} {name:<14} OK ({size_str})")
-            complete += 1
+            ok_names.add(name)
         else:
             reason = "(only config found)"
             if not (target / name).is_dir():
                 reason = "(subfolder missing)"
             lines.append(f"{tag} {name:<14} MISSING weights {reason}")
-    return complete
 
 
-def _print_svd_verify_summary(target: Path, lines: list[str], complete: int, total: int) -> None:
-    """Print the per-component lines and a completion summary."""
+def _print_svd_verify_summary(target: Path, lines: list[str], ok_names: set[str], total: int) -> None:
+    """Print the per-component lines and a completion summary.
+
+    The summary count is ``len(ok_names)`` — the number of distinct components
+    OK in at least one inspected location — so it is always consistent with the
+    printed per-component verdicts (issue #201).  When the count is partial,
+    the missing component names are listed so the user can see exactly which
+    pieces a non-verify run would fetch.
+    """
     for line in lines:
         log.info(line)
+    complete = len(ok_names)
+    missing = [name for name in _SVD_WEIGHT_COMPONENTS if name not in ok_names]
     if complete == total:
         log.info("→ %d/%d components complete — SVD base is ready.", complete, total)
     else:
+        missing_str = ", ".join(missing)
         log.info(
-            "→ %d/%d components complete; run without --verify-only to fetch the rest",
+            "→ %d/%d components complete (missing: %s); run without --verify-only to fetch the rest",
             complete,
             total,
+            missing_str,
         )
 
 
