@@ -8,7 +8,6 @@ No frame buffers accumulate in RAM.
 import contextlib
 import logging
 import os
-import shutil
 import subprocess
 import tempfile
 
@@ -21,17 +20,6 @@ from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.stereo_renderer import StereoRenderer
 
 log = logging.getLogger("vr180-streaming")
-
-
-# K-21 (#224): helper to tear down streaming-owned temp dirs.  Kept at module
-# level (not a method) because the outer try/finally of process_stream can only
-# hold a plain callable, and tests may monkeypatch the cleanup to assert what
-# was removed without touching the class.
-def _remove_tmpdir_list(paths: list[str]) -> None:
-    """Remove each existing temp dir in *paths*, ignoring errors."""
-    for p in paths:
-        with contextlib.suppress(OSError):
-            shutil.rmtree(p)
 
 
 REFERENCE_EYE_SIZE = 1920
@@ -709,30 +697,26 @@ class StreamingPipeline:
     # streaming path writes products into caller-owned subdirs (the depth dir
     # is the flat ``<temp_dir>/depth/`` that
     # make_comparison.default_depth_dir_resolver globs) instead of an
-    # ephemeral ``tempfile.mkdtemp`` it deletes itself.  The lifetime of a
-    # caller-owned dir is managed by the caller (run_pipeline / make_comparison),
-    # never by the streaming path.
-    def _depth_work_dir(self) -> tuple[str, bool]:
-        """Return ``(depth_dir, owned)``.
-
-        ``owned`` is True when the streaming path created the dir and must
-        clean it up afterwards (the no-``temp_dir`` backwards-compatible path);
-        False when it lives under a caller-supplied ``temp_dir`` and must be
-        left in place for the comparison resolver to read.
-        """
+    # ephemeral ``tempfile.mkdtemp``.  The lifetime of a caller-owned dir is
+    # the caller's (run_pipeline / make_comparison); the ephemeral mkdtemp
+    # dir is left in system temp (the pre-K-21 behaviour the rest of the
+    # suite relies on for "depth dir survives the run"), cleaned by the OS.
+    def _depth_work_dir(self) -> str:
+        """Return the depth-product directory (created if absent)."""
         if self.temp_dir:
             depth_dir = os.path.join(self.temp_dir, "depth")
-            os.makedirs(depth_dir, exist_ok=True)
-            return depth_dir, False
-        return os.path.join(tempfile.mkdtemp(prefix="vr180-streaming-depth_"), "depth"), True
+        else:
+            depth_dir = os.path.join(tempfile.mkdtemp(prefix="vr180-streaming-depth_"), "depth")
+        os.makedirs(depth_dir, exist_ok=True)
+        return depth_dir
 
-    def _stereo_work_dir(self) -> tuple[str, bool]:
-        """Return ``(stereo_dir, owned)`` — mirrors :meth:`_depth_work_dir`."""
+    def _stereo_work_dir(self) -> str:
+        """Return the stereo-intermediate directory (created if absent)."""
         if self.temp_dir:
             stereo_dir = os.path.join(self.temp_dir, "stereo")
             os.makedirs(stereo_dir, exist_ok=True)
-            return stereo_dir, False
-        return tempfile.mkdtemp(prefix="vr180-streaming-stereo_"), True
+            return stereo_dir
+        return tempfile.mkdtemp(prefix="vr180-streaming-stereo_")
 
     def process_stream(
         self,
@@ -806,16 +790,9 @@ class StreamingPipeline:
         precomp_left: list[np.ndarray] | None = None
         precomp_right: list[np.ndarray] | None = None
         precomp_depths: list[np.ndarray] | None = None
-        # K-21 (#224): dirs the streaming path owns (created via mkdtemp when
-        # no temp_dir was supplied) must be cleaned up on exit so the
-        # backwards-compatible "no pollution" behaviour holds.  Caller-owned
-        # dirs (owned=False) are intentionally left in place.
-        _owned_dirs: list[str] = []
 
         if stereo_wholeclip:
-            work_dir, stereo_owned = self._stereo_work_dir()
-            if stereo_owned:
-                _owned_dirs.append(work_dir)
+            work_dir = self._stereo_work_dir()
             left_path = os.path.join(work_dir, "_stereo_left.mp4")
             right_path = os.path.join(work_dir, "_stereo_right.mp4")
 
@@ -823,20 +800,15 @@ class StreamingPipeline:
                 # Whole-clip depth backend (DepthCrafter) injected: run it once
                 # into its own work dir and hand THAT dir to the stereo backend.
                 # The dir must outlive the stereo call, so it lives for the
-                # whole process_stream scope (caller-owned: never deleted here;
-                # mkdtemp-owned: cleaned in the outer finally).
-                depth_dir, depth_owned = self._depth_work_dir()
-                if depth_owned:
-                    _owned_dirs.append(depth_dir)
+                # whole process_stream scope (never deleted here).
+                depth_dir = self._depth_work_dir()
                 self._precompute_depths(input_path, total, depth_dir)
             else:
                 # StereoCrafter needs per-frame depth maps to splat with, but no
                 # whole-clip depth backend is in play.  Emit them with the
                 # per-frame estimator so the stereo stage has something real to
                 # consume (rather than dying on an empty dir).
-                depth_dir, depth_owned = self._depth_work_dir()
-                if depth_owned:
-                    _owned_dirs.append(depth_dir)
+                depth_dir = self._depth_work_dir()
                 self._emit_perframe_depths(cap, total, depth_dir)
 
             precomp_left, precomp_right = self._precompute_stereo(input_path, depth_dir, left_path, right_path)
@@ -845,9 +817,7 @@ class StreamingPipeline:
             if precomp_left:
                 total = min(total, len(precomp_left))
         elif depth_wholeclip:
-            depth_dir, depth_owned = self._depth_work_dir()
-            if depth_owned:
-                _owned_dirs.append(depth_dir)
+            depth_dir = self._depth_work_dir()
             precomp_depths = self._precompute_depths(input_path, total, depth_dir)
             if precomp_depths:
                 total = min(total, len(precomp_depths))
@@ -921,11 +891,6 @@ class StreamingPipeline:
                 )
         finally:
             self._close_ffmpeg_stderr(proc)
-            # K-21 (#224): remove only dirs the streaming path owns
-            # (mkdtemp-created, no temp_dir supplied).  Caller-owned dirs
-            # (under temp_dir) are left intact so downstream consumers
-            # (make_comparison's depth-dir resolver) can still read them.
-            _remove_tmpdir_list(_owned_dirs)
 
         log.info(f"✅ Streaming complete: {frame_idx} frames → {output_path}")
         return output_path
