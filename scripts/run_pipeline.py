@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import platform
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -256,6 +257,28 @@ def parse_args(argv: list[str] | None = None):
     )
     parser.add_argument("--no-temporal", action="store_true", help="Disable temporal smoothing")
     parser.add_argument("--temp-dir", default=None, help="Directory for intermediate files")
+    # K-18 (#210): --keep-temp.  Default (False) means the auto-derived
+    # intermediate directory (<input_stem>_vr180_temp/) is deleted after a
+    # successful --stage all run, so video/ no longer accumulates multi-GB
+    # stale residue (the same residue that fed #208's wrong numbers).  Only
+    # the auto-derived dir is cleaned up: a user-supplied --temp-dir is NEVER
+    # deleted (that directory belongs to the user), and a pre-existing
+    # auto-derived dir is NOT deleted either (a loud warning surfaces the
+    # stale-artefact risk instead).  On exception the temp dir is preserved
+    # and its path is printed for debugging.  --keep-temp preserves the
+    # auto-derived dir and prints its path.
+    parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        default=False,
+        help=(
+            "K-18: keep the auto-derived intermediate directory after the run "
+            "and print its path.  Default (False) deletes the auto-derived "
+            "directory after a successful --stage all run so stale residue "
+            "does not accumulate.  A user-supplied --temp-dir is never "
+            "deleted regardless of this flag."
+        ),
+    )
     parser.add_argument("--no-ffmpeg-v360", action="store_true", help="Disable ffmpeg v360, use OpenCV fallback")
     parser.add_argument(
         "--no-equirect-batched", action="store_true", help="Disable batched equirect mapping (revert to per-frame)"
@@ -610,6 +633,126 @@ def get_temp_dir(args, subdir=None):
     path = base / subdir if subdir else base
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
+
+
+# ---------------------------------------------------------------------------
+# K-18 (#210): auto-derived temp-dir lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _resolve_temp_dir_lifecycle(args) -> dict:
+    """Resolve the temp dir for a ``--stage all`` run and return its lifecycle metadata.
+
+    Returns a dict with:
+
+    * ``temp_dir`` (``Path``): the resolved auto-derived temp dir path (the
+      one that ``get_temp_dir`` would produce with ``subdir=None``).
+    * ``auto`` (``bool``): True when the dir is auto-derived
+      (``<input_stem>_vr180_temp``), False when ``--temp-dir`` was given.
+    * ``newly_created`` (``bool``): True when the auto-derived dir did NOT
+      exist before this run and we created it here — i.e. *this run* owns
+      it and is allowed to clean it up on success.
+    * ``pre_existed`` (``bool``): True when the auto-derived dir already
+      existed before this run — another run / operator owns it and we must
+      NOT delete it (but we must warn: this is the #208 stale-artefact trap).
+
+    The actual directory creation happens here (the lifecycle owner), so
+    ``get_temp_dir`` (which still exists for subdirectory children like
+    ``depth/`` / ``left/`` / ``right/``) does not double-create or race
+    with the pre-existence check.  ``main()`` calls this once at the top
+    of the ``--stage all`` block and then wraps the stage loop in
+    try/finally using the returned dict.
+
+    ``--temp-dir`` (explicit) → ``auto=False``: user owns the directory,
+    never delete.  Auto-derived + not-existed → ``auto=True``,
+    ``newly_created=True``: this run owns it, delete on success.
+    Auto-derived + pre-existed → ``auto=True``, ``pre_existed=True``:
+    warn and do NOT delete.
+    """
+    keep = bool(getattr(args, "keep_temp", False))
+    if getattr(args, "temp_dir", None):
+        # User-supplied --temp-dir: this run does not own the directory,
+        # so we never delete it (that would be a disaster — the user may
+        # have other state in there).
+        base = Path(args.temp_dir)
+        base.mkdir(parents=True, exist_ok=True)
+        return {
+            "temp_dir": base,
+            "auto": False,
+            "newly_created": False,
+            "pre_existed": False,
+            "keep": keep,
+        }
+
+    input_stem = Path(args.input).stem
+    base = Path(args.input).parent / f"{input_stem}_vr180_temp"
+    pre_existed = base.exists()
+
+    if pre_existed:
+        # K-18 / #208 trap: the dir already exists from a prior run or
+        # another process.  Do NOT delete it (we don't own it), and
+        # loudly warn the operator that it may contain stale artefacts
+        # (exactly the residue that fed #208's wrong comparison numbers).
+        log.warning(
+            "⚠️  发现已存在的中间目录 %s（可能含旧产物）— 本次不会清理它。 "
+            "如需全新运行请手动删除后再启动，或显式指定 --temp-dir 隔离产物。",
+            base,
+        )
+        return {
+            "temp_dir": base,
+            "auto": True,
+            "newly_created": False,
+            "pre_existed": True,
+            "keep": keep,
+        }
+
+    # Fresh auto-derived dir: create it and record that this run owns it.
+    base.mkdir(parents=True, exist_ok=False)
+    if keep:
+        log.info("💾 --keep-temp: 中间目录将保留 → %s", base)
+    else:
+        log.info("💾 中间目录 → %s（运行结束后将自动清理）", base)
+    return {
+        "temp_dir": base,
+        "auto": True,
+        "newly_created": True,
+        "pre_existed": False,
+        "keep": keep,
+    }
+
+
+def _cleanup_temp_dir_if_owned(lifecycle: dict) -> None:
+    """Clean up the auto-derived temp dir if this run owns it and it succeeded.
+
+    Only deletes when all three hold:
+
+    * ``lifecycle["auto"]`` is True (auto-derived, not user-supplied).
+    * ``lifecycle["newly_created"]`` is True (this run created it).
+    * ``lifecycle["keep"]`` is False (``--keep-temp`` was not given).
+
+    Uses ``shutil.rmtree`` for recursive removal; silent on
+    ``FileNotFoundError`` (race: already gone) — never raises.
+    """
+    if not lifecycle.get("auto"):
+        return
+    if not lifecycle.get("newly_created"):
+        return
+    if lifecycle.get("keep"):
+        return
+    base = lifecycle["temp_dir"]
+    try:
+        shutil.rmtree(base)
+        log.info("🧹 已清理中间目录 %s", base)
+    except FileNotFoundError:
+        # Already gone (race or manual delete) — nothing to do.
+        return
+
+
+def _print_temp_dir_path(lifecycle: dict) -> None:
+    """Print the temp dir path on --keep-temp or on exception."""
+    if not lifecycle.get("auto"):
+        return
+    print(f"💾 中间目录: {lifecycle['temp_dir']}")
 
 
 def build_depth_backend(args, *, fallback: bool = True):
@@ -1961,6 +2104,192 @@ def _manifest_prepare(args):
     return manifest, skip_internal, stages_internal
 
 
+# ---------------------------------------------------------------------------
+# K-18 (#210): the stage-all body, extracted so main() can wrap it in
+# try/finally for temp-dir lifecycle (auto-derived cleanup on success,
+# preserve + print path on exception).
+# ---------------------------------------------------------------------------
+
+
+def _stage_all_body(args, temp_dir, is_sbs, manifest, manifest_skip, manifest_stages, manifest_touched):
+    """Run the ``--stage all`` pipeline stages (the body of main()'s ``if args.stage == "all"``).
+
+    Extracted into a standalone function solely so ``main()`` can wrap the
+    entire stage loop in try/finally for K-18 temp-dir lifecycle management.
+    The logic inside is bit-for-bit identical to the pre-K-18 inline block;
+    see the original inline version for the per-stage rationale comments.
+    """
+    # Determine resume point
+    start_idx = 0
+    if args.resume:
+        start_idx = get_resume_start_stage(temp_dir)
+
+    # Use SBS stage order if input is already stereo
+    base_order = STAGE_ORDER_SBS if is_sbs else STAGE_ORDER
+    need_frames = start_idx == 0
+    stages_to_run = base_order[start_idx:] if start_idx > 0 else base_order
+
+    # Filter: only run upscale if --upscale is set
+    if "upscale" in stages_to_run and args.upscale == 0:
+        stages_to_run = [s for s in stages_to_run if s != "upscale"]
+
+    # V-3: apply --stages subset + manifest-resume skip list.
+    if manifest_stages is not None:
+        stages_to_run = [s for s in stages_to_run if s in manifest_stages]
+        if manifest_skip:
+            skipped = [s for s in base_order if s in manifest_skip and s in manifest_stages]
+            if skipped:
+                log.info("⏭️  Manifest-resume: skipping completed stage(s): %s", skipped)
+        log.info("🧩 Stage subset (--stages): running %s", stages_to_run or "[]")
+
+    def _record(internal_stage):
+        """Record a completed internal stage into the job manifest."""
+        if manifest is None:
+            return
+        mname = _INTERNAL_TO_MANIFEST.get(internal_stage)
+        if mname and mname not in manifest_touched:
+            _manifest_record_stage(manifest, args, mname)
+            manifest_touched.add(mname)
+
+    _chunked = bool(getattr(args, "chunk_size", None))
+    frames = None
+    if need_frames or "depth" in stages_to_run:
+        frames, _total = _intake_frames(args.input, args.max_frames, lazy=_chunked)
+
+    depths = None
+    left_frames, right_frames = None, None
+    sbs_frames = None
+    output = None
+    _fused_done: set[str] = set()
+
+    _fused_pending = (
+        _chunked
+        and "stereo" in stages_to_run
+        and "equirect" in stages_to_run
+        and "metadata" in stages_to_run
+        and getattr(args, "outpaint", "none") == "none"
+        and not is_sbs
+    )
+
+    for stage in stages_to_run:
+        if stage == "upscale":
+            frames = run_upscale_stage(args, frames)
+            save_checkpoint(temp_dir, "upscale")
+            _record("upscale")
+
+        elif stage == "depth":
+            if frames is None:
+                frames = list(read_frames(args.input, args.max_frames))
+            depths = run_depth_stage(args, frames)
+            save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
+            _record("depth")
+
+        elif stage == "stereo" and _fused_pending:
+            if depths is None:
+                depths = load_depth_checkpoint(args)
+            if frames is None or _chunked:
+                frames, _ = _intake_frames(args.input, args.max_frames, lazy=False)
+            if depths is None:
+                log.warning("⚠️  Recomputing depth (stale checkpoint) before stereo.")
+                depths = run_depth_stage(args, frames)
+                save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
+            output = run_chunked_fused_stage(args, frames, depths)
+            save_checkpoint(temp_dir, "stereo", {"num_frames": len(depths)})
+            _record("stereo")
+            _record("equirect")
+            _record("metadata")
+            _fused_done = {"equirect", "outpaint", "metadata"}
+
+        elif stage == "stereo":
+            if depths is None:
+                depths = load_depth_checkpoint(args)
+            if frames is None or _chunked:
+                frames, _ = _intake_frames(args.input, args.max_frames, lazy=False)
+            if depths is None:
+                log.warning("⚠️  Recomputing depth (stale checkpoint) before stereo.")
+                depths = run_depth_stage(args, frames)
+                save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
+            left_frames, right_frames = run_stereo_stage(args, frames, depths)
+            save_checkpoint(temp_dir, "stereo", {"num_frames": len(left_frames)})
+            _record("stereo")
+
+        elif stage == "equirect":
+            if stage in _fused_done:
+                continue
+            if is_sbs and left_frames is None:
+                log.info("🔲 SBS input detected — splitting frames into left/right")
+                if frames is None:
+                    frames = list(read_frames(args.input, args.max_frames))
+                left_frames, right_frames = [], []
+                for frame in frames:
+                    _h, w = frame.shape[:2]
+                    mid = w // 2
+                    left_frames.append(frame[:, :mid, :])
+                    right_frames.append(frame[:, mid:, :])
+                log.info(
+                    f"  Split {len(frames)} SBS frames: "
+                    f"{frames[0].shape[1]}×{frames[0].shape[0]} → "
+                    f"left/right {left_frames[0].shape[1]}×{left_frames[0].shape[0]}"
+                )
+            elif left_frames is None:
+                import glob
+
+                left_dir = get_temp_dir(args, "left")
+                right_dir = get_temp_dir(args, "right")
+                left_files = sorted(glob.glob(os.path.join(left_dir, "*.png")))
+                right_files = sorted(glob.glob(os.path.join(right_dir, "*.png")))
+                left_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in left_files]
+                right_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in right_files]
+                log.info(f"📂 Loaded {len(left_frames)} stereo frames from checkpoint")
+            sbs_frames = run_equirect_stage(args, left_frames, right_frames)
+            save_checkpoint(temp_dir, "equirect", {"num_frames": len(sbs_frames)})
+            _record("equirect")
+
+        elif stage == "outpaint":
+            if stage in _fused_done:
+                continue
+            if sbs_frames is None:
+                import glob
+
+                eq_dir = get_temp_dir(args, "equirect")
+                files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
+                sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
+                log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint for outpainting")
+            sbs_frames = run_outpaint_stage(args, sbs_frames)
+            save_checkpoint(temp_dir, "outpaint", {"num_frames": len(sbs_frames)})
+            _record("outpaint")
+
+        elif stage == "metadata":
+            if stage in _fused_done:
+                continue
+            if sbs_frames is None:
+                import glob
+
+                eq_dir = get_temp_dir(args, "equirect")
+                files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
+                sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
+                log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint")
+            output = run_metadata_stage(args, sbs_frames)
+            _record("metadata")
+
+    if output:
+        log.info(f"✅ Pipeline complete → {output}")
+
+    if output and getattr(args, "copy_audio_from", None):
+        _copy_audio_to_output(output, args.copy_audio_from, re_inject=True)
+    elif output:
+        _maybe_copy_audio_from_input(output, args.input, re_inject=True)
+
+    if output:
+        _write_sidecar_from_args(output, "vr180", args)
+
+    manifest_out = args.manifest if isinstance(args.manifest, str) else None
+    if manifest is not None and manifest_out:
+        from pipeline.job_manifest import save_manifest
+
+        save_manifest(manifest, manifest_out)
+
+
 def main():
     args = parse_args()
 
@@ -2142,217 +2471,37 @@ def main():
         # Smart SBS detection: if input is already SBS, skip depth/stereo
         is_sbs = detect_sbs_input(args.input, force_sbs=args.force_sbs)
 
-        temp_dir = get_temp_dir(args)
+        # K-18 (#210): resolve the temp-dir lifecycle.  The lifecycle dict
+        # records whether the dir is auto-derived, whether this run created
+        # it, and whether --keep-temp was given.  The stage loop below is
+        # wrapped in try/finally: on success the auto-derived dir is cleaned
+        # up if this run owns it; on exception the dir is preserved and its
+        # path is printed for debugging.  ``get_temp_dir`` (subdirectory
+        # children like depth/ / left/) still works because the lifecycle
+        # helper already created the parent.
+        _lifecycle = _resolve_temp_dir_lifecycle(args)
+        temp_dir = str(_lifecycle["temp_dir"])
 
-        # Determine resume point
-        start_idx = 0
-        if args.resume:
-            start_idx = get_resume_start_stage(temp_dir)
-
-        # Use SBS stage order if input is already stereo
-        base_order = STAGE_ORDER_SBS if is_sbs else STAGE_ORDER
-        need_frames = start_idx == 0
-        stages_to_run = base_order[start_idx:] if start_idx > 0 else base_order
-
-        # Filter: only run upscale if --upscale is set
-        if "upscale" in stages_to_run and args.upscale == 0:
-            stages_to_run = [s for s in stages_to_run if s != "upscale"]
-
-        # V-3: apply --stages subset + manifest-resume skip list.
-        if manifest_stages is not None:
-            stages_to_run = [s for s in stages_to_run if s in manifest_stages]
-            if manifest_skip:
-                skipped = [s for s in base_order if s in manifest_skip and s in manifest_stages]
-                if skipped:
-                    log.info("⏭️  Manifest-resume: skipping completed stage(s): %s", skipped)
-            log.info("🧩 Stage subset (--stages): running %s", stages_to_run or "[]")
-
-        def _record(internal_stage):
-            """Record a completed internal stage into the job manifest."""
-            if manifest is None:
-                return
-            mname = _INTERNAL_TO_MANIFEST.get(internal_stage)
-            if mname and mname not in manifest_touched:
-                _manifest_record_stage(manifest, args, mname)
-                manifest_touched.add(mname)
-
-        # Load frames if needed.  V-4.1a: when --chunk-size is active the
-        # intake is a lazy generator (never fully materialised); otherwise the
-        # legacy list path is preserved exactly for the non-chunked stages
-        # (upscale / stereo) that need random access.
-        _chunked = bool(getattr(args, "chunk_size", None))
-        frames = None
-        if need_frames or "depth" in stages_to_run:
-            frames, _total = _intake_frames(args.input, args.max_frames, lazy=_chunked)
-
-        # Run stages sequentially with checkpointing
-        depths = None
-        left_frames, right_frames = None, None
-        sbs_frames = None
-        output = None
-        _fused_done: set[str] = set()
-
-        # V-4.1b (#89): when --chunk-size is set and the full stereo→equirect→
-        # metadata tail is to run (no outpaint — outpaint needs the whole SBS
-        # list in RAM, which is out of scope for this card), fuse them into a
-        # single persistent-ffmpeg incremental encode so peak RSS ∝ chunk_size,
-        # not clip length.  The separate stages are skipped (marked done below).
-        _fused_pending = (
-            _chunked
-            and "stereo" in stages_to_run
-            and "equirect" in stages_to_run
-            and "metadata" in stages_to_run
-            and getattr(args, "outpaint", "none") == "none"
-            and not is_sbs
-        )
-
-        for stage in stages_to_run:
-            if stage == "upscale":
-                frames = run_upscale_stage(args, frames)
-                save_checkpoint(temp_dir, "upscale")
-                _record("upscale")
-
-            elif stage == "depth":
-                if frames is None:
-                    frames = list(read_frames(args.input, args.max_frames))
-                depths = run_depth_stage(args, frames)
-                save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
-                _record("depth")
-
-            elif stage == "stereo" and _fused_pending:
-                # V-4.1b: fused stereo→equirect→metadata incremental encode.
-                # Depths came from the (already-run) depth stage; frames are
-                # re-materialised here (the lazy intake generator was consumed
-                # by the depth stage).  Peak RAM ∝ chunk_size, not clip length.
-                if depths is None:
-                    depths = load_depth_checkpoint(args)
-                if frames is None or _chunked:
-                    frames, _ = _intake_frames(args.input, args.max_frames, lazy=False)
-                if depths is None:
-                    # I-6 (#121): cached depth is stale / wrong-model — recompute
-                    # fresh rather than silently reuse (resume safety).
-                    log.warning("⚠️  Recomputing depth (stale checkpoint) before stereo.")
-                    depths = run_depth_stage(args, frames)
-                    save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
-                output = run_chunked_fused_stage(args, frames, depths)
-                save_checkpoint(temp_dir, "stereo", {"num_frames": len(depths)})
-                _record("stereo")
-                _record("equirect")
-                _record("metadata")
-                # The equirect/outpaint/metadata iterations below are no-ops for
-                # the fused path — record them consumed so the loop doesn't
-                # double-encode.
-                _fused_done = {"equirect", "outpaint", "metadata"}
-
-            elif stage == "stereo":
-                if depths is None:
-                    # Load depth maps from disk (meta-validated; see
-                    # load_depth_checkpoint — a stale/wrong-model cache is
-                    # never silently reused, #121).
-                    depths = load_depth_checkpoint(args)
-                if frames is None or _chunked:
-                    # Stereo needs frames as a materialised list (zip over
-                    # frames+depths).  When chunked, the intake generator was
-                    # already consumed by the depth stage, so re-read here.
-                    # (Full frame/depth buffer reuse is V-4.1b — out of scope.)
-                    frames, _ = _intake_frames(args.input, args.max_frames, lazy=False)
-                if depths is None:
-                    # I-6 (#121): cached depth is stale / wrong-model — recompute
-                    # fresh rather than silently reuse (resume safety).
-                    log.warning("⚠️  Recomputing depth (stale checkpoint) before stereo.")
-                    depths = run_depth_stage(args, frames)
-                    save_checkpoint(temp_dir, "depth", {"num_frames": len(depths)})
-                left_frames, right_frames = run_stereo_stage(args, frames, depths)
-                save_checkpoint(temp_dir, "stereo", {"num_frames": len(left_frames)})
-                _record("stereo")
-
-            elif stage == "equirect":
-                if stage in _fused_done:
-                    continue
-                if is_sbs and left_frames is None:
-                    # SBS input: split each frame into left/right halves
-                    log.info("🔲 SBS input detected — splitting frames into left/right")
-                    if frames is None:
-                        frames = list(read_frames(args.input, args.max_frames))
-                    left_frames, right_frames = [], []
-                    for frame in frames:
-                        _h, w = frame.shape[:2]
-                        mid = w // 2
-                        left_frames.append(frame[:, :mid, :])
-                        right_frames.append(frame[:, mid:, :])
-                    log.info(
-                        f"  Split {len(frames)} SBS frames: "
-                        f"{frames[0].shape[1]}×{frames[0].shape[0]} → "
-                        f"left/right {left_frames[0].shape[1]}×{left_frames[0].shape[0]}"
-                    )
-                elif left_frames is None:
-                    # Standard input: load from checkpoint
-                    import glob
-
-                    left_dir = get_temp_dir(args, "left")
-                    right_dir = get_temp_dir(args, "right")
-                    left_files = sorted(glob.glob(os.path.join(left_dir, "*.png")))
-                    right_files = sorted(glob.glob(os.path.join(right_dir, "*.png")))
-                    left_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in left_files]
-                    right_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in right_files]
-                    log.info(f"📂 Loaded {len(left_frames)} stereo frames from checkpoint")
-                sbs_frames = run_equirect_stage(args, left_frames, right_frames)
-                save_checkpoint(temp_dir, "equirect", {"num_frames": len(sbs_frames)})
-                _record("equirect")
-
-            elif stage == "outpaint":
-                if stage in _fused_done:
-                    continue
-                if sbs_frames is None:
-                    import glob
-
-                    eq_dir = get_temp_dir(args, "equirect")
-                    files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
-                    sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
-                    log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint for outpainting")
-                sbs_frames = run_outpaint_stage(args, sbs_frames)
-                save_checkpoint(temp_dir, "outpaint", {"num_frames": len(sbs_frames)})
-                _record("outpaint")
-
-            elif stage == "metadata":
-                if stage in _fused_done:
-                    continue
-                if sbs_frames is None:
-                    import glob
-
-                    eq_dir = get_temp_dir(args, "equirect")
-                    files = sorted(glob.glob(os.path.join(eq_dir, "*.png")))
-                    sbs_frames = [cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in files]
-                    log.info(f"📂 Loaded {len(sbs_frames)} equirect frames from checkpoint")
-                output = run_metadata_stage(args, sbs_frames)
-                _record("metadata")
-
-        if output:
-            log.info(f"✅ Pipeline complete → {output}")
-
-        # H-1: audio passthrough. After all metadata (sv3d/st3d) is embedded,
-        # remux an audio track in with -c copy.  NOTE (issue #91): ffmpeg
-        # -c copy with -map 0:v -map 1:a does NOT preserve the sv3d/st3d
-        # sample-entry boxes, so the audio remux MUST be followed by a
-        # re-injection that self-verifies the boxes survived.  The audio
-        # source is explicit --copy-audio-from or, if omitted, the input
-        # video itself.
-        if output and getattr(args, "copy_audio_from", None):
-            _copy_audio_to_output(output, args.copy_audio_from, re_inject=True)
-        elif output:
-            # Implicit: if the input video has an audio stream, copy it in.
-            _maybe_copy_audio_from_input(output, args.input, re_inject=True)
-
-        # D-1: sidecar — one JSON per output artefact (see pipeline.sidecar).
-        if output:
-            _write_sidecar_from_args(output, "vr180", args)
-
-        # V-3: persist the job manifest (write new / update resumed one).
-        manifest_out = args.manifest if isinstance(args.manifest, str) else None
-        if manifest is not None and manifest_out:
-            from pipeline.job_manifest import save_manifest
-
-            save_manifest(manifest, manifest_out)
+        _success = False
+        try:
+            _stage_all_body(args, temp_dir, is_sbs, manifest, manifest_skip, manifest_stages, manifest_touched)
+            _success = True
+        except BaseException:
+            # K-18: exception path — preserve the temp dir for debugging
+            # and print where it lives so the operator can inspect artefacts.
+            if _lifecycle.get("auto"):
+                print(f"❌ 管线异常退出，中间目录已保留用于排障: {_lifecycle['temp_dir']}")
+            raise
+        finally:
+            # K-18: success path only — clean up if this run owns the
+            # auto-derived dir and --keep-temp was not given.  On exception
+            # the dir is preserved (do not delete); --keep-temp prints the
+            # path on both success and exception (so the operator always
+            # knows where to look).
+            if _success:
+                _cleanup_temp_dir_if_owned(_lifecycle)
+            if _lifecycle.get("auto") and _lifecycle.get("keep"):
+                _print_temp_dir_path(_lifecycle)
 
     elif args.stage == "depth":
         # Depth is the sole chunked consumer here — intake lazily when
