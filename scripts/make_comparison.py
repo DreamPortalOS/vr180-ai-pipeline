@@ -27,13 +27,20 @@ routine into a single command:
 4. **QA + summary** — every product is validated with
    :func:`scripts.vr180_qa.run_qa`; results land in one table
    (recipe / resolution / audio / QA verdict / elapsed seconds).
-5. **comparison.md** — the table above plus *empty* scoring columns
+5. **Depth-stability metrics** (K-16, #206) — after QA each rendered recipe is
+   annotated with three objective "is it dizzying?" cells
+   (temporal_jitter / flicker_ratio / edge_consistency, each with an OK/WARN/FAIL
+   mark) by calling :mod:`scripts.depth_stability`.  Missing depth products or a
+   depth_stability failure leaves the cell as ``—`` and never breaks the A/B set;
+   ``--no-metrics`` skips the call entirely.  A lead-measured single-frame depth
+   baseline is printed under the table so improvement is visible at a glance.
+6. **comparison.md** — the table above plus *empty* scoring columns
    (清晰度/重影/立体感/舒适度) for the owner to fill in inside the headset.
-6. **--push-to-quest** — optional ``adb -s <serial> push`` of every product
+7. **--push-to-quest** — optional ``adb -s <serial> push`` of every product
    followed by a media-scan broadcast.  Serial comes from ``--quest-serial``
    or the ``QUEST_SERIAL`` env var; when unset the step is skipped gracefully
    with a hint (never an error).
-7. **--dry-run** — prints the resolved recipes, output names and the exact
+8. **--dry-run** — prints the resolved recipes, output names and the exact
    command lines without rendering anything.
 
 Usage:
@@ -66,6 +73,21 @@ except ModuleNotFoundError:  # pragma: no cover - depends on invocation style
     # itself on sys.path, shadowing the ``scripts`` package — import the QA
     # module flat instead.
     from vr180_qa import run_qa  # type: ignore[no-redef]
+
+# depth_stability is only imported for the optional metrics step; keep it
+# lazy-tolerant so a broken import never blocks the core comparison flow.
+try:
+    from scripts.depth_stability import (
+        StabilityReport,
+        compute_report,
+        load_depth_npy_dir,
+    )
+except ModuleNotFoundError:  # pragma: no cover - depth_stability lives next door
+    from depth_stability import (  # type: ignore[no-redef]
+        StabilityReport,
+        compute_report,
+        load_depth_npy_dir,
+    )
 
 log = logging.getLogger("make-comparison")
 
@@ -119,6 +141,34 @@ QUEST_PUSH_DIR = "/sdcard/Movies/vr180-comparison"
 
 #: Env var read when --quest-serial is not given.
 QUEST_SERIAL_ENV = "QUEST_SERIAL"
+
+#: The three depth-stability metric columns added to the summary table (K-16,
+#: #206).  Each cell shows the value + an OK/WARN/FAIL mark derived from the
+#: thresholds in :mod:`scripts.depth_stability` (reused, never re-defined here).
+DEPTH_METRIC_COLUMNS: tuple[str, ...] = (
+    "temporal_jitter",
+    "flicker_ratio",
+    "edge_consistency",
+)
+
+#: Lead's measured single-frame depth baseline (the "dizzy" axis): per-frame
+#: Depth-Anything depth maps flip ~52 % of pixels frame-to-frame and keep only
+#: ~17 % edge overlap.  Shown under the table so the owner can see at a glance
+#: whether a recipe improved on it.  Source: lead headset + metric run.
+#:
+#: ``flicker_ratio`` baseline first (lower is better), then ``edge_consistency``
+#: (higher is better) — matches the order they appear in the note line.
+DEPTH_BASELINE_FLICKER: float = 0.5221
+DEPTH_BASELINE_EDGE: float = 0.1726
+
+#: Placeholder shown in a metric cell when no value could be produced (no depth
+#: products, or the depth_stability call raised).  Never fails the comparison.
+DEPTH_METRIC_NA: str = "—"
+
+#: depth-model names a recipe may select, in resolution-search order.  Used by
+#: the default depth-dir resolver to enumerate the model-scoped checkpoint dirs
+#: written by run_pipeline's :func:`get_depth_dir` (I-6, #121).
+DEPTH_MODEL_NAMES: tuple[str, ...] = ("depth-anything", "depthcrafter")
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +300,11 @@ class RecipeResult:
     audio: str = "-"
     verdict: str = "未渲染"
     qa_failed: bool = False
+    # K-16 (#206): depth-stability cells.  Each is "<value> <verdict>" (e.g.
+    # "0.5221 FAIL") or DEPTH_METRIC_NA when the metric could not be computed.
+    temporal_jitter: str = DEPTH_METRIC_NA
+    flicker_ratio: str = DEPTH_METRIC_NA
+    edge_consistency: str = DEPTH_METRIC_NA
     extra: dict = field(default_factory=dict)
 
 
@@ -270,6 +325,92 @@ def qa_recipe_output(output_path: str, result: RecipeResult) -> RecipeResult:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Depth-stability metrics (K-16, #206) — turns "is it dizzying?" into a number
+# ---------------------------------------------------------------------------
+
+
+def default_depth_dir_resolver(
+    input_path: str,
+    recipe: Recipe,
+    result: RecipeResult,
+) -> str | None:
+    """Locate the depth-product directory one recipe wrote, if any.
+
+    run_pipeline writes ``depth_*.npy`` into a model-scoped checkpoint dir
+    (I-6, #121): ``<input_dir>/<input_stem>_vr180_temp/depth/<depth_model>/``
+    (or ``--temp-dir/.../depth/<model>``).  The recipe flags tell us which model
+    it *asked* for, but the resolver also checks the other model dir so a depth
+    stage that silently fell back (e.g. depthcrafter→depth-anything) is still
+    found.  Returns the first dir containing ``depth_*.npy``, else ``None``.
+
+    Tests inject a fake resolver; the default never loads a model.
+    """
+    stem = Path(input_path).stem
+    base_temp = Path(input_path).parent / f"{stem}_vr180_temp"
+    # Prefer the model the recipe selected (depthcrafter if it asked, else
+    # depth-anything), then fall back to the other model dir.
+    requested = "depthcrafter" if any(a == "depthcrafter" for a in recipe.args) else "depth-anything"
+    ordered = [requested] + [m for m in DEPTH_MODEL_NAMES if m != requested]
+    for model in ordered:
+        cand = base_temp / "depth" / model
+        if cand.is_dir() and any(cand.glob("depth_*.npy")):
+            return str(cand)
+    return None
+
+
+def run_depth_metrics(depth_dir: str | Path) -> StabilityReport:
+    """Load a depth dir and compute the three stability metrics.
+
+    Thin wrapper over :mod:`scripts.depth_stability` — this exists as a seam so
+    tests can inject a fake (or assert it was never called) without depending on
+    numpy/real depth files.  Thresholds come entirely from ``compute_report``
+    (the ``JITTER_*`` / ``FLICKER_*`` / ``EDGE_*`` constants in depth_stability),
+    so the OK/WARN/FAIL marks are the *same* thresholds everywhere.
+    """
+    depths = load_depth_npy_dir(depth_dir)
+    return compute_report(depths)
+
+
+def _metric_cell(metric) -> str:
+    """Format one :class:`MetricResult`-like as ``"<value> <verdict>"``."""
+    return f"{float(metric.value):.4f} {metric.ok}"
+
+
+def apply_depth_metrics(
+    input_path: str,
+    recipe: Recipe,
+    result: RecipeResult,
+    depth_dir_resolver: Callable[..., str | None] = default_depth_dir_resolver,
+    metrics_runner: Callable[[str | Path], StabilityReport] = run_depth_metrics,
+) -> RecipeResult:
+    """Fill one row's three depth-metric cells, degrading to ``—`` on any miss.
+
+    This is a best-effort *post-hoc* statistic: a missing depth dir, an empty
+    dir, or an exception from depth_stability all leave the cells as ``—`` and
+    log a warning — **never** raise, never fail the comparison.  The render/QA
+    verdict above is what gates shipping; this just annotates.
+    """
+    try:
+        depth_dir = depth_dir_resolver(input_path, recipe, result)
+    except Exception as exc:  # resolver must not be able to kill the A/B
+        log.warning("⚠️  depth-dir resolver for %s raised: %s", recipe.name, exc)
+        depth_dir = None
+    if not depth_dir:
+        # No depth products for this recipe — not an error (e.g. --force-sbs).
+        log.info("depth metrics: no depth dir for %s — cells stay —", recipe.name)
+        return result
+    try:
+        report = metrics_runner(depth_dir)
+    except Exception as exc:  # the headline K-16 requirement: never fail here
+        log.warning("⚠️  depth_stability failed for %s (%s): %s", recipe.name, depth_dir, exc)
+        return result
+    result.temporal_jitter = _metric_cell(report.temporal_jitter)
+    result.flicker_ratio = _metric_cell(report.flicker_ratio)
+    result.edge_consistency = _metric_cell(report.edge_consistency)
+    return result
+
+
 def _status_cell(result: RecipeResult) -> str:
     if not result.ok:
         return f"❌ {result.error or 'render failed'}"
@@ -277,15 +418,21 @@ def _status_cell(result: RecipeResult) -> str:
 
 
 def render_summary_table(results: Sequence[RecipeResult]) -> str:
-    """Render the recipe / 分辨率 / 音频 / QA / 耗时 summary as Markdown."""
+    """Render the recipe / 分辨率 / 音频 / QA / 耗时 / 深度稳定性 summary as Markdown.
+
+    The last three columns (temporal_jitter / flicker_ratio / edge_consistency)
+    are the K-16 (#206) objective "dizzy" axis: each cell is ``"<value> <OK/
+    WARN/FAIL>"`` or ``—`` when depth_stability could not run for that recipe.
+    """
     lines = [
-        "| recipe | 说明 | 分辨率 | 音频 | QA 判定 | 耗时 | 状态 |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| recipe | 说明 | 分辨率 | 音频 | QA 判定 | 耗时 | 状态 | " + " | ".join(DEPTH_METRIC_COLUMNS) + " |",
+        "| --- | --- | --- | --- | --- | --- | --- | " + " | ".join("---" for _ in DEPTH_METRIC_COLUMNS) + " |",
     ]
     for r in results:
         lines.append(
             f"| {r.recipe} | {r.description or '-'} | {r.resolution} | {r.audio} "
-            f"| {r.verdict} | {r.elapsed_s:.1f}s | {_status_cell(r)} |"
+            f"| {r.verdict} | {r.elapsed_s:.1f}s | {_status_cell(r)} | "
+            f"{r.temporal_jitter} | {r.flicker_ratio} | {r.edge_consistency} |"
         )
     return "\n".join(lines)
 
@@ -308,6 +455,15 @@ def render_comparison_md(
         "## 汇总",
         "",
         render_summary_table(results),
+        "",
+        (
+            "> 深度稳定性（客观「晕」指标）：flicker_ratio 越低越好；"
+            "edge_consistency 越高越好；temporal_jitter 越低越好。"
+            f" 参照 lead 实测单帧深度基线 flicker_ratio={DEPTH_BASELINE_FLICKER:.4f}"
+            f" / edge_consistency={DEPTH_BASELINE_EDGE:.4f}"
+            "（=「非常晕」的量化解释，越远离这组数字越好）。"
+            " `—` 表示该配方无深度产物或统计失败，不影响出片。"
+        ),
         "",
         "## 头显打分（A/B）",
         "",
@@ -413,6 +569,9 @@ def run_comparison(
     quest_serial: str | None = None,
     dry_run: bool = False,
     push_runner: Callable[..., list] = push_to_quest,
+    metrics: bool = True,
+    depth_dir_resolver: Callable[..., str | None] = default_depth_dir_resolver,
+    metrics_runner: Callable[[str | Path], StabilityReport] = run_depth_metrics,
 ) -> list[RecipeResult]:
     """Render every recipe, QA each product, write comparison.md, optionally push.
 
@@ -422,6 +581,12 @@ def run_comparison(
             run_pipeline CLI).  Tests inject a fake — no real conversion runs.
         qa_runner: injectable QA callable ``(output_path, result) -> result``.
         push_runner: injectable adb push callable (tests assert the calls).
+        metrics: when True (default), after QA each rendered recipe is annotated
+            with the three depth-stability cells via
+            :func:`apply_depth_metrics` (K-16, #206).  ``--no-metrics`` flips
+            this off so depth_stability is never called.  The metrics step is
+            best-effort: it never raises into the orchestration — a miss leaves
+            the cells as ``—`` and the comparison proceeds.
 
     Returns:
         The per-recipe result rows (also written into ``comparison.md``).
@@ -466,6 +631,18 @@ def run_comparison(
                 log.warning("⚠️  QA failed for %s: %s", dest, exc)
                 row.verdict = f"QA 错误: {exc}"
                 row.qa_failed = True
+
+            if metrics:
+                # K-16 (#206): annotate the row with depth-stability cells.
+                # apply_depth_metrics swallows every error itself (cells stay —),
+                # so this block can never break the render/QA flow above.
+                apply_depth_metrics(
+                    input_path,
+                    recipe,
+                    row,
+                    depth_dir_resolver=depth_dir_resolver,
+                    metrics_runner=metrics_runner,
+                )
         results.append(row)
 
     # Push before writing comparison.md so the md records whether it happened.
@@ -527,6 +704,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--quest-serial", default=None, help=f"adb serial（默认读 env {QUEST_SERIAL_ENV}）")
     parser.add_argument("--dry-run", action="store_true", help="只打印将执行的配方与命令，不渲染")
+    parser.add_argument(
+        "--no-metrics",
+        action="store_true",
+        help="跳过深度稳定性统计（temporal_jitter/flicker_ratio/edge_consistency）。"
+        "默认开启统计；本开关只跳过调用 depth_stability，不影响渲染/QA。",
+    )
     return parser.parse_args(argv)
 
 
@@ -560,6 +743,7 @@ def main(argv: list[str] | None = None) -> int:
         push=args.push_to_quest,
         quest_serial=args.quest_serial,
         dry_run=args.dry_run,
+        metrics=not args.no_metrics,
     )
 
     if args.dry_run:
