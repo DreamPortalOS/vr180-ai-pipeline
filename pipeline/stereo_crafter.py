@@ -40,6 +40,9 @@ Reference:
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -285,6 +288,215 @@ def _write_splatting_grid_video(
 
 
 # ---------------------------------------------------------------------------
+# Stereo-product cache (issue #183, I-8b — stereo side)
+# ---------------------------------------------------------------------------
+# A cache entry lives at ``<cache_dir>/<key>/`` and holds the L/R SBS products
+# a real Stage-2 run produced, so a second run on the same input + same stereo
+# params + the *same upstream depth product* returns instantly without spawning
+# the CUDA subprocess.
+#
+# Cache key = sha256( video content digest ‖ stereo model name ‖ normalized JSON
+# of stereo key params ‖ upstream depth cache key ).
+#
+# Why the upstream depth key is folded in (issue #159 lead decision): stereo is
+# downstream of depth. If the key were only "input video + stereo params", then
+# swapping the depth model would change the depth product entirely yet still
+# hit an old stereo cache — serving stereo computed from the *wrong* depths.
+# Folding the depth key in makes the stereo entry self-invalidate whenever the
+# depth it depends on changes. When the depth side did NOT run with caching
+# (``use_cache=False``), there is no depth cache key; we fall back to hashing
+# the *actual used depth directory contents* (size + head/tail sample, same
+# scheme as the video content digest) so two different depth products still
+# produce distinct stereo keys.
+#
+# The stereo key params are the output-affecting knobs on the backend
+# (``max_resolution``, ``max_disp``, and the Stage-2 throughput knobs from
+# issue #217: ``frames_chunk``, ``overlap``, ``tile_num``).  All read with safe
+# ``getattr(..., None)`` so a minimal mock backend never raises
+# ``AttributeError`` (issue #182 round 1 pattern, mirrored).
+#
+# Default cache root is the in-repo ``models/.cache/stereo`` (gitignored).
+# Tests pass a ``cache_dir`` under ``tmp_path`` so the repo is never polluted.
+
+# Reuse the #121 meta file name so the cache's provenance block mirrors the
+# depth cache shape already landed by I-8a (#182).
+_STEREO_META_NAME = "meta.json"
+# The SBS (side-by-side) file we cache alongside L/R outputs — caching it
+# avoids re-running Stage 2 just to split the same SBS frame again.
+_SBS_NAME = "stereo_sbs.mp4"
+
+
+def _depth_dir_digest(depth_dir: str) -> str:
+    """Content fingerprint of a depth product *directory* (no depth cache key).
+
+    When the depth stage ran without caching (``use_cache=False`` in I-8a), the
+    stereo side has no depth cache key to fold in.  Fall back to hashing the
+    actual directory the stereo run consumed: the aggregate file count, total
+    size, and each file's (size + head + tail sample).  The sample size is
+    deliberately imported from ``depth_crafter`` (``_CONTENT_DIGEST_SAMPLE_BYTES``)
+    so the depth and stereo sides use byte-for-byte identical sampling — the
+    two caches then key on the same "quick content summary" primitive
+    (issue #182/#183: share rather than copy the digest logic).
+
+    ``sha256( file_count ‖ total_size ‖ sorted(filename ‖ file_size ‖
+    head ‖ tail)...)`` — order-independent, content-only (file paths are not
+    hashed, so the same depth product moved to a different dir still matches).
+
+    Raises ``OSError`` if any file in the directory cannot be opened for
+    reading (same "cannot cache this call → fall through to a normal run"
+    contract as :func:`pipeline.depth_crafter._video_content_digest`).
+    """
+    from pipeline.depth_crafter import _CONTENT_DIGEST_SAMPLE_BYTES
+
+    sample = _CONTENT_DIGEST_SAMPLE_BYTES
+    dir_path = Path(depth_dir)
+    files = sorted(p for p in dir_path.iterdir() if p.is_file())
+    total_size = sum(p.stat().st_size for p in files)
+    h = hashlib.sha256()
+    h.update(str(len(files)).encode("ascii"))
+    h.update(b"\x1f")
+    h.update(str(total_size).encode("ascii"))
+    h.update(b"\x1f")
+    for f in files:
+        st = f.stat().st_size
+        h.update(f.name.encode("utf-8"))
+        h.update(b"\x1f")
+        h.update(str(st).encode("ascii"))
+        h.update(b"\x1f")
+        with open(f, "rb") as fh:
+            h.update(fh.read(sample))
+            if st > sample:
+                fh.seek(-sample, os.SEEK_END)
+                h.update(fh.read(sample))
+        h.update(b"\x1f")
+    return h.hexdigest()
+
+
+def _stereo_cache_params(backend: object) -> dict:
+    """Pull the output-affecting stereo params off a pluggable *backend*.
+
+    Safe ``getattr(..., None)`` reads so a mock backend without these attrs
+    never raises.  These are exactly the knobs whose change MUST invalidate the
+    stereo cache: the resolution cap (changes output geometry), the stereo
+    baseline (changes the forward-splat), and the Stage-2 throughput knobs
+    (issue #217 — they can alter the inpainter's temporal/spatial behaviour,
+    so a change must not silently serve a stale cache).
+    """
+    return {
+        "max_res": getattr(backend, "max_resolution", None),
+        "max_disp": getattr(backend, "max_disp", None),
+        "frames_chunk": getattr(backend, "frames_chunk", None),
+        "overlap": getattr(backend, "overlap", None),
+        "tile_num": getattr(backend, "tile_num", None),
+    }
+
+
+def _stereo_cache_key(
+    input_path: str,
+    backend: object,
+    depth_cache_key: str | None,
+    depth_dir: str | None = None,
+) -> str:
+    """Compute the stereo cache key.
+
+    ``sha256( video content digest ‖ stereo model name ‖ normalized JSON of
+    stereo params ‖ depth key )``.
+
+    *depth_cache_key* is the I-8a depth cache key when the depth stage ran
+    with caching.  When it is ``None`` (depth ran without cache), we require
+    *depth_dir* and fall back to :func:`_depth_dir_digest` so the key still
+    distinguishes different depth products.  Raises ``ValueError`` if neither
+    is provided — an impossible state for a real call, but asserted here so a
+    bug surfaces loudly rather than as a silent key collision.
+    """
+    from pipeline.depth_crafter import _video_content_digest
+
+    content = _video_content_digest(input_path)
+    model_name = type(backend).__name__
+    params = _stereo_cache_params(backend)
+    params_json = json.dumps(params, sort_keys=True, separators=(",", ":"))
+    h = hashlib.sha256()
+    h.update(content.encode("ascii"))
+    h.update(b"\x1f")
+    h.update(model_name.encode("ascii"))
+    h.update(b"\x1f")
+    h.update(params_json.encode("utf-8"))
+    h.update(b"\x1f")
+    if depth_cache_key is not None:
+        h.update(depth_cache_key.encode("ascii"))
+    else:
+        if not depth_dir:
+            raise ValueError(
+                "stereo cache key requires either a depth_cache_key "
+                "(depth ran with cache) or a depth_dir (digest fallback); "
+                "got neither"
+            )
+        h.update(_depth_dir_digest(depth_dir).encode("ascii"))
+    return h.hexdigest()
+
+
+def _save_stereo_cache(
+    entry_dir: Path,
+    left_path: str,
+    right_path: str,
+    sbs_path: str | None,
+    backend: object,
+    depth_cache_key: str | None,
+    depth_dir: str | None,
+) -> None:
+    """Persist the stereo products + a #121-style meta.json into *entry_dir*.
+
+    Copies the L/R output videos and the SBS intermediate into the entry dir
+    so the cached artefacts are self-contained (the real Stage-2 work dir is a
+    ``tempfile.mkdtemp`` that does not survive across calls).  Reuses the
+    provenance block shape landed by I-8a (#182) — same fields an operator
+    already knows from inspecting a depth cache entry.
+    """
+    import shutil
+
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(left_path, str(entry_dir / "left.mp4"))
+    except OSError:
+        log.debug("[cache] could not stage left output for stereo entry at %s", entry_dir, exc_info=True)
+    try:
+        shutil.copy2(right_path, str(entry_dir / "right.mp4"))
+    except OSError:
+        log.debug("[cache] could not stage right output for stereo entry at %s", entry_dir, exc_info=True)
+    if sbs_path and Path(sbs_path).is_file():
+        try:
+            shutil.copy2(sbs_path, str(entry_dir / _SBS_NAME))
+        except OSError:
+            log.debug("[cache] could not stage SBS for stereo entry at %s", entry_dir, exc_info=True)
+    meta = {
+        "stereo_model": type(backend).__name__,
+    }
+    meta.update(_stereo_cache_params(backend))
+    meta["depth_cache_key"] = depth_cache_key
+    meta["depth_dir"] = depth_dir
+    meta["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+    with open(entry_dir / _STEREO_META_NAME, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+
+def _load_stereo_cache(entry_dir: Path) -> dict[str, str] | None:
+    """Load cached L/R products from *entry_dir*, or ``None`` if absent.
+
+    Returns a ``{"left": ..., "right": ...}`` path mapping when both cached
+    output videos exist; ``None`` (no entry dir / missing videos) means
+    "miss → recompute".  The L/R videos are the deliverables; the SBS is
+    a convenience that may or may not be present.
+    """
+    if not entry_dir.is_dir():
+        return None
+    left = entry_dir / "left.mp4"
+    right = entry_dir / "right.mp4"
+    if not left.is_file() or not right.is_file():
+        return None
+    return {"left": str(left), "right": str(right)}
+
+
+# ---------------------------------------------------------------------------
 # In-repo default paths (managed by scripts/setup_stereocrafter.py)
 # ---------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -313,6 +525,12 @@ DEFAULT_MAX_RESOLUTION = 512
 # historical hard-coded 2 hours.  Override via STEREOCRAFTER_TIMEOUT_SEC
 # (issue #134).
 DEFAULT_TIMEOUT_SEC = 7200
+
+# Default cache root for stereo products (issue #183, I-8b): the in-repo
+# ``models/.cache/stereo`` dir, which is gitignored alongside ``models/``.
+# Tests override this with a ``tmp_path``-based ``cache_dir`` so the repo
+# working tree is never polluted with real cache files.
+_DEFAULT_STEREO_CACHE_DIR = _REPO_ROOT / "models" / ".cache" / "stereo"
 
 # Stereo baseline used when forward-splatting the right eye (issue #140).
 # Mirrors the upstream Stage-1 default: disp = (depth * 2 - 1) * MAX_DISP,
@@ -960,6 +1178,8 @@ class StereoCrafterRenderer:
         frames_chunk: int | None = None,
         overlap: int | None = None,
         tile_num: int | None = None,
+        use_cache: bool = True,
+        cache_dir: Path | None = None,
     ) -> None:
         _assert_cuda()
 
@@ -978,12 +1198,26 @@ class StereoCrafterRenderer:
                 tile_num=tile_num,
             )
 
+        # Issue #183 (I-8b, stereo side): content-keyed product cache so a
+        # second run on the same input + same stereo params + the *same
+        # upstream depth product* returns without spawning the CUDA subprocess.
+        # The cache key folds in the depth side's cache key (see the module-
+        # level :func:`_stereo_cache_key` docstring for the lead's rationale:
+        # a changed depth model must invalidate stereo).  ``cache_dir=None`` →
+        # the in-repo ``models/.cache/stereo`` default (gitignored).  Both
+        # params default so every existing call site (``build_stereo_backend``
+        # and the streaming path) keeps working unchanged — same footgun #168
+        # rejected on the depth side.
+        self.use_cache = use_cache
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else _DEFAULT_STEREO_CACHE_DIR
+
     def render_video(
         self,
         input_path: str,
         depth_dir: str | None = None,
         output_left: str | None = None,
         output_right: str | None = None,
+        depth_cache_key: str | None = None,
     ) -> tuple[str, str]:
         """Generate stereoscopic L/R videos with disocclusion inpainting.
 
@@ -998,9 +1232,28 @@ class StereoCrafterRenderer:
                 If None, a temp path is generated.
             output_right: Desired path for the right-eye output video.
                 If None, a temp path is generated.
+            depth_cache_key: The I-8a (#182) depth cache key for the depth
+                product this stereo run consumes.  When provided, it is folded
+                into the stereo cache key so a changed depth model naturally
+                invalidates the stereo entry.  When ``None`` (the depth side
+                ran without caching, ``use_cache=False``), the key falls back
+                to a content digest of *depth_dir* — the same quick-summary
+                scheme the depth side uses — so different depth products still
+                yield distinct stereo keys.  Defaults to ``None`` for
+                backward compatibility with existing call sites.
 
         Returns:
             Tuple of (left_video_path, right_video_path).
+
+        Issue #183 (I-8b): when ``use_cache`` is set, the L/R products are
+        served from / written to a content-keyed cache so the CUDA subprocess
+        is only spawned on a cache miss.  A hit logs
+        ``[cache] hit <key前8位>`` and never touches the backend;
+        ``use_cache=False`` forces a recompute.  A run that cannot be keyed
+        (e.g. a locked input file — see
+        :func:`pipeline.depth_crafter._video_content_digest`) falls through
+        to a normal, uncached run so inference never breaks on a cache
+        failure.
         """
         resolved_depth = depth_dir or tempfile.mkdtemp(prefix="stereocrafter_depth_")
         resolved_left = output_left or tempfile.mktemp(suffix=".mp4", prefix="stereocrafter_left_")
@@ -1015,6 +1268,35 @@ class StereoCrafterRenderer:
                 f"Provide a valid --depth-dir or ensure depth maps are saved."
             )
 
+        # Cache lookup (issue #183).  Done before the backend is invoked: a
+        # hit neither spawns the subprocess nor writes anything.
+        # ``_cache_enabled`` is per-call: key computation may fail (locked
+        # input file), in which case we skip the cache entirely for this call
+        # rather than break the inference — the same contract as I-8a (#182).
+        key: str | None = None
+        entry_dir: Path | None = None
+        _cache_enabled = self.use_cache
+        if _cache_enabled:
+            try:
+                key = _stereo_cache_key(input_path, self.backend, depth_cache_key, resolved_depth)
+                entry_dir = self.cache_dir / key
+                cached = _load_stereo_cache(entry_dir)
+                if cached is not None:
+                    log.info(
+                        "[cache] hit %s (%s → %s | %s)",
+                        key[:8],
+                        input_path,
+                        cached["left"],
+                        cached["right"],
+                    )
+                    return cached["left"], cached["right"]
+            except (OSError, ValueError):
+                _cache_enabled = False
+                log.debug(
+                    "[cache] disabled for this call — stereo key could not be computed",
+                    exc_info=True,
+                )
+
         log.info(
             "StereoCrafterRenderer: %s + depth/ → %s | %s",
             input_path,
@@ -1022,9 +1304,28 @@ class StereoCrafterRenderer:
             resolved_right,
         )
 
-        return self.backend.render_video(
+        left_out, right_out = self.backend.render_video(
             input_path=input_path,
             depth_dir=resolved_depth,
             output_left=resolved_left,
             output_right=resolved_right,
         )
+
+        # Populate the cache on a miss so the next identical call hits.
+        # Failure to cache must never break a successful render — wrap it.
+        if _cache_enabled and key is not None and entry_dir is not None:
+            try:
+                _save_stereo_cache(
+                    entry_dir,
+                    left_path=left_out,
+                    right_path=right_out,
+                    sbs_path=None,
+                    backend=self.backend,
+                    depth_cache_key=depth_cache_key,
+                    depth_dir=resolved_depth,
+                )
+                log.info("[cache] stored %s", key[:8])
+            except OSError:
+                log.debug("[cache] could not write stereo cache entry at %s", entry_dir, exc_info=True)
+
+        return left_out, right_out
