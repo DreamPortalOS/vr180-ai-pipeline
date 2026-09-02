@@ -250,18 +250,35 @@ def recipe_output_name(input_path: str, recipe_name: str) -> str:
     )
 
 
+def _recipe_temp_dir(outdir: str | Path, recipe: Recipe) -> str:
+    """The per-recipe depth/temp work directory.
+
+    K-17 (#208): every recipe renders into its *own* ``_work/<recipe>`` dir
+    so the depth-dir resolver can never reach into another recipe's (or a
+    prior run's) depth products.  ``_work`` keeps this out of the way of the
+    artefacts written directly into ``outdir``.
+    """
+    return str(Path(outdir) / "_work" / recipe.name)
+
+
 def build_render_command(
     input_path: str,
     output_path: str,
     recipe: Recipe,
     base_args: Sequence[str] = (),
+    outdir: str | Path | None = None,
 ) -> list[str]:
     """Assemble the exact ``run_pipeline`` command line for one recipe.
 
     Kept separate from the runner so ``--dry-run`` can print *precisely* what
     would execute, and tests can assert on the argv without spawning anything.
+
+    ``outdir``, when given, is forwarded as ``--temp-dir`` so each recipe's
+    depth products land in its own per-recipe work directory (K-17, #208).
+    Called without ``outdir`` (e.g. unit tests of argv shape) the command is
+    otherwise identical to before.
     """
-    return [
+    argv = [
         sys.executable,
         str(Path(__file__).with_name("run_pipeline.py")),
         "--input",
@@ -271,6 +288,9 @@ def build_render_command(
         *base_args,
         *recipe.args,
     ]
+    if outdir is not None:
+        argv.extend(["--temp-dir", _recipe_temp_dir(outdir, recipe)])
+    return argv
 
 
 def default_render_runner(cmd: Sequence[str]) -> str:
@@ -316,6 +336,13 @@ class RecipeResult:
     temporal_jitter: str = DEPTH_METRIC_NA
     flicker_ratio: str = DEPTH_METRIC_NA
     edge_consistency: str = DEPTH_METRIC_NA
+    # K-17 (#208): per-recipe depth work directory and render start time.
+    # The resolver uses ``temp_dir`` as the *only* place to look for this
+    # recipe's depth products (no cross-model / cross-recipe fallback), and
+    # requires depth_*.npy mtime to be *after* ``render_started`` so a stale
+    # render from a prior run can never be misread as this recipe's result.
+    temp_dir: str | None = None
+    render_started: float = 0.0
     extra: dict = field(default_factory=dict)
 
 
@@ -346,28 +373,63 @@ def default_depth_dir_resolver(
     recipe: Recipe,
     result: RecipeResult,
 ) -> str | None:
-    """Locate the depth-product directory one recipe wrote, if any.
+    """Locate this recipe's depth-product directory, if any — nothing else.
 
-    run_pipeline writes ``depth_*.npy`` into a model-scoped checkpoint dir
-    (I-6, #121): ``<input_dir>/<input_stem>_vr180_temp/depth/<depth_model>/``
-    (or ``--temp-dir/.../depth/<model>``).  The recipe flags tell us which model
-    it *asked* for, but the resolver also checks the other model dir so a depth
-    stage that silently fell back (e.g. depthcrafter→depth-anything) is still
-    found.  Returns the first dir containing ``depth_*.npy``, else ``None``.
+    K-17 (#208) rules:
+
+    1. The resolver only looks inside this recipe's own temp dir (``result.temp_dir``).
+       There is **no** cross-model fallback and **no** cross-recipe probing — a
+       depth dir that exists for the *other* model, or for a *different* recipe,
+       or from a *prior run*, is never read.  If this recipe's dir is missing or
+       empty, the result is ``None`` and the cells render as ``—``.
+    2. Freshness: even when this recipe's dir exists, the ``depth_*.npy`` files
+       inside must have been written *after this recipe's render began*
+       (``result.render_started``).  Stale files left over from an earlier run
+       are ignored with a warning rather than silently graded as the current
+       result — the old behaviour of producing identical numbers for two
+       different depth backends was exactly this bug.
+
+    ``render_started`` is a wall-clock timestamp (``time.time()``) taken
+    immediately before this recipe's render started (see ``run_comparison``).
+    File mtime is wall-clock too, so the two are directly comparable; the gate
+    is anchored on the render *start* so any depth product genuinely written
+    during this render is necessarily newer.  A zero/missing ``render_started``
+    (e.g. an injected unit test without a real render) disables the freshness
+    gate and only requires the dir to exist with content, keeping the old unit
+    tests green.
 
     Tests inject a fake resolver; the default never loads a model.
     """
-    stem = Path(input_path).stem
-    base_temp = Path(input_path).parent / f"{stem}_vr180_temp"
-    # Prefer the model the recipe selected (depthcrafter if it asked, else
-    # depth-anything), then fall back to the other model dir.
-    requested = "depthcrafter" if any(a == "depthcrafter" for a in recipe.args) else "depth-anything"
-    ordered = [requested] + [m for m in DEPTH_MODEL_NAMES if m != requested]
-    for model in ordered:
-        cand = base_temp / "depth" / model
-        if cand.is_dir() and any(cand.glob("depth_*.npy")):
-            return str(cand)
-    return None
+    temp_dir = result.temp_dir
+    if not temp_dir:
+        log.info("depth metrics: no per-recipe temp dir set for %s — cells stay —", recipe.name)
+        return None
+    cand = Path(temp_dir) / "depth"
+    if not cand.is_dir():
+        log.info("depth metrics: dir %s absent for %s — cells stay —", cand, recipe.name)
+        return None
+    npy_files = sorted(cand.glob("depth_*.npy"))
+    if not npy_files:
+        log.info("depth metrics: no depth_*.npy in %s for %s — cells stay —", cand, recipe.name)
+        return None
+    # Freshness gate: refuse to read files that pre-date this render.
+    if result.render_started > 0.0:
+        newest = max(os.path.getmtime(p) for p in npy_files)
+        # ``render_started`` and file mtime are both wall-clock.  Allow a small
+        # 1-second window for renders that finish essentially instantly (the
+        # depth file can be written at the very start of the render).  Anything
+        # more than 1 s older than the render start is unambiguously stale and
+        # is rejected — this is the guard against grading a prior run's depth.
+        if newest < (result.render_started - 1.0):
+            log.warning(
+                "⚠️  depth products under %s for %s are older than this render "
+                "(newest mtime predates render start) — ignoring to avoid "
+                "grading a prior run's depth as this recipe's result.",
+                cand,
+                recipe.name,
+            )
+            return None
+    return str(cand)
 
 
 def run_depth_metrics(depth_dir: str | Path) -> StabilityReport:
@@ -562,7 +624,7 @@ def _print_dry_run(
     print(f"  输出目录: {outdir}")
     for recipe in recipes:
         out_name = recipe_output_name(input_path, recipe.name)
-        cmd = build_render_command(input_path, outdir / out_name, recipe, base_args)
+        cmd = build_render_command(input_path, outdir / out_name, recipe, base_args, outdir=outdir)
         desc = f" — {recipe.description}" if recipe.description else ""
         print(f"\n[{recipe.name}]{desc}")
         print(f"  输出: {out_name}")
@@ -622,10 +684,25 @@ def run_comparison(
     for recipe in recipe_list:
         out_name = recipe_output_name(input_path, recipe.name)
         dest = out_path / out_name
-        row = RecipeResult(recipe=recipe.name, description=recipe.description, output=str(dest))
-        cmd = build_render_command(input_path, dest, recipe, base_args)
-        log.info("=== Recipe %s/%s: %s ===", len(results) + 1, len(recipe_list), recipe.name)
+        # K-17 (#208): record the render start time *before* the render begins,
+        # and pin the per-recipe temp dir onto the row.  The depth-dir resolver
+        # later uses both: it only looks inside this recipe's temp dir, and
+        # rejects any depth_*.npy whose mtime is not after ``render_started``.
+        temp_dir = _recipe_temp_dir(out_path, recipe)
+        # Wall-clock render start (comparable to os.path.getmtime for the
+        # freshness gate in default_depth_dir_resolver).  We still use
+        # monotonic below for the elapsed-s measurement.
+        render_start_wall = time.time()
         started = time.monotonic()
+        row = RecipeResult(
+            recipe=recipe.name,
+            description=recipe.description,
+            output=str(dest),
+            temp_dir=temp_dir,
+            render_started=render_start_wall,
+        )
+        cmd = build_render_command(input_path, dest, recipe, base_args, outdir=out_path)
+        log.info("=== Recipe %s/%s: %s ===", len(results) + 1, len(recipe_list), recipe.name)
         try:
             runner(cmd)
             row.ok = True
