@@ -32,38 +32,49 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
-from tqdm import tqdm
+# K-15 (#205): let this script run directly (``python scripts/run_pipeline.py``)
+# without the caller having to set PYTHONPATH — put the repo root on sys.path
+# before importing the ``pipeline`` package.  Idempotent (no duplicate entries)
+# and a no-op when PYTHONPATH already points here.  The imports below are now
+# module-level-but-post-statement, so each is silenced for E402 (repo
+# convention, see tests/test_batch_runner.py etc.) rather than being
+# reshuffled — order is load-bearing for the existing call graph.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-from pipeline.comfort_presets import COMFORT_PRESETS, DEFAULT_COMFORT, resolve_comfort
-from pipeline.depth_crafter import DepthCrafterEstimator
-from pipeline.depth_estimator import DepthEstimator
-from pipeline.device_utils import detect_best_device, resolve_device
-from pipeline.equirectangular_mapper import EquirectangularMapper
-from pipeline.fulldome_mapper import FulldomeMapper
-from pipeline.outpainter import Outpainter
-from pipeline.playback_presets import (
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+
+from pipeline.comfort_presets import COMFORT_PRESETS, DEFAULT_COMFORT, resolve_comfort  # noqa: E402
+from pipeline.depth_crafter import DepthCrafterEstimator  # noqa: E402
+from pipeline.depth_estimator import DepthEstimator  # noqa: E402
+from pipeline.device_utils import detect_best_device, resolve_device  # noqa: E402
+from pipeline.equirectangular_mapper import EquirectangularMapper  # noqa: E402
+from pipeline.fulldome_mapper import FulldomeMapper  # noqa: E402
+from pipeline.outpainter import Outpainter  # noqa: E402
+from pipeline.playback_presets import (  # noqa: E402
     DEFAULT_PLAYBACK,
     PLAYBACK_PRESETS,
     resolve_playback,
 )
-from pipeline.segment_concat import (
+from pipeline.segment_concat import (  # noqa: E402
     ConcatError,
     ConcatSegment,
     concat_segments,
 )
-from pipeline.stereo_crafter import StereoCrafterRenderer
-from pipeline.stereo_renderer import StereoRenderer
-from pipeline.streaming_pipeline import (
+from pipeline.stereo_crafter import StereoCrafterRenderer  # noqa: E402
+from pipeline.stereo_renderer import StereoRenderer  # noqa: E402
+from pipeline.streaming_pipeline import (  # noqa: E402
     DEFAULT_QUALITY,
     StreamingPipeline,
     resolve_quality,
     scaled_bitrate_mbps,
 )
-from pipeline.upscaler import PixelUpscaler
-from pipeline.video_upscaler import SeedVR2Upscaler
-from pipeline.vr_metadata import VRMetadataEmbedder
+from pipeline.upscaler import PixelUpscaler  # noqa: E402
+from pipeline.video_upscaler import SeedVR2Upscaler  # noqa: E402
+from pipeline.vr_metadata import VRMetadataEmbedder  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,

@@ -14,9 +14,18 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 
-import httpx
-from integrations.factory import get_provider, list_providers
+# K-15 (#205): let this script run directly (``python scripts/generate.py``)
+# without the caller having to set PYTHONPATH — put the repo root on sys.path
+# before importing the repo's top-level packages.  Idempotent (no duplicate
+# entries) and a no-op when PYTHONPATH already points here.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import httpx  # noqa: E402
+from integrations.factory import get_provider, list_providers  # noqa: E402
 
 log = logging.getLogger(__name__)
 
