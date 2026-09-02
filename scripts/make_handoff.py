@@ -244,13 +244,130 @@ def fetch_open_issues(
 # ---------------------------------------------------------------------------
 
 
-def scan_artefacts(video_dir: Path | None = None) -> list[VideoArtefact]:
+FFPROBE_BIN = "ffprobe"
+FFPROBE_TIMEOUT = 15  # seconds — never let one mp4 stall the whole digest
+
+
+def _probe_with_ffprobe(
+    mp4_path: Path,
+    runner: Any = subprocess.run,
+    ffprobe_bin: str = FFPROBE_BIN,
+    timeout: float = FFPROBE_TIMEOUT,
+    probe_resolution: bool = True,
+    probe_audio: bool = True,
+) -> tuple[str, str]:
+    """Probe an mp4's resolution + audio presence via ``ffprobe``.
+
+    Returns ``(resolution, has_audio)`` where ``has_audio`` is one of
+    ``"yes"`` / ``"no"`` / ``"unknown"`` (matching the sidecar-derived
+    vocabulary). Resolution is ``"WxH"`` (plain ASCII ``x`` — this is the
+    machine-readable fallback, not the display form) or ``""`` on failure.
+
+    ``probe_resolution`` / ``probe_audio`` gate which probe runs so a
+    partial sidecar (one field known, one missing) only pays for the
+    missing probe.
+
+    Used only as a **fallback** when a sidecar is missing or a field is
+    empty: ffprobe needs no metadata file to read container-level facts.
+    ``QA 判定`` is intentionally NOT probed here — it requires the sidecar's
+    QA conclusion and we do not run ``vr180_qa.py`` (that would slow the
+    digest down).
+
+    subprocess is **always list-form, never ``shell=True``** (CLAUDE.md red
+    line), and the runner is injectable so tests assert without a real
+    ffprobe binary. timeout / non-zero return / missing binary / any
+    exception → ``("", "unknown")``; the summary must never crash or hang
+    on one bad file.
+    """
+    resolution = ""
+    audio = "unknown"
+    if probe_resolution:
+        cmd = [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            str(mp4_path),
+        ]
+        try:
+            res = runner(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            return "", "unknown"
+        if res.returncode == 0:
+            resolution = _parse_ffprobe_resolution(getattr(res, "stdout", "") or "")
+    if probe_audio:
+        audio_cmd = [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            str(mp4_path),
+        ]
+        try:
+            ares = runner(audio_cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            return resolution, "unknown"
+        if ares.returncode == 0:
+            audio = _parse_ffprobe_audio(getattr(ares, "stdout", "") or "")
+    return resolution, audio
+
+
+def _parse_ffprobe_resolution(stdout: str) -> str:
+    """``ffprobe -show_entries stream=width,height`` → ``"WxH"`` or ``""``.
+
+    Output is ``csv=p=0`` so a video stream line is ``W,H``. Take the first
+    parseable numeric pair; anything else (empty, a single token, text) → ``""``.
+    """
+    for line in stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            w, h = int(parts[0]), int(parts[1])
+            if w and h:
+                return f"{w}x{h}"
+    return ""
+
+
+def _parse_ffprobe_audio(stdout: str) -> str:
+    """``ffprobe -select_streams a`` stdout → ``"yes"`` if any audio stream, else ``"no"``.
+
+    With ``-select_streams a`` ffprobe prints nothing when there is no audio
+    stream (and a codec name / ``audio`` when there is). Any non-empty line
+    ⇒ audio present; empty ⇒ silent.
+    """
+    return "yes" if stdout.strip() else "no"
+
+
+def scan_artefacts(
+    video_dir: Path | None = None,
+    runner: Any = subprocess.run,
+    ffprobe_bin: str = FFPROBE_BIN,
+    ffprobe_timeout: float = FFPROBE_TIMEOUT,
+) -> list[VideoArtefact]:
     """Scan ``video/*.mp4`` newest-first, attaching sidecar QA verdict/resolution.
 
     The sidecar JSON lives beside the mp4 with the same stem
     (e.g. ``scene_v1.mp4`` ↔ ``scene_v1.json``). Fields consumed are the
     same shape the pipeline sidecar writer emits
     (``qa.verdict``, ``immersive.eye_resolution`` or ``spatial_metadata``).
+
+    When a sidecar is missing — or a specific field is empty — **resolution
+    and audio presence fall back to a direct ``ffprobe`` probe** of the mp4
+    (issue #211). Those two facts are container-level and need no sidecar.
+    ``QA 判定`` stays ``unknown`` without a sidecar: probing it would mean
+    running ``vr180_qa.py``, which is too slow for a nightly digest.
+
+    The ``runner`` is injectable (defaults to ``subprocess.run``) so tests
+    never spawn a real ffprobe binary; it mirrors the ``_gh`` runner pattern.
     """
     root = video_dir or VIDEO_DIR
     if not root.is_dir():
@@ -263,7 +380,8 @@ def scan_artefacts(video_dir: Path | None = None) -> list[VideoArtefact]:
         verdict = "unknown"
         resolution = ""
         audio = "unknown"
-        if sidecar.is_file():
+        has_sidecar = sidecar.is_file()
+        if has_sidecar:
             try:
                 data = json.loads(sidecar.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
@@ -272,6 +390,24 @@ def scan_artefacts(video_dir: Path | None = None) -> list[VideoArtefact]:
             verdict = qa.get("verdict") or "unknown"
             audio = _audio_status(data, qa)
             resolution = _resolution_from_sidecar(data)
+        # Fallback: probe the mp4 itself for whatever the sidecar couldn't
+        # answer (no sidecar, or a field came back empty/unknown). Only the
+        # missing field is probed so a partial sidecar pays for one probe.
+        need_res = not resolution
+        need_audio = audio == "unknown"
+        if need_res or need_audio:
+            probe_res, probe_audio = _probe_with_ffprobe(
+                mp4,
+                runner=runner,
+                ffprobe_bin=ffprobe_bin,
+                timeout=ffprobe_timeout,
+                probe_resolution=need_res,
+                probe_audio=need_audio,
+            )
+            if need_res and probe_res:
+                resolution = probe_res
+            if need_audio and probe_audio != "unknown":
+                audio = probe_audio
         out.append(
             VideoArtefact(
                 filename=mp4.name,
@@ -431,6 +567,7 @@ def render_markdown(data: HandoffData) -> str:
     lines.append("")
 
     lines.append("## ④ 可验收产物")
+    lines.append("_分辨率/音轨在缺 sidecar 时由 ffprobe 直接探测；QA 判定仍需 sidecar_")
     if data.artefacts:
         for art in data.artefacts:
             res = art.resolution or "—"
@@ -552,7 +689,7 @@ def build_handoff(
         since=f"{since_dt.isoformat()} .. now",
         merged_prs=fetch_merged_prs(since_dt, gh_bin=gh_bin, runner=runner),
         open_issues=fetch_open_issues(gh_bin=gh_bin, runner=runner),
-        artefacts=scan_artefacts(video_dir),
+        artefacts=scan_artefacts(video_dir, runner=runner),
     )
 
 

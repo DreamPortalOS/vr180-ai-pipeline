@@ -469,6 +469,177 @@ def test_scan_artefacts_missing_video_dir():
 
 
 # ---------------------------------------------------------------------------
+# ffprobe fallback (issue #211)
+# ---------------------------------------------------------------------------
+
+
+def _ffprobe_runner(
+    res_stdout: str = "",
+    audio_stdout: str = "",
+    res_rc: int = 0,
+    audio_rc: int = 0,
+    raise_on_call: Exception | None = None,
+):
+    """Build a fake runner that answers the two ffprobe query shapes.
+
+    ``res_stdout``/``audio_stdout`` are what ffprobe prints for the
+    resolution / audio probe respectively. ``raise_on_call`` makes the runner
+    throw (timeout / binary-missing) so we can assert the summary survives.
+    """
+    calls: list[list[str]] = []
+
+    def runner(cmd: list[str], **_: object) -> SimpleNamespace:
+        calls.append(list(cmd))
+        if raise_on_call is not None:
+            raise raise_on_call
+        # Distinguish the two probes by the -select_streams argument.
+        if "a" in cmd and "-select_streams" in cmd and cmd[cmd.index("-select_streams") + 1] == "a":
+            return SimpleNamespace(returncode=audio_rc, stdout=audio_stdout, stderr="")
+        return SimpleNamespace(returncode=res_rc, stdout=res_stdout, stderr="")
+
+    return runner, calls
+
+
+def _is_audio_probe(cmd: list[str]) -> bool:
+    return "-select_streams" in cmd and cmd[cmd.index("-select_streams") + 1] == "a"
+
+
+def test_scan_artefacts_with_sidecar_does_not_call_ffprobe(tmp_path):
+    """A sidecar that supplies resolution + audio → ffprobe is never invoked."""
+    (tmp_path / "scene.mp4").write_bytes(b"fake")
+    sidecar_data = {
+        "immersive": {"eye_resolution": [3840, 1920]},
+        "qa": {"verdict": "VR180 (180° 3D SBS)", "checks": {"audio stream": {"status": "pass"}}},
+    }
+    (tmp_path / "scene.json").write_text(json.dumps(sidecar_data), encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    def runner(cmd: list[str], **_: object) -> SimpleNamespace:
+        calls.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout="0,0", stderr="")
+
+    result = scan_artefacts(tmp_path, runner=runner)
+    assert result[0].resolution == "3840×1920"
+    assert result[0].has_audio == "yes"
+    # ffprobe must NOT have been called — sidecar answered everything.
+    assert calls == []
+    assert not any(c and c[0] in {"ffprobe", "ffprobe-bin"} for c in calls)
+
+
+def test_scan_artefacts_no_sidecar_probes_ffprobe(tmp_path):
+    """No sidecar → ffprobe fills resolution + audio from the container."""
+    (tmp_path / "bare.mp4").write_bytes(b"fake")
+
+    runner, _ = _ffprobe_runner(res_stdout="1920,1080\n", audio_stdout="aac\n")
+
+    result = scan_artefacts(tmp_path, runner=runner)
+    art = result[0]
+    assert art.resolution == "1920x1080"
+    assert art.has_audio == "yes"
+    # No sidecar ⇒ QA verdict stays unknown (we don't run vr180_qa.py).
+    assert art.qa_verdict == "unknown"
+
+
+def test_scan_artefacts_no_sidecar_silent_audio(tmp_path):
+    """ffprobe audio probe printing nothing ⇒ 'no' (silent)."""
+    (tmp_path / "silent.mp4").write_bytes(b"fake")
+    runner, _ = _ffprobe_runner(res_stdout="1280,720\n", audio_stdout="")
+    art = scan_artefacts(tmp_path, runner=runner)[0]
+    assert art.resolution == "1280x720"
+    assert art.has_audio == "no"
+
+
+def test_scan_artefacts_ffprobe_nonzero_keeps_summary_alive(tmp_path):
+    """ffprobe returning non-zero → that field degrades to '—', summary still built."""
+    (tmp_path / "bad.mp4").write_bytes(b"fake")
+    runner, calls = _ffprobe_runner(res_rc=1, audio_rc=1, res_stdout="", audio_stdout="")
+    art = scan_artefacts(tmp_path, runner=runner)[0]
+    assert art.resolution == ""  # renders as '—'
+    assert art.has_audio == "unknown"  # renders as '音轨未知'
+    # But ffprobe WAS invoked (we tried the fallback).
+    assert len(calls) >= 1
+
+
+def test_scan_artefacts_ffprobe_timeout_keeps_summary_alive(tmp_path):
+    """A runner that raises (simulating timeout) must not crash the digest."""
+    (tmp_path / "hang.mp4").write_bytes(b"fake")
+    # subprocess.TimeoutExpired is a SubprocessError subclass → caught path.
+    import subprocess as _sp
+
+    runner, _ = _ffprobe_runner(raise_on_call=_sp.TimeoutExpired(cmd=["ffprobe"], timeout=15))
+    art = scan_artefacts(tmp_path, runner=runner)[0]
+    assert art.resolution == ""
+    assert art.has_audio == "unknown"
+
+
+def test_scan_artefacts_ffprobe_binary_missing_keeps_summary_alive(tmp_path):
+    """ffprobe binary absent (FileNotFoundError) → degrade to '—', no crash."""
+    (tmp_path / "gone.mp4").write_bytes(b"fake")
+    runner, _ = _ffprobe_runner(raise_on_call=FileNotFoundError("no ffprobe"))
+    art = scan_artefacts(tmp_path, runner=runner)[0]
+    assert art.resolution == ""
+    assert art.has_audio == "unknown"
+
+
+def test_scan_artefacts_ffprobe_argv_is_list_form_no_shell(tmp_path):
+    """The ffprobe command must be list-form and never pass shell=True (CLAUDE.md red line)."""
+    (tmp_path / "probe.mp4").write_bytes(b"fake")
+    runner, calls = _ffprobe_runner(res_stdout="640,480\n", audio_stdout="aac\n")
+    scan_artefacts(tmp_path, runner=runner)
+    ffprobe_cmds = [c for c in calls if c and c[0] == "ffprobe"]
+    assert ffprobe_cmds, "expected at least one ffprobe invocation"
+    for cmd in ffprobe_cmds:
+        assert isinstance(cmd, list)
+        assert "shell=True" not in cmd  # no shell flag anywhere
+        assert "-show_entries" in cmd  # ffprobe uses single-dash flag form
+        # The mp4 path is passed as a positional arg, not via shell.
+        assert any(str(tmp_path / "probe.mp4") == arg for arg in cmd)
+
+
+def test_scan_artefacts_partial_sidecar_probes_only_missing_field(tmp_path):
+    """Sidecar with resolution but no audio → ffprobe probes audio, keeps resolution."""
+    (tmp_path / "partial.mp4").write_bytes(b"fake")
+    sidecar_data = {
+        "immersive": {"eye_resolution": [4096, 2048]},
+        "qa": {"verdict": "VR180 (180° 3D SBS)"},  # no checks.audio stream
+    }
+    (tmp_path / "partial.json").write_text(json.dumps(sidecar_data), encoding="utf-8")
+    runner, calls = _ffprobe_runner(res_stdout="0,0\n", audio_stdout="opus\n")
+    art = scan_artefacts(tmp_path, runner=runner)[0]
+    assert art.resolution == "4096×2048"  # kept from sidecar
+    assert art.has_audio == "yes"  # filled by ffprobe
+    assert art.qa_verdict == "VR180 (180° 3D SBS)"  # sidecar QA intact
+    # Only the audio probe should have run (resolution was already known).
+    audio_calls = [c for c in calls if c and c[0] == "ffprobe" and _is_audio_probe(c)]
+    res_calls = [c for c in calls if c and c[0] == "ffprobe" and not _is_audio_probe(c)]
+    assert len(audio_calls) == 1
+    assert len(res_calls) == 0
+
+
+def test_scan_artefacts_qa_verdict_unch_with_ffprobe(tmp_path):
+    """Regression: ffprobe fallback must never touch the QA 判定 column.
+
+    Whether the sidecar is present or not, QA verdict comes solely from the
+    sidecar's qa.verdict — never from ffprobe (we do not run vr180_qa.py).
+    """
+    # With sidecar: verdict preserved; ffprobe not invoked (sidecar has no
+    # immersive/spatial block so resolution is empty → ffprobe runs for it,
+    # but the QA column must be untouched).
+    (tmp_path / "a.mp4").write_bytes(b"fake")
+    (tmp_path / "a.json").write_text(json.dumps({"qa": {"verdict": "plain 2D"}}), encoding="utf-8")
+    runner, _ = _ffprobe_runner(res_stdout="640,360\n", audio_stdout="")
+    a = next(x for x in scan_artefacts(tmp_path, runner=runner) if x.filename == "a.mp4")
+    assert a.qa_verdict == "plain 2D"
+
+    # Without sidecar: verdict stays unknown regardless of ffprobe success.
+    (tmp_path / "b.mp4").write_bytes(b"fake")
+    runner2, _ = _ffprobe_runner(res_stdout="640,360\n", audio_stdout="aac\n")
+    b = next(x for x in scan_artefacts(tmp_path, runner=runner2) if x.filename == "b.mp4")
+    assert b.qa_verdict == "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Worklog append idempotence
 # ---------------------------------------------------------------------------
 
