@@ -338,6 +338,51 @@ INFERENCE_SCRIPT_CANDIDATES = [
     INFERENCE_SCRIPT,  # Stage 2 (inpainting) — the only entry this repo drives
 ]
 
+# Stage-2 throughput / VRAM knobs (issue #217): how many frames the video
+# diffusion inpainter is fed at once (``--frames_chunk``), how many of the
+# previous chunk's frames overlap into the next (``--overlap``), and how many
+# spatial tiles each frame is split into (``--tile_num``).  All three directly
+# trade VRAM for speed; the upstream defaults are tuned for big GPUs and are
+# not necessarily the sweet spot for a 12 GB RTX 4070 SUPER.  This repo
+# exposes them as opt-in: a value of None means "do not pass the flag at all"
+# (use the upstream default — current behaviour unchanged).  Priority is
+# explicit constructor arg > env var > None.
+ENV_FRAMES_CHUNK = "STEREOCRAFTER_FRAMES_CHUNK"
+ENV_OVERLAP = "STEREOCRAFTER_OVERLAP"
+ENV_TILE_NUM = "STEREOCRAFTER_TILE_NUM"
+
+
+def _resolve_tunable(
+    explicit: int | None,
+    env_var: str,
+    *,
+    name: str,
+) -> int | None:
+    """Resolve a Stage-2 throughput knob: explicit arg > env var > None.
+
+    A ``None`` result means "do not add the flag" — the upstream default is
+    then used, preserving pre-#217 behaviour.  An env var that is set but not
+    a valid int is *not* fatal: it is warned about and ignored (treated as
+    unset), so a typo in STEREOCRAFTER_FRAMES_CHUNK=abx does not crash a
+    long-running render that worked without it.
+    """
+    if explicit is not None:
+        return int(explicit)
+    raw = os.environ.get(env_var)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        log.warning(
+            "StereoCrafter: ignoring invalid %s=%r (not an int); using the "
+            "upstream default for --%s.  Set it to an integer or unset it.",
+            env_var,
+            raw,
+            name,
+        )
+        return None
+
 
 def _inrepo_env_hint() -> str:
     """Text appended to errors when no StereoCrafter paths were configured/found."""
@@ -425,7 +470,18 @@ class CLIBackend(StereoCrafterBackend):
     ``max_resolution``    ``STEREOCRAFTER_MAX_RES``       ``512`` (12 GB VRAM safe)
     ``max_disp``          ``STEREOCRAFTER_MAX_DISP``      ``20.0`` (stereo baseline, upstream Stage-1 default)
     (stage timeout)       ``STEREOCRAFTER_TIMEOUT_SEC``   ``7200`` (2 hours)
+    ``frames_chunk``      ``STEREOCRAFTER_FRAMES_CHUNK``  unset → upstream default (issue #217)
+    ``overlap``           ``STEREOCRAFTER_OVERLAP``       unset → upstream default (issue #217)
+    ``tile_num``          ``STEREOCRAFTER_TILE_NUM``       unset → upstream default (issue #217)
     ===================== =============================== =============================================
+
+    The Stage-2 throughput knobs ``frames_chunk`` / ``overlap`` / ``tile_num``
+    (issue #217) are **opt-in**: when ``None`` the corresponding
+    ``--frames_chunk`` / ``--overlap`` / ``--tile_num`` flag is **not** added
+    to the command line, so upstream defaults apply and pre-#217 behaviour is
+    unchanged.  Priority is explicit arg > env var > None (flag omitted).  An
+    invalid (non-int) env value is warned and ignored rather than crashing the
+    render — see :func:`_resolve_tunable`.
 
     ``checkpoint_dir`` is the StereoCrafter UNet dir (``--unet_path``) and
     ``pre_trained_path`` the SVD base model dir (``--pre_trained_path``), both
@@ -446,6 +502,9 @@ class CLIBackend(StereoCrafterBackend):
         pre_trained_path: str | None = None,
         max_resolution: int | None = None,
         max_disp: float | None = None,
+        frames_chunk: int | None = None,
+        overlap: int | None = None,
+        tile_num: int | None = None,
     ) -> None:
         # repo_dir: explicit > env > in-repo default (only if it exists on disk)
         _repo_dir = repo_dir or os.environ.get("STEREOCRAFTER_REPO_DIR")
@@ -529,11 +588,38 @@ class CLIBackend(StereoCrafterBackend):
             max_disp if max_disp is not None else os.environ.get("STEREOCRAFTER_MAX_DISP", str(DEFAULT_MAX_DISP))
         )
 
+        # Stage-2 throughput knobs (issue #217): None → flag omitted (upstream
+        # default, pre-#217 behaviour).  Invalid env values are warned + ignored.
+        self.frames_chunk: int | None = _resolve_tunable(frames_chunk, ENV_FRAMES_CHUNK, name="frames_chunk")
+        self.overlap: int | None = _resolve_tunable(overlap, ENV_OVERLAP, name="overlap")
+        self.tile_num: int | None = _resolve_tunable(tile_num, ENV_TILE_NUM, name="tile_num")
+
         # Subprocess timeout in seconds (issue #134: was a hard-coded 2 hours).
         self.timeout_sec: int = int(os.environ.get("STEREOCRAFTER_TIMEOUT_SEC", str(DEFAULT_TIMEOUT_SEC)))
 
         # Verify paths
         self._validate_paths()
+
+    # ------------------------------------------------------------------
+    # OOM / throughput diagnostics
+    # ------------------------------------------------------------------
+    def _oom_tunables_hint(self) -> str:
+        """List the Stage-2 VRAM/throughput knobs an operator can lower on OOM.
+
+        Stage 2 (disocclusion inpainting) is the pipeline's heavy bottleneck
+        (≈66.7 s/frame on a 12 GB GPU).  All four knobs below trade VRAM for
+        speed; they are surfaced in every failure/timeout message so an
+        operator hitting OOM knows exactly what to dial down (issue #217).
+        ``unset`` means the flag is not passed and the upstream default is in
+        effect.
+        """
+        return (
+            f"  VRAM/throughput knobs (lower these on OOM — issue #217):\n"
+            f"    STEREOCRAFTER_MAX_RES        (currently {self.max_resolution})\n"
+            f"    STEREOCRAFTER_FRAMES_CHUNK   (currently {self.frames_chunk!r})\n"
+            f"    STEREOCRAFTER_OVERLAP        (currently {self.overlap!r})\n"
+            f"    STEREOCRAFTER_TILE_NUM       (currently {self.tile_num!r})\n"
+        )
 
     # ------------------------------------------------------------------
     # Path validation
@@ -654,6 +740,15 @@ class CLIBackend(StereoCrafterBackend):
             "--save_dir",
             sbs_dir,
         ]
+        # Stage-2 throughput knobs (issue #217): only add a flag when a value
+        # was explicitly set (arg or env).  None → omit the flag entirely so the
+        # upstream default applies (pre-#217 behaviour unchanged).
+        if self.frames_chunk is not None:
+            cmd += ["--frames_chunk", str(self.frames_chunk)]
+        if self.overlap is not None:
+            cmd += ["--overlap", str(self.overlap)]
+        if self.tile_num is not None:
+            cmd += ["--tile_num", str(self.tile_num)]
         self._run_subprocess(cmd, label="Stage 2 (disocclusion inpainting)", output_dir=sbs_dir)
 
         # --- Split the SBS output into separate L/R videos ---------------
@@ -732,7 +827,8 @@ class CLIBackend(StereoCrafterBackend):
                     f"StereoCrafter {label} timed out after {self.timeout_sec} seconds "
                     f"(configured via STEREOCRAFTER_TIMEOUT_SEC; default {DEFAULT_TIMEOUT_SEC}).\n"
                     f"  The video may be too long or the GPU too slow — raise the timeout or\n"
-                    f"  lower the workload (e.g. STEREOCRAFTER_MAX_RES, currently {self.max_resolution}).\n"
+                    f"  lower the workload.\n"
+                    f"{self._oom_tunables_hint()}"
                     f"  Command: {' '.join(cmd)}\n"
                     f"  cwd: {self.repo_dir}\n"
                     f"  Output dir: {output_dir}\n"
@@ -764,6 +860,7 @@ class CLIBackend(StereoCrafterBackend):
                     f"  cwd: {self.repo_dir}\n"
                     f"  Output dir: {output_dir}\n"
                     f"{_dir_listing_block(output_dir)}"
+                    f"{self._oom_tunables_hint()}"
                     f"  --- stdout (last {_OUTPUT_TAIL_FAILURE_LINES} lines) ---\n"
                     f"{_indent(stdout_tail)}\n"
                     f"  --- stderr (last {_OUTPUT_TAIL_FAILURE_LINES} lines) ---\n"
@@ -860,6 +957,9 @@ class StereoCrafterRenderer:
         pre_trained_path: str | None = None,
         max_resolution: int | None = None,
         max_disp: float | None = None,
+        frames_chunk: int | None = None,
+        overlap: int | None = None,
+        tile_num: int | None = None,
     ) -> None:
         _assert_cuda()
 
@@ -873,6 +973,9 @@ class StereoCrafterRenderer:
                 pre_trained_path=pre_trained_path,
                 max_resolution=max_resolution,
                 max_disp=max_disp,
+                frames_chunk=frames_chunk,
+                overlap=overlap,
+                tile_num=tile_num,
             )
 
     def render_video(
