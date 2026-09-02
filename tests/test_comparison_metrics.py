@@ -21,6 +21,8 @@ numpy frames (CPU-only, no GPU/cv2) — used to prove the threshold linkage.
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -475,3 +477,160 @@ class TestComparisonMdMetricsRendering:
         rows = [RecipeResult(recipe="x", ok=True)]
         md = render_comparison_md(rows, source="s.mp4", outdir="/o")
         assert f"{DEPTH_BASELINE_FLICKER:.4f}" in md
+
+
+# ---------------------------------------------------------------------------
+# K-17 (#208): per-recipe depth dirs, no cross-model fallback, freshness gate
+# ---------------------------------------------------------------------------
+
+
+def _write_npy_at(tmp_path: Path, name: str, mtime: float) -> Path:
+    """Write a tiny depth_*.npy and stamp an arbitrary mtime onto it."""
+    p = tmp_path / name
+    np.save(p, np.zeros((4, 4), dtype=np.float32))
+    os.utime(p, (mtime, mtime))
+    return p
+
+
+class TestPerRecipeDepthDir:
+    """Each recipe must render into, and be graded from, its own depth dir."""
+
+    def test_build_render_command_appends_distinct_temp_dir_per_recipe(self, tmp_path: Path) -> None:
+        recipes = [
+            mc.Recipe(name="baseline", args=["--comfort", "strong"]),
+            mc.Recipe(name="temporal", args=["--depth-model", "depthcrafter", "--comfort", "safe"]),
+        ]
+        cmd_a = mc.build_render_command("in.mp4", "out/a.mp4", recipes[0], outdir=tmp_path)
+        cmd_b = mc.build_render_command("in.mp4", "out/b.mp4", recipes[1], outdir=tmp_path)
+
+        assert "--temp-dir" in cmd_a and "--temp-dir" in cmd_b
+        temp_a = cmd_a[cmd_a.index("--temp-dir") + 1]
+        temp_b = cmd_b[cmd_b.index("--temp-dir") + 1]
+        # the two recipes resolve to different per-recipe work dirs
+        assert temp_a != temp_b
+        assert temp_a.endswith("baseline")
+        assert temp_b.endswith("temporal")
+
+    def test_no_outdir_keeps_argv_shape_unchanged(self) -> None:
+        """Unit tests that only check argv order still get the pre-#208 shape."""
+        recipe = mc.Recipe(name="x", args=[])
+        cmd = mc.build_render_command("in.mp4", "out/x.mp4", recipe)
+        assert "--temp-dir" not in cmd
+
+
+class TestDefaultDepthDirResolver:
+    """The default resolver must only grade this recipe's own, fresh depth dir."""
+
+    def test_fresh_npy_in_recipe_dir_is_returned(self, tmp_path: Path) -> None:
+        work = tmp_path / "_work" / "baseline"
+        depth_dir = work / "depth"
+        depth_dir.mkdir(parents=True)
+        now = time.time()
+        _write_npy_at(depth_dir, "depth_001.npy", now + 5)
+        _write_npy_at(depth_dir, "depth_002.npy", now + 6)
+
+        result = RecipeResult(
+            recipe="baseline",
+            temp_dir=str(work),
+            render_started=now - 60,
+        )
+        got = mc.default_depth_dir_resolver("src.mp4", mc.Recipe(name="baseline", args=[]), result)
+        assert got == str(depth_dir)
+
+    def test_missing_recipe_dir_returns_none(self, tmp_path: Path) -> None:
+        """No depth dir at all → None, cells render as —."""
+        work = tmp_path / "_work" / "baseline"  # deliberately absent
+        result = RecipeResult(recipe="baseline", temp_dir=str(work), render_started=0.0)
+        assert mc.default_depth_dir_resolver("src.mp4", mc.Recipe(name="baseline", args=[]), result) is None
+
+    def test_no_temp_dir_returns_none(self, tmp_path: Path) -> None:
+        """Row without a per-recipe temp dir (e.g. a legacy/injected unit row) → None."""
+        result = RecipeResult(recipe="baseline", temp_dir=None)
+        assert mc.default_depth_dir_resolver("src.mp4", mc.Recipe(name="baseline", args=[]), result) is None
+
+    def test_empty_recipe_dir_returns_none(self, tmp_path: Path) -> None:
+        work = tmp_path / "_work" / "baseline"
+        (work / "depth").mkdir(parents=True)  # dir exists but has no npy
+        result = RecipeResult(recipe="baseline", temp_dir=str(work), render_started=0.0)
+        assert mc.default_depth_dir_resolver("src.mp4", mc.Recipe(name="baseline", args=[]), result) is None
+
+    def test_other_recipe_dir_with_npy_is_never_read(self, tmp_path: Path) -> None:
+        """A depth dir populated for a *different* recipe must not be graded as
+        this recipe's result — the exact cross-recipe contamination this bug
+        introduced.  Even when the other dir is full of fresh-looking npy, the
+        answer is —.
+        """
+        baseline_work = tmp_path / "_work" / "baseline"
+        temporal_work = tmp_path / "_work" / "temporal"
+        (temporal_work / "depth").mkdir(parents=True)
+        now = time.time()
+        _write_npy_at(temporal_work / "depth", "depth_001.npy", now + 5)
+        _write_npy_at(temporal_work / "depth", "depth_002.npy", now + 6)
+
+        # Ask about the baseline recipe — whose own dir does NOT exist.
+        result = RecipeResult(
+            recipe="baseline",
+            temp_dir=str(baseline_work),
+            render_started=now - 60,
+        )
+        assert mc.default_depth_dir_resolver("src.mp4", mc.Recipe(name="baseline", args=[]), result) is None
+
+    def test_stale_npy_older_than_render_returns_none_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """npy present but mtime predates this render → — with a warning.
+
+        This is the headline K-17 bug: an 18-hour-old depth dir being graded as
+        the current recipe's result produced identical flicker numbers for both
+        backends.  After the fix the resolver refuses stale files.
+        """
+        work = tmp_path / "_work" / "baseline"
+        depth_dir = work / "depth"
+        depth_dir.mkdir(parents=True)
+        now = time.time()
+        # write npy as if it were 2 hours old — way before this render started
+        _write_npy_at(depth_dir, "depth_001.npy", now - 7200)
+
+        result = RecipeResult(
+            recipe="baseline",
+            temp_dir=str(work),
+            render_started=now,
+        )
+        assert mc.default_depth_dir_resolver("src.mp4", mc.Recipe(name="baseline", args=[]), result) is None
+        assert any("older than this render" in r.message for r in caplog.records)
+
+    def test_recently_rendered_npy_at_start_of_render_is_not_stale(self, tmp_path: Path) -> None:
+        """A file written essentially at render start (within the 1s grace
+        window) must NOT be rejected — genuine near-instant renders are valid."""
+        work = tmp_path / "_work" / "baseline"
+        depth_dir = work / "depth"
+        depth_dir.mkdir(parents=True)
+        now = time.time()
+        # written just a tick before render_started — still within the window
+        _write_npy_at(depth_dir, "depth_001.npy", now - 0.5)
+
+        result = RecipeResult(recipe="baseline", temp_dir=str(work), render_started=now)
+        assert mc.default_depth_dir_resolver("src.mp4", mc.Recipe(name="baseline", args=[]), result) == str(depth_dir)
+
+    def test_different_backends_resolve_to_different_dirs(self, tmp_path: Path) -> None:
+        """baseline and temporal must grade from *different* depth dirs, so
+        their flicker numbers can actually diverge."""
+        now = time.time()
+
+        baseline_work = tmp_path / "_work" / "baseline"
+        temporal_work = tmp_path / "_work" / "temporal"
+        (baseline_work / "depth").mkdir(parents=True)
+        (temporal_work / "depth").mkdir(parents=True)
+        _write_npy_at(baseline_work / "depth", "depth_001.npy", now + 5)
+        _write_npy_at(temporal_work / "depth", "depth_001.npy", now + 5)
+
+        baseline_result = RecipeResult(recipe="baseline", temp_dir=str(baseline_work), render_started=now - 60)
+        temporal_result = RecipeResult(recipe="temporal", temp_dir=str(temporal_work), render_started=now - 60)
+        got_baseline = mc.default_depth_dir_resolver("src.mp4", mc.Recipe(name="baseline", args=[]), baseline_result)
+        got_temporal = mc.default_depth_dir_resolver(
+            "src.mp4",
+            mc.Recipe(name="temporal", args=["--depth-model", "depthcrafter"]),
+            temporal_result,
+        )
+        assert got_baseline is not None and got_temporal is not None
+        assert got_baseline != got_temporal
