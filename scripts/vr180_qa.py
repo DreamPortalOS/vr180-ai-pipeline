@@ -37,7 +37,15 @@ from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
-from pipeline.spherical_injector import _STEREO_LEFT_RIGHT, _find_box_recursive
+# K-15 (#205): let this script run directly (``python scripts/vr180_qa.py``)
+# without the caller having to set PYTHONPATH — put the repo root on sys.path
+# before importing the ``pipeline`` package.  Idempotent (no duplicate entries)
+# and a no-op when PYTHONPATH already points here.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from pipeline.spherical_injector import _STEREO_LEFT_RIGHT, _find_box_recursive  # noqa: E402
 
 # V-1 standard tier: 2880×2880 per eye (5760×2880 SBS frame).
 MIN_PER_EYE_WIDTH = 2880

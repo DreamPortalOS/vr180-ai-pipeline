@@ -56,6 +56,15 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+# K-15 (#205): let this script run directly (``python scripts/batch_runner.py``)
+# without the caller having to set PYTHONPATH — put the repo root on sys.path
+# before the (lazily-imported) ``pipeline`` / ``scripts`` packages are touched.
+# Idempotent (no duplicate entries) and a no-op when PYTHONPATH already points
+# here.  All repo imports here are inside functions, so no E402 to silence.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 log = logging.getLogger("batch-runner")
 
 # Collision-guard: when a scene-named target already exists and is NOT a

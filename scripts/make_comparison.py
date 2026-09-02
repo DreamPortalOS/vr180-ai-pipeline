@@ -56,7 +56,18 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pipeline.naming import SceneAssetSpec, compose_scene_name
+# K-15 (#205): let this script run directly (``python scripts/make_comparison.py``)
+# without the caller having to set PYTHONPATH — put the repo root on sys.path
+# before importing the ``pipeline`` / ``scripts`` packages.  Idempotent (no
+# duplicate entries) and a no-op when PYTHONPATH already points here.  With the
+# repo root on sys.path the ``scripts.vr180_qa`` package import below succeeds
+# for direct invocation too, so the flat-import fallback is no longer reached
+# (kept for safety / other invocation styles — ``# pragma: no cover``).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from pipeline.naming import SceneAssetSpec, compose_scene_name  # noqa: E402
 
 try:
     # Package import (tests, ``python -m scripts.make_comparison``).
