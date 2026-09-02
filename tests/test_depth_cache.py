@@ -13,7 +13,6 @@ All tests use mock backends and plain files under ``tmp_path``-based
 
 from __future__ import annotations
 
-import io
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -392,94 +391,81 @@ def _depth_npy_files(depth_dir: Path) -> list[Path]:
 
 
 def _seed_and_hit(tmp_path: Path):
-    """Run twice with the same clip to produce a miss-then-hit pair.
+    """Set up a cache entry and a fresh depth_dir, returning objects for a hit.
 
-    Returns ``(estimator, backend, depth_dir, clip)`` where the cache is
-    already populated and ``backend.call_count == 1``.  Callers then clear
-    *depth_dir* and re-invoke to prove the hit path refills it.
+    ``CountingBackend`` (like any in-memory mock) does NOT write depth_*.npy
+    files on the miss path — only the real CLIBackend subprocess does that as
+    a side effect.  To exercise the *hit* path in isolation (which is exactly
+    the K-23a bug), we seed the cache entry dir directly, then clear depth_dir
+    so the hit has an empty dir to refill.  Returns
+    ``(estimator, backend, depth_dir, clip, entry_dir, cached_depths)``.
     """
+    from pipeline.depth_crafter import _save_depth_cache
+
     cache_dir = tmp_path / "cache"
     depth_dir = tmp_path / "depth"
+    depth_dir.mkdir(parents=True, exist_ok=True)
     backend = CountingBackend(num_frames=3)
     est = _make_estimator(backend, cache_dir=cache_dir)
     clip = _write_fake_video(tmp_path / "clip.mp4")
 
-    # First call: miss. Populates cache AND depth_dir.
-    depths = est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
+    # Seed the cache entry directly (the miss path's _save_depth_cache step).
+    rng = np.random.default_rng(42)
+    cached_depths = [rng.random((64, 96)).astype(np.float32) for _ in range(3)]
+    key = _depth_cache_key(str(clip), backend, target_size=None)
+    entry_dir = cache_dir / key
+    _save_depth_cache(entry_dir, cached_depths, backend, target_size=None)
+    assert entry_dir.is_dir()
 
-    assert backend.call_count == 1
-    assert len(depths) == 3
-    assert len(_depth_npy_files(depth_dir)) == 3, "miss path must leave npy files in depth_dir"
-    return est, backend, depth_dir, clip
+    return est, backend, depth_dir, clip, entry_dir, cached_depths
 
 
 def test_hit_materializes_npy_into_depth_dir(tmp_path: Path) -> None:
     """Hit path with a depth_dir must write depth_*.npy there (the K-23a bug)."""
-    est, backend, depth_dir, clip = _seed_and_hit(tmp_path)
+    est, backend, depth_dir, clip, _entry_dir, _cached = _seed_and_hit(tmp_path)
 
-    # Clear the depth_dir that the miss left behind — the exact situation
-    # the streaming pipeline creates: <temp_dir>/depth exists but is empty
-    # when the second (identical) run hits the cache.
-    for f in _depth_npy_files(depth_dir):
-        f.unlink()
+    # depth_dir exists but is empty — the exact situation the streaming
+    # pipeline creates on a repeat run.
+    assert depth_dir.is_dir()
     assert len(_depth_npy_files(depth_dir)) == 0
 
-    # Second call: hit. Must refill depth_dir WITHOUT touching the backend.
     depths = est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
 
-    assert backend.call_count == 1, "cache hit must not invoke the backend"
+    assert backend.call_count == 0, "cache hit must not invoke the backend"
     assert len(depths) == 3
     assert len(_depth_npy_files(depth_dir)) == 3, "hit path must materialize npy into depth_dir"
 
 
-def test_hit_materialized_files_equal_miss_files(tmp_path: Path) -> None:
-    """Files written by the hit path must be byte-equal to the miss path's."""
-    est, _backend, depth_dir, clip = _seed_and_hit(tmp_path)
+def test_hit_materialized_files_equal_cache_files(tmp_path: Path) -> None:
+    """Files materialized by the hit path must be byte-equal to the cached ones."""
+    est, backend, depth_dir, clip, _entry_dir, cached_depths = _seed_and_hit(tmp_path)
 
-    miss_files = sorted(p.read_bytes() for p in _depth_npy_files(depth_dir))
+    depths = est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
 
-    for f in _depth_npy_files(depth_dir):
-        f.unlink()
-    est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
-
-    hit_arrays = [np.load(str(p)) for p in _depth_npy_files(depth_dir)]
-    miss_arrays = [np.load(io.BytesIO(b)) for b in miss_files]
-    for hit, miss in zip(hit_arrays, miss_arrays, strict=True):
-        np.testing.assert_array_equal(hit, miss)
+    assert backend.call_count == 0
+    for materialized, cached in zip(depths, cached_depths, strict=True):
+        np.testing.assert_array_equal(materialized, cached)
+    for i, p in enumerate(_depth_npy_files(depth_dir), start=0):
+        on_disk = np.load(str(p))
+        np.testing.assert_array_equal(on_disk, cached_depths[i])
 
 
 def test_hit_with_none_depth_dir_is_memory_only(tmp_path: Path) -> None:
     """Hit + depth_dir=None must NOT write any files and still returns arrays."""
-    import shutil
+    est, backend, depth_dir, clip, _entry_dir, _cached = _seed_and_hit(tmp_path)
 
-    cache_dir = tmp_path / "cache"
-    backend = CountingBackend(num_frames=3)
-    est = _make_estimator(backend, cache_dir=cache_dir)
-    clip = _write_fake_video(tmp_path / "clip.mp4")
-    depth_dir = tmp_path / "depth"
-
-    # Seed with a real depth_dir so the cache entry exists and depth_dir is
-    # populated (miss path).  Then remove it to have a clean "no files"
-    # baseline to assert against.
-    est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
-    assert backend.call_count == 1
-    shutil.rmtree(depth_dir)  # start with NO depth_dir at all
-
-    # Hit with depth_dir=None.  Must return arrays but write nothing.
     depths = est.estimate_video(input_path=str(clip), output_dir=None)
 
-    assert backend.call_count == 1, "must be a cache hit"
+    assert backend.call_count == 0, "must be a cache hit"
     assert len(depths) == 3
-    assert not depth_dir.exists(), "depth_dir=None must not create any depth_dir"
+    assert len(_depth_npy_files(depth_dir)) == 0, "depth_dir=None must not create any files"
 
 
 def test_hit_materialize_logs_materialized_message(tmp_path: Path, caplog) -> None:
     """Hit + depth_dir logs ``[cache] hit <key> → materialized N maps``."""
     import logging
 
-    est, _backend, depth_dir, clip = _seed_and_hit(tmp_path)
-    for f in _depth_npy_files(depth_dir):
-        f.unlink()
+    est, _backend, depth_dir, clip, _entry_dir, _cached = _seed_and_hit(tmp_path)
 
     with caplog.at_level(logging.INFO, logger="pipeline.depth_crafter"):
         est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
@@ -492,9 +478,9 @@ def test_hit_materialize_logs_materialized_message(tmp_path: Path, caplog) -> No
 
 def test_hit_materialize_link_fallback_to_copy(tmp_path: Path, monkeypatch) -> None:
     """When os.link raises OSError, fall back to shutil.copy2 and still succeed."""
-    import shutil as _shutil
+    import shutil
 
-    est, backend, depth_dir, clip = _seed_and_hit(tmp_path)
+    est, backend, depth_dir, clip, _entry_dir, _cached = _seed_and_hit(tmp_path)
 
     calls = {"link": 0, "copy": 0}
 
@@ -504,16 +490,15 @@ def test_hit_materialize_link_fallback_to_copy(tmp_path: Path, monkeypatch) -> N
 
     def fake_copy2(src, dst, *a, **kw):
         calls["copy"] += 1
-        return _shutil.copy2(src, dst, *a, **kw)
+        with open(src, "rb") as f_in, open(dst, "wb") as f_out:
+            f_out.write(f_in.read())
 
     monkeypatch.setattr("pipeline.depth_crafter.os.link", fake_link)
-    monkeypatch.setattr("pipeline.depth_crafter.shutil.copy2", fake_copy2)
+    monkeypatch.setattr(shutil, "copy2", fake_copy2)
 
-    for f in _depth_npy_files(depth_dir):
-        f.unlink()
     depths = est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
 
-    assert backend.call_count == 1
+    assert backend.call_count == 0
     assert len(depths) == 3
     assert len(_depth_npy_files(depth_dir)) == 3, "copy fallback must still populate depth_dir"
     assert calls["link"] >= 1, "should have attempted os.link"
