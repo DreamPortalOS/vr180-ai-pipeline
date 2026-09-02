@@ -1380,3 +1380,104 @@ class TestVerifyOnlyDualPath:
         with pytest.raises(SystemExit):
             setup.main(["--verify-only"])
         fake_hf.snapshot_download.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Issue #201: --verify-only summary count must match the per-line verdicts on
+# the HF-cache branch.  The bug: a 2/3 HF-cache copy was reported as 0/3
+# because the summary only promoted the HF count when it was FULLY complete.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyOnlySummaryCount:
+    """Issue #201: the summary ``X/3`` count must equal the number of distinct
+    components OK in at least one inspected location — consistent with the
+    per-line verdicts printed above it — across all three completeness states
+    on the HF-cache branch (where the bug lived)."""
+
+    @staticmethod
+    def _hf_cache_state(tmp_path, present: tuple[str, ...]) -> Path:
+        """Build a fake HF-cache snapshot dir with the given components present
+        as real weights; any of the three components not in *present* is left
+        config-only (so it is correctly MISSING)."""
+        hf_snap = tmp_path / "hf-cache" / "snapshots" / "abc123"
+        hf_snap.mkdir(parents=True)
+        for name in setup._SVD_WEIGHT_COMPONENTS:
+            if name in present:
+                _write_weight(hf_snap, name)
+            else:
+                comp = hf_snap / name
+                comp.mkdir(parents=True, exist_ok=True)
+                (comp / "config.json").write_text("{}", encoding="utf-8")
+        (hf_snap / "model_index.json").write_text("{}", encoding="utf-8")
+        return hf_snap
+
+    def _capture_summary(self, caplog, sandbox, monkeypatch, hf_snap) -> str:
+        """Run --verify-only with an absent in-repo dir + the given HF-cache
+        snapshot, returning the joined log so the summary line can be asserted."""
+        caplog.set_level("INFO", logger="setup-stereocrafter")
+
+        # In-repo dir absent → the HF-cache branch is the one that prints.
+        assert not sandbox.svd_dir.exists()
+        monkeypatch.setattr(setup, "_hf_cache_snapshot_dir", lambda _r: hf_snap)
+        monkeypatch.setitem(sys.modules, "huggingface_hub", MagicMock(snapshot_download=MagicMock()))
+        with pytest.raises(SystemExit):
+            setup.main(["--verify-only"])
+        return "\n".join(r.message for r in caplog.records)
+
+    def test_hf_cache_all_complete_summary_is_three_thirds(self, sandbox, monkeypatch, tmp_path, caplog):
+        """3/3: all components OK → summary says 3/3 (and exits 0)."""
+        hf_snap = self._hf_cache_state(tmp_path, present=("image_encoder", "unet", "vae"))
+        joined = self._capture_summary(caplog, sandbox, monkeypatch, hf_snap)
+        assert "3/3 components complete" in joined, joined
+        # The complete summary has no "(missing: …)" clause (note: the
+        # in-repo "directory missing:" line is unrelated and must not match).
+        assert "(missing:" not in joined.lower(), joined
+
+    def test_hf_cache_only_unet_missing_summary_is_two_thirds(self, sandbox, monkeypatch, tmp_path, caplog):
+        """THE BUG (issue #201): only unet missing → summary must say 2/3 (not
+        0/3) and name `unet`.  This is the exact state the lead hit on #190:
+        image_encoder + vae OK in the HF cache, unet config-only."""
+        hf_snap = self._hf_cache_state(tmp_path, present=("image_encoder", "vae"))
+        joined = self._capture_summary(caplog, sandbox, monkeypatch, hf_snap)
+        assert "2/3 components complete" in joined, joined
+        assert "missing: unet" in joined.lower(), joined
+        # Must NOT claim 0/3 (the buggy behaviour that sent the lead to re-download).
+        assert "0/3" not in joined, joined
+
+    def test_hf_cache_all_missing_summary_is_zero_thirds(self, sandbox, monkeypatch, tmp_path, caplog):
+        """0/3: all three components missing → summary says 0/3 and lists all three."""
+        hf_snap = self._hf_cache_state(tmp_path, present=())
+        joined = self._capture_summary(caplog, sandbox, monkeypatch, hf_snap)
+        assert "0/3 components complete" in joined, joined
+        # Every component must be named in the missing list.
+        for name in setup._SVD_WEIGHT_COMPONENTS:
+            assert name in joined.lower(), (name, joined)
+
+    def test_hf_cache_count_matches_per_line_verdicts(self, sandbox, monkeypatch, tmp_path, caplog):
+        """The summary count must equal the number of `OK` lines printed for
+        the HF-cache branch — the consistency guarantee at the heart of #201.
+        With only unet missing, exactly two `[hf-cache]` OK lines are printed
+        and the summary says 2/3."""
+        hf_snap = self._hf_cache_state(tmp_path, present=("image_encoder", "vae"))
+        joined = self._capture_summary(caplog, sandbox, monkeypatch, hf_snap)
+        ok_lines = [ln for ln in joined.splitlines() if "[hf-cache]" in ln and " OK " in ln]
+        assert len(ok_lines) == 2, joined
+        assert "2/3 components complete" in joined, joined
+
+    def test_inrepo_all_complete_summary_unchanged(self, sandbox, monkeypatch, tmp_path, caplog):
+        """Sanity: the in-repo branch (where the count was already correct)
+        must keep reporting 3/3.  Guards against the refactor regressing the
+        non-buggy path."""
+        sandbox.svd_dir.mkdir(parents=True)
+        for name in setup._SVD_WEIGHT_COMPONENTS:
+            _write_weight(sandbox.svd_dir, name)
+        # No HF-cache fallback so the in-repo path is the sole source.
+        monkeypatch.setattr(setup, "_hf_cache_snapshot_dir", lambda _r: None)
+        monkeypatch.setitem(sys.modules, "huggingface_hub", MagicMock(snapshot_download=MagicMock()))
+        caplog.set_level("INFO", logger="setup-stereocrafter")
+        with pytest.raises(SystemExit) as exc_info:
+            setup.main(["--verify-only"])
+        assert exc_info.value.code == 0
+        joined = "\n".join(r.message for r in caplog.records)
+        assert "3/3 components complete" in joined, joined
