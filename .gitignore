@@ -62,6 +62,11 @@ video/mock_*.mp4
 models/
 !models/.gitkeep
 
+# Depth-product cache (issue #182, I-8a): content-keyed depth maps produced
+# by DepthCrafter runs.  Lives under models/ so it's already ignored above,
+# but listed explicitly so the cache is never accidentally committed.
+models/.cache/
+
 # In-repo third-party deps (SeedVR2 node + its dedicated venv — gitignored, never committed)
 third_party/
 

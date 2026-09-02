@@ -1,0 +1,376 @@
+"""Tests for the DepthCrafter content-keyed product cache (issue #182, I-8a).
+
+The cache sits in front of the pluggable backend in
+``DepthCrafterEstimator.estimate_video``: a hit serves the cached depth maps
+and never spawns the (CUDA) subprocess/injected backend; a miss runs the
+backend and stores its product.  The key is *content-only* — same source at a
+different path still hits — folded with the backend's output-affecting params
+(``target_size`` included).
+
+All tests use mock backends and plain files under ``tmp_path``-based
+``cache_dir`` roots — no CUDA, no real model, no repo working-tree pollution.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+
+from pipeline.depth_crafter import (
+    DepthCrafterBackend,
+    DepthCrafterEstimator,
+    _backend_cache_params,
+    _depth_cache_key,
+    _video_content_digest,
+)
+
+# ---------------------------------------------------------------------------
+# Mock backends — pluggable, like the production ones
+# ---------------------------------------------------------------------------
+
+
+class CountingBackend(DepthCrafterBackend):
+    """Mock backend that records every call and returns deterministic depths.
+
+    Mirrors the real backend's attribute surface (``max_resolution``,
+    ``process_length``, ``target_fps``) so the cache key has something to fold
+    in.  ``call_count`` is the assertion hook for "subprocess not spawned".
+    """
+
+    def __init__(
+        self,
+        num_frames: int = 3,
+        h: int = 64,
+        w: int = 96,
+        max_resolution: int = 512,
+        process_length: int | None = None,
+        target_fps: int | None = None,
+    ) -> None:
+        self.num_frames = num_frames
+        self.h = h
+        self.w = w
+        self.max_resolution = max_resolution
+        self.process_length = process_length
+        self.target_fps = target_fps
+        self.call_count = 0
+        self.last_target_size: tuple[int, int] | None = None
+
+    def estimate_video(
+        self,
+        input_path: str,
+        output_dir: str,
+        target_size: tuple[int, int] | None = None,
+    ) -> list[np.ndarray]:
+        self.call_count += 1
+        self.last_target_size = target_size
+        rng = np.random.default_rng(42)
+        return [rng.random((self.h, self.w)).astype(np.float32) for _ in range(self.num_frames)]
+
+
+class BareBackend(DepthCrafterBackend):
+    """Backend with NONE of the optional cache params (issue #182 round 1).
+
+    Has no ``max_resolution`` / ``process_length`` / ``target_fps`` — proves
+    the safe ``getattr(..., None)`` reads never raise ``AttributeError`` and
+    the cache path still works (hit and miss).
+    """
+
+    def __init__(self, num_frames: int = 2, h: int = 32, w: int = 48) -> None:
+        self.num_frames = num_frames
+        self.h = h
+        self.w = w
+        self.call_count = 0
+
+    def estimate_video(
+        self,
+        input_path: str,
+        output_dir: str,
+        target_size: tuple[int, int] | None = None,
+    ) -> list[np.ndarray]:
+        self.call_count += 1
+        rng = np.random.default_rng(7)
+        return [rng.random((self.h, self.w)).astype(np.float32) for _ in range(self.num_frames)]
+
+
+def _write_fake_video(path: Path, content: bytes = b"fake video content") -> Path:
+    """Write a plain file standing in for an input clip (NOT a NamedTemporaryFile).
+
+    A plain path is used instead of ``tempfile.NamedTemporaryFile`` because
+    on Windows the latter holds an exclusive lock that prevents the content
+    digest's ``open(path, 'rb')`` from reading it — the exact gotcha that
+    forces ``estimate_video`` to disable caching for locked inputs.  Using a
+    plain file means the cache path is exercised for real.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Content digest + cache key primitives
+# ---------------------------------------------------------------------------
+
+
+def test_video_content_digest_is_path_independent(tmp_path: Path) -> None:
+    """Same bytes at a different path → same digest (content-only, not path)."""
+    a = _write_fake_video(tmp_path / "clip_a.mp4", b"hello world video")
+    b = _write_fake_video(tmp_path / "nested" / "clip_b.mp4", b"hello world video")
+    assert _video_content_digest(a) == _video_content_digest(b)
+
+
+def test_video_content_digest_differs_on_content(tmp_path: Path) -> None:
+    """Different bytes → different digest."""
+    a = _write_fake_video(tmp_path / "a.mp4", b"content one")
+    b = _write_fake_video(tmp_path / "b.mp4", b"content two")
+    assert _video_content_digest(a) != _video_content_digest(b)
+
+
+def test_video_content_digest_differs_on_size_only(tmp_path: Path) -> None:
+    """Same prefix, different length → different digest (size term)."""
+    a = _write_fake_video(tmp_path / "a.mp4", b"abc")
+    b = _write_fake_video(tmp_path / "b.mp4", b"abcd")
+    assert _video_content_digest(a) != _video_content_digest(b)
+
+
+def test_cache_key_includes_target_size(tmp_path: Path) -> None:
+    """A different target_size MUST yield a different key (round 2 regression)."""
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+    backend = CountingBackend()
+    k1 = _depth_cache_key(str(clip), backend, target_size=(720, 1280))
+    k2 = _depth_cache_key(str(clip), backend, target_size=(360, 640))
+    assert k1 != k2
+
+
+def test_cache_key_changes_when_max_res_changes(tmp_path: Path) -> None:
+    """A backend with a different max_resolution yields a different key."""
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+    k1 = _depth_cache_key(str(clip), CountingBackend(max_resolution=512), target_size=None)
+    k2 = _depth_cache_key(str(clip), CountingBackend(max_resolution=768), target_size=None)
+    assert k1 != k2
+
+
+def test_backend_cache_params_safe_on_bare_backend() -> None:
+    """A backend without max_resolution etc. contributes None, never raises."""
+    params = _backend_cache_params(BareBackend(), target_size=None)
+    assert params["max_res"] is None
+    assert params["process_length"] is None
+    assert params["target_fps"] is None
+    assert params["target_size"] is None
+
+
+# ---------------------------------------------------------------------------
+# Hit / miss / reuse behaviour via DepthCrafterEstimator
+# ---------------------------------------------------------------------------
+
+
+def _make_estimator(backend: DepthCrafterBackend, cache_dir: Path) -> DepthCrafterEstimator:
+    """Build an estimator whose cache lives under *cache_dir* (never the repo)."""
+    with patch("pipeline.depth_crafter._assert_cuda"):  # bypass CUDA check in CI
+        return DepthCrafterEstimator(backend=backend, cache_dir=cache_dir)
+
+
+def test_second_call_hits_cache_and_skips_backend(tmp_path: Path) -> None:
+    """Same input + same params twice → second call hits, backend NOT called again."""
+    backend = CountingBackend(num_frames=3)
+    estimator = _make_estimator(backend, cache_dir=tmp_path / "cache")
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+
+    first = estimator.estimate_video(str(clip))
+    second = estimator.estimate_video(str(clip))
+
+    assert backend.call_count == 1, "backend must not be invoked on a cache hit"
+    assert len(first) == 3 and len(second) == 3
+    # Byte-exact reuse: the cached maps are the very same arrays returned the first time.
+    for a, b in zip(first, second, strict=True):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_hit_logs_key_prefix(tmp_path: Path, caplog) -> None:
+    """A cache hit logs ``[cache] hit <key前8位>``."""
+    import logging
+
+    backend = CountingBackend()
+    estimator = _make_estimator(backend, cache_dir=tmp_path / "cache")
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+    estimator.estimate_video(str(clip))  # seed
+
+    with caplog.at_level(logging.INFO, logger="pipeline.depth_crafter"):
+        estimator.estimate_video(str(clip))  # hit
+
+    assert any("[cache] hit" in r.message for r in caplog.records)
+    # The 8-char key prefix is surfaced.
+    hit_rec = next(r for r in caplog.records if "[cache] hit" in r.message)
+    assert any(c.isalnum() for c in hit_rec.message)
+
+
+def test_changed_max_res_misses_and_recomputes(tmp_path: Path) -> None:
+    """Changing a key param (max_resolution) → miss → backend called again."""
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+
+    backend_a = CountingBackend(max_resolution=512)
+    est_a = _make_estimator(backend_a, cache_dir=tmp_path / "cache")
+    est_a.estimate_video(str(clip))
+    assert backend_a.call_count == 1
+
+    # Same clip, different max_res → different key → miss.
+    backend_b = CountingBackend(max_resolution=768)
+    est_b = _make_estimator(backend_b, cache_dir=tmp_path / "cache")
+    est_b.estimate_video(str(clip))
+    assert backend_b.call_count == 1, "changed max_res must not hit the old entry"
+
+
+def test_changed_target_size_misses_and_recomputes(tmp_path: Path) -> None:
+    """Changing ONLY target_size (everything else identical) → miss → re-invoke."""
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+    cache_dir = tmp_path / "cache"
+
+    backend = CountingBackend()
+    est = _make_estimator(backend, cache_dir=cache_dir)
+
+    est.estimate_video(str(clip), target_size=(720, 1280))
+    assert backend.call_count == 1
+    assert backend.last_target_size == (720, 1280)
+
+    est.estimate_video(str(clip), target_size=(360, 640))
+    assert backend.call_count == 2, "different target_size must re-invoke the backend"
+    assert backend.last_target_size == (360, 640)
+
+    # And the same target_size as before now hits (it was cached on its miss).
+    est.estimate_video(str(clip), target_size=(720, 1280))
+    assert backend.call_count == 2, "returning to a previously-cached target_size must hit"
+
+
+def test_use_cache_false_forces_recompute(tmp_path: Path) -> None:
+    """``use_cache=False`` bypasses the cache entirely — even after a seed."""
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+    cache_dir = tmp_path / "cache"
+    backend = CountingBackend()
+
+    with patch("pipeline.depth_crafter._assert_cuda"):
+        est_cache = DepthCrafterEstimator(backend=backend, cache_dir=cache_dir)
+        est_nocache = DepthCrafterEstimator(backend=backend, cache_dir=cache_dir, use_cache=False)
+
+    est_cache.estimate_video(str(clip))  # seed the cache (backend called once)
+    assert backend.call_count == 1
+
+    est_nocache.estimate_video(str(clip))  # use_cache=False → must NOT hit
+    assert backend.call_count == 2, "use_cache=False must force a recompute"
+
+
+def test_same_content_different_path_still_hits(tmp_path: Path) -> None:
+    """The 'only by content' requirement: copy the clip elsewhere → still a hit."""
+    cache_dir = tmp_path / "cache"
+    backend = CountingBackend()
+    est = _make_estimator(backend, cache_dir=cache_dir)
+
+    original = _write_fake_video(tmp_path / "originals" / "clip.mp4", b"identical bytes")
+    est.estimate_video(str(original))  # seed
+    assert backend.call_count == 1
+
+    # Copy the SAME bytes to a different location + name.  Content digest is
+    # path-independent, so the cache must hit and the backend stays at 1 call.
+    copy = _write_fake_video(tmp_path / "elsewhere" / "renamed_clip.mp4", b"identical bytes")
+    est.estimate_video(str(copy))
+    assert backend.call_count == 1, "same content at a new path must hit the cache"
+
+
+def test_different_content_misses(tmp_path: Path) -> None:
+    """Genuinely different content → different digest → miss → recompute."""
+    cache_dir = tmp_path / "cache"
+    backend = CountingBackend()
+    est = _make_estimator(backend, cache_dir=cache_dir)
+
+    a = _write_fake_video(tmp_path / "a.mp4", b"clip content A")
+    b = _write_fake_video(tmp_path / "b.mp4", b"clip content B")
+
+    est.estimate_video(str(a))
+    est.estimate_video(str(b))
+    assert backend.call_count == 2, "different content must not hit"
+
+
+# ---------------------------------------------------------------------------
+# Round 1 regression: backend without the optional params
+# ---------------------------------------------------------------------------
+
+
+def test_bare_backend_caches_hit(tmp_path: Path) -> None:
+    """A backend lacking max_resolution/process_length/target_fps still hits."""
+    cache_dir = tmp_path / "cache"
+    backend = BareBackend(num_frames=2)
+    est = _make_estimator(backend, cache_dir=cache_dir)
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+
+    est.estimate_video(str(clip))
+    est.estimate_video(str(clip))
+    assert backend.call_count == 1, "bare backend must hit on the second call"
+
+
+def test_bare_backend_with_target_size_caches(tmp_path: Path) -> None:
+    """Bare backend + a target_size still caches, and a new target_size misses."""
+    cache_dir = tmp_path / "cache"
+    backend = BareBackend()
+    est = _make_estimator(backend, cache_dir=cache_dir)
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+
+    est.estimate_video(str(clip), target_size=(100, 200))
+    est.estimate_video(str(clip), target_size=(100, 200))  # same → hit
+    assert backend.call_count == 1
+
+    est.estimate_video(str(clip), target_size=(300, 400))  # different → miss
+    assert backend.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# meta.json provenance (reuses the #121 structure)
+# ---------------------------------------------------------------------------
+
+
+def test_cache_entry_has_meta_json_with_provenance(tmp_path: Path) -> None:
+    """A stored entry carries a #121-style meta.json (model + params + timestamp)."""
+    cache_dir = tmp_path / "cache"
+    backend = CountingBackend(max_resolution=640, num_frames=4)
+    est = _make_estimator(backend, cache_dir=cache_dir)
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+    est.estimate_video(str(clip), target_size=(720, 1280))
+
+    # Exactly one entry dir under the cache root.
+    entries = [p for p in cache_dir.iterdir() if p.is_dir()]
+    assert len(entries) == 1
+    entry = entries[0]
+
+    meta_path = entry / "meta.json"
+    assert meta_path.is_file(), "cache entry must write a meta.json (#121 shape)"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    # #121 provenance fields.
+    assert meta["depth_model"] == type(backend).__name__
+    assert meta["num_frames"] == 4
+    assert meta["max_res"] == 640
+    assert meta["target_size"] == [720, 1280]  # JSON list, not tuple
+    assert "timestamp" in meta
+    assert meta["timestamp"]
+
+
+# ---------------------------------------------------------------------------
+# No working-tree pollution — tests never leave cache files in the repo
+# ---------------------------------------------------------------------------
+
+
+def test_cache_uses_only_the_given_cache_dir(tmp_path: Path) -> None:
+    """No cache files appear outside the tmp_path-based cache_dir."""
+    cache_dir = tmp_path / "cache"
+    backend = CountingBackend()
+    est = _make_estimator(backend, cache_dir=cache_dir)
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+    est.estimate_video(str(clip))
+
+    # The only thing under cache_dir is the one entry dir.
+    assert cache_dir.is_dir()
+    entries = [p for p in cache_dir.iterdir()]
+    assert len(entries) == 1
+    # And the entry holds npy + meta.json only.
+    files = {p.name for p in entries[0].iterdir()}
+    assert "meta.json" in files
+    assert any(name.startswith("depth_") and name.endswith(".npy") for name in files)
