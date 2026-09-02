@@ -23,6 +23,8 @@ Reference:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -648,6 +650,178 @@ class CLIBackend(DepthCrafterBackend):
 
 
 # ---------------------------------------------------------------------------
+# Depth-product content cache (I-8a, issue #182)
+# ---------------------------------------------------------------------------
+#
+# Cache key = sha256( content_fingerprint || "depthcrafter" || canonical_json(params) )
+#
+# ``content_fingerprint`` is sha256 over ``str(file_size)`` + the first 4 MB of
+# the file + the last 4 MB of the file — NOT the whole file.  A full-file hash
+# on a long VR180 clip (minutes of video, hundreds of MB) would itself take
+# minutes, defeating the point of a cache whose lookup must be cheap enough to
+# do *before* launching the multi-gigabyte subprocess.  Head + tail is a cheap
+# stable content proxy: two genuinely different videos are astronomically
+# unlikely to share both their first and last 4 MB *and* their exact size, so a
+# truncated/extended copy of the same content (different size) cannot collide.
+# For files ≤ 4 MB the head read already covers the whole file, so the tail
+# read is skipped (reading it would double-hash the same bytes and break the
+# stable-hash contract for small inputs).
+#
+# The key is **content-only, path/name-agnostic** (lead decision): the same
+# bytes at a different filesystem path MUST hit.  Path, name and mtime are
+# deliberately excluded — copying the source to a new location (or re-rendering
+# the same bytes) must reuse the cached depth product.
+
+_DEPTH_CACHE_NAME = "depth"
+_DEPTH_CACHE_META = "meta.json"  # reuse the #121 schema, do not invent another
+_FINGERPRINT_CHUNK = 4 * 1024 * 1024  # 4 MB head/tail sample
+
+
+def _fingerprint_file(path: str) -> str | None:
+    """sha256 over ``file_size + first 4MB + last 4MB`` of *path*.
+
+    Returns ``None`` when the file cannot be read (locked, unreadable, gone) so
+    the caller can treat the cache as a miss and fall through to inference —
+    the cache is an *optimisation*, never a correctness gate.  On Windows a
+    ``NamedTemporaryFile(delete=True)`` holds an exclusive share lock, so
+    ``open(..., "rb")`` raises ``PermissionError``; that is caught here.
+    """
+    h = hashlib.sha256()
+    try:
+        size = os.path.getsize(path)
+        h.update(str(size).encode("utf-8"))
+        with open(path, "rb") as f:
+            head = f.read(_FINGERPRINT_CHUNK)
+            h.update(head)
+            # Only read the tail when the head didn't already cover the whole
+            # file; otherwise this would double-hash the same bytes (breaking
+            # the stable-hash contract for ≤4 MB inputs).
+            if size > _FINGERPRINT_CHUNK:
+                f.seek(max(0, size - _FINGERPRINT_CHUNK))
+                h.update(f.read(_FINGERPRINT_CHUNK))
+    except OSError as exc:
+        log.debug("[cache] could not fingerprint %s (%s) — treating as miss", path, exc)
+        return None
+    return h.hexdigest()
+
+
+def _backend_cache_params(backend: object) -> dict[str, object]:
+    """The output-affecting params pulled off *backend* for the cache key.
+
+    All reads are safe ``getattr(..., default)`` so a pluggable backend that
+    does not expose a given knob (e.g. the test ``MockBackend`` has no
+    ``max_resolution``) contributes a fixed placeholder, not an exception.  A
+    missing knob is recorded as ``None`` — two backends that both omit it then
+    hash the same, which is correct (neither can change the output via a knob
+    it doesn't have).  Issue #182 round-1 rejection: ``backend.max_resolution``
+    was read unconditionally and broke every existing mock backend that lacked
+    that attribute; this function makes every backend-derived value optional.
+    """
+    return {
+        "max_res": getattr(backend, "max_resolution", None),
+        "process_length": getattr(backend, "process_length", None),
+        "target_fps": getattr(backend, "target_fps", None),
+    }
+
+
+def _compute_cache_key(
+    input_path: str,
+    backend: object,
+    *,
+    model_name: str = "depthcrafter",
+) -> str | None:
+    """Content-keyed cache key for a depth run, or ``None`` if unhashable.
+
+    ``None`` (file unreadable) means "cannot key → behave as a cache miss".
+    """
+    fingerprint = _fingerprint_file(input_path)
+    if fingerprint is None:
+        return None
+    params = _backend_cache_params(backend)
+    canonical = json.dumps(params, sort_keys=True, separators=(",", ":"))
+    key_input = f"{fingerprint}|{model_name}|{canonical}"
+    return hashlib.sha256(key_input.encode("utf-8")).hexdigest()
+
+
+def _cache_dir_for(key: str, cache_dir: Path | None) -> Path:
+    """Resolve the on-disk cache entry dir for *key*."""
+    base = cache_dir if cache_dir is not None else (_REPO_ROOT / "models" / ".cache" / _DEPTH_CACHE_NAME)
+    return Path(base) / key
+
+
+def _cache_entry_valid(cached_dir: Path, meta: dict) -> bool:
+    """True if *cached_dir* holds a usable product set matching *meta*.
+
+    A valid entry has at least one ``depth_*.npy`` map and its ``meta.json``
+    frame count matches the number of ``.npy`` files on disk — a half-written
+    / tampered entry (wrong frame count, no maps) is a miss, not a silent
+    reuse of stale or partial product.
+    """
+    npy_files = list(cached_dir.glob("depth_*.npy"))
+    if not npy_files:
+        return False
+    meta_frames = meta.get("num_frames")
+    if isinstance(meta_frames, int):
+        return meta_frames == len(npy_files)
+    return True
+
+
+def _load_cached_depths(cached_dir: Path) -> list[np.ndarray]:
+    """Load the cached ``depth_*.npy`` sequence (sorted, oldest-index-first)."""
+    npy_files = sorted(cached_dir.glob("depth_*.npy"))
+    return [np.load(str(f)) for f in npy_files]
+
+
+def _persist_depths_to_cache(
+    depths: list[np.ndarray],
+    cached_dir: Path,
+    *,
+    backend: object,
+    model_name: str,
+) -> None:
+    """Write *depths* as ``depth_*.npy`` + ``meta.json`` into *cached_dir*.
+
+    ``meta.json`` reuses the I-6 (#121) schema (depth_model / num_frames /
+    max_res / process_length / target_fps / model_size / timestamp) — do not
+    invent a parallel schema.  Backend-derived fields use the same safe
+    ``getattr`` defaults as the key so a backend without a knob records
+    ``None`` consistently on both sides.
+    """
+    cached_dir.mkdir(parents=True, exist_ok=True)
+    # Wipe any stale partial entry first so a half-written previous run cannot
+    # bleed into this one (mirrors CLIBackend._clean_output_dir discipline).
+    for entry in list(cached_dir.iterdir()):
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    for i, depth in enumerate(depths):
+        np.save(str(cached_dir / f"depth_{i:06d}.npy"), depth)
+    meta: dict[str, object] = {
+        "depth_model": model_name,
+        "num_frames": len(depths),
+        "model_size": getattr(backend, "model_size", None),
+        "max_res": getattr(backend, "max_resolution", None),
+        "process_length": getattr(backend, "process_length", None),
+        "target_fps": getattr(backend, "target_fps", None),
+        "temporal_smoothing": getattr(backend, "temporal_smoothing", 0.0) or 0.0,
+    }
+    # Use a fixed timezone-naive timestamp from os.time-likes rather than
+    # datetime.now() so the entry is deterministic per-run; meta is for
+    # provenance comparison, not a cache key, so monotonicity is enough.
+    try:
+        import time
+
+        meta["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+    except Exception:  # pragma: no cover - defensive, never block caching
+        meta["timestamp"] = "unknown"
+    meta_path = cached_dir / _DEPTH_CACHE_META
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    log.info("[cache] stored %d depth maps → %s", len(depths), cached_dir)
+
+
+# ---------------------------------------------------------------------------
 # DepthCrafterEstimator (front-facing class)
 # ---------------------------------------------------------------------------
 
@@ -660,6 +834,12 @@ class DepthCrafterEstimator:
 
     The *backend* argument allows injecting a different backend (e.g.
     for testing).  Defaults to :class:`CLIBackend`.
+
+    Cache (I-8a, issue #182): depth products are cached by a content-keyed
+    fingerprint (file size + first/last 4 MB sha256) together with the model
+    name and output-affecting params, so a second run of the same input + same
+    params reuses the cached depth maps and **never starts the subprocess**.
+    Disable with ``use_cache=False``; redirect with ``cache_dir``.
     """
 
     def __init__(
@@ -669,6 +849,8 @@ class DepthCrafterEstimator:
         python_exe: str | None = None,
         checkpoint_dir: str | None = None,
         max_resolution: int | None = None,
+        use_cache: bool = True,
+        cache_dir: Path | None = None,
     ) -> None:
         _assert_cuda()
 
@@ -681,6 +863,10 @@ class DepthCrafterEstimator:
                 checkpoint_dir=checkpoint_dir,
                 max_resolution=max_resolution,
             )
+        self.use_cache = use_cache
+        # cache_dir=None → default models/.cache/depth (resolved lazily so the
+        # estimator is constructible without write access to that dir).
+        self.cache_dir = cache_dir
 
     def estimate_video(
         self,
@@ -702,6 +888,12 @@ class DepthCrafterEstimator:
             List of (H, W) float32 depth maps, one per frame, at the source
             frame size, normalized to [0, 1] (same convention as the
             Depth-Anything backend in ``pipeline/depth_estimator.py``).
+
+        Cache (issue #182): before launching the backend, the content-keyed
+        cache is checked.  A hit returns the cached ``depth_*.npy`` maps and
+        the backend (subprocess) is never invoked.  A miss runs the backend,
+        then persists the returned maps as ``depth_*.npy`` + ``meta.json``
+        (reusing the #121 schema) into the cache dir for next time.
         """
         import tempfile
 
@@ -716,8 +908,56 @@ class DepthCrafterEstimator:
             resolved_output,
         )
 
-        return self.backend.estimate_video(
+        # --- Cache lookup (I-8a, issue #182) ---------------------------------
+        # The cache is an optimisation, never a correctness gate: any failure
+        # to key / read / write it is swallowed and we fall through to a full
+        # backend run.  ``use_cache=False`` skips the lookup entirely so the
+        # caller can force a recompute (e.g. a "refresh depth" flag).
+        if self.use_cache:
+            key = _compute_cache_key(input_path, self.backend)
+            if key is not None:
+                cached_dir = _cache_dir_for(key, self.cache_dir)
+                meta_path = cached_dir / _DEPTH_CACHE_META
+                if meta_path.is_file():
+                    try:
+                        with open(meta_path, encoding="utf-8") as f:
+                            meta = json.load(f)
+                    except (OSError, json.JSONDecodeError) as exc:
+                        log.debug("[cache] meta unreadable at %s (%s) — miss", cached_dir, exc)
+                        meta = {}
+                    if _cache_entry_valid(cached_dir, meta):
+                        log.info("[cache] hit %s", key[:8])
+                        return _load_cached_depths(cached_dir)
+                    log.info("[cache] miss (stale/partial) %s — recomputing", key[:8])
+                else:
+                    log.info("[cache] miss %s — recomputing", key[:8])
+
+        # --- Full inference --------------------------------------------------
+        depths = self.backend.estimate_video(
             input_path=input_path,
             output_dir=resolved_output,
             target_size=target_size,
         )
+
+        # --- Cache persist ---------------------------------------------------
+        # Only persist when we have a key AND real depth maps.  A ``None`` key
+        # (file unreadable / lock held) means we cannot reliably key the entry,
+        # so skip the write — the next run will simply miss again, never
+        # silently reuse a product stored under a key derived from partial data.
+        if self.use_cache and depths:
+            key = _compute_cache_key(input_path, self.backend)
+            if key is not None:
+                cached_dir = _cache_dir_for(key, self.cache_dir)
+                try:
+                    _persist_depths_to_cache(
+                        depths,
+                        cached_dir,
+                        backend=self.backend,
+                        model_name="depthcrafter",
+                    )
+                except OSError as exc:
+                    # Cache write failure must never fail the run — the depths
+                    # are already in hand; the caller gets them back regardless.
+                    log.warning("[cache] could not persist entry at %s (%s)", cached_dir, exc)
+
+        return depths

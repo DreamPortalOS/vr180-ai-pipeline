@@ -48,6 +48,11 @@ output/
 htmlcov/
 .coverage
 
+# Depth-product content cache (I-8a, issue #182): content-keyed .npy + meta.json
+# under models/.cache/depth/<key>/. models/ is already ignored above; this line
+# documents the cache subtree explicitly so the intent is obvious.
+models/.cache/
+
 # Jupyter
 .ipynb_checkpoints/
 
