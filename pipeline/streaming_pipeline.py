@@ -334,6 +334,15 @@ class StreamingPipeline:
         gop: int | None = None,
         force_idr: bool = False,
         faststart: bool | None = None,
+        # K-21 (#224): when a caller owns an intermediate directory (e.g.
+        # run_pipeline's --temp-dir / make_comparison's per-recipe work dir),
+        # pass it here so the streaming path writes depth products into
+        # ``<temp_dir>/depth/`` and stereo intermediates into
+        # ``<temp_dir>/stereo/`` — the layout the comparison
+        # default_depth_dir_resolver expects.  When None the streaming path
+        # falls back to the historical tempfile.mkdtemp (self-cleaning)
+        # behaviour, so existing callers / pre-K-21 behaviour is bit-exact.
+        temp_dir: str | None = None,
         # I-5 (#120): injectable depth/stereo backends.  When None the defaults
         # (Depth-Anything V2 per-frame + StereoRenderer depth-shift) are used,
         # so pre-I-5 behaviour is bit-exact.  The CLI streaming branch injects
@@ -362,6 +371,9 @@ class StreamingPipeline:
         self.gop = gop
         self.force_idr = force_idr
         self.faststart = faststart
+        # K-21 (#224): caller-owned work directory. None ⇒ streaming path uses
+        # (and owns cleanup of) a fresh tempfile.mkdtemp.
+        self.temp_dir = temp_dir
         # Hardware (NVENC) encoding — issue #49: CUDA availability does NOT
         # imply NVENC works (driver/ffmpeg ABI mismatch). "auto" (None) probes
         # the actual encoder with a tiny synthetic encode and falls back to
@@ -681,6 +693,31 @@ class StreamingPipeline:
                 ) from None
             raise
 
+    # K-21 (#224): work-directory helpers.  When ``self.temp_dir`` is set the
+    # streaming path writes products into caller-owned subdirs (the depth dir
+    # is the flat ``<temp_dir>/depth/`` that
+    # make_comparison.default_depth_dir_resolver globs) instead of an
+    # ephemeral ``tempfile.mkdtemp``.  The lifetime of a caller-owned dir is
+    # the caller's (run_pipeline / make_comparison); the ephemeral mkdtemp
+    # dir is left in system temp (the pre-K-21 behaviour the rest of the
+    # suite relies on for "depth dir survives the run"), cleaned by the OS.
+    def _depth_work_dir(self) -> str:
+        """Return the depth-product directory (created if absent)."""
+        if self.temp_dir:
+            depth_dir = os.path.join(self.temp_dir, "depth")
+        else:
+            depth_dir = os.path.join(tempfile.mkdtemp(prefix="vr180-streaming-depth_"), "depth")
+        os.makedirs(depth_dir, exist_ok=True)
+        return depth_dir
+
+    def _stereo_work_dir(self) -> str:
+        """Return the stereo-intermediate directory (created if absent)."""
+        if self.temp_dir:
+            stereo_dir = os.path.join(self.temp_dir, "stereo")
+            os.makedirs(stereo_dir, exist_ok=True)
+            return stereo_dir
+        return tempfile.mkdtemp(prefix="vr180-streaming-stereo_")
+
     def process_stream(
         self,
         input_path: str,
@@ -755,9 +792,7 @@ class StreamingPipeline:
         precomp_depths: list[np.ndarray] | None = None
 
         if stereo_wholeclip:
-            import tempfile
-
-            work_dir = tempfile.mkdtemp(prefix="vr180-streaming-stereo_")
+            work_dir = self._stereo_work_dir()
             left_path = os.path.join(work_dir, "_stereo_left.mp4")
             right_path = os.path.join(work_dir, "_stereo_right.mp4")
 
@@ -766,16 +801,14 @@ class StreamingPipeline:
                 # into its own work dir and hand THAT dir to the stereo backend.
                 # The dir must outlive the stereo call, so it lives for the
                 # whole process_stream scope (never deleted here).
-                depth_dir = os.path.join(tempfile.mkdtemp(prefix="vr180-streaming-depth_"), "depth")
-                os.makedirs(depth_dir, exist_ok=True)
+                depth_dir = self._depth_work_dir()
                 self._precompute_depths(input_path, total, depth_dir)
             else:
                 # StereoCrafter needs per-frame depth maps to splat with, but no
                 # whole-clip depth backend is in play.  Emit them with the
                 # per-frame estimator so the stereo stage has something real to
                 # consume (rather than dying on an empty dir).
-                depth_dir = os.path.join(work_dir, "depth")
-                os.makedirs(depth_dir, exist_ok=True)
+                depth_dir = self._depth_work_dir()
                 self._emit_perframe_depths(cap, total, depth_dir)
 
             precomp_left, precomp_right = self._precompute_stereo(input_path, depth_dir, left_path, right_path)
@@ -784,10 +817,7 @@ class StreamingPipeline:
             if precomp_left:
                 total = min(total, len(precomp_left))
         elif depth_wholeclip:
-            import tempfile
-
-            depth_dir = os.path.join(tempfile.mkdtemp(prefix="vr180-streaming-depth_"), "depth")
-            os.makedirs(depth_dir, exist_ok=True)
+            depth_dir = self._depth_work_dir()
             precomp_depths = self._precompute_depths(input_path, total, depth_dir)
             if precomp_depths:
                 total = min(total, len(precomp_depths))

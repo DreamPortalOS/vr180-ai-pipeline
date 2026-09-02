@@ -2409,6 +2409,15 @@ def main():
             stereo_renderer=stereo_backend,
             depth_backend_name=depth_backend_name,
             stereo_backend_name=stereo_backend_name,
+            # K-21 (#224): hand the caller-owned --temp-dir into the streaming
+            # path so depth products land under <temp-dir>/depth/ (the layout
+            # make_comparison's depth-dir resolver globs) instead of a
+            # self-cleaning mkdtemp.  Only the *explicit* --temp-dir is
+            # forwarded: the auto-derived (input-stem-scoped) dir is managed
+            # by _resolve_temp_dir_lifecycle/_cleanup_temp_dir_if_owned below
+            # and is NOT forwarded — passing it would make the streaming path
+            # own a dir the caller also thinks it owns, breaking cleanup.
+            temp_dir=getattr(args, "temp_dir", None),
         )
         output = get_output_path(args)
         result = pipeline.process_stream(args.input, output, max_frames=args.max_frames)
