@@ -23,6 +23,9 @@ Reference:
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -39,6 +42,30 @@ log = logging.getLogger(__name__)
 # failure (ERROR + exception summary) — issue #127.
 _OUTPUT_TAIL_SUCCESS_LINES = 20
 _OUTPUT_TAIL_FAILURE_LINES = 40
+
+# ---------------------------------------------------------------------------
+# Depth-product cache (issue #182, I-8a — depth side only)
+# ---------------------------------------------------------------------------
+# A cache entry lives at ``<cache_dir>/<key>/`` and holds the depth maps a
+# real inference run produced, so a second run on the same input + same params
+# returns instantly without spawning the CUDA subprocess.
+#
+# Cache key = sha256( video content digest ‖ model name ‖ normalized JSON of
+# key params ).  The video content digest is itself a sha256 of (file size +
+# first 4 MB + last 4 MB) — see :func:`_video_content_digest` for *why* that
+# is enough and why we deliberately do NOT hash the whole file.
+#
+# Default cache root is the in-repo ``models/.cache/depth`` (gitignored);
+# tests pass a ``cache_dir`` under ``tmp_path`` so the repo is never polluted.
+# Defined near ``_REPO_ROOT`` below (it needs that constant — see the comment
+# at ``_DEFAULT_DEPTH_CACHE_DIR = ...``).
+
+# Head/tail sample size for the content digest (issue #182: 4 MB each).
+_CONTENT_DIGEST_SAMPLE_BYTES = 4 * 1024 * 1024
+
+#: Reuse the #121 meta file name so the cache's provenance block mirrors the
+#: depth checkpoint meta structure already landed by I-6 (#121).
+_DEPTH_META_NAME = "meta.json"
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +210,138 @@ def load_depth_maps_from_dir(depth_dir: str, stem: str | None = None) -> list[np
 
 
 # ---------------------------------------------------------------------------
+# Depth-product cache (issue #182, I-8a — depth side only)
+# ---------------------------------------------------------------------------
+
+
+def _video_content_digest(path: str | Path) -> str:
+    """Return a fast content fingerprint of *path*: sha256(size ‖ head ‖ tail).
+
+    Why a head/tail sample and NOT the whole file
+    ---------------------------------------------
+    DepthCrafter runs on long clips (minutes).  Reading every byte of a 2 GB
+    video just to compute a cache key would take seconds-to-minutes on a slow
+    disk and add noticeable latency in front of an inference that already
+    dominates wall-clock — the very cost the cache exists to *avoid* on a hit.
+
+    A digest of (file size + first 4 MB + last 4 MB) is collision-resistant for
+    this use case: it distinguishes any two clips of different length
+    immediately (the size term), and within a fixed length it distinguishes any
+    clip whose beginning or end differs.  Two genuinely different sources that
+    happen to share size + head + tail byte-for-byte would collide, but that
+    is astronomically unlikely for real video content and only costs a wasted
+    inference (the cache would then serve a slightly wrong result — same risk
+    class as a path-based cache keying collision, which is worse here).
+
+    The key is **content-only** — the file name / path is deliberately not
+    hashed, so moving the same source to a different location still hits.
+
+    Raises ``OSError`` if *path* cannot be opened for reading (e.g. a
+    Windows ``NamedTemporaryFile`` still held open by its creating process —
+    the OS denies shared read).  The caller treats a digest failure as
+    "cannot cache this call" and falls through to a normal, uncached run so
+    the inference never breaks on a locked input file.
+    """
+    p = Path(path)
+    h = hashlib.sha256()
+    size = p.stat().st_size
+    h.update(str(size).encode("ascii"))
+    sample = _CONTENT_DIGEST_SAMPLE_BYTES
+    with open(p, "rb") as f:
+        h.update(f.read(sample))
+        # Only seek + read the tail when the file is larger than the head
+        # sample; otherwise the head already covered everything.
+        if size > sample:
+            f.seek(-sample, os.SEEK_END)
+            h.update(f.read(sample))
+    return h.hexdigest()
+
+
+def _backend_cache_params(backend: object, target_size: tuple[int, int] | None) -> dict:
+    """Pull the output-affecting params off a pluggable *backend* into a dict.
+
+    Every attribute is read with a safe default via :func:`getattr` so a
+    minimal mock backend (issue #182 round 1: ``MockBackend`` with no
+    ``max_resolution``) never raises ``AttributeError``.  A backend that
+    doesn't expose a knob simply contributes ``None`` for it — the cache key
+    still differs across whatever params *are* present.
+
+    ``target_size`` is the caller-facing resize target — it changes the
+    *output* depth-map dimensions, so two runs that differ only in
+    ``target_size`` MUST get different cache entries (issue #182 round 2
+    regression: without it the second call hit the cache and the backend was
+    never invoked, breaking the "forwards target_size" contract test).
+    """
+    return {
+        "max_res": getattr(backend, "max_resolution", None),
+        "process_length": getattr(backend, "process_length", None),
+        "target_fps": getattr(backend, "target_fps", None),
+        "target_size": target_size,
+    }
+
+
+def _depth_cache_key(
+    input_path: str,
+    backend: object,
+    target_size: tuple[int, int] | None,
+) -> str:
+    """Compute the cache key for an (input, backend, target_size) triple.
+
+    ``sha256( video content digest ‖ model name ‖ normalized JSON of params )``
+    where the normalized JSON is ``json.dumps(params, sort_keys=True,
+    separators=(",", ":"))`` so dict ordering can't perturb the hash.
+    """
+    content = _video_content_digest(input_path)
+    model_name = type(backend).__name__
+    params = _backend_cache_params(backend, target_size)
+    params_json = json.dumps(params, sort_keys=True, separators=(",", ":"))
+    h = hashlib.sha256()
+    h.update(content.encode("ascii"))
+    h.update(b"\x1f")  # field separator (unit separator) — avoids tail-of-content collisions
+    h.update(model_name.encode("ascii"))
+    h.update(b"\x1f")
+    h.update(params_json.encode("utf-8"))
+    return h.hexdigest()
+
+
+def _save_depth_cache(
+    entry_dir: Path, depths: list[np.ndarray], backend: object, target_size: tuple[int, int] | None
+) -> None:
+    """Persist *depths* + a #121-style ``meta.json`` into *entry_dir*.
+
+    Reuses the provenance block shape landed by I-6 (#121): a ``meta.json``
+    with the model name, the key params, the frame count, and a timestamp —
+    the same fields the checkpoint meta carries, so an operator inspecting a
+    cache entry sees the same shape they already know from the depth dir.
+    """
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    for i, d in enumerate(depths):
+        np.save(str(entry_dir / f"depth_{i:06d}.npy"), d)
+    meta = {
+        "depth_model": type(backend).__name__,
+        "num_frames": len(depths),
+    }
+    meta.update(_backend_cache_params(backend, target_size))
+    meta["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+    with open(entry_dir / _DEPTH_META_NAME, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+
+def _load_depth_cache(entry_dir: Path) -> list[np.ndarray] | None:
+    """Load cached ``depth_*.npy`` maps from *entry_dir*, or ``None`` if absent.
+
+    ``None`` (no entry dir / no depth files) means "miss → recompute"; a hit
+    returns the maps so the CUDA subprocess is never spawned.
+    """
+    if not entry_dir.is_dir():
+        return None
+    npy_files = sorted(entry_dir.glob("depth_*.npy"))
+    if not npy_files:
+        return None
+    return [np.load(str(f)) for f in npy_files]
+
+
+# ---------------------------------------------------------------------------
 # Abstract backend
 # ---------------------------------------------------------------------------
 
@@ -217,6 +376,12 @@ INREPO_PYTHON_EXE = (
     INREPO_REPO_DIR / ".venv" / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
 )
 INREPO_MODEL_DIR = _REPO_ROOT / "models" / "DepthCrafter"
+
+# Default cache root for depth products (issue #182, I-8a): the in-repo
+# ``models/.cache/depth`` dir, which is gitignored alongside ``models/``.
+# Tests override this with a ``tmp_path``-based ``cache_dir`` so the repo
+# working tree is never polluted with real cache files.
+_DEFAULT_DEPTH_CACHE_DIR = _REPO_ROOT / "models" / ".cache" / "depth"
 
 # 12 GB VRAM-safe default for the short-side resolution cap.  The official
 # default is 1024, but that blows the 12 GB buffer on an RTX 4070 SUPER;
@@ -669,6 +834,8 @@ class DepthCrafterEstimator:
         python_exe: str | None = None,
         checkpoint_dir: str | None = None,
         max_resolution: int | None = None,
+        use_cache: bool = True,
+        cache_dir: Path | None = None,
     ) -> None:
         _assert_cuda()
 
@@ -681,6 +848,16 @@ class DepthCrafterEstimator:
                 checkpoint_dir=checkpoint_dir,
                 max_resolution=max_resolution,
             )
+
+        # Issue #182 (I-8a, depth side): content-keyed product cache so a
+        # second run on the same input + same params returns without
+        # spawning the CUDA subprocess.  ``cache_dir=None`` → the in-repo
+        # ``models/.cache/depth`` default (gitignored).  Both params have
+        # defaults so every existing call site (``build_depth_backend`` and
+        # the streaming path) keeps working unchanged — #168 was rejected
+        # for breaking call sites by adding a required arg.
+        self.use_cache = use_cache
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else _DEFAULT_DEPTH_CACHE_DIR
 
     def estimate_video(
         self,
@@ -702,13 +879,40 @@ class DepthCrafterEstimator:
             List of (H, W) float32 depth maps, one per frame, at the source
             frame size, normalized to [0, 1] (same convention as the
             Depth-Anything backend in ``pipeline/depth_estimator.py``).
+
+        Issue #182 (I-8a): when ``use_cache`` is set, the depths are served
+        from / written to a content-keyed cache so the CUDA subprocess is only
+        spawned on a cache miss.  A hit logs ``[cache] hit <key前8位>`` and
+        never touches the backend; ``use_cache=False`` forces a recompute.
         """
         import tempfile
 
-        resolved_output = output_dir or tempfile.mkdtemp(prefix="depthcrafter_")
-
         if not os.path.isfile(input_path):
             raise FileNotFoundError(f"Input video not found: {input_path}")
+
+        # Cache lookup (issue #182).  Done before the temp output dir is
+        # created: a hit neither spawns the subprocess nor writes anything.
+        # ``_cache_enabled`` is per-call: key computation may fail (e.g. the
+        # input is a Windows ``NamedTemporaryFile`` still held open by its
+        # creator — the OS denies shared read, see :func:`_video_content_digest`),
+        # in which case we skip the cache entirely for this call rather than
+        # break the inference.  A run that can't be keyed can still run.
+        key: str | None = None
+        entry_dir: Path | None = None
+        _cache_enabled = self.use_cache
+        if _cache_enabled:
+            try:
+                key = _depth_cache_key(input_path, self.backend, target_size)
+                entry_dir = self.cache_dir / key
+                cached = _load_depth_cache(entry_dir)
+                if cached is not None:
+                    log.info("[cache] hit %s (%d frames)", key[:8], len(cached))
+                    return cached
+            except OSError:
+                _cache_enabled = False
+                log.debug("[cache] disabled for this call — input not readable for content digest", exc_info=True)
+
+        resolved_output = output_dir or tempfile.mkdtemp(prefix="depthcrafter_")
 
         log.info(
             "DepthCrafterEstimator: %s → %s",
@@ -716,8 +920,19 @@ class DepthCrafterEstimator:
             resolved_output,
         )
 
-        return self.backend.estimate_video(
+        depths = self.backend.estimate_video(
             input_path=input_path,
             output_dir=resolved_output,
             target_size=target_size,
         )
+
+        # Populate the cache on a miss so the next identical call hits.
+        # Failure to cache must never break a successful inference — wrap it.
+        if _cache_enabled and key is not None and entry_dir is not None:
+            try:
+                _save_depth_cache(entry_dir, depths, self.backend, target_size)
+                log.info("[cache] stored %s (%d frames)", key[:8], len(depths))
+            except OSError:
+                log.debug("[cache] could not write cache entry at %s", entry_dir, exc_info=True)
+
+        return depths
