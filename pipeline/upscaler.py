@@ -4,10 +4,23 @@ Super-resolution using Real-ESRGAN for enhanced visual quality.
 Supports 2× and 4× upscaling with MPS/CUDA/CPU auto-detection.
 """
 
+import logging
 from typing import ClassVar
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+_FALLBACK_WARNING = (
+    "Real-ESRGAN backend unavailable (realesrgan/basicsr not installed): "
+    "falling back to bicubic interpolation. This is NOT super-resolution and "
+    "does not add detail."
+)
+
+
+class RealESRGANUnavailableError(RuntimeError):
+    """Raised when the Real-ESRGAN backend is required but not installed."""
 
 
 class PixelUpscaler:
@@ -48,13 +61,18 @@ class PixelUpscaler:
         model_name: str | None = None,
         device: str | None = None,
         half_precision: bool = False,
+        strict: bool = False,
     ):
         self.scale = scale
         self.model_name = model_name or f"RealESRGAN_x{scale}plus"
         self.device = self._resolve_device(device)
         self.half = half_precision and self.device == "cuda"
+        self.strict = strict
         self._upsampler = None
-        self._use_opencv_fallback = False
+        self._backend = "unknown"  # 'realesrgan' | 'bicubic' | 'unknown'
+        self._outscale = self.scale
+        # Whether the fallback warning has already been emitted.
+        self._fallback_warned = False
 
     @staticmethod
     def _resolve_device(device: str | None) -> str:
@@ -71,19 +89,56 @@ class PixelUpscaler:
             pass
         return "cpu"
 
+    @property
+    def backend(self) -> str:
+        """Resolved backend name: 'realesrgan' or 'bicubic'."""
+        self._load_model()
+        return self._backend
+
+    def _realbackend_available(self) -> bool:
+        """True iff both realesrgan and basicsr can actually be imported.
+
+        This is the *real* detection point — the imports that would be needed
+        at inference time.  A bare ``import realesrgan`` elsewhere in the
+        module would never catch the failure, because the actual import lives
+        here, in ``_load_model``.
+        """
+        try:
+            import basicsr.archs.rrdbnet_arch  # noqa: F401
+            import realesrgan  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
     def _load_model(self):
-        if self._upsampler is not None:
+        if self._backend != "unknown":
             return
 
-        try:
-            from basicsr.archs.rrdbnet_arch import RRDBNet
-            from realesrgan import RealESRGANer
-        except ImportError:
-            # Fall back to OpenCV-based upscaling
-            self._use_opencv_fallback = True
-            self._upsampler = "opencv_fallback"
-            print(f"[Upscale] Real-ESRGAN not installed, using OpenCV bicubic fallback (scale={self.scale}×)")
-            return
+        if self._realbackend_available():
+            try:
+                self._load_realesrgan()
+                return
+            except (ImportError, RuntimeError) as e:
+                # realesrgan claimed to import but failed to load the model —
+                # degrade to bicubic rather than silently hanging.
+                logger.warning("%s (model load failed: %s)", _FALLBACK_WARNING, e)
+        else:
+            logger.warning(_FALLBACK_WARNING)
+
+        self._backend = "bicubic"
+        if self.strict:
+            raise RealESRGANUnavailableError(
+                "Real-ESRGAN backend (realesrgan/basicsr) is not available "
+                "and --upscale-strict is set; refusing to silently upscale "
+                "with bicubic interpolation."
+            )
+        self._upsampler = "bicubic"
+        self._fallback_warned = True
+
+    def _load_realesrgan(self):
+        """Import and construct the Real-ESRGAN backend."""
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        from realesrgan import RealESRGANer
 
         model_info = self.MODELS.get(self.model_name)
         if not model_info:
@@ -120,6 +175,7 @@ class PixelUpscaler:
             device=upsampler_device,
         )
         self._outscale = outscale
+        self._backend = "realesrgan"
         print(f"[Upscale] Loaded {self.model_name} on {upsampler_device} (scale={self.scale}×)")
 
     @staticmethod
@@ -152,7 +208,7 @@ class PixelUpscaler:
         """
         self._load_model()
 
-        if getattr(self, "_use_opencv_fallback", False):
+        if self._backend == "bicubic":
             h, w = frame.shape[:2]
             return cv2.resize(
                 frame,
@@ -198,6 +254,14 @@ class PixelUpscaler:
         """
         self._load_model()
         import torch
+
+        if self._backend == "bicubic":
+            h, w = frame.shape[:2]
+            return cv2.resize(
+                frame,
+                (w * self.scale, h * self.scale),
+                interpolation=cv2.INTER_CUBIC,
+            )
 
         h, w = frame.shape[:2]
         scale = self._outscale
@@ -352,6 +416,20 @@ class PixelUpscaler:
         results = []
         total = len(frames)
 
+        if self._backend == "bicubic":
+            for i, frame in enumerate(frames):
+                h, w = frame.shape[:2]
+                results.append(
+                    cv2.resize(
+                        frame,
+                        (w * self.scale, h * self.scale),
+                        interpolation=cv2.INTER_CUBIC,
+                    )
+                )
+                if progress_callback:
+                    progress_callback(i + 1, total)
+            return results
+
         for i, frame in enumerate(frames):
             output, _ = self._upsampler.enhance(frame, outscale=self._outscale)
             results.append(output)
@@ -455,13 +533,11 @@ def create_upscaler(
     scale: int = 2,
     model_name: str | None = None,
     device: str | None = None,
-) -> PixelUpscaler | None:
-    """Factory: create upscaler with graceful fallback.
+) -> PixelUpscaler:
+    """Factory: create an upscaler instance.
 
-    Returns PixelUpscaler if realesrgan is installed, None otherwise.
+    Backend availability is *not* checked here — it is checked lazily when
+    upscaling first runs (in ``_load_model``), so the honest detection point
+    is always the place where the import would actually be used.
     """
-    try:
-        return PixelUpscaler(scale=scale, model_name=model_name, device=device)
-    except ImportError:
-        print("[Upscale] realesrgan not installed, upscaling will be skipped")
-        return None
+    return PixelUpscaler(scale=scale, model_name=model_name, device=device)
