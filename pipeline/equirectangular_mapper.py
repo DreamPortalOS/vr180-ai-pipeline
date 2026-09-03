@@ -36,10 +36,21 @@ class EquirectangularMapper:
 
     Output: 7680×1920 SBS frame (2 × 3840×1920 hemispheres).
 
-    Key behavior for non-180° source footage:
-    - Source content is placed centered in the equirectangular frame
-    - Regions outside the source FOV are filled with black (not stretched)
-    - Vertical flip is applied to match Quest/VR headset convention
+    Handling of regions outside the source FOV depends on the active path
+    (issue #240 — earlier docstrings claimed a single behaviour, which was
+    inaccurate):
+
+    - **ffmpeg v360 path** (default, ``use_ffmpeg=True``): the v360 filter is
+      built with ``alpha_mask=1``. Output pixels that fall outside the source
+      FOV get **alpha=0** (a real hole), and their RGB stays whatever v360
+      computes — by *default* v360 clamps the source's edge pixels into the
+      periphery (smear); the alpha mask is what lets a compositor replace
+      that smear cleanly. ``map_single`` drops the alpha by default (3-channel
+      RGB contract); pass ``with_alpha=True`` to keep it.
+    - **OpenCV remap path** (fallback, ``use_ffmpeg=False``): out-of-FOV
+      pixels are remapped with a constant black border and then forced to
+      **RGB (0,0,0)** — genuinely black, not smeared. With
+      ``with_alpha=True`` they also carry alpha=0.
     """
 
     def __init__(
@@ -70,19 +81,24 @@ class EquirectangularMapper:
         self.use_ffmpeg = use_ffmpeg
         self._mesh: tuple[np.ndarray, np.ndarray] | None = None
 
-    def map_single(self, frame: np.ndarray) -> np.ndarray:
+    def map_single(self, frame: np.ndarray, with_alpha: bool = False) -> np.ndarray:
         """Map a single planar frame to equirectangular VR180.
 
         Args:
-            frame: Input planar image (H, W, 3), uint8
+            frame: Input planar image (H, W, 3), uint8.
+            with_alpha: When True, return an RGBA frame whose alpha plane is 0
+                for pixels that fall outside the source FOV (ffmpeg path only;
+                the OpenCV fallback synthesises a binary mask the same way).
+                Default False → the historical 3-channel RGB contract used by
+                :meth:`map_stereo_pair` and downstream consumers.
 
         Returns:
-            Equirectangular frame (output_height, output_width, 3), uint8
+            Equirectangular frame (output_height, output_width, 3 or 4), uint8.
         """
         if self.use_ffmpeg and self._ffmpeg_available():
-            return self._map_via_ffmpeg(frame)
+            return self._map_via_ffmpeg(frame, with_alpha=with_alpha)
         else:
-            return self._map_via_opencv(frame)
+            return self._map_via_opencv(frame, with_alpha=with_alpha)
 
     def _ffmpeg_available(self) -> bool:
         """Check if ffmpeg with v360 filter is available."""
@@ -107,21 +123,37 @@ class EquirectangularMapper:
         vfov_rad = 2.0 * math.atan(math.tan(hfov_rad / 2.0) * src_height / src_width)
         return math.degrees(vfov_rad)
 
-    def _v360_filter(self, src_width: int, src_height: int) -> str:
-        """Build v360 filter string for perspective → half-equirectangular."""
+    def _v360_filter(self, src_width: int, src_height: int, alpha_mask: bool = True) -> str:
+        """Build v360 filter string for perspective → half-equirectangular.
+
+        Args:
+            alpha_mask: When True (default) v360 emits an RGBA frame whose alpha
+                plane is 0 for pixels that fall outside the source FOV — a real
+                *hole*, not ffmpeg's default edge-pixel smear. The RGB planes are
+                identical with or without the flag, so callers that ignore alpha
+                see no change. See issue #240.
+        """
         src_vfov = self._calc_vertical_fov(src_width, src_height)
+        mask = "alpha_mask=1:" if alpha_mask else ""
         return (
             f"v360=input=flat:output=hequirect:"
             f"ih_fov={self.src_hfov}:iv_fov={src_vfov:.2f}:"
             f"h_fov=180:v_fov=180:"
-            f"w={self.output_width}:h={self.output_height}"
-        )
+            f"w={self.output_width}:h={self.output_height}:"
+            f"{mask}"
+        ).rstrip(":")
 
-    def _map_via_ffmpeg(self, frame: np.ndarray) -> np.ndarray:
+    def _map_via_ffmpeg(self, frame: np.ndarray, with_alpha: bool = False) -> np.ndarray:
         """Use ffmpeg v360 filter for equirectangular mapping.
 
         Maps a flat perspective image (with src_hfov FOV) onto a
         180° hemispherical equirectangular projection.
+
+        The v360 filter is built with ``alpha_mask=1`` (see issue #240): the
+        alpha plane of the output is 0 outside the source FOV and 255 inside —
+        a genuine mask, not ffmpeg's default edge-pixel smear.  The RGB planes
+        are identical to a no-mask run, so :meth:`map_single` drops the alpha
+        by default and callers that never ask for it see no behaviour change.
         """
         import tempfile
 
@@ -137,10 +169,11 @@ class EquirectangularMapper:
             cmd = ["ffmpeg", "-y", "-i", in_path, "-vf", vfilter, "-frames:v", "1", out_path]
             subprocess.run(cmd, check=True, capture_output=True, timeout=30)
 
-            out_img = cv2.imread(out_path)
+            out_img = cv2.imread(out_path, cv2.IMREAD_UNCHANGED)
             if out_img is None:
                 raise RuntimeError("ffmpeg v360 failed to produce output")
-            return cv2.cvtColor(out_img, cv2.COLOR_BGR2RGB)
+            out_img = cv2.cvtColor(out_img, cv2.COLOR_BGRA2RGBA)
+            return out_img if with_alpha else out_img[:, :, :3]
         finally:
             try:
                 os.unlink(in_path)
@@ -149,10 +182,13 @@ class EquirectangularMapper:
             except OSError:
                 pass
 
-    def _map_via_opencv(self, frame: np.ndarray) -> np.ndarray:
+    def _map_via_opencv(self, frame: np.ndarray, with_alpha: bool = False) -> np.ndarray:
         """Pure OpenCV equirectangular mapping (fallback).
 
-        Pixels outside the source camera's FOV are filled with black.
+        Pixels outside the source camera's FOV are filled with pure black (RGB
+        0,0,0) — remapped with a constant black border and masked explicitly.
+        With ``with_alpha=True`` those pixels also carry alpha=0, mirroring the
+        ffmpeg path's real alpha hole; RGB is unchanged either way.
         """
         import cv2
 
@@ -178,7 +214,11 @@ class EquirectangularMapper:
         if not np.all(valid_mask):
             equirect[~valid_mask] = [0, 0, 0]
 
-        return equirect
+        if not with_alpha:
+            return equirect
+
+        rgba = np.dstack([equirect, np.where(valid_mask, 255, 0).astype(np.uint8)])
+        return rgba
 
     def _build_mesh(self, src_width: int, src_height: int):
         """Pre-compute equirectangular→planar mapping mesh.
