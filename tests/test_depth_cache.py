@@ -14,6 +14,8 @@ All tests use mock backends and plain files under ``tmp_path``-based
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -93,6 +95,50 @@ class BareBackend(DepthCrafterBackend):
         self.call_count += 1
         rng = np.random.default_rng(7)
         return [rng.random((self.h, self.w)).astype(np.float32) for _ in range(self.num_frames)]
+
+
+class FileWritingBackend(DepthCrafterBackend):
+    """Mock backend that writes ``depth_*.npy`` into *output_dir* (miss path).
+
+    ``CountingBackend`` / ``BareBackend`` never touch disk, so they can't
+    exercise the miss path's file-freshness contract.  The real CLIBackend
+    writes the depth maps into the caller's output dir as a subprocess side
+    effect; this mock does the same in-process so the miss-path mtime tests
+    (issue #235) run without CUDA.  Mirrors ``CountingBackend``'s param
+    surface so ``_backend_cache_params`` has something to fold in.
+    """
+
+    def __init__(
+        self,
+        num_frames: int = 2,
+        h: int = 32,
+        w: int = 48,
+        max_resolution: int = 512,
+        process_length: int | None = None,
+        target_fps: int | None = None,
+    ) -> None:
+        self.num_frames = num_frames
+        self.h = h
+        self.w = w
+        self.max_resolution = max_resolution
+        self.process_length = process_length
+        self.target_fps = target_fps
+        self.call_count = 0
+
+    def estimate_video(
+        self,
+        input_path: str,
+        output_dir: str,
+        target_size: tuple[int, int] | None = None,
+    ) -> list[np.ndarray]:
+        self.call_count += 1
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        rng = np.random.default_rng(7)
+        depths = [rng.random((self.h, self.w)).astype(np.float32) for _ in range(self.num_frames)]
+        for i, d in enumerate(depths):
+            np.save(str(out / f"depth_{i:06d}.npy"), d)
+        return depths
 
 
 def _write_fake_video(path: Path, content: bytes = b"fake video content") -> Path:
@@ -503,3 +549,94 @@ def test_hit_materialize_link_fallback_to_copy(tmp_path: Path, monkeypatch) -> N
     assert len(_depth_npy_files(depth_dir)) == 3, "copy fallback must still populate depth_dir"
     assert calls["link"] >= 1, "should have attempted os.link"
     assert calls["copy"] == 3, "should have fallen back to copy2 for each npy"
+
+
+# ---------------------------------------------------------------------------
+# Round 4 regression (issue #235, K-24): the K-16 freshness gate in
+# make_comparison.default_depth_dir_resolver rejects any depth dir whose
+# newest depth_*.npy mtime predates render_started - 1s.  A cache hit hard-
+# links the cached npy into the caller's depth dir, and a hard link shares the
+# cache file's (old) mtime — so on every repeat run the materialized files
+# looked stale and the metrics stayed "—" even though the dir was populated.
+# Fix: stamp "now" onto every materialized file (and rely on the natural "now"
+# of the miss path), verified below.
+# ---------------------------------------------------------------------------
+
+#: An mtime unambiguously older than any wall-clock "now" the test can observe.
+_STALE_MTIME = 946684800  # 2000-01-01 00:00:00 UTC
+
+
+def test_hit_materialized_files_get_fresh_mtime(tmp_path: Path) -> None:
+    """Cache hit must stamp fresh mtimes even when the cached npy is old.
+
+    This is the K-24 bug directly: age the cache entry's npy to 2000, take a
+    hit, and assert every materialized file in depth_dir is no older than the
+    call's start time.  Also re-checks byte-identity (stamping mtime must not
+    change content).
+    """
+    est, backend, depth_dir, clip, entry_dir, cached_depths = _seed_and_hit(tmp_path)
+
+    # Age every cached npy to 2000 — the "18h-old leftover" state the
+    # freshness gate is built to reject.
+    for src in entry_dir.glob("depth_*.npy"):
+        os.utime(src, (_STALE_MTIME, _STALE_MTIME))
+
+    start = time.time()
+    est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
+
+    assert backend.call_count == 0, "cache hit must not invoke the backend"
+    materialized = _depth_npy_files(depth_dir)
+    assert len(materialized) == len(cached_depths)
+    for i, p in enumerate(materialized):
+        assert p.stat().st_mtime >= start, f"{p.name} mtime is stale: {p.stat().st_mtime} < {start}"
+        # Regression: stamping mtime must not touch the bytes.
+        np.testing.assert_array_equal(np.load(str(p)), cached_depths[i])
+
+
+def test_hit_materialize_copy_fallback_sets_fresh_mtime(tmp_path: Path, monkeypatch) -> None:
+    """Copy fallback must stamp fresh mtimes too (copy2 preserves the old one)."""
+    est, backend, depth_dir, clip, entry_dir, cached_depths = _seed_and_hit(tmp_path)
+
+    for src in entry_dir.glob("depth_*.npy"):
+        os.utime(src, (_STALE_MTIME, _STALE_MTIME))
+
+    # Force the copy2 fallback for every file.  shutil.copy2 is left real so
+    # the test exercises the genuine "copy2 preserves old mtime → os.utime
+    # overrides it" path, not a hand-rolled stub.
+    def fake_link(src, dst):
+        raise OSError("simulated cross-device link failure")
+
+    monkeypatch.setattr("pipeline.depth_crafter.os.link", fake_link)
+
+    start = time.time()
+    est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
+
+    assert backend.call_count == 0
+    materialized = _depth_npy_files(depth_dir)
+    assert len(materialized) == len(cached_depths)
+    for i, p in enumerate(materialized):
+        assert p.stat().st_mtime >= start, f"{p.name} mtime is stale after copy fallback"
+        np.testing.assert_array_equal(np.load(str(p)), cached_depths[i])
+
+
+def test_miss_path_files_get_fresh_mtime(tmp_path: Path) -> None:
+    """Miss-path (backend-written) npy files have fresh mtimes by nature.
+
+    Pins the contract so a future change can't silently regress it: the real
+    CLIBackend writes depth_*.npy as it runs, so their mtime is necessarily
+    "now"; a FileWritingBackend stands in for that side effect here.
+    """
+    cache_dir = tmp_path / "cache"
+    depth_dir = tmp_path / "depth"
+    backend = FileWritingBackend(num_frames=2)
+    est = _make_estimator(backend, cache_dir=cache_dir)
+    clip = _write_fake_video(tmp_path / "clip.mp4")
+
+    start = time.time()
+    est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
+
+    assert backend.call_count == 1, "fresh cache_dir → must be a miss"
+    files = _depth_npy_files(depth_dir)
+    assert len(files) == 2
+    for p in files:
+        assert p.stat().st_mtime >= start, f"{p.name} mtime is stale on the miss path"
