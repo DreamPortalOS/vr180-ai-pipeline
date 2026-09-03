@@ -304,6 +304,39 @@ def _depth_cache_key(
     return h.hexdigest()
 
 
+def _materialize_cache_hit(
+    cached: list[np.ndarray],
+    entry_dir: Path,
+    output_dir: str,
+    key: str,
+) -> None:
+    """Link/copy the cached ``depth_*.npy`` files into *output_dir* on a hit.
+
+    Issue #231 (K-23a): a cache hit previously returned the maps in-memory
+    and never wrote them to the caller's depth dir, leaving the streaming
+    path's ``<temp_dir>/depth`` empty on every repeat run — which killed the
+    K-16 metrics (they glob for ``depth_*.npy`` there).
+
+    Tries a hard link first (same-filesystem, zero-copy, byte-identical
+    product — the linked file *is* the cached file, so the miss-path's
+    written npy and this path's linked npy are trivially array-equal).
+    Falls back to ``shutil.copy2`` when ``os.link`` raises (cross-device,
+    permissions, or other OS-level refusal).  Either way the resulting files
+    use the exact same naming convention as the miss path:
+    ``depth_%%06d.npy``.
+    """
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    npy_files = sorted(entry_dir.glob("depth_*.npy"))
+    for src in npy_files:
+        dst = out_path / src.name
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+    log.info("[cache] hit %s → materialized %d maps into %s", key[:8], len(npy_files), output_dir)
+
+
 def _save_depth_cache(
     entry_dir: Path, depths: list[np.ndarray], backend: object, target_size: tuple[int, int] | None
 ) -> None:
@@ -907,6 +940,8 @@ class DepthCrafterEstimator:
                 cached = _load_depth_cache(entry_dir)
                 if cached is not None:
                     log.info("[cache] hit %s (%d frames)", key[:8], len(cached))
+                    if output_dir is not None:
+                        _materialize_cache_hit(cached, entry_dir, output_dir, key)
                     return cached
             except OSError:
                 _cache_enabled = False
