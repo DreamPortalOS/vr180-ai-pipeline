@@ -324,6 +324,21 @@ def _materialize_cache_hit(
     permissions, or other OS-level refusal).  Either way the resulting files
     use the exact same naming convention as the miss path:
     ``depth_%%06d.npy``.
+
+    Issue #235 (K-24): after linking/copying, stamp each materialized file's
+    mtime to *now* via ``os.utime(dst, None)``.  The K-16 freshness gate in
+    ``make_comparison.default_depth_dir_resolver`` only counts ``depth_*.npy``
+    whose mtime is no older than ``render_started - 1s``; a hard link shares
+    the cache file's inode and thus its (potentially hours-old) mtime, so on
+    every hit the materialized files looked stale and the metrics stayed
+    ``—`` (third time this axis broke after #224 / #231).  ``shutil.copy2``
+    preserves the source mtime too, so the copy fallback needs the same stamp.
+
+    Hard-link caveat chosen deliberately: ``os.utime`` on a link updates the
+    shared inode, so the *cache source* file's mtime is bumped to now as well.
+    That is harmless — the cache key is content-only (no mtime term) and
+    nothing reads cache-entry file mtimes — and is the price for keeping the
+    zero-copy fast path (copy2 would re-copy every npy on every hit).
     """
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -334,6 +349,11 @@ def _materialize_cache_hit(
             os.link(src, dst)
         except OSError:
             shutil.copy2(src, dst)
+        # Issue #235: stamp "now" so the K-16 freshness gate (mtime must be
+        # no older than render_started) accepts the materialized files.  On
+        # the hard-link path this also touches the cache source's inode,
+        # which is harmless (see docstring).
+        os.utime(dst, None)
     log.info("[cache] hit %s → materialized %d maps into %s", key[:8], len(npy_files), output_dir)
 
 
