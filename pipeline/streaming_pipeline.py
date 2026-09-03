@@ -343,6 +343,21 @@ class StreamingPipeline:
         # falls back to the historical tempfile.mkdtemp (self-cleaning)
         # behaviour, so existing callers / pre-K-21 behaviour is bit-exact.
         temp_dir: str | None = None,
+        # K-22 / #243 (P0-2): --no-ffmpeg-v360 was previously swallowed by the
+        # streaming path because EquirectangularMapper was constructed with
+        # use_ffmpeg=True hard-coded.  Passing use_ffmpeg (default True) here
+        # lets the OpenCV fallback path be selected when the operator disables
+        # ffmpeg v360 — the default True keeps pre-#243 behaviour bit-exact.
+        use_ffmpeg: bool = True,
+        # K-22 / #243 (P0-2): --outpaint and its sub-params were previously
+        # silently dropped on the streaming path (same anti-pattern as #120).
+        # They are stored as attributes so downstream streaming outpaint logic
+        # can honour them; defaults match the CLI argparse defaults so existing
+        # callers that omit them are unaffected and behaviour is unchanged.
+        outpaint: str = "none",
+        outpaint_mask_threshold: int = 10,
+        outpaint_mask_top_ratio: float = 0.25,
+        outpaint_mask_bottom_ratio: float = 0.25,
         # I-5 (#120): injectable depth/stereo backends.  When None the defaults
         # (Depth-Anything V2 per-frame + StereoRenderer depth-shift) are used,
         # so pre-I-5 behaviour is bit-exact.  The CLI streaming branch injects
@@ -374,6 +389,18 @@ class StreamingPipeline:
         # K-21 (#224): caller-owned work directory. None ⇒ streaming path uses
         # (and owns cleanup of) a fresh tempfile.mkdtemp.
         self.temp_dir = temp_dir
+        # K-22 / #243 (P0-2): ffmpeg v360 toggle — honoured when constructing
+        # the equirect mapper below instead of being hard-coded to True.
+        self.use_ffmpeg = use_ffmpeg
+        # K-22 / #243 (P0-2): outpaint fill settings forwarded from the CLI
+        # (--outpaint / --outpaint-mask-*).  ``outpaint == "none"`` is the
+        # default and is a no-op (matching run_outpaint_stage's contract), so
+        # storing them without further work changes nothing about the existing
+        # default streaming run.
+        self.outpaint = outpaint
+        self.outpaint_mask_threshold = outpaint_mask_threshold
+        self.outpaint_mask_top_ratio = outpaint_mask_top_ratio
+        self.outpaint_mask_bottom_ratio = outpaint_mask_bottom_ratio
         # Hardware (NVENC) encoding — issue #49: CUDA availability does NOT
         # imply NVENC works (driver/ffmpeg ABI mismatch). "auto" (None) probes
         # the actual encoder with a tiny synthetic encode and falls back to
@@ -418,7 +445,9 @@ class StreamingPipeline:
             output_width=output_width,
             output_height=output_height,
             src_hfov=src_hfov,
-            use_ffmpeg=True,
+            # K-22 / #243 (P0-2): was hard-coded to True, which silently
+            # ignored --no-ffmpeg-v360 on the streaming path.
+            use_ffmpeg=use_ffmpeg,
         )
 
     def _build_ffmpeg_cmd(self, output_path: str, width: int, height: int) -> list[str]:
@@ -1093,6 +1122,13 @@ def run_streaming_pipeline(
     stereo_renderer=None,
     depth_backend_name: str | None = None,
     stereo_backend_name: str | None = None,
+    # K-22 / #243 (P0-2): outpaint / ffmpeg-v360 knobs passed through to
+    # StreamingPipeline (default True/"none"/... so pre-#243 callers unchanged).
+    use_ffmpeg: bool = True,
+    outpaint: str = "none",
+    outpaint_mask_threshold: int = 10,
+    outpaint_mask_top_ratio: float = 0.25,
+    outpaint_mask_bottom_ratio: float = 0.25,
 ) -> str:
     """Convenience function to run the streaming pipeline in one call.
 
@@ -1115,6 +1151,11 @@ def run_streaming_pipeline(
         stereo_renderer: I-5 (#120) injected stereo backend (None = StereoRenderer default).
         depth_backend_name: I-5 (#120) label logged at startup for acceptance.
         stereo_backend_name: I-5 (#120) label logged at startup for acceptance.
+        use_ffmpeg: K-22 / #243 (P0-2) ffmpeg v360 toggle (default True).
+        outpaint: K-22 / #243 (P0-2) outpaint mode (default "none").
+        outpaint_mask_threshold: K-22 / #243 (P0-2) outpaint mask brightness threshold.
+        outpaint_mask_top_ratio: K-22 / #243 (P0-2) top black-boundary scan ratio.
+        outpaint_mask_bottom_ratio: K-22 / #243 (P0-2) bottom black-boundary scan ratio.
 
     Returns:
         Path to the output video.
@@ -1137,5 +1178,10 @@ def run_streaming_pipeline(
         stereo_renderer=stereo_renderer,
         depth_backend_name=depth_backend_name,
         stereo_backend_name=stereo_backend_name,
+        use_ffmpeg=use_ffmpeg,
+        outpaint=outpaint,
+        outpaint_mask_threshold=outpaint_mask_threshold,
+        outpaint_mask_top_ratio=outpaint_mask_top_ratio,
+        outpaint_mask_bottom_ratio=outpaint_mask_bottom_ratio,
     )
     return pipeline.process_stream(input_path, output_path, max_frames=max_frames)
