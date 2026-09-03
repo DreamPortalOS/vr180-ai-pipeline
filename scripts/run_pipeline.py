@@ -51,7 +51,12 @@ from tqdm import tqdm  # noqa: E402
 from pipeline.comfort_presets import COMFORT_PRESETS, DEFAULT_COMFORT, resolve_comfort  # noqa: E402
 from pipeline.depth_crafter import DepthCrafterEstimator  # noqa: E402
 from pipeline.depth_estimator import DepthEstimator  # noqa: E402
-from pipeline.device_utils import detect_best_device, resolve_device  # noqa: E402
+from pipeline.device_utils import (  # noqa: E402
+    detect_best_device,
+    format_preflight,
+    preflight_check,
+    resolve_device,
+)
 from pipeline.equirectangular_mapper import EquirectangularMapper  # noqa: E402
 from pipeline.fulldome_mapper import FulldomeMapper  # noqa: E402
 from pipeline.outpainter import Outpainter  # noqa: E402
@@ -82,6 +87,134 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("vr180-pipeline")
+
+
+# P-4b (#230): preflight thresholds per backend.  These are starting values
+# tuned to the worker's 12 GB RTX 4070 SUPER and the 09-02 MemoryError post-
+# mortem (host with 7.4 GB free + a 2.84 GB unet → diffusers OOM during
+# DepthCrafter load).  They are module-level so they can be retuned as
+# backends evolve, and are overridable per-run via env vars
+# VR180_PREFLIGHT_MIN_RAM_GB / VR180_PREFLIGHT_MIN_VRAM_GB.  See
+# :func:`_preflight_thresholds` for the per-backend resolution.
+# Depth backends — RAM required to load the model + hold the frame buffer
+# without falling into the OS page cache and surfacing a misleading diffusers
+# ``open().read()`` MemoryError.
+_DEFAULT_MIN_RAM_DEPTH_ANYTHING_GB = 4.0
+_DEFAULT_MIN_RAM_DEPTHCRAFTER_GB = 12.0
+# Stereo backends — VRAM required to hold the StereoCrafter unet (fp16) +
+# intermediate feature maps without evicting the depth tensor.
+_DEFAULT_MIN_VRAM_STEREOCRAFTER_GB = 8.0
+# Env-var keys used to override the per-backend defaults above.
+_PREFLIGHT_ENV_RAM = "VR180_PREFLIGHT_MIN_RAM_GB"
+_PREFLIGHT_ENV_VRAM = "VR180_PREFLIGHT_MIN_VRAM_GB"
+
+
+def _resolve_threshold(name: str, fallback: float | None) -> float | None:
+    """Read an optional env-var override for a preflight threshold.
+
+    ``None`` stays ``None`` (check is skipped); a positive float is honoured;
+    a non-numeric or non-positive value is rejected with a loud warning and
+    the fallback is used (never silently accept garbage).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return fallback
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        log.warning("⚠️  Invalid %s=%r — not a number, using default.", name, raw)
+        return fallback
+    if val <= 0:
+        log.warning("⚠️  %s=%r must be > 0 — ignoring, using default.", name, val)
+        return fallback
+    return val
+
+
+def _preflight_thresholds(args) -> tuple[float, float | None]:
+    """Return ``(min_free_ram_gb, min_free_vram_gb)`` for this run's backends.
+
+    Resolution order (matches the I-5 backend-selection philosophy):
+
+    1. Env var override (``VR180_PREFLIGHT_MIN_RAM_GB`` / ``_VRAM``) — an
+       explicit operator dial always wins.
+    2. Backend-specific default: ``depthcrafter`` ⇒ 12 GB RAM; ``stereocrafter``
+       ⇒ 8 GB VRAM; default depth path ⇒ 4 GB RAM; default stereo ⇒ no
+       VRAM check.
+
+    The RAM / VRAM thresholds are chosen independently — a run with
+    ``--depth-model depthcrafter --stereo-model stereocrafter`` picks up both
+    thresholds; a run with just the default backends only picks up the 4 GB
+    RAM check and skips VRAM.
+    """
+    depth_model = getattr(args, "depth_model", "depth-anything")
+    stereo_model = getattr(args, "stereo_model", "default")
+
+    if depth_model == "depthcrafter":
+        ram_default = _DEFAULT_MIN_RAM_DEPTHCRAFTER_GB
+    else:
+        ram_default = _DEFAULT_MIN_RAM_DEPTH_ANYTHING_GB
+
+    vram_default = _DEFAULT_MIN_VRAM_STEREOCRAFTER_GB if stereo_model == "stereocrafter" else None
+
+    return (
+        _resolve_threshold(_PREFLIGHT_ENV_RAM, ram_default),
+        _resolve_threshold(_PREFLIGHT_ENV_VRAM, vram_default),
+    )
+
+
+def _run_preflight(args) -> None:
+    """Invoke the P-4b (#230) preflight check for this run.
+
+    Called by :func:`main` **before** any heavy backend is constructed
+    (depth/stereo), and before stage-body execution for the batch path.
+
+    Behaviour is governed by ``--preflight``:
+
+    * ``warn`` (default): log :func:`format_preflight` regardless of pass/fail;
+      on fail also emit a WARNING with the reasons. Pipeline continues
+      (legacy behaviour preserved — the preflight never exits here).
+    * ``strict``: on fail, print the reasons and ``sys.exit(1)``.
+    * ``off``: no-op — ``preflight_check`` is NOT called.
+
+    A crash *inside* ``preflight_check`` (e.g. platform memory read fails) is
+    caught and warned — the preflight must never take down the pipeline.
+    """
+    if getattr(args, "preflight", "warn") == "off":
+        return
+
+    min_ram, min_vram = _preflight_thresholds(args)
+
+    try:
+        report = preflight_check(
+            min_free_ram_gb=min_ram,
+            min_free_vram_gb=min_vram,
+        )
+    except Exception as exc:
+        # Platform read failure (missing /proc, ctypes oddity) must not abort.
+        log.warning(
+            "⚠️  Preflight check failed to read host resources (%s: %s) — continuing without a preflight gate.",
+            type(exc).__name__,
+            exc,
+        )
+        return
+
+    log.info(format_preflight(report))
+
+    if not report.ok:
+        reasons_text = "; ".join(report.reasons)
+        if getattr(args, "preflight", "warn") == "strict":
+            vram_text = f"VRAM ≥ {min_vram:.1f} GB" if min_vram is not None else "VRAM n/a"
+            msg = (
+                f"❌ Preflight check FAILED (--preflight strict):\n"
+                f"    {reasons_text}\n"
+                f"    Thresholds: RAM ≥ {min_ram:.1f} GB, {vram_text}\n"
+                f"    Override with env vars VR180_PREFLIGHT_MIN_RAM_GB / VR180_PREFLIGHT_MIN_VRAM_GB, "
+                f"or pass --preflight warn to continue anyway."
+            )
+            print(msg, file=sys.stderr)
+            log.error(msg)
+            sys.exit(1)
+        log.warning("⚠️  Preflight check FAILED (warn mode): %s", reasons_text)
 
 
 def parse_args(argv: list[str] | None = None):
@@ -392,6 +525,22 @@ def parse_args(argv: list[str] | None = None):
         default="depth-anything",
         help="Depth estimation backend: depth-anything (per-frame, default) or "
         "depthcrafter (temporally-consistent video depth, CUDA-only)",
+    )
+    parser.add_argument(
+        "--preflight",
+        choices=["warn", "strict", "off"],
+        default="warn",
+        help=(
+            "P-4b (#230): host-memory preflight behaviour before launching heavy "
+            "models (depth/stereo backends). 'warn' (default) = log a WARNING "
+            "when the check fails but continue (matches legacy behaviour — the "
+            "pipeline never exits for a preflight miss here); 'strict' = exit "
+            "non-zero with the failure reasons; 'off' = skip the check entirely. "
+            "Thresholds are derived from the selected --depth-model / --stereo-model "
+            "(depthcrafter RAM ≥ 12 GB, depth-anything RAM ≥ 4 GB, "
+            "stereocrafter VRAM ≥ 8 GB); override per-run with env vars "
+            "VR180_PREFLIGHT_MIN_RAM_GB and VR180_PREFLIGHT_MIN_VRAM_GB."
+        ),
     )
     parser.add_argument(
         "--depthcrafter-repo-dir",
@@ -2375,6 +2524,15 @@ def main():
     # +faststart, and IDR flags land on args here so every encode path below
     # (streaming / chunked / metadata) sees them.  ``source`` = no-op.
     apply_playback_preset(args)
+
+    # P-4b (#230): resource preflight — runs before ANY heavy backend is
+    # constructed (streaming's build_depth_backend/build_stereo_backend,
+    # the batch depth/stereo stages inside _stage_all_body, or the
+    # single-stage --stage depth / --stage stereo entries further below).
+    # Default mode is 'warn', which never exits — behaviour is identical to
+    # the pre-P-4b pipeline unless the operator opts into 'strict' or
+    # switches it 'off'.
+    _run_preflight(args)
 
     # Streaming pipeline mode (PRD §7.2).  V-3: the streaming path is a
     # single fused run — it cannot be split across machines, so --stages /
