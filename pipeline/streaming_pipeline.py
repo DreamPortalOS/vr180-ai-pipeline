@@ -612,6 +612,38 @@ class StreamingPipeline:
         )
         return left_frames, right_frames
 
+    @staticmethod
+    def _depth_npy_path(depth_dir: str, idx: int) -> str:
+        """Canonical path for one per-frame depth map.
+
+        The ``depth_<idx:06d>.npy`` layout is what the stereo stage's depth
+        loader globs for **and** what ``make_comparison``'s stability metrics
+        resolve.  Both the whole-clip-stereo fallback (:meth:`_emit_perframe_depths`)
+        and the per-frame fuse loop (K-23b, #232) must produce identical names,
+        so they share this helper instead of each spelling the format string.
+        """
+        return os.path.join(depth_dir, f"depth_{idx:06d}.npy")
+
+    def _persist_depth_npy(self, depth_dir: str, idx: int, depth: np.ndarray) -> None:
+        """Checkpoint one per-frame depth map to *depth_dir* (K-23b, #232).
+
+        A write failure (disk full, permission, …) is **non-fatal** — it only
+        costs the K-16 stability metric for that run (no npy to read back), it
+        must not interrupt the render.  Mirrors the naming used by
+        :meth:`_emit_perframe_depths` via :meth:`_depth_npy_path`.
+        """
+        try:
+            np.save(self._depth_npy_path(depth_dir, idx), np.asarray(depth))
+        except OSError as exc:
+            log.warning(
+                "⚠️  [Depth] could not persist depth_%06d.npy to %s (%s) — "
+                "render continues, but K-16 stability metric will be missing "
+                "for this run.",
+                idx,
+                depth_dir,
+                exc,
+            )
+
     def _emit_perframe_depths(
         self,
         cap: cv2.VideoCapture,
@@ -652,7 +684,7 @@ class StreamingPipeline:
                 break
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             depth = self.depth_estimator.estimate(rgb)
-            np.save(os.path.join(depth_dir, f"depth_{idx:06d}.npy"), np.asarray(depth))
+            self._persist_depth_npy(depth_dir, idx, depth)
             del depth, rgb, bgr
             emitted = idx + 1
         log.info(
@@ -822,6 +854,21 @@ class StreamingPipeline:
             if precomp_depths:
                 total = min(total, len(precomp_depths))
 
+        # K-23b (#232): the default per-frame path (no whole-clip backend)
+        # computes each frame's depth inline and feeds it straight to the
+        # stereo render — it never touched disk, so make_comparison's K-16
+        # stability metric had nothing to read back and stayed ``—`` (the
+        # baseline recipe, the reference row in the comparison table, was
+        # silently metric-less).  When the caller owns a work dir we persist
+        # each per-frame depth alongside the whole-clip layout (same helper
+        # as ``_emit_perframe_depths``) so the resolver finds it.  Without a
+        # temp_dir we stay O(1)-memory and write nothing (the default).
+        # ``precomp_depths is not None`` means the whole-clip depth backend
+        # already wrote its own maps — don't double-write over them.
+        perframe_persist_dir: str | None = None
+        if precomp_left is None and precomp_depths is None and self.temp_dir:
+            perframe_persist_dir = self._depth_work_dir()
+
         proc = self._open_ffmpeg_writer(output_path, out_w, out_h)
 
         try:
@@ -858,6 +905,13 @@ class StreamingPipeline:
                             depth = precomp_depths[frame_idx]
                         else:
                             depth = self.depth_estimator.estimate(rgb)
+
+                        # K-23b (#232): persist per-frame depth so K-16 stability
+                        # metrics have npy to read back.  No-op when no work dir
+                        # (O(1)-memory default); write failures are non-fatal
+                        # (warning only, render never interrupted).
+                        if perframe_persist_dir is not None:
+                            self._persist_depth_npy(perframe_persist_dir, frame_idx, depth)
 
                         # --- Stage 2: Stereo rendering ---
                         left, right = self.stereo_renderer.render(rgb, depth)
