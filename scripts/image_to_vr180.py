@@ -43,6 +43,22 @@ log = logging.getLogger("image-to-vr180")
 # Exit code when final QA fails (machine-detectable, non-zero).
 EXIT_QA_FAILED = 3
 
+# Seedance duration contract (Ark): 4-15 seconds inclusive.
+DURATION_MIN = 4
+DURATION_MAX = 15
+
+
+def _duration_type(value: str) -> int:
+    """Argparse type for --duration: int in the Ark-supported 4-15 range."""
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from None
+    if ivalue < DURATION_MIN or ivalue > DURATION_MAX:
+        raise argparse.ArgumentTypeError(f"--duration must be between {DURATION_MIN} and {DURATION_MAX}; got {ivalue}")
+    return ivalue
+
+
 # Manifest stage names, in the order they run.
 STAGE_ORDER = ("prepare", "generate", "streamcheck", "upscale", "convert", "audio", "qa")
 
@@ -68,11 +84,15 @@ class JobArgs:
     prompt: str = ""
     provider: str = "mock"
     duration: int = 5
-    # Generation tier (H-2): passed through to the provider as kwargs so
-    # raising the tier is a CLI switch, not a code change. Defaults keep
-    # the quota discipline (480p / 5s / adaptive).
+    # Generation tier (H-2 / P-1 #246): passed through to the provider as
+    # kwargs so raising the tier is a CLI switch, not a code change.
+    # Defaults keep the quota discipline (480p / 5s / adaptive / fast).
     gen_resolution: str = "480p"
     gen_ratio: str = "adaptive"
+    # Model id for Seedance. Default is the fast (low-cost) variant; 4k /
+    # 1080p require the standard model. Stored as the string id so the
+    # JobArgs → gen_kwargs pass-through is lossless.
+    gen_model: str = "doubao-seedance-2-0-fast-260128"
     upscale: str = "none"
     quality: str = "preview"
 
@@ -278,12 +298,14 @@ def stage_generate(args: JobArgs, prepared_image: str | None = None) -> str:
         args.generated_video,
     )
 
-    # Generation-tier kwargs (H-2): handed to the provider so it can put
-    # resolution/ratio into the request body. Seedance reads these; the mock
-    # provider ignores them (per the card's "mock provider 忽略即可").
+    # Generation-tier kwargs (H-2 / P-1 #246): handed to the provider so it
+    # can put resolution/ratio/model into the request body. Seedance reads
+    # these; the mock provider ignores them (per the card's
+    # "mock provider 忽略即可").
     gen_kwargs: dict[str, str] = {
         "resolution": args.gen_resolution,
         "ratio": args.gen_ratio,
+        "model": args.gen_model,
     }
 
     # Ensure the mock provider (and any other provider) writes into our workdir
@@ -846,19 +868,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["kling", "seedance", "veo", "mock"],
         help="Video generation provider (default: mock)",
     )
-    parser.add_argument("--duration", type=int, default=5, help="Generated video duration in seconds (default: 5)")
+    parser.add_argument(
+        "--duration",
+        type=_duration_type,
+        default=5,
+        help=f"Generated video duration in seconds (default: 5, must be {DURATION_MIN}-{DURATION_MAX})",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="doubao-seedance-2-0-fast-260128",
+        help="Seedance model id (default: fast variant). "
+        "4k and 1080p require the standard model "
+        "(doubao-seedance-2-0-260128); the fast variant tops out at 720p. "
+        "Ignored by providers that do not use Seedance.",
+    )
     parser.add_argument(
         "--gen-resolution",
         default="480p",
-        choices=["480p", "720p", "1080p"],
+        choices=["480p", "720p", "1080p", "4k"],
         help="Generation resolution tier (default: 480p — quota discipline). "
-        "Higher tiers consume more quota; a reminder is logged when >480p is selected.",
+        "Higher tiers consume more quota; a reminder is logged when >480p is selected. "
+        "4k needs --model <standard>.",
     )
     parser.add_argument(
         "--gen-ratio",
         default="adaptive",
+        choices=["adaptive", "16:9", "9:16", "1:1"],
         help="Generation aspect ratio passed through to the provider (default: adaptive). "
-        "Seedance accepts e.g. adaptive/16:9/9:16/1:1.",
+        "Seedance accepts: adaptive/16:9/9:16/1:1.",
     )
     parser.add_argument(
         "--upscale",
@@ -946,6 +984,7 @@ def main(argv: list[str] | None = None) -> int:
             duration=args.duration,
             gen_resolution=args.gen_resolution,
             gen_ratio=args.gen_ratio,
+            gen_model=args.model,
             upscale=args.upscale,
             quality=args.quality,
             comfort=args.comfort,

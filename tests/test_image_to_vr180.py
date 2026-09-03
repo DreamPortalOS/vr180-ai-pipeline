@@ -520,9 +520,16 @@ class TestCLI:
         assert args.duration == 5
 
     def test_gen_resolution_choices_enforced(self):
-        """Only 480p/720p/1080p are accepted."""
+        """480p/720p/1080p/4k are accepted; other values are rejected."""
+        args = i2v.parse_args(["--image", "x.png", "--gen-resolution", "4k"])
+        assert args.gen_resolution == "4k"
         with pytest.raises(SystemExit):
-            i2v.parse_args(["--image", "x.png", "--gen-resolution", "4k"])
+            i2v.parse_args(["--image", "x.png", "--gen-resolution", "768p"])
+
+    def test_gen_model_default_is_fast(self):
+        """P-1 (#246): --model defaults to the fast (low-cost) variant."""
+        args = i2v.parse_args(["--image", "x.png"])
+        assert args.model == "doubao-seedance-2-0-fast-260128"
 
 
 class TestQualityPresetResolution:
@@ -620,7 +627,7 @@ class TestGenTierPassthrough:
         assert body["duration"] == 8
 
     def test_defaults_are_480p_5s_adaptive(self, synthetic_image, tmp_path, monkeypatch):
-        """With no tier overrides the body reflects 480p / 5s / adaptive."""
+        """With no tier overrides the body reflects 480p / 5s / adaptive / fast."""
         monkeypatch.setenv("ARK_API_KEY", "test-key")
 
         job = self._job(synthetic_image, tmp_path)
@@ -638,6 +645,58 @@ class TestGenTierPassthrough:
         assert body["resolution"] == "480p"
         assert body["ratio"] == "adaptive"
         assert body["duration"] == 5
+        # P-1 (#246): default model is the fast variant — regression guard.
+        assert body["model"] == "doubao-seedance-2-0-fast-260128"
+
+    def test_std_model_4k_1x1_reaches_request_body(self, synthetic_image, tmp_path, monkeypatch):
+        """P-1 (#246): gen_model=std + 4k + 1:1 reaches the Ark body."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        job = self._job(
+            synthetic_image,
+            tmp_path,
+            gen_resolution="4k",
+            gen_ratio="1:1",
+            gen_model="doubao-seedance-2-0-260128",
+        )
+        Path(job.generated_video).parent.mkdir(parents=True, exist_ok=True)
+        Path(job.generated_video).write_bytes(b"fake-generated-video")
+
+        mock_client = _seedance_httpx(job.generated_video)
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+        ):
+            i2v.stage_generate(job, prepared_image=str(synthetic_image))
+
+        body = mock_client.post.call_args[1]["json"]
+        assert body["resolution"] == "4k"
+        assert body["ratio"] == "1:1"
+        assert body["model"] == "doubao-seedance-2-0-260128"
+
+    def test_fast_model_with_4k_fails_before_request(self, synthetic_image, tmp_path, monkeypatch):
+        """P-1 (#246): fast + 4k raises before any HTTP request is sent."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        job = self._job(
+            synthetic_image,
+            tmp_path,
+            gen_resolution="4k",
+            gen_ratio="1:1",
+        )
+        Path(job.generated_video).parent.mkdir(parents=True, exist_ok=True)
+        Path(job.generated_video).write_bytes(b"fake-generated-video")
+
+        mock_client = _seedance_httpx(job.generated_video)
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+            pytest.raises(ValueError) as excinfo,
+        ):
+            i2v.stage_generate(job, prepared_image=str(synthetic_image))
+
+        assert "4k" in str(excinfo.value)
+        assert mock_client.post.call_count == 0
 
     def test_manifest_records_gen_tier_params(self, synthetic_image, tmp_path, monkeypatch):
         """The generate stage's manifest params capture resolution + ratio."""
@@ -648,6 +707,7 @@ class TestGenTierPassthrough:
             tmp_path,
             gen_resolution="1080p",
             gen_ratio="9:16",
+            gen_model="doubao-seedance-2-0-260128",
             duration=10,
         )
         Path(job.generated_video).parent.mkdir(parents=True, exist_ok=True)

@@ -40,6 +40,24 @@ _DEFAULT_RESOLUTION = "480p"
 _DEFAULT_RATIO = "adaptive"
 _DEFAULT_DURATION = 5
 
+# Resolution tiers each model variant supports (issue #246). The fast variant
+# caps at 720p; 4k (2880x2880 for 1:1) is standard-model-only. This is a
+# pre-flight contract so callers see a clear, local error instead of the
+# opaque Ark ``ModelNotOpen`` response after burning quota.
+MODEL_RESOLUTIONS: dict[str, set[str]] = {
+    MODEL_FAST: {"480p", "720p"},
+    MODEL_STD: {"480p", "720p", "1080p", "4k"},
+}
+
+# Provider fields the CLI may request but which are sent into the Ark body
+# only when explicitly supplied (default = omit, so the existing request
+# shape is byte-for-byte unchanged for the common path).
+PASSTHROUGH_FIELDS = ("draft", "return_last_frame", "seed", "camera_fixed")
+
+# Canonical tier order, shared by both CLAs so ``choices`` never drift.
+VALID_RESOLUTIONS = ("480p", "720p", "1080p", "4k")
+VALID_RATIOS = ("adaptive", "16:9", "9:16", "1:1")
+
 
 class SeedanceProvider(VideoGenProvider):
     """Seedance video generation on Volcengine Ark.
@@ -81,6 +99,8 @@ class SeedanceProvider(VideoGenProvider):
         cross-provider surface.
         """
         content = [{"type": "text", "text": prompt}]
+        if "ratio" not in kwargs and aspect_ratio != "16:9":
+            kwargs["aspect_ratio"] = aspect_ratio
         return self._run(content, duration=duration, **kwargs)
 
     # ------------------------------------------------------------------
@@ -106,6 +126,13 @@ class SeedanceProvider(VideoGenProvider):
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": encoded}},
         ]
+        # Issue #246: aspect_ratio used to be a silent no-op on Ark.
+        # Forward it through to _build_body (which maps it onto body["ratio"]),
+        # but let an explicit ``ratio=`` kwarg override it. The cross-provider
+        # default "16:9" is treated as "not set" so the Ark default "adaptive"
+        # is preserved when nobody explicitly picks a ratio.
+        if "ratio" not in kwargs and aspect_ratio != "16:9":
+            kwargs["aspect_ratio"] = aspect_ratio
         return self._run(content, duration=duration, **kwargs)
 
     # ------------------------------------------------------------------
@@ -116,15 +143,13 @@ class SeedanceProvider(VideoGenProvider):
         self,
         content: list[dict[str, object]],
         duration: int = 5,
-        **kwargs: str | int | float,
+        **kwargs: str | int | float | bool,
     ) -> GenerationResult:
-        body: dict[str, object] = {
-            "model": kwargs.get("model", MODEL_FAST),
-            "content": content,
-            "resolution": kwargs.get("resolution", _DEFAULT_RESOLUTION),
-            "ratio": kwargs.get("ratio", _DEFAULT_RATIO),
-            "duration": kwargs.get("duration", duration),
-        }
+        body = self._build_body(
+            content=content,
+            duration=duration,
+            **kwargs,
+        )
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -167,6 +192,79 @@ class SeedanceProvider(VideoGenProvider):
                     raise RuntimeError(f"Seedance task {task_id} {status}: {msg}")
 
             raise RuntimeError(f"Seedance task {task_id} did not complete within {_MAX_POLL_SECONDS}s")
+
+    @staticmethod
+    def _build_body(
+        content: list[dict[str, object]],
+        *,
+        duration: int = _DEFAULT_DURATION,
+        **kwargs: str | int | float | bool,
+    ) -> dict[str, object]:
+        """Assemble the Ark request body from provider kwargs.
+
+        The five base keys (model/content/resolution/ratio/duration) always
+        appear, so the default request shape is unchanged.  Optional body
+        fields from :data:`PASSTHROUGH_FIELDS` are copied through **only when
+        explicitly supplied** — an absent flag never adds a key, so quota and
+        pricing stay exactly what the pre-#246 client sent.
+
+        ``aspect_ratio`` is the cross-provider surface name; the Ark body
+        expects ``ratio``.  An explicit ``ratio`` wins, otherwise the caller's
+        ``aspect_ratio`` is honoured (it is no longer silently dropped).
+
+        Raises ``ValueError`` for a model/resolution pair the model variant
+        does not support — raised *before* any HTTP traffic so the operator
+        sees the reason locally instead of a later ``ModelNotOpen``.
+        """
+        model = kwargs.get("model", MODEL_FAST)
+        resolution = kwargs.get("resolution", _DEFAULT_RESOLUTION)
+
+        SeedanceProvider._validate_model_resolution(model, resolution)
+
+        ratio = kwargs.get("ratio")
+        if ratio is None:
+            # Legacy alias: the cross-provider aspect_ratio was previously a
+            # silent no-op on Ark. It now maps onto the real body field.
+            ratio = kwargs.get("aspect_ratio", _DEFAULT_RATIO)
+
+        body: dict[str, object] = {
+            "model": model,
+            "content": content,
+            "resolution": resolution,
+            "ratio": ratio,
+            "duration": kwargs.get("duration", duration),
+        }
+        for field in PASSTHROUGH_FIELDS:
+            if field in kwargs:
+                body[field] = kwargs[field]
+        return body
+
+    @staticmethod
+    def _validate_model_resolution(model: object, resolution: object) -> None:
+        """Reject a resolution the chosen model variant cannot produce.
+
+        The Ark fast variant tops out at 720p; requesting 4k with it yields
+        ``ModelNotOpen`` from the API — an opaque failure that costs quota.
+        Fail locally instead, naming both the unsupported tier and the model
+        that does support it.
+        """
+        if not isinstance(model, str):
+            model = str(model)
+        if not isinstance(resolution, str):
+            resolution = str(resolution)
+
+        supported = MODEL_RESOLUTIONS.get(model)
+        if supported is None:
+            return  # unknown model id: let the API report it (misspelling case)
+        if resolution in supported:
+            return
+
+        supported_str = ", ".join(sorted(supported))
+        raise ValueError(
+            f"Model {model} does not support resolution '{resolution}' "
+            f"(supported: {supported_str}). "
+            f"Use --model {MODEL_STD} for 4k / 1080p."
+        )
 
     @staticmethod
     def _handle_submit(resp: httpx.Response) -> str:
@@ -242,8 +340,7 @@ class SeedanceProvider(VideoGenProvider):
             return f"{code}: model not found ({message}). The configured model id may be invalid or misspelled."
         if code == "ModelNotOpen":
             model = error.get("model", "the configured model")
-            return f"{code}: model {model} is not enabled for your project. "
-            f"请在方舟控制台开通模型 {model}。"
+            return f"{code}: model {model} is not enabled for your project. 请在方舟控制台开通模型 {model}。"
         if code == "ResourceNotFound":
             return f"{code}: task/resource not found, may have expired ({message})"
         return msg

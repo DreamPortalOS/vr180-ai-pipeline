@@ -26,10 +26,31 @@ if str(_REPO_ROOT) not in sys.path:
 
 import httpx  # noqa: E402
 from integrations.factory import get_provider, list_providers  # noqa: E402
+from integrations.seedance import (  # noqa: E402
+    MODEL_FAST,
+    VALID_RATIOS,
+    VALID_RESOLUTIONS,
+)
 
 log = logging.getLogger(__name__)
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "video")
+
+# Seedance duration contract (Ark): 4-15 seconds inclusive. Only enforced
+# for the seedance provider — other providers (mock, kling, veo) have
+# different duration contracts and existing CLI flows that use shorter
+# durations should keep working.
+DURATION_MIN = 4
+DURATION_MAX = 15
+
+# Model choices for the --model flag. Both constants are wired so callers can
+# pick the standard model (needed for 4k / 1080p) without hardcoding an id.
+_MODEL_CHOICES = [MODEL_FAST, "doubao-seedance-2-0-260128"]
+
+
+def _model_sort_key(model: str) -> int:
+    """Return a stable sort key so --model choices list the fast default first."""
+    return 0 if model == MODEL_FAST else 1
 
 
 def _ensure_output_dir() -> str:
@@ -107,27 +128,65 @@ def build_parser() -> argparse.ArgumentParser:
         "-d",
         type=int,
         default=5,
-        help="Target duration in seconds (default: 5).",
+        help=f"Target duration in seconds (default: 5). Seedance (Ark) "
+        f"requires {DURATION_MIN}-{DURATION_MAX}; the CLI validates that "
+        f"range when --provider seedance is selected.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=MODEL_FAST,
+        choices=sorted(_MODEL_CHOICES, key=_model_sort_key),
+        metavar="MODEL_ID",
+        help=f"Seedance model id (default: {MODEL_FAST} — quota discipline). "
+        "4k and 1080p require the standard model; the fast variant tops out at 720p. "
+        "Ignored by providers that do not use Seedance.",
     )
     parser.add_argument(
         "--gen-resolution",
         default="480p",
-        choices=["480p", "720p", "1080p"],
+        choices=list(VALID_RESOLUTIONS),
         help="Generation resolution tier (default: 480p — quota discipline). "
-        "Higher tiers consume more quota; a reminder is logged when >480p is selected.",
+        "Higher tiers consume more quota; a reminder is logged when >480p is selected. "
+        "4k (2880x2880 at 1:1) needs --model <standard>.",
     )
     parser.add_argument(
         "--gen-ratio",
         default="adaptive",
+        choices=list(VALID_RATIOS),
         help="Generation aspect ratio passed through to the provider (default: adaptive). "
-        "Seedance accepts e.g. adaptive/16:9/9:16/1:1.",
+        f"Seedance accepts: {'/'.join(VALID_RATIOS)}. "
+        "Ignored when --aspect-ratio is also given.",
     )
     parser.add_argument(
         "--aspect-ratio",
         "-a",
         type=str,
         default="16:9",
-        help='Aspect ratio (default: "16:9").',
+        help='Aspect ratio (default: "16:9"). Maps onto the Seedance body field '
+        '"ratio" and overrides --gen-ratio; --gen-ratio wins otherwise.',
+    )
+    parser.add_argument(
+        "--draft",
+        action="store_true",
+        help="Seedance draft (样片) mode — cheaper preview pass to check the "
+        "camera motion before paying for the full render. Body field only sent when set.",
+    )
+    parser.add_argument(
+        "--return-last-frame",
+        action="store_true",
+        help="Ask Seedance for the final frame alongside the video. Body field only sent when set.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seedance generation seed for reproducible output. Only sent when given.",
+    )
+    parser.add_argument(
+        "--camera-fixed",
+        action="store_true",
+        help="Seedance camera-fixed mode. Body field only sent when set.",
     )
     parser.add_argument(
         "--fps",
@@ -241,6 +300,17 @@ def main(argv: list[str] | None = None) -> int:
         log.error("--template and a positional prompt are mutually exclusive.")
         return 2
 
+    # Seedance (Ark) caps duration at [4, 15]. Other providers have different
+    # contracts, so this check only fires for the seedance provider.
+    if args.provider == "seedance" and (args.duration < DURATION_MIN or args.duration > DURATION_MAX):
+        log.error(
+            "--duration must be between %d and %d for seedance; got %d",
+            DURATION_MIN,
+            DURATION_MAX,
+            args.duration,
+        )
+        return 2
+
     prompt = args.prompt
     negative_prompt: str | None = None
 
@@ -305,14 +375,31 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Provider error: %s", exc)
         return 1
 
-    kwargs: dict[str, str | int | float] = {}
+    kwargs: dict[str, str | int | float | bool] = {}
     if negative_prompt:
         kwargs["negative_prompt"] = negative_prompt
-    # H-2: generation-tier passthrough. Seedance reads resolution/ratio from
-    # the request body; other providers ignore unknown kwargs. Default stays
-    # 480p/adaptive so the quota discipline is unchanged.
+    # H-2 / P-1 (#246): generation-tier passthrough. Seedance reads
+    # resolution/ratio/model from the request body; other providers ignore
+    # unknown kwargs. Default stays 480p/adaptive/fast so the quota
+    # discipline is unchanged.
     kwargs["resolution"] = args.gen_resolution
-    kwargs["ratio"] = args.gen_ratio
+    kwargs["model"] = args.model
+    # --aspect-ratio (-a) is passed explicitly below to the provider surface
+    # (aspect_ratio=...) and SeedanceProvider._build_body maps it onto the
+    # Ark body field "ratio". So we only send "ratio" here when --aspect-ratio
+    # is at its default — otherwise the two would disagree.
+    if args.aspect_ratio == "16:9":
+        kwargs["ratio"] = args.gen_ratio
+    # Optional Seedance body fields. Only inserted when the flag is set so
+    # the default request body is byte-for-byte unchanged for the common path.
+    if args.draft:
+        kwargs["draft"] = True
+    if args.return_last_frame:
+        kwargs["return_last_frame"] = True
+    if args.seed is not None:
+        kwargs["seed"] = args.seed
+    if args.camera_fixed:
+        kwargs["camera_fixed"] = True
     if args.gen_resolution != "480p":
         log.warning("⚠️  高档位（%s）消耗更多额度，请确认后再继续。", args.gen_resolution)
 
@@ -340,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
         except NotImplementedError as exc:
             log.error("Provider %s does not support image-to-video: %s", args.provider, exc)
             return 1
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             log.error("Generation failed: %s", exc)
             return 1
     else:
@@ -362,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
                 fps=args.fps,
                 **kwargs,
             )
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             log.error("Generation failed: %s", exc)
             return 1
 

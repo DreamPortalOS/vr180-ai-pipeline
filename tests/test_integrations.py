@@ -319,6 +319,81 @@ class TestSeedanceProvider:
         assert body["ratio"] == "16:9"
         assert body["duration"] == 8
 
+    def test_build_body_default_is_five_keys(self) -> None:
+        """Regression: the default body shape is byte-for-byte unchanged."""
+        body = SeedanceProvider._build_body(content=[{"type": "text", "text": "x"}])
+        assert set(body) == {"model", "content", "resolution", "ratio", "duration"}
+        assert body["model"] == "doubao-seedance-2-0-fast-260128"
+        assert body["resolution"] == "480p"
+        assert body["ratio"] == "adaptive"
+        assert body["duration"] == 5
+
+    def test_build_body_passthrough_fields_only_when_supplied(self) -> None:
+        """P-1 (#246): draft/return_last_frame/seed/camera_fixed are omitted
+        by default and included only when the caller supplies them."""
+        base = {"type": "text", "text": "x"}
+        default = SeedanceProvider._build_body(content=[base])
+        assert "draft" not in default
+        assert "return_last_frame" not in default
+        assert "seed" not in default
+        assert "camera_fixed" not in default
+
+        full = SeedanceProvider._build_body(
+            content=[base],
+            draft=True,
+            return_last_frame=True,
+            seed=42,
+            camera_fixed=True,
+        )
+        assert full["draft"] is True
+        assert full["return_last_frame"] is True
+        assert full["seed"] == 42
+        assert full["camera_fixed"] is True
+
+    def test_build_body_aspect_ratio_maps_to_ratio(self) -> None:
+        """P-1 (#246): aspect_ratio used to be a silent no-op on Ark. It
+        now lands in body["ratio"] so callers actually see their value."""
+        body = SeedanceProvider._build_body(
+            content=[{"type": "text", "text": "x"}],
+            aspect_ratio="9:16",
+        )
+        assert body["ratio"] == "9:16"
+
+    def test_build_body_explicit_ratio_wins_over_aspect_ratio(self) -> None:
+        """An explicit ratio kwarg wins over aspect_ratio."""
+        body = SeedanceProvider._build_body(
+            content=[{"type": "text", "text": "x"}],
+            ratio="1:1",
+            aspect_ratio="9:16",
+        )
+        assert body["ratio"] == "1:1"
+
+    def test_build_body_model_resolution_fast_rejects_4k(self) -> None:
+        """P-1 (#246): fast + 4k fails locally with a reason that names
+        both the unsupported tier and the model that supports it."""
+        std_id = SeedanceProvider.MODEL_STD
+        with pytest.raises(ValueError) as excinfo:
+            SeedanceProvider._build_body(
+                content=[{"type": "text", "text": "x"}],
+                model=SeedanceProvider.MODEL_FAST,
+                resolution="4k",
+            )
+        msg = str(excinfo.value)
+        assert "fast" in msg.lower()
+        assert "4k" in msg
+        assert std_id in msg
+
+    def test_build_body_model_resolution_std_allows_4k(self) -> None:
+        """standard model accepts 4k."""
+        body = SeedanceProvider._build_body(
+            content=[{"type": "text", "text": "x"}],
+            model=SeedanceProvider.MODEL_STD,
+            resolution="4k",
+            ratio="1:1",
+        )
+        assert body["resolution"] == "4k"
+        assert body["ratio"] == "1:1"
+
     def test_generate_submit_missing_task_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ARK_API_KEY", "test-key")
         provider = SeedanceProvider()
@@ -417,6 +492,63 @@ class TestSeedanceProvider:
             pytest.raises(RuntimeError, match="did not complete"),
         ):
             provider.generate("test")
+
+    def test_model_not_open_error_message_mentions_model_and_chinese_hint(self) -> None:
+        """P-1 (#246): the ModelNotOpen branch was previously a dead f-string
+        — the Chinese hint after the ``return`` was unreachable. Verify the
+        returned string actually contains both the model id and the hint."""
+        error = {"code": "ModelNotOpen", "message": "model not enabled", "model": "doubao-seedance-2-0-260128"}
+        msg = SeedanceProvider._error_message(error)
+        assert "ModelNotOpen" in msg
+        assert "doubao-seedance-2-0-260128" in msg
+        assert "请在方舟控制台开通模型" in msg
+
+    def test_model_not_open_error_message_via_poll(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        """P-1 (#246): a ModelNotOpen poll must surface the Chinese hint in
+        the error (previously it was a dead f-string so the hint was never
+        printed).  capsys sees nothing because the error raises before any
+        print, but the error *message itself* is what the CLI echoes.
+        We assert on the raised RuntimeError text to guarantee the hint is
+        present in what operators will actually see."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        provider = SeedanceProvider()
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"id": "cgt-20260828040000-mno01"}
+        submit_resp.raise_for_status.return_value = None
+
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {
+            "id": "cgt-20260828040000-mno01",
+            "status": "running",
+        }
+        poll_resp.raise_for_status.return_value = None
+        poll_resp2 = MagicMock(spec=httpx.Response)
+        poll_resp2.json.return_value = {
+            "id": "cgt-20260828040000-mno01",
+            "status": "failed",
+            "error": {"code": "ModelNotOpen", "message": "model not enabled", "model": "doubao-seedance-2-0-260128"},
+        }
+        poll_resp2.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.side_effect = [poll_resp, poll_resp2]
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+            pytest.raises(RuntimeError) as excinfo,
+        ):
+            provider.generate("test")
+
+        # capsys.readouterr() — nothing printed, but the hint must be in the
+        # exception text that the CLI logs/prints via log.error(f"…: {exc}").
+        _ = capsys.readouterr()
+        assert "请在方舟控制台开通模型" in str(excinfo.value)
+        assert "doubao-seedance-2-0-260128" in str(excinfo.value)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
