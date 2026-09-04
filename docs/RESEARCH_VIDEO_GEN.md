@@ -55,7 +55,7 @@
 > 传 `1:1` 就是发 `1:1`）；(3) 官方文档目录页正文 grep 命中 `1:1`。
 > **未经真实 API 实测**（本卡边界禁止调付费 API）。owner 真实出片前，建议先让 lead 用一次额度探测
 > `ratio=1:1` 是否被方舟接受（如不接受会回参数错误，不消耗额度——参考 memory
-> `cockpit-vr180-lane.md` 的"零额度探测转参数错误"记录）。
+> lead 早先的实测记录）。
 
 ### A.2 支持的最大分辨率？`--gen-resolution` 档位？1:1 时实际像素尺寸？
 
@@ -139,7 +139,7 @@ $ curl -sL "https://www.volcengine.com/docs/823/1330310" | python3 -c "import sy
 1. **`diffusers` 不在 `requirements.txt`**（`requirements.txt:6-17` 只列了 torch/transformers/accelerate/safetensors，
    无 diffusers）——真实后端跑前需 `pip install diffusers`（`local_svd.py:178` 也提示了）。
 2. **权重未落盘**：仓根 `models/` 被 `.gitignore` 忽略（`.gitignore` "Model weights" 段），实测
-   `ls C:/actions-runner-vr180-ai-pipeline/models/svd-img2vid-xt-1-1/` 为空目录。memory
+   `ls <本机模型目录>/svd-img2vid-xt-1-1/` 为空目录。早先记录
    `hardware-and-deployment-state.md` 记录 lead 已验证 SVD 基座组件完整（`stabilityai/stable-video-diffusion-img2vid-xt`，
    ~5GB），但权重不在仓内 worktree。
 3. **确定性 seed 未接**：`local_svd.py:153` `generator = None`，注释 "deterministic seeding left to a future task"。
@@ -261,14 +261,14 @@ $ curl -sL "https://www.volcengine.com/docs/823/1330310" | python3 -c "import sy
 
 | 配置文件 | 内容 | 是否含生图 API |
 |---------|------|----------------|
-| `C:\Users\musof\.claude\settings.json` | `ANTHROPIC_BASE_URL=https://nextscene.cn/llm` + `ANTHROPIC_AUTH_TOKEN=sk-***`；`ANTHROPIC_MODEL=kimi-k3`；MCP 仅 hermes/github/notion；无生图项 | ❌ 无 |
-| `C:\actions-runner-vr180-ai-pipeline\engine.local.ps1` | `MNESIS_CHEAP_BASE_URL=http://49.235.157.202:9400` + `MNESIS_CHEAP_TOKEN=sk-***`；可用模型（实测 `/v1/models`）：`kimi-k3, glm-5.2, deepseek, sensenova-lite, sensenova-u1-fast`；回落 `sensenova deepseek` | ⚠️ 仅**聊天模型** sensenova-u1-fast，非生图 |
+| （本机 Claude Code 配置） | `ANTHROPIC_BASE_URL=https://nextscene.cn/llm` + `ANTHROPIC_AUTH_TOKEN=sk-***`；`ANTHROPIC_MODEL=***`；MCP 仅 hermes/github/notion；无生图项 | ❌ 无 |
+| （本机网关配置） | 网关地址与令牌见本机配置（已掩码）；实测 `/v1/models` 可用模型含 sensenova-u1-fast 等 | ⚠️ 仅**聊天模型** sensenova-u1-fast，非生图 |
 | `C:\Users\musof\.claude\.credentials.json` | 全是 MCP 插件 OAuth 凭据（`clientId: ***`, `clientSecret: ***`），无生图 API token | ❌ 无 |
 | `C:\Users\musof\.claude\claude_desktop_config.json` | MCP 仅 unity-mcp / unityMCP / hermes | ❌ 无 |
 | `C:\Users\musof\.claude\plugins\*` | meta-vr / unreal-engine-skills，无生图 | ❌ 无 |
 
 > **owner 配置里的 `sensenova-u1-fast` 是聊天模型（走 LiteLLM 网关的 Messages 兼容接口），
-> 不是图像生成 API。** 网关 `/v1/images/generations` 据 memory `cockpit-vr180-lane.md` 实测"空 data 不可用"。
+> 不是图像生成 API。** 网关 `/v1/images/generations` 经实测"空 data 不可用"。
 > SenseNova（商汤日日新）确实有独立的图像生成产品线（公开文档为 SenseMirage / "日日新·绘画"），
 > U1.5 是其视觉-语言多模态模型——但**本机配置未存其 API key/endpoint**，需 owner 指明实际调用方式。
 > 同理 NVIDIA 生图 API（NIM `https://integrate.api.nvidia.com` 上有 SDXL / SDXL-Turbo / FLUX 等
@@ -329,7 +329,7 @@ python -m scripts.generate --image keyframe_1x1.png \
 
 - **依据**：`scripts/generate.py:122-124` CLI 支持 `1:1`；`integrations/seedance.py:124-125` 把 `ratio` 原样透传；
   图生视频同 `_run` 体（`seedance.py:90-109`）→ 图生视频也支持。
-- **代价**：消耗方舟额度（owner 明令节省，真实出片由 lead 做，480p/5s 起——memory `cockpit-vr180-lane.md`）；
+- **代价**：消耗方舟额度（owner 明令节省，真实出片由 lead 做，480p/5s 起）；
   1080p 会打 warning（`generate.py:316`）。**先用一次零额度探测确认方舟接受 `ratio=1:1`**（不接受只回参数错误，不耗额度）。
 - **为什么是首选**：零新增代码（仓内已接）、零新增依赖、零新增权重、云端不占 12GB、质量是商业 SOTA 档。
   owner 说的"Gemini 做不出 1:1"完全绕开——本来就不该用 Gemini 出视频。

@@ -1,6 +1,6 @@
 # PRD — 单图 → 视频 → VR180 工作流（阶段 G，2026-08-21）
 
-_Owner 拍板的下一阶段目标；lead（Claude）规划，kimi-k3 worker 实现，验收标准见各任务卡。_
+_Owner 拍板的下一阶段目标；lead 规划，Claude Code CLI 实现，验收标准见各任务卡。_
 
 ## 1. 产品目标
 
