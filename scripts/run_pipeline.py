@@ -220,8 +220,9 @@ def _run_preflight(args) -> None:
         log.warning("⚠️  Preflight check FAILED (warn mode): %s", reasons_text)
 
 
-def parse_args(argv: list[str] | None = None):
-    """Parse CLI arguments.  Accept optional *argv* for testing."""
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI argument parser (K-22/#243: re-used by
+    :func:`_warn_streaming_unsupported_args` to read argparse defaults)."""
     parser = argparse.ArgumentParser(description="2D AI Video → VR180 Conversion Pipeline")
 
     # C-1b (#191): single input vs multi-segment concat are mutually exclusive
@@ -690,7 +691,12 @@ def parse_args(argv: list[str] | None = None):
         help="Fraction of height scanned from bottom for black boundaries (default: 0.25)",
     )
 
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_args(argv: list[str] | None = None):
+    """Parse CLI arguments.  Accept optional *argv* for testing."""
+    return _build_parser().parse_args(argv)
 
 
 def read_frames(video_path: str, max_frames: int | None = None):
@@ -1989,6 +1995,131 @@ def _apply_comfort_preset(args) -> None:
     )
 
 
+# K-22 / #243 (P0-2): the single source of truth for which CLI knobs the
+# streaming pipeline actually honours.  This table is checked by
+# :func:`_warn_streaming_unsupported_args` so that a future CLI flag added
+# here without being threaded into :class:`StreamingPipeline` surfaces as a
+# loud warning instead of being silently swallowed (the same anti-pattern that
+# caused both #120 (--depth-model) and #243 (--outpaint / --no-ffmpeg-v360)).
+#
+# Each entry maps a CLI arg name (the argparse ``dest`` spelling) to a human
+# label shown in the warning.  Keep this list in sync whenever StreamingPipeline
+# gains (or loses) support for a knob — the test
+# ``tests/test_streaming_passthrough.py`` asserts that omission of any listed
+# entry triggers the warning, so the defense holds.
+_STREAMING_SUPPORTED: dict[str, str] = {
+    "input": "input video",
+    "output": "output path",
+    "output_width": "per-eye width",
+    "output_height": "per-eye height",
+    "src_hfov": "source horizontal FOV",
+    "max_frames": "frame cap",
+    "quality": "quality preset",
+    "model_size": "depth model size",
+    "device": "compute device",
+    "ipd": "interpupillary distance",
+    "max_disparity": "max disparity",
+    "convergence": "stereo convergence",
+    "no_temporal": "disable temporal smoothing",
+    "codec": "output codec",
+    "crf": "constant rate factor",
+    "fps": "output frame rate",
+    "bitrate": "target bitrate",
+    "max_bitrate": "bitrate cap",
+    "hw_encoder": "NVENC hardware encoding",
+    "preset": "playback preset",
+    "gop": "GOP length",
+    "comfort": "comfort preset",
+    "depth_model": "depth backend",
+    "stereo_model": "stereo backend",
+    "depthcrafter_repo_dir": "DepthCrafter repo",
+    "depthcrafter_python": "DepthCrafter python",
+    "depthcrafter_checkpoint_dir": "DepthCrafter checkpoint dir",
+    "depthcrafter_max_res": "DepthCrafter max resolution",
+    "stereocrafter_repo_dir": "StereoCrafter repo",
+    "stereocrafter_python": "StereoCrafter python",
+    "stereocrafter_checkpoint_dir": "StereoCrafter checkpoint dir",
+    "stereocrafter_max_res": "StereoCrafter max resolution",
+    "temp_dir": "explicit temp directory",
+    "streaming": "streaming mode",
+    "no_ffmpeg_v360": "disable ffmpeg v360",
+    "outpaint": "equirect outpaint fill",
+    "outpaint_mask_threshold": "outpaint mask threshold",
+    "outpaint_mask_top_ratio": "outpaint top ratio",
+    "outpaint_mask_bottom_ratio": "outpaint bottom ratio",
+    # V-3 manifest / cross-machine flags — the streaming branch rejects them
+    # (they force the batch path), so they are documented here but never
+    # silently honoured by the stream.
+    "stages": "(manifest) stage subset",
+    "manifest": "(manifest) write path",
+    "resume_from": "(manifest) resume path",
+    "machine": "(manifest) machine label",
+    # Other entry-mode / branch selectors — they route the run to a
+    # non-streaming branch and therefore are not consumed by the stream;
+    # they are listed so the warning can name them precisely instead of
+    # treating them as unknown.
+    "stage": "single-stage selector",
+    "projection": "projection mode",
+    "force_sbs": "force SBS input",
+    "validate_input": "input validation",
+    "preflight": "preflight mode",
+    "copy_audio_from": "audio source",
+}
+
+
+def _warn_streaming_unsupported_args(args) -> None:
+    """Warn about any CLI flags the user set that the streaming path ignores.
+
+    K-22 / #243 (P0-2) defense-in-depth: the streaming pipeline can only act
+    on a fixed set of knobs (see :data:`_STREAMING_SUPPORTED`).  If the
+    operator passes a flag the stream does not honour (and that is not part
+    of the supported list), this logs a WARNING that *names each ignored flag*.
+    This turns a silent no-op into an explicit signal the operator can see,
+    which is exactly what would have caught both #120 and #243 at the moment
+    they were introduced.
+
+    Detection compares ``args`` against a freshly-parsed empty ``parse_args([])``
+    namespace, which carries the real argparse defaults (post-mutual-exclusion
+    group, post ``nargs``/``choices`` normalisation): a value equal to that
+    default means "user did not set this" and is not reported, so a vanilla
+    streaming run (no outpaint, ffmpeg v360 on) never self-warns.  ``dest``s
+    that argparse never writes to the namespace (builtins like ``--help``,
+    which only materialise on ``--help`` itself) are skipped outright.
+    """
+    if not (getattr(args, "streaming", False) and getattr(args, "stage", None) == "all"):
+        return
+
+    defaults = _build_parser().parse_args([])  # real argparse defaults
+
+    # argparse only materialises --help / --version on those flags themselves,
+    # which exit before reaching here; they are never present on a successful
+    # parse and would otherwise look "set" against a MagicMock args object.
+    builtin_dests = {"help", "version"}
+
+    unsupported: list[str] = []
+    for dest in sorted(defaults.__dict__):
+        if dest in _STREAMING_SUPPORTED or dest in builtin_dests:
+            continue
+        val = getattr(args, dest, None)
+        if val == getattr(defaults, dest, None):
+            continue  # user did not set it — nothing to warn about
+        if isinstance(val, list) and not val:
+            continue
+        unsupported.append(dest)
+
+    if unsupported:
+        labels = [f"--{d.replace('_', '-')}" for d in unsupported]
+        log.warning(
+            "⚠️  Streaming pipeline does NOT honour the following CLI flag(s); "
+            "they were provided but will be IGNORED (the same silent-drop class "
+            "as --depth-model #120 and --outpaint/--no-ffmpeg-v360 #243):\n"
+            "    %s\n"
+            "    If this looks wrong, add the flag to _STREAMING_SUPPORTED and "
+            "thread it into StreamingPipeline — a test guards against that forgetting.",
+            ", ".join(labels),
+        )
+
+
 def apply_playback_preset(args) -> None:
     """Resolve ``--preset`` into concrete encode knobs (D-2, #79).
 
@@ -2572,6 +2703,13 @@ def main():
     # --resume-from force the batch path.
     if args.streaming and args.stage == "all" and manifest_stages is None:
         log.info("🚀 Streaming pipeline mode (O(1) memory)")
+        # K-22 / #243 (P0-2): before constructing the pipeline, surface any
+        # CLI flag the streaming path does not honour.  This is the generic
+        # "swallowed-arg" defense that #120 lacked — a forgotten passthrough
+        # now logs a WARNING naming the ignored flag instead of silently
+        # doing the wrong thing (the #243 defect: --outpaint and
+        # --no-ffmpeg-v360 were both silently dropped here).
+        _warn_streaming_unsupported_args(args)
         # I-5 (#120): the streaming path previously hard-coded Depth-Anything +
         # StereoRenderer and *silently ignored* --depth-model/--stereo-model.
         # Build the requested backends via the shared factory (same construction
@@ -2600,6 +2738,18 @@ def main():
             stereo_renderer=stereo_backend,
             depth_backend_name=depth_backend_name,
             stereo_backend_name=stereo_backend_name,
+            # K-22 / #243 (P0-2): --no-ffmpeg-v360 was hard-coded to True here,
+            # silently dropping the operator's OpenCV-fallback request.  Now
+            # honoured by StreamingPipeline's EquirectangularMapper.
+            use_ffmpeg=not getattr(args, "no_ffmpeg_v360", False),
+            # K-22 / #243 (P0-2): --outpaint (and sub-params) were silently
+            # swallowed on the streaming path.  Forward them so the stream
+            # can honour outpaint fill; "none" (default) is a no-op so the
+            # default streaming run is unchanged.
+            outpaint=getattr(args, "outpaint", "none"),
+            outpaint_mask_threshold=getattr(args, "outpaint_mask_threshold", 10),
+            outpaint_mask_top_ratio=getattr(args, "outpaint_mask_top_ratio", 0.25),
+            outpaint_mask_bottom_ratio=getattr(args, "outpaint_mask_bottom_ratio", 0.25),
             # K-21 (#224): hand the caller-owned --temp-dir into the streaming
             # path so depth products land under <temp-dir>/depth/ (the layout
             # make_comparison's depth-dir resolver globs) instead of a
