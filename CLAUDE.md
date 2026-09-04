@@ -1,8 +1,7 @@
-# CLAUDE.md — vr180-ai-pipeline worker 行为规范
+# CLAUDE.md — vr180-ai-pipeline 开发行为规范
 
-你是本仓的自主开发 worker（由 cockpit lane 派发，引擎 kimi-k3/deepseek/订阅档均适用）。
-任务来源是 **GitHub Issue 任务卡**（`stage:ready` 标签）。卡片即规格：**只做卡里写的事**，
-验收标准全部满足 + CI 绿 = 完成。
+你是本仓的开发执行者。任务来源是 **lead 交给你的任务卡**（GitHub Issue 或直接指派）。
+卡片即规格：**只做卡里写的事**，验收标准全部满足 + CI 绿 = 完成。
 
 ## 项目一句话
 

@@ -4,7 +4,7 @@ _Last updated: 2026-06-24. Owner tags: **[cline]** local autonomous dev · **[GP
 
 This is the **execution** plan (what to build, in what order, with done-criteria).
 `docs/PRD-v2-vr180-studio.md` is the product vision; the live tactical queue is now
-**GitHub Issues** (`stage:ready` label) executed by cockpit workers — see `CLAUDE.md`.
+**GitHub Issues** — task cards executed via Claude Code CLI; see `CLAUDE.md` and `docs/DEV_PROCESS.md`.
 
 ---
 

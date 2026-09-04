@@ -37,7 +37,7 @@
 
 ```
 vr180-ai-pipeline/
-├── CLAUDE.md                    # ★ 自主 worker 行为规范（cockpit 派单执行）
+├── CLAUDE.md                    # ★ 开发行为规范
 ├── pipeline/                    # 核心转换管线
 │   ├── depth_estimator.py       #   深度估计（Depth-Anything-V2，路线2）
 │   ├── depth_crafter.py         #   DepthCrafter 时序深度（可插拔后端）
@@ -120,14 +120,14 @@ pytest -q
 
 ---
 
-## 协作模式（2026-08 起：cockpit 派单）
-**lead（Claude）** 作为 PM/架构师写详细任务卡到 **GitHub Issues**（打 `stage:ready` + `model:cheap` 标签）；
-本地 **cockpit lane** 轮询领卡，派 worker（当前引擎 **kimi-k3**，网关探活失败自动回落 deepseek）在隔离
-worktree 里实现、自测、开 PR；自动评审（CI 绿 + AI 评审）squash 合并；**项目所有者** 通过仓根
-`WORKLOG.md`（本地异步工作台）实测打分、定方向。worker 行为规范见 [CLAUDE.md](CLAUDE.md)。
+## 协作模式
+**lead** 作为 PM/架构师，把需求写成详细任务卡（**GitHub Issues**，写清「只许改哪些文件」与验收标准），
+再自己调起 **Claude Code CLI** 实现、自测、开 PR；CI 绿后由 lead 人工评审并 squash 合并。
+**项目所有者** 通过仓根 `WORKLOG.md`（本地异步工作台）实测打分、定方向。
+开发行为规范见 [CLAUDE.md](CLAUDE.md)，完整流程见 [docs/DEV_PROCESS.md](docs/DEV_PROCESS.md)。
 
 ## 当前进展（2026-08-21 晚）
-- ✅ **画质冲刺 V-1…V-9 全部交付**（kimi-k3 编码 + lead 实机验收）：质量预设（3840²/眼流式默认路径）、
+- ✅ **画质冲刺 V-1…V-9 全部交付**（Claude Code CLI 编码 + lead 实机验收）：质量预设（3840²/眼流式默认路径）、
   流式 SBS 布局/元数据注入/编码器回退三连修、立体参数扫描工具、VR180 QA 校验器、跨机 job manifest。
 - ✅ 3840²/眼 · 视差 0.06 · hfov150 样片已交付 Quest 真机（等 owner 打分）。
 - ▶ **阶段 G：单图 → 视频 → VR180 工作流**（见 [docs/PRD-image-to-vr180.md](docs/PRD-image-to-vr180.md)）：
@@ -138,7 +138,7 @@ worktree 里实现、自测、开 PR；自动评审（CI 绿 + AI 评审）squas
 | 文档 | 内容 |
 |------|------|
 | [CLAUDE.md](CLAUDE.md) | ★ 自主 worker 行为规范 |
-| [docs/DEV_PROCESS.md](docs/DEV_PROCESS.md) | ★ 开发协作机制（owner/lead/kimi-k3 分工与验收流程） |
+| [docs/DEV_PROCESS.md](docs/DEV_PROCESS.md) | ★ 开发协作机制（owner/lead 分工与验收流程） |
 | [docs/PRD-image-to-vr180.md](docs/PRD-image-to-vr180.md) | ★ 阶段 G PRD：单图→视频→VR180 |
 | [docs/SOLUTION_ARCHITECTURE.md](docs/SOLUTION_ARCHITECTURE.md) | ★ 两路线系统方案 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 执行路线图（里程碑） |

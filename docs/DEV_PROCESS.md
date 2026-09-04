@@ -8,30 +8,36 @@ _Owner 拍板的固定流程；此后全部开发严格按此执行。_
 |---|---|---|
 | **Owner（Muso）** | 人 | 定方向、拍板决策（API key/参数取舍）、**阶段门真机测试**（Quest/球幕） |
 | **Lead（Claude）** | Claude（本会话/巡检唤醒） | PRD/架构/任务卡编写 · 验收（代码 + 实机）· CI/CD · 阶段门交付 · 排障定位 |
-| **Worker（kimi-k3）** | Claude Code CLI 挂 kimi-k3 引擎（cockpit lane 自动派发） | **全部编码与调研实现**：按任务卡开发、自测、开 PR |
+| **执行者** | Lead 自己调起的 **Claude Code CLI** | **全部编码与调研实现**：按任务卡开发、自测、开 PR |
 
 ### 分工红线（2026-08-31 owner 拍板）
 
 **lead 不直接写实现代码、不手工搭环境**。凡是「要动手做」的事——写代码、装依赖、搭第三方
-环境、调研某个库怎么用——**一律写成任务卡交给 Claude Code CLI（kimi-k3）执行**，lead 只负责
-把要求写清楚、事后验收。
+环境、调研某个库怎么用——**一律写成任务卡，由 lead 自己调起 Claude Code CLI 执行**，
+lead 只负责把要求写清楚、事后验收。
 
 lead 手上只保留三类动作：
 1. **只读诊断**：跑测试/lint、真实跑一遍现有 CLI、抽帧看画质、读日志定位根因（结论写进任务卡）；
 2. **交付物产出**：用**已合并的**管线渲染样片、推 Quest、写 WORKLOG；
-3. **一行级热修**（例外，需在 PR 描述写明理由）：worker 交付后实机才暴露、且修改 ≤ 几行的
-   阻塞性缺陷（如版本号写错）。**超过这个规模一律回写任务卡重派。**
+3. **一行级热修**（例外，需在 PR 描述写明理由）：交付后实机才暴露、且修改 ≤ 几行的
+   阻塞性缺陷（如版本号写错）。**超过这个规模一律回写任务卡重做。**
 
-判据：如果一件事需要「写超过几行代码」或「装/配环境」，它就是 worker 的活，不是 lead 的活。
+判据：如果一件事需要「写超过几行代码」或「装/配环境」，它就该交给 Claude Code CLI，不是 lead 自己上手。
+
+### 边界锁（owner 拍板，硬规则）
+
+**本仓的一切工作只在 `D:\Githubr180-ai-pipeline` 内进行。**
+不读、不改、不依赖任何外部编排系统或其配置/状态/日志目录。
+外部系统的存活与调度**不是 lead 的职责**，也不写进本仓文档。
 
 ## 流程（一张卡的生命周期）
 
 ```
-Lead 写卡（GitHub Issue, stage:ready + model:cheap + agent-ok）
-  → cockpit lane（≤8 分钟轮询）领卡 → kimi-k3 在隔离 worktree 实现 + 自测 → 开 PR
-  → 自动评审门：CI 绿 + AI 评审 APPROVE → squash 合并 → 关卡
-  → Lead 巡检验收（见下）→ 通过 → 派下一批卡；不通过 → 开修复卡（附诊断）回到顶部
-  → 一个阶段（如 G-α）全卡通过 → 写 WORKLOG 通知 Owner 真机测试
+Lead 写卡（GitHub Issue，写清「只许改哪些文件」与验收标准）
+  → Lead 调起 Claude Code CLI 执行 → 实现 + 自测 → 开 PR
+  → CI 绿 → Lead 人工评审（读 diff 对照卡片要求）→ squash 合并 → 关卡
+  → Lead 验收（见下）→ 通过 → 做下一张卡；不通过 → 开修复卡（附精确诊断）回到顶部
+  → 一个阶段全卡通过 → 渲样片推 Quest，写 WORKLOG 通知 Owner 真机测试
 ```
 
 ## Lead 验收标准（每阶段必做，mock 测试拦不住的正是这些）
@@ -46,12 +52,10 @@ Lead 写卡（GitHub Issue, stage:ready + model:cheap + agent-ok）
 3. 产物过 `scripts/vr180_qa.py`；视频类交付抽帧肉眼核对。
 4. 验收结论写进 WORKLOG（发现的缺陷 → 修复卡附字节级诊断）。
 
-## 监控机制（自动）
+## 执行方式
 
-- **cockpit lane**：常驻轮询派卡/评审/合并（重启：`D:\Github\_ops\start-vr180-lane.ps1`；
-  日志 `D:\Github\_ops\logs\lane-DreamPortalOS--vr180-ai-pipeline*.log`）。
-- **Lead 定时巡检**：Claude 定时任务每小时唤醒 lead —— 检查新合并 PR → 执行验收 →
-  阶段完成则派下一批卡/通知 Owner；lane 挂了自动拉起。Owner 无需干预。
+Lead 需要开发或调研时，**自己调起 Claude Code CLI** 执行任务卡，完成后自行验收合并。
+一次只推进少数几张卡，避免多卡改同一文件产生冲突（卡片里必须写死「只许改哪些文件」）。
 
 ## 任务卡模板（Lead 写卡用）
 
