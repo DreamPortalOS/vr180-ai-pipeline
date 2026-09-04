@@ -78,7 +78,10 @@ from pipeline.streaming_pipeline import (  # noqa: E402
     resolve_quality,
     scaled_bitrate_mbps,
 )
-from pipeline.upscaler import PixelUpscaler  # noqa: E402
+from pipeline.upscaler import (  # noqa: E402
+    PixelUpscaler,
+    RealESRGANUnavailableError,
+)
 from pipeline.video_upscaler import SeedVR2Upscaler  # noqa: E402
 from pipeline.vr_metadata import VRMetadataEmbedder  # noqa: E402
 
@@ -436,6 +439,15 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--upscale-model", default=None, help="Real-ESRGAN model name (auto if omitted)")
     parser.add_argument(
         "--upscale-ffmpeg", action="store_true", help="Use ffmpeg/OpenCV lanczos upscale instead of Real-ESRGAN"
+    )
+    parser.add_argument(
+        "--upscale-strict",
+        action="store_true",
+        default=False,
+        help=(
+            "Exit non-zero if the Real-ESRGAN backend is unavailable, instead of silently "
+            "falling back to bicubic interpolation (default: fall back)"
+        ),
     )
 
     # New: output encoding options
@@ -1624,7 +1636,14 @@ def run_seedvr2_prestage(args) -> str:
 
 
 def run_upscale_stage(args, frames):
-    """Stage 0: Pixel upscaling (optional)."""
+    """Stage 0: Pixel upscaling (optional).
+
+    Backend selection is reported honestly.  When the Real-ESRGAN backend is
+    not importable the stage degrades to bicubic interpolation — and says so,
+    both before processing starts and in the progress-bar label (issue #245).
+    With ``--upscale-strict`` the absence of a real backend is a hard failure
+    instead, so scripted callers get a reliable gate.
+    """
     log.info(f"=== Stage 0: Pixel Upscaling ({args.upscale}×) ===")
 
     if args.upscale_ffmpeg:
@@ -1636,26 +1655,40 @@ def run_upscale_stage(args, frames):
             upscaled.append(result)
         return upscaled
 
-    try:
-        upscaler = PixelUpscaler(
-            scale=args.upscale,
-            model_name=args.upscale_model,
-            device=args.device,
+    strict = getattr(args, "upscale_strict", False)
+    upscaler = PixelUpscaler(
+        scale=args.upscale,
+        model_name=args.upscale_model,
+        device=args.device,
+        strict=strict,
+    )
+
+    # Resolve the backend BEFORE any frame is touched.  This is where the
+    # honest detection lives (upscaler._load_model) — and under
+    # --upscale-strict this is where the run aborts.
+    if strict:
+        try:
+            backend = upscaler.backend
+        except RealESRGANUnavailableError as e:
+            log.error(str(e))
+            sys.exit(2)
+    else:
+        backend = upscaler.backend
+
+    label = "Real-ESRGAN" if backend == "realesrgan" else "bicubic"
+    if backend == "bicubic":
+        log.warning(
+            "WARNING: Real-ESRGAN unavailable — using bicubic interpolation. "
+            "This is NOT super-resolution and does not add detail. "
+            "(Pass --upscale-strict to fail instead of falling back.)"
         )
-    except ImportError:
-        log.warning("realesrgan not installed, falling back to OpenCV lanczos")
-        upscaled = []
-        for frame in tqdm(frames, desc="Upscaling (lanczos)"):
-            h, w = frame.shape[:2]
-            result = cv2.resize(frame, (w * args.upscale, h * args.upscale), interpolation=cv2.INTER_LANCZOS4)
-            upscaled.append(result)
-        return upscaled
 
     upscaled = []
-    use_tiled = getattr(args, "tiled_upscale", False)
+    use_tiled = getattr(args, "tiled_upscale", False) and backend == "realesrgan"
     tile_size = getattr(args, "tile_size", 512)
 
-    for frame in tqdm(frames, desc=f"Upscaling ({args.upscale}× Real-ESRGAN{' tiled' if use_tiled else ''})"):
+    tiled_note = " tiled" if use_tiled else ""
+    for frame in tqdm(frames, desc=f"Upscaling ({args.upscale}× {label}{tiled_note})"):
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         if use_tiled:
             result_bgr = upscaler.upscale_tiled(
@@ -1669,7 +1702,7 @@ def run_upscale_stage(args, frames):
         upscaled.append(result_rgb)
 
     log.info(
-        f"Upscaled {len(upscaled)} frames: "
+        f"Upscaled {len(upscaled)} frames via {label}: "
         f"{frames[0].shape[1]}×{frames[0].shape[0]} → "
         f"{upscaled[0].shape[1]}×{upscaled[0].shape[0]}"
     )
