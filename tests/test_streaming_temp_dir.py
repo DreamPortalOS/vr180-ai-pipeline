@@ -23,6 +23,7 @@ All tests are CPU-only: cv2 capture / ffmpeg / model stages are mocked or
 faked.  No real model download, no real inference, no real ffmpeg.
 """
 
+import logging
 import os
 import sys
 import time
@@ -111,6 +112,52 @@ def _run(p, num_frames=2):
         patch("pipeline.streaming_pipeline._load_video_frames", return_value=([], [])),
     ):
         p.process_stream("in.mp4", "out.mp4")
+
+
+# ---------------------------------------------------------------------------
+# K-23b (#232): the *per-frame* streaming path must persist depth_*.npy too.
+#
+# The existing tests above exercise the whole-clip stereo path
+# (``_emit_perframe_depths``), which already checkpointed depth.  But the
+# DEFAULT streaming route — no whole-clip backend injected, the plain
+# Depth-Anything + StereoRenderer fuse loop — historically never wrote depth to
+# disk, so ``make_comparison --recipe baseline`` produced no ``depth_*.npy`` and
+# the K-16 stability metric stayed ``—``.  These pin the K-23b fix: that same
+# default path now checkpoints per-frame depth into ``<temp_dir>/depth/`` via the
+# same helper as the whole-clip paths, only when ``temp_dir`` is set, and that a
+# write fault never aborts a render.
+# ---------------------------------------------------------------------------
+
+
+def _make_perframe_pipeline(temp_dir=None, **kwargs):
+    """Build a StreamingPipeline on the **per-frame** path (no whole-clip
+    backends), with the heavy eq_mapper mocked out.
+
+    Both depth and stereo are injected (so detection sees them as caller-owned)
+    but only expose the per-frame contract — ``estimate`` / ``render`` — so
+    ``_is_wholeclip_depth`` / ``_is_wholeclip_stereo`` stay False and the plain
+    fuse loop runs (the path K-23b fixes).
+    """
+    with patch("pipeline.streaming_pipeline.EquirectangularMapper"):
+        kwargs.setdefault("device", "cpu")
+        kwargs.setdefault("output_width", 100)
+        kwargs.setdefault("output_height", 50)
+        if temp_dir is not None:
+            kwargs["temp_dir"] = temp_dir
+        # Per-frame depth estimator (spec keeps render_video absent → not
+        # whole-clip).
+        kwargs.setdefault("depth_estimator", MagicMock(spec=["estimate"]))
+        # Per-frame stereo renderer (spec keeps render_video absent → not
+        # whole-clip).
+        kwargs.setdefault("stereo_renderer", MagicMock(spec=["render"]))
+        p = StreamingPipeline(**kwargs)
+        p.depth_estimator.estimate.return_value = np.full((8, 8), 0.5, dtype=np.float32)
+        p.stereo_renderer.render.return_value = (
+            np.zeros((8, 8, 3), dtype=np.uint8),
+            np.zeros((8, 8, 3), dtype=np.uint8),
+        )
+        p.eq_mapper.map_stereo_pair.return_value = np.zeros((50, 200, 3), dtype=np.uint8)
+        return p
 
 
 # ---------------------------------------------------------------------------
@@ -253,3 +300,113 @@ class TestDefaultUnchanged:
         with patch("pipeline.streaming_pipeline.EquirectangularMapper"):
             p = StreamingPipeline(output_width=100, output_height=50, device="cpu")
         assert p.temp_dir is None
+
+
+# ---------------------------------------------------------------------------
+# K-23b (#232): per-frame path persists depth_*.npy when temp_dir is set
+# ---------------------------------------------------------------------------
+
+
+class TestPerFrameDepthPersist:
+    """The default per-frame streaming fuse loop must checkpoint each frame's
+    depth into ``<temp_dir>/depth/`` (K-23b, #232) — the whole-clip paths
+    already did, but baseline / depth-anything recipes use this path and
+    previously wrote nothing, leaving the K-16 stability metric ``—``."""
+
+    def test_perframe_writes_npy_per_frame_under_temp_dir(self, tmp_path):
+        """Per-frame path + temp_dir → ``<temp_dir>/depth/`` holds exactly N
+        ``depth_*.npy`` files, one per source frame."""
+        temp_dir = tmp_path / "work"
+        p = _make_perframe_pipeline(temp_dir=str(temp_dir))
+        _run(p, num_frames=4)
+
+        depth_dir = temp_dir / "depth"
+        npy = sorted(depth_dir.glob("depth_*.npy"))
+        assert len(npy) == 4, f"expected 4 depth_*.npy, got {len(npy)}: {[f.name for f in npy]}"
+        # Sanity: they really are the arrays the fake estimator returned.
+        loaded = np.load(str(npy[0]))
+        assert loaded.shape == (8, 8)
+        assert np.allclose(loaded, 0.5)
+        # Naming format: zero-padded 6-digit index.
+        assert npy[0].name == "depth_000000.npy"
+        assert npy[-1].name == "depth_000003.npy"
+
+    def test_perframe_temp_dir_none_writes_no_depth_dir(self, tmp_path, monkeypatch):
+        """Per-frame path + temp_dir=None → no ``depth/`` directory is created
+        anywhere in the working tree (the O(1) memory default must not trade
+        disk for metrics)."""
+        cwd = tmp_path / "runroot"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+
+        before = {p for p in Path(cwd).rglob("*")}
+
+        p = _make_perframe_pipeline()  # no temp_dir
+        _run(p, num_frames=3)
+
+        after = {p for p in Path(cwd).rglob("*")}
+        assert after - before == set(), f"per-frame path polluted cwd: {after - before}"
+        # And specifically no depth/ subtree appeared.
+        assert not (cwd / "depth").exists()
+
+    def test_perframe_save_oserror_warns_and_render_continues(self, tmp_path, caplog):
+        """When ``np.save`` raises OSError (disk full / permission), the
+        per-frame path only warns and keeps rendering — a metrics-only I/O
+        fault must not abort the output.  The ffmpeg writer still receives all
+        frames and the run completes normally."""
+        temp_dir = tmp_path / "work"
+        p = _make_perframe_pipeline(temp_dir=str(temp_dir))
+
+        # Make _save_depth_frame's np.save blow up on every frame.
+        with patch(
+            "pipeline.streaming_pipeline.np.save",
+            side_effect=OSError("simulated disk full"),
+        ):
+            caplog.set_level(logging.WARNING, logger="vr180-streaming")
+            _run(p, num_frames=3)
+
+        # No depth_*.npy landed (the save always failed).
+        depth_dir = temp_dir / "depth"
+        # The dir itself is created by _maybe_depth_dir before the save attempt,
+        # but no npy files survive the failing save.
+        npy = list(depth_dir.glob("depth_*.npy")) if depth_dir.exists() else []
+        assert npy == [], f"expected no depth_*.npy after OSError, got {npy}"
+        # The fault was surfaced as a warning, not raised.
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("depth" in r.getMessage().lower() for r in warnings), (
+            f"expected a depth-checkpoint warning, got: {[r.getMessage() for r in warnings]}"
+        )
+        # Stereo render still ran once per frame → the render was NOT aborted.
+        assert p.stereo_renderer.render.call_count == 3
+
+    def test_perframe_and_precompute_share_naming_helper(self, tmp_path):
+        """The per-frame fuse loop and ``_emit_perframe_depths`` (the whole-clip
+        stereo fallback) must persist with the SAME naming, because both call
+        the shared ``_save_depth_frame`` helper.  Run both paths against the
+        same temp_dir and assert their ``depth_*.npy`` names match exactly."""
+        temp_dir_a = tmp_path / "perframe"
+        temp_dir_b = tmp_path / "emit"
+
+        # Path A: per-frame fuse loop (no whole-clip backends).
+        p_a = _make_perframe_pipeline(temp_dir=str(temp_dir_a))
+        _run(p_a, num_frames=3)
+        names_a = sorted(f.name for f in (temp_dir_a / "depth").glob("depth_*.npy"))
+
+        # Path B: _emit_perframe_depths (whole-clip stereo, no whole-clip depth)
+        # — the existing K-21 fixture path.
+        p_b, _stereo = _make_pipeline(temp_dir=str(temp_dir_b), _num_frames=3)
+        _run(p_b, num_frames=3)
+        names_b = sorted(f.name for f in (temp_dir_b / "depth").glob("depth_*.npy"))
+
+        # Same frame counts → identical naming (the helper is shared).
+        assert (
+            names_a
+            == names_b
+            == [
+                "depth_000000.npy",
+                "depth_000001.npy",
+                "depth_000002.npy",
+            ]
+        ), f"per-frame {names_a} != emit {names_b}"
+        # Belt-and-braces: the helper itself is one and the same callable.
+        assert StreamingPipeline._save_depth_frame is type(p_a)._save_depth_frame is type(p_b)._save_depth_frame

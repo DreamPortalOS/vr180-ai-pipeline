@@ -830,7 +830,7 @@ class StreamingPipeline:
                 break
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             depth = self.depth_estimator.estimate(rgb)
-            np.save(os.path.join(depth_dir, f"depth_{idx:06d}.npy"), np.asarray(depth))
+            self._save_depth_frame(depth_dir, idx, depth)
             del depth, rgb, bgr
             emitted = idx + 1
         log.info(
@@ -887,6 +887,49 @@ class StreamingPipeline:
             depth_dir = os.path.join(tempfile.mkdtemp(prefix="vr180-streaming-depth_"), "depth")
         os.makedirs(depth_dir, exist_ok=True)
         return depth_dir
+
+    def _maybe_depth_dir(self) -> str | None:
+        """Depth dir for the per-frame path, or None when nothing should persist.
+
+        K-23b (#232): the per-frame fuse path historically computed each frame's
+        depth and fed it straight to the stereo renderer without ever writing it
+        to disk — so ``make_comparison --recipe baseline`` (the comparison
+        reference) never produced ``depth_*.npy`` and the K-16 stability metric
+        stayed ``—``.  When ``self.temp_dir`` is set (a caller owns a work dir),
+        materialise ``<temp_dir>/depth/`` here so the per-frame path checkpoints
+        each map there with the **same** helper/naming as ``_emit_perframe_depths``
+        / ``_precompute_depths``.  When ``temp_dir`` is None the per-frame path
+        keeps its O(1) memory default and writes nothing — never trade the
+        streaming memory contract for metrics.
+        """
+        if not self.temp_dir:
+            return None
+        depth_dir = os.path.join(self.temp_dir, "depth")
+        os.makedirs(depth_dir, exist_ok=True)
+        return depth_dir
+
+    @staticmethod
+    def _save_depth_frame(depth_dir: str, idx: int, depth: np.ndarray) -> None:
+        """Checkpoint one depth map to ``<depth_dir>/depth_<idx:06d>.npy``.
+
+        Shared by every streaming depth path — the per-frame fuse loop
+        (K-23b/#232), ``_emit_perframe_depths`` (I-7.2/#143) and the whole-clip
+        precompute branches all persist maps with this identical naming so
+        ``make_comparison.default_depth_dir_resolver`` / ``depth_stability`` glob
+        them regardless of which backend produced them.  A write failure (disk
+        full, permission, …) only warns — depth is still fed to the stereo
+        renderer in memory, so a metrics-only I/O fault must not abort a render.
+        """
+        try:
+            np.save(os.path.join(depth_dir, f"depth_{idx:06d}.npy"), np.asarray(depth))
+        except OSError as e:
+            log.warning(
+                "⚠️  failed to checkpoint depth frame %d to %s (%s) — "
+                "render continues, but K-16 metrics may show — for this run",
+                idx,
+                depth_dir,
+                e,
+            )
 
     def _stereo_work_dir(self) -> str:
         """Return the stereo-intermediate directory (created if absent)."""
@@ -1030,6 +1073,20 @@ class StreamingPipeline:
                         if max_frames and frame_idx >= max_frames:
                             break
                 else:
+                    # K-23b (#232): the per-frame fuse path is the default
+                    # streaming route (no whole-clip backend injected).  When a
+                    # caller owns a work dir (``temp_dir``), checkpoint each
+                    # frame's depth there with the shared helper so
+                    # ``make_comparison``'s baseline / depth-anything recipes
+                    # finally produce the ``depth_*.npy`` the K-16 stability
+                    # metric globs — without it, baseline has no metrics and the
+                    # "did temporal depth improve flicker?" comparison is
+                    # ungrounded.  ``_maybe_depth_dir`` returns None when
+                    # ``temp_dir`` is unset, so the O(1) memory default writes
+                    # nothing.  A whole-clip depth backend already checkpointed
+                    # into its own depth_dir above, so only the inline estimator
+                    # branch persists here.
+                    perframe_depth_dir = self._maybe_depth_dir()
                     while frame_idx < total:
                         ret, bgr = cap.read()
                         if not ret:
@@ -1049,6 +1106,9 @@ class StreamingPipeline:
                         timer.start("depth")
                         if precomp_depths is not None:
                             depth = precomp_depths[frame_idx]
+                        elif perframe_depth_dir is not None:
+                            depth = self.depth_estimator.estimate(rgb)
+                            self._save_depth_frame(perframe_depth_dir, frame_idx, depth)
                         else:
                             depth = self.depth_estimator.estimate(rgb)
                         timer.stop("depth")
