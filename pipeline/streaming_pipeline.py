@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 
 import cv2
 import numpy as np
@@ -46,6 +47,154 @@ _NVENC_PROBE_CACHE: dict[str, tuple[bool, str]] = {}
 
 # How many bytes of stderr tail to keep for diagnostics.
 STDERR_TAIL_BYTES = 4096
+
+
+# ---------------------------------------------------------------------------
+# P-1 (#216): lightweight per-stage wall-clock timer.
+#
+# Records cumulative wall-clock seconds per logical pipeline stage
+# (depth / stereo / equirect / encode / metadata) using
+# ``time.perf_counter``.  Always on — the cost is a handful of
+# perf_counter() calls per frame, negligible next to inference.
+#
+# The timer is deliberately fault-tolerant: if ``time.perf_counter``
+# itself raises (broken clock, hostile test double), a single stage
+# record is simply skipped.  It never re-raises, never swallows a
+# stage's own exception, and never lets its own failure take down the
+# pipeline.  ``start`` returns a sentinel that ``stop`` uses to guard
+# against double-stops (e.g. when a stage raises between start and stop).
+# ---------------------------------------------------------------------------
+
+# Ordered list of logical stages the timer knows about.  ``encode`` is the
+# residual stage (total wall-clock minus the measured depth/stereo/equirect/
+# metadata), which is why it has no ``total`` bucket of its own and why the
+# logged percentages always sum to 100%.
+_STAGE_ORDER = ("depth", "stereo", "equirect", "metadata")
+
+
+class _StageTimer:
+    """Accumulate wall-clock seconds per pipeline stage via ``time.perf_counter``.
+
+    Usage::
+
+        timer = _StageTimer()
+        timer.start("depth")
+        ...do depth work, possibly raising...
+        timer.stop("depth")      # guards against double-stop
+
+        # The caller's outermost block measures total wall-clock so encode can
+        # be derived as the residual:  total - sum(measured stages).
+        timer.start_total()
+        try:
+            ...whole pipeline...
+        finally:
+            timer.stop_total()
+
+        timings = timer.report()  # dict {stage: seconds, "_total": seconds}
+        timer.log_table()         # logging.info aligned table
+    """
+
+    def __init__(self):
+        self._total: dict[str, float] = {}
+        self._active: dict[str, float] = {}
+        self._started: set[str] = set()
+
+    def start_total(self) -> None:
+        try:
+            self._total["ts"] = time.perf_counter()
+        except Exception:
+            # Timer failure must never crash the pipeline.
+            self._total.clear()
+
+    def stop_total(self) -> None:
+        if "ts" not in self._total:
+            return
+        try:
+            start = self._total.pop("ts")
+            self._total["_total"] = time.perf_counter() - start
+        except Exception:
+            self._total.pop("ts", None)
+
+    def start(self, stage: str) -> bool:
+        """Mark the start of *stage*.
+
+        Returns True on success so ``stop`` can guard against a
+        no-op/redundant stop.  On ``perf_counter`` failure the record is
+        silently skipped (returns False) and the stage continues.
+        """
+        try:
+            if stage in self._started:
+                return False
+            self._active[stage] = time.perf_counter()
+            self._started.add(stage)
+            return True
+        except Exception:
+            return False
+
+    def stop(self, stage: str) -> None:
+        """Accumulate the elapsed time for *stage* since its ``start``.
+
+        Idempotent: a stage that raised before ``stop`` (no active
+        timestamp) is a no-op rather than a crash.  A second ``stop``
+        for the same stage is also a no-op (double-stop guard for the
+        per-frame fuse loop where a stage may skip frames).
+        """
+        if stage not in self._active or stage not in self._started:
+            return
+        ts = self._active.pop(stage)
+        try:
+            elapsed = time.perf_counter() - ts
+            self._total[stage] = self._total.get(stage, 0.0) + elapsed
+        except Exception:
+            # perf_counter failed mid-stop — drop this frame's record
+            # rather than crash the pipeline.
+            pass
+        finally:
+            self._started.discard(stage)
+
+    def report(self) -> dict[str, float]:
+        """Return ``{stage: seconds}`` plus ``_total``, with ``encode``
+        filled in as the residual so percentages sum to exactly 100%.
+
+        Every known stage appears as a key (0.0 when the stage had no
+        work to do — e.g. ``metadata`` in the streaming path, which does
+        sv3d/st3d injection downstream rather than here).  This keeps the
+        sidecar payload schema stable regardless of which branch ran.
+        """
+        out = dict(self._total)
+        # Ensure every known stage is present (0.0 if it never ran).
+        for stage in _STAGE_ORDER:
+            out.setdefault(stage, 0.0)
+        measured_sum = sum(out.get(s, 0.0) for s in _STAGE_ORDER)
+        total = out.get("_total", 0.0)
+        out["encode"] = max(0.0, total - measured_sum)
+        # Encode's wall-clock includes the pipe writes PLUS the ffmpeg
+        # process-lifetime overhead (open/wait/cleanup) that isn't
+        # attributed to depth/stereo/equirect.  That is the desired
+        # "where did the seconds go" attribution: encode owns the
+        # pipeline's non-model-cost baseline.
+        return out
+
+    def log_table(self, logger: logging.Logger | None = None) -> None:
+        """Emit an aligned stage-timing table via logging.info.
+
+        The table is the card's core deliverable: lead reads it from a
+        real render's log to decide which stage to optimise next.
+        """
+        out = self.report()
+        total = out.get("_total", 0.0)
+        lines = ["📊 stage_timings (wall-clock):"]
+        header = f"{'stage':<10} {'seconds':>10} {'pct':>7}"
+        lines.append(header)
+        lines.append("-" * len(header))
+        for stage in (*_STAGE_ORDER, "encode"):
+            secs = out.get(stage, 0.0)
+            pct = (100.0 * secs / total) if total > 0 else 0.0
+            lines.append(f"{stage:<10} {secs:>10.3f} {pct:>6.1f}%")
+        lines.append(f"{'total':<10} {total:>10.3f}")
+        log_fn = logger.info if logger is not None else log.info
+        for line in lines:
+            log_fn(line)
 
 
 def _probe_nvenc_detail(encoder: str, ffmpeg: str = "ffmpeg") -> tuple[bool, str]:
@@ -822,6 +971,13 @@ class StreamingPipeline:
             if precomp_depths:
                 total = min(total, len(precomp_depths))
 
+        # P-1 (#216): lightweight per-stage wall-clock timer.  Always on; cost
+        # = a handful of time.perf_counter() calls.  Total wall-clock wraps the
+        # whole ffmpeg-driven run so ``encode`` can be derived as the residual
+        # (total − sum(measured stages)), guaranteeing percentages sum to 100%.
+        timer = _StageTimer()
+        timer.start_total()
+
         proc = self._open_ffmpeg_writer(output_path, out_w, out_h)
 
         try:
@@ -834,7 +990,9 @@ class StreamingPipeline:
                     # Whole-clip stereo (StereoCrafter): L/R precomputed, skip
                     # depth + stereo-render; just map → encode per frame.
                     for left, right in zip(precomp_left, precomp_right, strict=False):
+                        timer.start("equirect")
                         sbs = self.eq_mapper.map_stereo_pair(left, right)
+                        timer.stop("equirect")
                         self._write_sbs_frame(proc, sbs, frame_idx, out_w, out_h)
                         del sbs
                         frame_idx += 1
@@ -851,19 +1009,30 @@ class StreamingPipeline:
                         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
                         # --- Stage 1: Depth estimation ---
+                        # I-5 (#216): the per-frame estimate call is the depth
+                        # stage.  Whole-clip precomputed depths are indexed
+                        # inside the timer so the (near-zero) lookup cost is
+                        # attributed to depth, not silently lost.
+                        #
                         # I-5 (#120): whole-clip depth (DepthCrafter) was
                         # precomputed; index into it.  Otherwise call the
                         # per-frame estimator (Depth-Anything) inline.
+                        timer.start("depth")
                         if precomp_depths is not None:
                             depth = precomp_depths[frame_idx]
                         else:
                             depth = self.depth_estimator.estimate(rgb)
+                        timer.stop("depth")
 
                         # --- Stage 2: Stereo rendering ---
+                        timer.start("stereo")
                         left, right = self.stereo_renderer.render(rgb, depth)
+                        timer.stop("stereo")
 
                         # --- Stage 3: Equirectangular mapping ---
+                        timer.start("equirect")
                         sbs = self.eq_mapper.map_stereo_pair(left, right)
+                        timer.stop("equirect")
 
                         self._write_sbs_frame(proc, sbs, frame_idx, out_w, out_h)
 
@@ -891,6 +1060,18 @@ class StreamingPipeline:
                 )
         finally:
             self._close_ffmpeg_stderr(proc)
+            # Stop the total wrapper in the finally so the timer always sees a
+            # _total even when a stage raises.  Report/log in the finally so the
+            # aligned table is always emitted (the card's core deliverable) and
+            # stage_timings is always attached — even on failure — before the
+            # original exception re-raises.  Timer/report failures are isolated
+            # so they never replace a real stage error.
+            timer.stop_total()
+            try:
+                self.stage_timings = timer.report()
+                timer.log_table()
+            except Exception:
+                pass
 
         log.info(f"✅ Streaming complete: {frame_idx} frames → {output_path}")
         return output_path
