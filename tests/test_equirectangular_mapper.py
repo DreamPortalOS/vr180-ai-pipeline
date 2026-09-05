@@ -4,8 +4,16 @@ Prior to issue #240 this module had **zero** tests, which is how a docstring
 claiming "filled with black (not stretched)" survived while the default ffmpeg
 path actually did neither — ffmpeg's v360 clamps edge pixels into the
 periphery. These tests run the *real* ffmpeg v360 mapping on a tiny synthetic
-frame and assert the behaviour that issue #240 introduces: out-of-FOV pixels
-are a genuine ``alpha=0`` hole, not a smear.
+frame and assert issue #255's contract: out-of-FOV pixels are **pure black RGB
+on the default path**, because alpha does not survive the ``yuv420p`` encode
+downstream.
+
+**The fixture frame matters.** Issue #240's tests used a frame with a *black*
+border, so v360's edge-clamped smear was itself black and every "the hole is
+black" assertion passed vacuously — which is exactly how PR #254 shipped green
+CI while the operator still saw a cream band on the real render. The frame
+below therefore has a **bright cream border** (the very RGB the operator
+reported), so a smeared hole is loudly distinguishable from a black one.
 
 The ffmpeg path is exercised only when ffmpeg + the v360 filter are present
 (skipped otherwise, so CI stays green on a minimal runner). The OpenCV fallback
@@ -22,12 +30,26 @@ import pytest
 
 from pipeline.equirectangular_mapper import EquirectangularMapper
 
-# Small, deterministic synthetic frame.  A solid red patch dead-centre on a
-# black background: content that is bright and clearly *not* the fill colour,
-# so "untouched content pixel" assertions are meaningful.
+# Small, deterministic synthetic frame: a solid red patch dead-centre on the
+# cream background the operator reported smearing into the periphery
+# (RGB 237,218,193). Both colours are far from black, so *any* black pixel in
+# the output can only have come from the fix.
 _H, _W = 36, 64
-_FRAME = np.zeros((_H, _W, 3), dtype=np.uint8)
+_CREAM = (237, 218, 193)
+_FRAME = np.full((_H, _W, 3), _CREAM, dtype=np.uint8)
 _FRAME[12:24, 22:42] = (255, 0, 0)  # red patch
+
+
+def _black_fraction(rgb: np.ndarray) -> float:
+    """Fraction of pixels that are exactly RGB (0,0,0)."""
+    return float((rgb[:, :, :3].sum(axis=2) == 0).mean())
+
+
+def test_fixture_frame_has_no_black_pixels():
+    """Guard the guard: if the fixture ever regains a black border, every
+    "hole is black" assertion below silently becomes vacuous (the #254 trap).
+    """
+    assert _black_fraction(_FRAME) == 0.0
 
 
 def _ffmpeg_v360_available() -> bool:
@@ -51,7 +73,7 @@ _FFMPEG = pytest.mark.skipif(not _HAS_V360, reason="ffmpeg v360 unavailable")
 
 @_FFMPEG
 class TestFfmpegAlphaMask:
-    """The v360 filter must be built with ``alpha_mask=1`` (issue #240)."""
+    """v360 must request the alpha mask *and* composite it onto black."""
 
     def _mapper(self) -> EquirectangularMapper:
         return EquirectangularMapper(output_width=_W, output_height=_H, src_hfov=90.0)
@@ -63,6 +85,18 @@ class TestFfmpegAlphaMask:
         m = self._mapper()
         flt = m._v360_filter(_W, _H)
         assert "alpha_mask=1" in flt
+
+    def test_filter_string_composites_onto_black(self):
+        # issue #255: the alpha mask alone is inert once the frame is encoded
+        # to yuv420p. The chain must also flatten the hole onto black *inside*
+        # ffmpeg, and must terminate in an opaque pixel format by default.
+        flt = self._mapper()._v360_filter(_W, _H)
+        assert "overlay" in flt
+        assert flt.endswith("format=rgb24")
+
+    def test_filter_string_keeps_alpha_when_requested(self):
+        flt = self._mapper()._v360_filter(_W, _H, with_alpha=True)
+        assert flt.endswith("format=rgba")
 
     def test_output_is_rgba_when_alpha_requested(self):
         rgba = self._mapper().map_single(_FRAME, with_alpha=True)
@@ -105,11 +139,62 @@ class TestFfmpegAlphaMask:
 
     def test_hole_rgb_is_black(self):
         # Where the alpha mask says "no coverage", the RGB must be zero so a
-        # compositor that ignores alpha sees pure black (no white smear).
+        # compositor that ignores alpha sees pure black (no cream smear).
         rgba = self._mapper().map_single(_FRAME, with_alpha=True)
         hole = rgba[rgba[:, :, 3] == 0][:, :3]
         assert hole.shape[0] > 0
         assert int(hole.max()) == 0
+
+    # -- issue #255: the DEFAULT (with_alpha=False) path is what ships ------ #
+
+    def test_default_corners_are_black(self):
+        # The headline acceptance criterion. Before #255 these corners were
+        # RGB(237,218,193) — v360's clamped copy of the source's edge pixel.
+        rgb = self._mapper().map_single(_FRAME)
+        for r, c in [(0, 0), (0, -1), (-1, 0), (-1, -1)]:
+            assert tuple(int(x) for x in rgb[r, c]) == (0, 0, 0), f"corner ({r},{c}) = {rgb[r, c]}, expected black"
+
+    def test_default_has_substantial_black_region(self):
+        # A 90° source in a 180° dome leaves a large uncovered periphery. If
+        # this drops to ~0 the smear is back.
+        rgb = self._mapper().map_single(_FRAME)
+        assert _black_fraction(rgb) > 0.2
+
+    def test_default_does_not_blacken_inside_the_fov(self):
+        # The fix must only touch the hole. Assert the centre region — well
+        # inside the 90° FOV — survives, so an over-broad mask can't pass by
+        # blackening the whole frame.
+        rgb = self._mapper().map_single(_FRAME)
+        centre = rgb[_H // 2 - 4 : _H // 2 + 4, _W // 2 - 6 : _W // 2 + 6]
+        assert _black_fraction(centre) == 0.0
+        assert int(centre.max()) > 0
+
+    def test_default_black_region_matches_the_alpha_hole(self):
+        # The composited black must be exactly the alpha==0 set: no more
+        # (content eaten), no less (smear left behind).
+        m = self._mapper()
+        rgb = m.map_single(_FRAME)
+        alpha = m.map_single(_FRAME, with_alpha=True)[:, :, 3]
+        assert np.array_equal(rgb.sum(axis=2) == 0, alpha == 0)
+
+    def test_stereo_pair_corners_are_black(self):
+        # map_stereo_pair shares map_single's path, so both eyes must agree.
+        sbs = self._mapper().map_stereo_pair(_FRAME, _FRAME)
+        assert sbs.shape == (_H, _W * 2, 3)
+        for r, c in [(0, 0), (0, _W - 1), (0, _W), (0, -1), (-1, 0), (-1, -1)]:
+            assert tuple(int(x) for x in sbs[r, c]) == (0, 0, 0)
+
+    def test_sequence_batch_path_is_black(self, tmp_path):
+        # The batched map_sequence path builds its own ffmpeg call from the
+        # same _v360_filter; verify the composite survives the image-sequence
+        # invocation (different rate/frame-count handling than a single PNG).
+        m = self._mapper()
+        frames = [_FRAME, _FRAME, _FRAME]
+        out = m.map_sequence(frames, frames, str(tmp_path))
+        assert len(out) == 3
+        for sbs in out:
+            assert tuple(int(x) for x in sbs[0, 0]) == (0, 0, 0)
+            assert _black_fraction(sbs) > 0.2
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +237,17 @@ class TestOpenCvFallback:
         rgb = m.map_single(_FRAME)
         rgba = m.map_single(_FRAME, with_alpha=True)
         assert np.array_equal(rgb, rgba[:, :, :3])
+
+    def test_default_corners_are_black(self):
+        # Same #255 contract as the ffmpeg path — the two must not diverge.
+        rgb = self._mapper().map_single(_FRAME)
+        for r, c in [(0, 0), (0, -1), (-1, 0), (-1, -1)]:
+            assert tuple(int(x) for x in rgb[r, c]) == (0, 0, 0)
+
+    def test_default_does_not_blacken_inside_the_fov(self):
+        rgb = self._mapper().map_single(_FRAME)
+        centre = rgb[_H // 2 - 4 : _H // 2 + 4, _W // 2 - 6 : _W // 2 + 6]
+        assert _black_fraction(centre) == 0.0
 
 
 # --------------------------------------------------------------------------- #

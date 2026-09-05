@@ -36,21 +36,26 @@ class EquirectangularMapper:
 
     Output: 7680×1920 SBS frame (2 × 3840×1920 hemispheres).
 
-    Handling of regions outside the source FOV depends on the active path
-    (issue #240 — earlier docstrings claimed a single behaviour, which was
-    inaccurate):
+    Regions outside the source FOV are **pure black RGB (0,0,0)** on *both*
+    paths (issue #255).  This is a terminal state, not an intermediate one:
+    the output of this class is encoded to H.264/HEVC ``yuv420p``, which
+    carries no alpha, so anything that relies on alpha to hide the hole is
+    discarded at encode time.
 
-    - **ffmpeg v360 path** (default, ``use_ffmpeg=True``): the v360 filter is
-      built with ``alpha_mask=1``. Output pixels that fall outside the source
-      FOV get **alpha=0** (a real hole), and their RGB stays whatever v360
-      computes — by *default* v360 clamps the source's edge pixels into the
-      periphery (smear); the alpha mask is what lets a compositor replace
-      that smear cleanly. ``map_single`` drops the alpha by default (3-channel
-      RGB contract); pass ``with_alpha=True`` to keep it.
+    - **ffmpeg v360 path** (default, ``use_ffmpeg=True``): ``alpha_mask=1``
+      marks the uncovered region with alpha=0, and the *same* filter chain
+      immediately composites that RGBA frame over a black background
+      (``split`` → ``lutrgb`` black → ``overlay``).  What comes back is
+      genuinely black outside the FOV, not v360's default edge-pixel smear.
+      Compositing happens inside ffmpeg — no per-frame NumPy pass.
     - **OpenCV remap path** (fallback, ``use_ffmpeg=False``): out-of-FOV
       pixels are remapped with a constant black border and then forced to
-      **RGB (0,0,0)** — genuinely black, not smeared. With
-      ``with_alpha=True`` they also carry alpha=0.
+      RGB (0,0,0).
+
+    ``map_single`` returns 3-channel RGB by default; ``with_alpha=True``
+    additionally keeps the alpha plane (0 outside the FOV) for callers that
+    need a real mask for feathering/compositing.  The RGB planes are identical
+    either way.
     """
 
     def __init__(
@@ -84,13 +89,15 @@ class EquirectangularMapper:
     def map_single(self, frame: np.ndarray, with_alpha: bool = False) -> np.ndarray:
         """Map a single planar frame to equirectangular VR180.
 
+        Pixels outside the source FOV are pure black RGB (0,0,0) regardless of
+        ``with_alpha`` — see the class docstring and issue #255.
+
         Args:
             frame: Input planar image (H, W, 3), uint8.
             with_alpha: When True, return an RGBA frame whose alpha plane is 0
-                for pixels that fall outside the source FOV (ffmpeg path only;
-                the OpenCV fallback synthesises a binary mask the same way).
-                Default False → the historical 3-channel RGB contract used by
-                :meth:`map_stereo_pair` and downstream consumers.
+                for pixels that fall outside the source FOV. Default False →
+                the 3-channel RGB contract used by :meth:`map_stereo_pair` and
+                downstream consumers. The RGB planes are identical either way.
 
         Returns:
             Equirectangular frame (output_height, output_width, 3 or 4), uint8.
@@ -123,25 +130,54 @@ class EquirectangularMapper:
         vfov_rad = 2.0 * math.atan(math.tan(hfov_rad / 2.0) * src_height / src_width)
         return math.degrees(vfov_rad)
 
-    def _v360_filter(self, src_width: int, src_height: int, alpha_mask: bool = True) -> str:
-        """Build v360 filter string for perspective → half-equirectangular.
+    #: Composite an ``alpha_mask=1`` v360 frame onto black, inside ffmpeg.
+    #:
+    #: ``alpha_mask=1`` alone only zeroes the *alpha* plane — the RGB planes
+    #: still hold v360's edge-clamped smear, and alpha is thrown away the
+    #: moment the frame is encoded to ``yuv420p`` (issue #255).  So the hole
+    #: has to become black RGB before the frame ever leaves ffmpeg.
+    #:
+    #: The black background is derived from the v360 output itself via
+    #: ``split`` + ``lutrgb`` rather than a ``color=black`` lavfi source: the
+    #: two branches then share timestamps and frame count by construction, so
+    #: the chain behaves identically for a single PNG, an image sequence and a
+    #: full video (a ``color`` source has its own frame rate and would need
+    #: per-call rate matching).
+    #:
+    #: ``lutrgb`` leaves the alpha plane untouched, so straight-alpha
+    #: ``overlay`` yields ``out_a = fg_a`` — the mask survives for
+    #: ``with_alpha=True`` callers while the RGB is already composited.
+    #: ``overlay`` (unlike ``premultiply=inplace=1``, which rounds
+    #: ``rgb*alpha/255`` down and darkens every in-FOV pixel by 1 LSB) leaves
+    #: covered pixels bit-exact.
+    _BLACK_COMPOSITE = (
+        "split[_fg][_bgsrc];[_bgsrc]lutrgb=r=0:g=0:b=0[_bg];[_bg][_fg]overlay=format=rgb:eof_action=endall"
+    )
+
+    def _v360_filter(self, src_width: int, src_height: int, with_alpha: bool = False) -> str:
+        """Build the perspective → half-equirectangular filter chain.
+
+        The chain is ``v360=...:alpha_mask=1`` followed by
+        :attr:`_BLACK_COMPOSITE`, so out-of-FOV pixels come back as real black
+        RGB rather than v360's edge smear (issue #255).
 
         Args:
-            alpha_mask: When True (default) v360 emits an RGBA frame whose alpha
-                plane is 0 for pixels that fall outside the source FOV — a real
-                *hole*, not ffmpeg's default edge-pixel smear. The RGB planes are
-                identical with or without the flag, so callers that ignore alpha
-                see no change. See issue #240.
+            src_width: Source frame width (px), for the vertical-FOV solve.
+            src_height: Source frame height (px).
+            with_alpha: Terminate the chain in ``rgba`` (keeping the alpha
+                mask, 0 outside the FOV) instead of ``rgb24``. The RGB planes
+                are identical either way.
         """
         src_vfov = self._calc_vertical_fov(src_width, src_height)
-        mask = "alpha_mask=1:" if alpha_mask else ""
-        return (
+        v360 = (
             f"v360=input=flat:output=hequirect:"
             f"ih_fov={self.src_hfov}:iv_fov={src_vfov:.2f}:"
             f"h_fov=180:v_fov=180:"
             f"w={self.output_width}:h={self.output_height}:"
-            f"{mask}"
-        ).rstrip(":")
+            f"alpha_mask=1"
+        )
+        pix_fmt = "rgba" if with_alpha else "rgb24"
+        return f"{v360},{self._BLACK_COMPOSITE},format={pix_fmt}"
 
     def _map_via_ffmpeg(self, frame: np.ndarray, with_alpha: bool = False) -> np.ndarray:
         """Use ffmpeg v360 filter for equirectangular mapping.
@@ -149,11 +185,11 @@ class EquirectangularMapper:
         Maps a flat perspective image (with src_hfov FOV) onto a
         180° hemispherical equirectangular projection.
 
-        The v360 filter is built with ``alpha_mask=1`` (see issue #240): the
-        alpha plane of the output is 0 outside the source FOV and 255 inside —
-        a genuine mask, not ffmpeg's default edge-pixel smear.  The RGB planes
-        are identical to a no-mask run, so :meth:`map_single` drops the alpha
-        by default and callers that never ask for it see no behaviour change.
+        The v360 output is composited onto black **inside the same ffmpeg
+        invocation** (see :attr:`_BLACK_COMPOSITE` and issue #255), so the RGB
+        that comes back is genuinely (0,0,0) outside the source FOV — no
+        per-frame NumPy post-pass, and nothing that depends on alpha surviving
+        the ``yuv420p`` encode downstream.
         """
         import tempfile
 
@@ -165,15 +201,20 @@ class EquirectangularMapper:
 
         out_path = in_path.replace(".png", "_eq.png")
         try:
-            vfilter = self._v360_filter(W, H)
+            vfilter = self._v360_filter(W, H, with_alpha=with_alpha)
             cmd = ["ffmpeg", "-y", "-i", in_path, "-vf", vfilter, "-frames:v", "1", out_path]
             subprocess.run(cmd, check=True, capture_output=True, timeout=30)
 
             out_img = cv2.imread(out_path, cv2.IMREAD_UNCHANGED)
             if out_img is None:
                 raise RuntimeError("ffmpeg v360 failed to produce output")
-            out_img = cv2.cvtColor(out_img, cv2.COLOR_BGRA2RGBA)
-            return out_img if with_alpha else out_img[:, :, :3]
+            if with_alpha:
+                if out_img.ndim != 3 or out_img.shape[2] != 4:
+                    raise RuntimeError(f"ffmpeg v360 produced {out_img.shape} where RGBA was requested")
+                return cv2.cvtColor(out_img, cv2.COLOR_BGRA2RGBA)
+            # The chain terminates in ``format=rgb24``; drop any stray alpha
+            # defensively so the 3-channel contract holds unconditionally.
+            return cv2.cvtColor(out_img[:, :, :3], cv2.COLOR_BGR2RGB)
         finally:
             try:
                 os.unlink(in_path)
