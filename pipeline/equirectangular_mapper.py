@@ -8,13 +8,23 @@ projection. The output is a 7680×1920 SBS frame (3840×1920 per eye).
 Two strategies:
 1. **ffmpeg v360 filter** (recommended) — Uses ffmpeg's built-in
    v360 filter for fast, correct perspective→equirectangular mapping.
+   Per-frame calls (``map_single`` / ``map_stereo_pair``) are served by a
+   **long-lived ffmpeg worker** fed over stdin/stdout as packed raw RGB
+   (issue #256): one worker per (source size, alpha) is started lazily and
+   reused for every following frame, so there is no per-frame process
+   spawn and no per-frame temp-file round trip.  The filter chain is the
+   very same one the old one-shot path used, so output is bit-identical.
 2. **OpenCV remap** (fallback) — Pure NumPy/OpenCV implementation.
 
-Batched mode (default):
+Batched mode (``map_sequence``):
   Instead of calling ffmpeg 2×N times (once per eye per frame), the
   ``map_sequence()`` method writes all frames as a temporary image
   sequence and runs ffmpeg **once per eye** on the whole video.
-  This yields ~10× speedup for long clips.
+
+Lifecycle: the persistent ffmpeg workers are shut down by ``close()``, by
+using the mapper as a context manager, or when the mapper is garbage
+collected.  If a worker dies or stalls, the mapper restarts it once and
+otherwise falls back to the one-shot ffmpeg path (same pixels, old speed).
 
 Usage:
     from pipeline.equirectangular_mapper import EquirectangularMapper
@@ -23,12 +33,205 @@ Usage:
     sbs_frames = mapper.map_sequence(left_frames, right_frames, temp_dir)
 """
 
+import contextlib
+import logging
 import os
+import queue
 import subprocess
+import sys
+import threading
+import weakref
+from collections import deque
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+log = logging.getLogger(__name__)
+
+
+class _PipeError(RuntimeError):
+    """The persistent ffmpeg worker died, stalled past its timeout, or hit a short read."""
+
+
+def _shutdown_worker(proc: subprocess.Popen, threads: tuple[threading.Thread, ...], kill: bool) -> None:
+    """Stop *proc*, reap it, and let its reader threads exit before their pipes are closed.
+
+    Shared by :meth:`_FfmpegV360Pipe.close` and the ``weakref.finalize`` safety
+    net (which runs in the ``atexit`` phase, while daemon threads are still
+    live).  Never raises.
+
+    The order matters: a ``BufferedReader`` whose lock is held by a daemon
+    thread that the interpreter has already frozen must **not** be closed —
+    CPython aborts with ``_enter_buffered_busy`` at shutdown.  So the files are
+    closed only once the readers have provably exited; otherwise the fds are
+    left to the OS.
+    """
+    with contextlib.suppress(Exception):
+        if proc.stdin:
+            proc.stdin.close()  # EOF → a healthy ffmpeg flushes and exits
+    if kill:
+        with contextlib.suppress(Exception):
+            if proc.poll() is None:
+                proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=5)
+    join_timeout = 0.0 if sys.is_finalizing() else 2.0
+    for t in threads:
+        with contextlib.suppress(Exception):
+            t.join(timeout=join_timeout)
+    if all(not t.is_alive() for t in threads):
+        for f in (proc.stdout, proc.stderr):
+            with contextlib.suppress(Exception):
+                if f:
+                    f.close()
+
+
+class _FfmpegV360Pipe:
+    """A long-lived ``ffmpeg`` worker that remaps raw RGB frames over stdin/stdout.
+
+    Protocol: the caller writes exactly ``src_nbytes`` of packed ``rgb24`` per
+    frame to stdin and gets exactly ``out_nbytes`` of packed ``rgb24``/``rgba``
+    back on stdout — one output frame per input frame, in order.  A reader
+    thread drains stdout continuously so the writer can never deadlock on a
+    full pipe; a second thread keeps the tail of stderr for diagnostics.
+
+    ``-threads 1`` on the *output* side is load-bearing: with ffmpeg's default
+    thread count the frame-threaded rawvideo encoder holds one frame back, so
+    frame N only surfaces once frame N+1 has been pushed — a permanent
+    one-frame stall for a synchronous caller (verified empirically on ffmpeg
+    N-125258; ``-fps_mode``/``-flush_packets``/``-avioflags direct`` do not
+    help).  Single-threading a rawvideo "encoder" (a memcpy) costs nothing and
+    the v360 filter keeps its slice threads.
+
+    Not thread-safe across callers; a lock serialises ``process`` so two
+    threads sharing one mapper cannot interleave their frames.
+    """
+
+    def __init__(
+        self,
+        vfilter: str,
+        src_w: int,
+        src_h: int,
+        out_w: int,
+        out_h: int,
+        with_alpha: bool,
+        timeout: float,
+    ):
+        self.src_nbytes = src_w * src_h * 3
+        self.channels = 4 if with_alpha else 3
+        self.out_shape = (out_h, out_w, self.channels)
+        self.out_nbytes = out_h * out_w * self.channels
+        self.timeout = timeout
+        self.cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{src_w}x{src_h}",
+            "-i",
+            "pipe:0",
+            "-vf",
+            vfilter,
+            "-threads",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba" if with_alpha else "rgb24",
+            "-flush_packets",
+            "1",
+            "pipe:1",
+        ]
+        self.proc = subprocess.Popen(
+            self.cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._frames: queue.Queue = queue.Queue()
+        self._stderr_tail: deque[bytes] = deque(maxlen=20)
+        self._lock = threading.Lock()
+        self._threads = (
+            threading.Thread(target=self._read_frames, name="v360-pipe-stdout", daemon=True),
+            threading.Thread(target=self._drain_stderr, name="v360-pipe-stderr", daemon=True),
+        )
+        # Safety net for a mapper that is never closed: runs at interpreter
+        # exit (atexit phase, readers still live) and kills + reaps the worker.
+        # Deliberately references the components, never ``self``.
+        self._finalizer = weakref.finalize(self, _shutdown_worker, self.proc, self._threads, True)
+        for t in self._threads:
+            t.start()
+
+    # -- background I/O ----------------------------------------------------
+
+    def _read_frames(self) -> None:
+        stdout = self.proc.stdout
+        try:
+            while True:
+                buf = bytearray(self.out_nbytes)
+                view = memoryview(buf)
+                got = 0
+                while got < self.out_nbytes:
+                    n = stdout.readinto(view[got:])
+                    if not n:
+                        # EOF (worker exited) — a partial frame is dropped on purpose.
+                        self._frames.put(None)
+                        return
+                    got += n
+                self._frames.put(buf)
+        except (OSError, ValueError):
+            # Pipe closed underneath us during shutdown.
+            self._frames.put(None)
+
+    def _drain_stderr(self) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            for line in self.proc.stderr:
+                self._stderr_tail.append(line)
+
+    def stderr_text(self) -> str:
+        return b"".join(self._stderr_tail).decode("utf-8", errors="replace").strip()
+
+    @property
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    # -- public --------------------------------------------------------------
+
+    def process(self, frame: np.ndarray) -> np.ndarray:
+        """Push one packed rgb24 frame, block for its remapped output frame."""
+        with self._lock:
+            if not self.alive:
+                raise _PipeError(f"ffmpeg worker exited (rc={self.proc.returncode}): {self.stderr_text()}")
+            try:
+                self.proc.stdin.write(frame.tobytes())
+                self.proc.stdin.flush()
+            except OSError as e:  # BrokenPipeError included
+                raise _PipeError(f"write to ffmpeg worker failed ({e}): {self.stderr_text()}") from e
+            try:
+                item = self._frames.get(timeout=self.timeout)
+            except queue.Empty:
+                self.close(kill=True)
+                raise _PipeError(f"ffmpeg worker produced no frame within {self.timeout:g}s") from None
+            if item is None:
+                raise _PipeError(f"ffmpeg worker exited mid-frame (rc={self.proc.poll()}): {self.stderr_text()}")
+            # bytearray-backed → writable view, no copy.
+            return np.frombuffer(item, dtype=np.uint8).reshape(self.out_shape)
+
+    def close(self, kill: bool = False) -> None:
+        """Stop the worker (EOF on stdin, or kill) and reap it. Idempotent."""
+        self._finalizer.detach()
+        _shutdown_worker(self.proc, self._threads, kill)
 
 
 class EquirectangularMapper:
@@ -85,6 +288,38 @@ class EquirectangularMapper:
         self.src_hfov = src_hfov
         self.use_ffmpeg = use_ffmpeg
         self._mesh: tuple[np.ndarray, np.ndarray] | None = None
+        # Persistent ffmpeg workers, keyed by (src_w, src_h, with_alpha) — issue #256.
+        self._pipes: dict[tuple[int, int, bool], _FfmpegV360Pipe] = {}
+        self._pipe_disabled = False
+        #: Seconds to wait for one remapped frame before declaring the worker stalled.
+        self.pipe_timeout: float = self.PIPE_TIMEOUT_SEC
+        # ``ffmpeg -filters`` probe result, cached per mapper (was re-spawned on every frame).
+        self._ffmpeg_ok: bool | None = None
+
+    #: Default per-frame stall timeout for the persistent worker (seconds).  A
+    #: 2880² eye-frame takes ~0.2 s on a desktop CPU; this leaves a wide margin
+    #: for loaded or slow hosts while still catching a genuinely stuck worker.
+    PIPE_TIMEOUT_SEC: float = 60.0
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def close(self) -> None:
+        """Shut down every persistent ffmpeg worker (idempotent, safe to call twice)."""
+        pipes, self._pipes = self._pipes, {}
+        for pipe in pipes.values():
+            with contextlib.suppress(Exception):
+                pipe.close()
+
+    def __enter__(self) -> "EquirectangularMapper":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # ``_pipes`` may not exist if ``__init__`` failed early — suppress.
+        with contextlib.suppress(Exception):
+            self.close()
 
     def map_single(self, frame: np.ndarray, with_alpha: bool = False) -> np.ndarray:
         """Map a single planar frame to equirectangular VR180.
@@ -108,7 +343,17 @@ class EquirectangularMapper:
             return self._map_via_opencv(frame, with_alpha=with_alpha)
 
     def _ffmpeg_available(self) -> bool:
-        """Check if ffmpeg with v360 filter is available."""
+        """Check if ffmpeg with v360 filter is available.
+
+        Probed once per mapper and cached: before #256 this spawned an
+        ``ffmpeg -filters`` process on *every* ``map_single`` call.
+        """
+        if self._ffmpeg_ok is None:
+            self._ffmpeg_ok = self._probe_ffmpeg_v360()
+        return self._ffmpeg_ok
+
+    @staticmethod
+    def _probe_ffmpeg_v360() -> bool:
         import shutil
 
         if not shutil.which("ffmpeg"):
@@ -185,11 +430,78 @@ class EquirectangularMapper:
         Maps a flat perspective image (with src_hfov FOV) onto a
         180° hemispherical equirectangular projection.
 
-        The v360 output is composited onto black **inside the same ffmpeg
-        invocation** (see :attr:`_BLACK_COMPOSITE` and issue #255), so the RGB
-        that comes back is genuinely (0,0,0) outside the source FOV — no
-        per-frame NumPy post-pass, and nothing that depends on alpha surviving
-        the ``yuv420p`` encode downstream.
+        Issue #256: the frame is streamed as packed raw RGB through a
+        **persistent** ffmpeg worker (:class:`_FfmpegV360Pipe`, one per source
+        size / alpha flag) instead of spawning ffmpeg and round-tripping PNGs
+        on disk for every frame.  The filter chain is identical to the one-shot
+        path, so the pixels are identical too — only the transport changed.
+
+        Robustness: a worker that died between frames is restarted once; if
+        the fresh worker fails as well the persistent path is disabled for
+        this mapper and every later frame takes :meth:`_map_via_ffmpeg_oneshot`
+        (correct output, pre-#256 speed) with a single warning.
+
+        The v360 output is composited onto black **inside ffmpeg** (see
+        :attr:`_BLACK_COMPOSITE` and issue #255), so the RGB that comes back is
+        genuinely (0,0,0) outside the source FOV.
+        """
+        if frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8:
+            # The raw-byte protocol has no header: a wrong dtype/shape would
+            # silently desynchronise the stream, so refuse loudly instead.
+            raise ValueError(f"expected an (H, W, 3) uint8 RGB frame, got shape={frame.shape} dtype={frame.dtype}")
+        H, W = frame.shape[:2]
+
+        if self._pipe_disabled:
+            return self._map_via_ffmpeg_oneshot(frame, with_alpha=with_alpha)
+
+        last_err: _PipeError | None = None
+        for _attempt in range(2):
+            try:
+                return self._get_pipe(W, H, with_alpha).process(frame)
+            except _PipeError as e:
+                last_err = e
+                self._drop_pipe((W, H, with_alpha))
+
+        self._pipe_disabled = True
+        log.warning(
+            "persistent ffmpeg v360 worker failed twice in a row (%s); "
+            "falling back to one-shot ffmpeg per frame for the rest of this run",
+            last_err,
+        )
+        return self._map_via_ffmpeg_oneshot(frame, with_alpha=with_alpha)
+
+    def _get_pipe(self, src_w: int, src_h: int, with_alpha: bool) -> _FfmpegV360Pipe:
+        """Return the live worker for this (source size, alpha), starting one if needed."""
+        key = (src_w, src_h, with_alpha)
+        pipe = self._pipes.get(key)
+        if pipe is not None and not pipe.alive:
+            self._drop_pipe(key)
+            pipe = None
+        if pipe is None:
+            pipe = _FfmpegV360Pipe(
+                self._v360_filter(src_w, src_h, with_alpha=with_alpha),
+                src_w,
+                src_h,
+                self.output_width,
+                self.output_height,
+                with_alpha,
+                self.pipe_timeout,
+            )
+            self._pipes[key] = pipe
+        return pipe
+
+    def _drop_pipe(self, key: tuple[int, int, bool]) -> None:
+        pipe = self._pipes.pop(key, None)
+        if pipe is not None:
+            with contextlib.suppress(Exception):
+                pipe.close(kill=True)
+
+    def _map_via_ffmpeg_oneshot(self, frame: np.ndarray, with_alpha: bool = False) -> np.ndarray:
+        """Pre-#256 transport: one ffmpeg process + PNG temp files per frame.
+
+        Kept as the fallback for a host whose ffmpeg cannot sustain the
+        persistent pipe, and as the pixel-equivalence reference in the tests.
+        Same :meth:`_v360_filter` chain as the persistent worker.
         """
         import tempfile
 
