@@ -59,7 +59,7 @@ from pipeline.device_utils import (  # noqa: E402
 )
 from pipeline.equirectangular_mapper import EquirectangularMapper  # noqa: E402
 from pipeline.fulldome_mapper import FulldomeMapper  # noqa: E402
-from pipeline.outpainter import Outpainter  # noqa: E402
+from pipeline.outpainter import Outpainter, resolve_edge_feather  # noqa: E402
 from pipeline.playback_presets import (  # noqa: E402
     DEFAULT_PLAYBACK,
     PLAYBACK_PRESETS,
@@ -690,13 +690,43 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.25,
         help="Fraction of height scanned from bottom for black boundaries (default: 0.25)",
     )
+    # P0-3 (#244): angle-weighted edge feather.  Independent of --outpaint and
+    # OFF unless one of the two flags is given (both default None → behaviour
+    # byte-identical to before).
+    parser.add_argument(
+        "--edge-feather-start",
+        type=float,
+        default=None,
+        metavar="DEG",
+        help="P0-3 (#244): angle (0-180 FOV scale, 0 = forward axis) where the content starts fading to "
+        "black towards the edge. Off unless --edge-feather-start or --edge-feather-end is given; the "
+        "omitted one defaults to 165 / 180. The fade is anchored at the source-FOV (alpha) edge, so "
+        "165->180 works for a 126-degree source as well as a full 180-degree one; use e.g. 110 for a "
+        "wide 'peripheral vision' fall-off (Plan C).",
+    )
+    parser.add_argument(
+        "--edge-feather-end",
+        type=float,
+        default=None,
+        metavar="DEG",
+        help="P0-3 (#244): angle (0-180 FOV scale) at which the content is fully black (default 180 when "
+        "only --edge-feather-start is given). Must satisfy 0 <= start <= end <= 180; anything else is "
+        "rejected at parse time.",
+    )
 
     return parser
 
 
 def parse_args(argv: list[str] | None = None):
     """Parse CLI arguments.  Accept optional *argv* for testing."""
-    return _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    # P0-3 (#244): reject impossible feather angles here, not after depth/stereo ran.
+    try:
+        resolve_edge_feather(args.edge_feather_start, args.edge_feather_end)
+    except ValueError as e:
+        parser.error(str(e))
+    return args
 
 
 def read_frames(video_path: str, max_frames: int | None = None):
@@ -1423,18 +1453,86 @@ def run_equirect_stage(args, left_frames, right_frames):
         for i, sbs in enumerate(sbs_frames):
             cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(sbs, cv2.COLOR_RGB2BGR))
 
+    # P0-3 (#244): persist the FOV alpha plane next to the frames so Stage 3.5
+    # can fill / feather against the real hole instead of hunting for black rows.
+    _save_equirect_alpha(args, mapper, left_frames[0])
+
     log.info(
         f"Generated {len(sbs_frames)} equirectangular SBS frames ({sbs_frames[0].shape[1]}×{sbs_frames[0].shape[0]})"
     )
     return sbs_frames
 
 
-def run_outpaint_stage(args, sbs_frames):
-    """Stage 3.5: Outpaint black boundary regions in equirect frames."""
-    log.info("=== Stage 3.5: 180° Outpaint Fill (%s) ===", args.outpaint)
+# ---------------------------------------------------------------------------
+# P0-3 (#244): FOV alpha side-car — written by Stage 3, consumed by Stage 3.5
+# ---------------------------------------------------------------------------
 
-    if args.outpaint == "none":
-        log.info("Outpainting disabled (--outpaint none) — skipping")
+_EQUIRECT_ALPHA_FILE = "alpha_mask.npy"  # .npy on purpose: the stage loaders glob *.png
+
+
+def _equirect_alpha_path(args) -> str:
+    """Path of the SBS alpha plane saved next to the equirect checkpoint frames."""
+    return os.path.join(get_temp_dir(args, "equirect"), _EQUIRECT_ALPHA_FILE)
+
+
+def _save_equirect_alpha(args, mapper: EquirectangularMapper, src_frame: np.ndarray) -> np.ndarray | None:
+    """Compute the per-eye FOV alpha once (geometry only) and persist it as SBS.
+
+    The hole depends on the source size / ``--src-hfov`` / output size only, so
+    a single ``map_single(with_alpha=True)`` call (on whichever mapper path is
+    active) describes every frame of the run.  Failures are logged, never
+    fatal — Stage 3.5 then falls back to black-row detection.
+    """
+    try:
+        alpha_eye = mapper.map_single(src_frame, with_alpha=True)[:, :, 3]
+        alpha_sbs = np.concatenate([alpha_eye, alpha_eye], axis=1)
+        np.save(_equirect_alpha_path(args), alpha_sbs)
+        log.info(
+            "Saved FOV alpha side-car (%.1f%% hole) → %s", 100.0 * float((alpha_sbs == 0).mean()), _EQUIRECT_ALPHA_FILE
+        )
+        return alpha_sbs
+    except Exception as e:  # best effort — the mapping itself already succeeded
+        log.warning("Could not compute the FOV alpha side-car (%s); Stage 3.5 falls back to black-row detection", e)
+        return None
+
+
+def _load_equirect_alpha(args, frame_shape) -> np.ndarray | None:
+    """Load the side-car written by :func:`_save_equirect_alpha`, or ``None``.
+
+    A side-car whose shape does not match the frames (stale temp dir, other
+    resolution) is ignored rather than trusted.
+    """
+    path = _equirect_alpha_path(args)
+    if not os.path.exists(path):
+        log.info("No FOV alpha side-car at %s — Stage 3.5 falls back to black-row detection", path)
+        return None
+    alpha = np.load(path)
+    if alpha.shape != tuple(frame_shape[:2]):
+        log.warning(
+            "FOV alpha side-car %s has shape %s but frames are %s — ignoring it", path, alpha.shape, frame_shape[:2]
+        )
+        return None
+    return alpha
+
+
+def run_outpaint_stage(args, sbs_frames):
+    """Stage 3.5: fill the FOV hole and/or feather the content edge (#244).
+
+    Runs when ``--outpaint`` is not ``none`` **or** an ``--edge-feather-*``
+    flag was given (``--outpaint none`` alone stays a no-op, byte-identical to
+    before).  The fill mask / feather anchor comes from the alpha side-car that
+    :func:`run_equirect_stage` saved; without it the outpainter falls back to
+    black-row detection (fill) or a fully covered hemisphere (feather).
+    """
+    feather = resolve_edge_feather(getattr(args, "edge_feather_start", None), getattr(args, "edge_feather_end", None))
+    log.info(
+        "=== Stage 3.5: 180° Outpaint Fill (%s, edge feather %s) ===",
+        args.outpaint,
+        "off" if feather is None else f"{feather[0]:g}°→{feather[1]:g}°",
+    )
+
+    if args.outpaint == "none" and feather is None:
+        log.info("Outpainting disabled (--outpaint none, no --edge-feather-*) — skipping")
         return sbs_frames
 
     outpainter = Outpainter(
@@ -1442,16 +1540,19 @@ def run_outpaint_stage(args, sbs_frames):
         mask_threshold=args.outpaint_mask_threshold,
         mask_top_ratio=args.outpaint_mask_top_ratio,
         mask_bottom_ratio=args.outpaint_mask_bottom_ratio,
+        edge_feather_start=getattr(args, "edge_feather_start", None),
+        edge_feather_end=getattr(args, "edge_feather_end", None),
     )
 
-    result = outpainter.process(sbs_frames)
+    alpha = _load_equirect_alpha(args, sbs_frames[0].shape) if sbs_frames else None
+    result = outpainter.process(sbs_frames, alpha=alpha)
 
     # Overwrite equirect checkpoint files with outpainted versions
     out_dir = get_temp_dir(args, "equirect")
     for i, frame in enumerate(result):
         cv2.imwrite(os.path.join(out_dir, f"equirect_{i:06d}.png"), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
 
-    log.info("Outpainted %d frames (mode=%s)", len(result), args.outpaint)
+    log.info("Outpainted %d frames (mode=%s, edge feather=%s)", len(result), args.outpaint, "on" if feather else "off")
     return result
 
 
