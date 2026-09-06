@@ -440,18 +440,17 @@ class TestExistingCallSitesConstruct(unittest.TestCase):
         p = _make_pipeline()
         self.assertIsInstance(p, StreamingPipeline)
 
-    def test_run_streaming_pipeline_convenience_defaults(self):
-        from pipeline.streaming_pipeline import run_streaming_pipeline
-
-        # The convenience wrapper must still construct with only the original
-        # required args (the new outpaint/use_ffmpeg params are optional).
+    def test_original_required_args_only_defaults(self):
+        # F-5 (#268): the dead ``run_streaming_pipeline`` wrapper is gone; the
+        # regression assertion is that a caller passing only the original
+        # required args still constructs (the newer outpaint/use_ffmpeg params
+        # are optional and default to the pre-#243 behaviour).
         with patch("pipeline.streaming_pipeline.EquirectangularMapper"):
             # We cannot call process_stream (no real video), but construction
             # alone is the regression assertion.
             p = StreamingPipeline(output_width=100, output_height=50, device="cpu")
         self.assertEqual(p.outpaint, "none")
         self.assertTrue(p.use_ffmpeg)
-        self.assertTrue(callable(run_streaming_pipeline))
 
 
 if __name__ == "__main__":

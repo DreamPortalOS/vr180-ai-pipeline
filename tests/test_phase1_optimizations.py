@@ -109,11 +109,16 @@ class TestStreamingPipeline(unittest.TestCase):
 
         self.assertTrue(callable(StreamingPipeline))
 
-    def test_convenience_function_exists(self):
-        """run_streaming_pipeline convenience function exists."""
-        from pipeline.streaming_pipeline import run_streaming_pipeline
+    def test_convenience_function_removed(self):
+        """F-5 (#268): the dead ``run_streaming_pipeline`` wrapper stays deleted.
 
-        self.assertTrue(callable(run_streaming_pipeline))
+        It forwarded a ``flip_vertical`` kwarg that ``StreamingPipeline.__init__``
+        never accepted (TypeError on every call) and had no caller; the CLI
+        streaming branch in ``scripts/run_pipeline.py`` is the only entry point.
+        """
+        import pipeline.streaming_pipeline as sp
+
+        self.assertFalse(hasattr(sp, "run_streaming_pipeline"))
 
     def test_init_defaults(self):
         """StreamingPipeline initializes with correct defaults."""
