@@ -667,8 +667,12 @@ class TestRunPipelineWiring:
         assert out[32, last].max() == 0, "anchored at the content edge: last content pixel is black"
         assert out[32, 32].max() > 0, "centre survives"
 
-    def test_streaming_warns_that_feather_is_ignored(self, rp):
+    def test_streaming_no_longer_warns_that_feather_is_ignored(self, rp):
+        """F-1 (#261): the streaming path now applies the feather per frame, so the
+        swallowed-arg detector must not name the flags any more (was the inverse
+        assertion when #244 shipped batch-only).  Full streaming coverage lives in
+        ``tests/test_streaming_feather.py``."""
         args = rp.parse_args([])
         args.streaming, args.stage, args.edge_feather_start = True, "all", 165.0
         warned = _capture_warnings("vr180-pipeline", lambda: rp._warn_streaming_unsupported_args(args))
-        assert any("--edge-feather-start" in m for m in warned), warned
+        assert not any("--edge-feather" in m for m in warned), warned

@@ -2148,6 +2148,10 @@ _STREAMING_SUPPORTED: dict[str, str] = {
     "outpaint_mask_threshold": "outpaint mask threshold",
     "outpaint_mask_top_ratio": "outpaint top ratio",
     "outpaint_mask_bottom_ratio": "outpaint bottom ratio",
+    # F-1 (#261): the angle-weighted edge feather (#244) is applied per frame
+    # on the streaming path (StreamingPipeline._project_sbs).
+    "edge_feather_start": "edge feather start angle",
+    "edge_feather_end": "edge feather end angle",
     # V-3 manifest / cross-machine flags — the streaming branch rejects them
     # (they force the batch path), so they are documented here but never
     # silently honoured by the stream.
@@ -2851,6 +2855,12 @@ def main():
             outpaint_mask_threshold=getattr(args, "outpaint_mask_threshold", 10),
             outpaint_mask_top_ratio=getattr(args, "outpaint_mask_top_ratio", 0.25),
             outpaint_mask_bottom_ratio=getattr(args, "outpaint_mask_bottom_ratio", 0.25),
+            # F-1 (#261): --edge-feather-start/--edge-feather-end used to be
+            # reported by the swallowed-arg detector above and ignored; the
+            # stream now applies the #244 feather per frame after the equirect
+            # map (both None = off ⇒ bytes unchanged).
+            edge_feather_start=getattr(args, "edge_feather_start", None),
+            edge_feather_end=getattr(args, "edge_feather_end", None),
             # K-21 (#224): hand the caller-owned --temp-dir into the streaming
             # path so depth products land under <temp-dir>/depth/ (the layout
             # make_comparison's depth-dir resolver globs) instead of a
