@@ -6,6 +6,7 @@ No frame buffers accumulate in RAM.
 """
 
 import contextlib
+import dataclasses
 import logging
 import os
 import subprocess
@@ -18,6 +19,7 @@ import numpy as np
 from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import resolve_device
 from pipeline.equirectangular_mapper import EquirectangularMapper
+from pipeline.outpainter import resolve_edge_feather, sbs_edge_feather_weights
 from pipeline.stereo_renderer import StereoRenderer
 
 log = logging.getLogger("vr180-streaming")
@@ -452,6 +454,105 @@ def _load_video_frames(video_path: str) -> list[np.ndarray]:
     return frames
 
 
+# ---------------------------------------------------------------------------
+# F-1 (#261): edge feather on the streaming path.
+#
+# The geometry (angle-weighted fade anchored at the alpha edge, issue #244)
+# is ``pipeline.outpainter.sbs_edge_feather_weights`` — imported, not
+# re-implemented.  What differs here is only *how* the constant per-pixel
+# weights are applied per frame:
+#
+#   ``apply_edge_feather`` multiplies the whole SBS frame in float32
+#   (~360 ms/frame at 2880²/eye — nearly 2× the v360 map itself, so far
+#   outside the card's 15 % equirect budget).  The feather only changes the
+#   ramp ring plus the one-pixel guard ring at the content edge; the hole
+#   (``alpha == 0``) is already black on both mapper paths (#255/#258) and
+#   the content interior has weight 1.  So the plan below keeps, per eye,
+#   the bounding box of the pixels whose weight is < 1 *inside* the content,
+#   and multiplies just that box in place with OpenCV (``cv2.multiply`` with
+#   ``dtype=CV_8U`` = float32 product + round-to-nearest, bit-identical to
+#   ``apply_edge_feather``'s ``rint``).  ~18 ms/frame at 2880²/eye.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class _FeatherPlan:
+    """Constant per-frame feather work for one (eye size → SBS size) geometry.
+
+    ``rois`` holds ``(r0, r1, c0, c1, weights)`` per eye where *weights* is the
+    float32 ``(r1 - r0, (c1 - c0) * 3)`` multiplier block (channels
+    interleaved, i.e. the SBS box viewed as one 2-D uint8 plane).
+    """
+
+    eye_shape: tuple[int, int]
+    sbs_shape: tuple[int, int]
+    rois: tuple[tuple[int, int, int, int, np.ndarray], ...]
+    touched_pct: float
+    roi_pct: float
+
+
+def _build_feather_plan(weights: np.ndarray, alpha_sbs: np.ndarray, eye_shape: tuple[int, int]) -> _FeatherPlan:
+    """Reduce a full SBS weight plane to the per-eye boxes that change pixels.
+
+    Args:
+        weights: ``(H, 2W)`` float32 in ``[0, 1]`` from
+            :func:`pipeline.outpainter.sbs_edge_feather_weights`.
+        alpha_sbs: ``(H, 2W)`` alpha plane the weights were derived from
+            (0 = hole).  Hole pixels are excluded from the boxes: the mapper
+            already renders them black, and a weight of 0 on black is a no-op.
+        eye_shape: ``(h, w)`` of the *source* eye frames the plan is valid for.
+    """
+    h, w2 = weights.shape
+    w = w2 // 2
+    touched = (weights < 1.0) & (alpha_sbs > 0)
+    rois: list[tuple[int, int, int, int, np.ndarray]] = []
+    for x0 in (0, w):
+        eye_touched = touched[:, x0 : x0 + w]
+        rows = np.flatnonzero(eye_touched.any(axis=1))
+        if rows.size == 0:
+            continue
+        cols = np.flatnonzero(eye_touched.any(axis=0))
+        r0, r1 = int(rows[0]), int(rows[-1]) + 1
+        c0, c1 = x0 + int(cols[0]), x0 + int(cols[-1]) + 1
+        block = np.repeat(weights[r0:r1, c0:c1, None].astype(np.float32), 3, axis=2)
+        block = np.ascontiguousarray(block).reshape(r1 - r0, -1)
+        # Both eyes share the source geometry, so their boxes are normally
+        # identical — keep one copy (37 MB at 2880²/eye) instead of two.
+        if rois and rois[0][4].shape == block.shape and np.array_equal(rois[0][4], block):
+            block = rois[0][4]
+        rois.append((r0, r1, c0, c1, block))
+    roi_px = sum((r1 - r0) * (c1 - c0) for r0, r1, c0, c1, _ in rois)
+    return _FeatherPlan(
+        eye_shape=(int(eye_shape[0]), int(eye_shape[1])),
+        sbs_shape=(h, w2),
+        rois=tuple(rois),
+        touched_pct=100.0 * float(touched.mean()),
+        roi_pct=100.0 * roi_px / float(weights.size),
+    )
+
+
+def _apply_feather_plan(sbs: np.ndarray, plan: _FeatherPlan) -> np.ndarray:
+    """Apply *plan* to one SBS frame (in place when possible) and return it.
+
+    Bit-identical to ``apply_edge_feather(sbs, weights)`` for the weights the
+    plan was built from, given the mapper's black hole (see
+    :func:`_build_feather_plan`).
+    """
+    if sbs.ndim != 3 or sbs.shape[2] != 3 or sbs.shape[:2] != plan.sbs_shape:
+        raise RuntimeError(
+            f"edge feather: SBS frame shape {sbs.shape} does not match the planned geometry {plan.sbs_shape}"
+        )
+    sbs = np.ascontiguousarray(sbs, dtype=np.uint8)
+    for r0, r1, c0, c1, block in plan.rois:
+        # Row-strided (h, w*3) view of the box — a view, not a copy, so the
+        # multiply lands in the frame itself.
+        view = sbs[r0:r1, c0:c1].reshape(r1 - r0, -1)
+        out = cv2.multiply(view, block, dst=view, dtype=cv2.CV_8U)
+        if not np.may_share_memory(out, view):  # binding returned a fresh buffer
+            view[...] = out
+    return sbs
+
+
 class StreamingPipeline:
     """Stream-based VR180 conversion with O(1) memory footprint.
 
@@ -459,6 +560,7 @@ class StreamingPipeline:
       1. Opens the input video with cv2.VideoCapture
       2. Reads one frame at a time
       3. Runs depth estimation → stereo rendering → equirectangular mapping
+         (→ edge feather when enabled, F-1 #261)
       4. Pipes the processed frame directly into ffmpeg for encoding
       5. Releases intermediate tensors after each frame
 
@@ -507,6 +609,14 @@ class StreamingPipeline:
         outpaint_mask_threshold: int = 10,
         outpaint_mask_top_ratio: float = 0.25,
         outpaint_mask_bottom_ratio: float = 0.25,
+        # F-1 (#261): angle-weighted edge feather (#244 / PR #259) on the
+        # streaming path.  Both None (default) = feather OFF — the bytes handed
+        # to ffmpeg are exactly ``map_stereo_pair``'s output, as before.  A
+        # single bound enables it with the other at its #244 default
+        # (165 / 180); invalid angles raise ValueError here (same rule as
+        # Outpainter / the CLI parser).
+        edge_feather_start: float | None = None,
+        edge_feather_end: float | None = None,
         # I-5 (#120): injectable depth/stereo backends.  When None the defaults
         # (Depth-Anything V2 per-frame + StereoRenderer depth-shift) are used,
         # so pre-I-5 behaviour is bit-exact.  The CLI streaming branch injects
@@ -550,6 +660,11 @@ class StreamingPipeline:
         self.outpaint_mask_threshold = outpaint_mask_threshold
         self.outpaint_mask_top_ratio = outpaint_mask_top_ratio
         self.outpaint_mask_bottom_ratio = outpaint_mask_bottom_ratio
+        # F-1 (#261): ``(start, end)`` degrees or None (off).  The per-frame
+        # plan is built lazily from the first eye frame (needs its size) and
+        # cached — see _feather_plan_for.
+        self.edge_feather = resolve_edge_feather(edge_feather_start, edge_feather_end)
+        self._feather_plan: _FeatherPlan | None = None
         # Hardware (NVENC) encoding — issue #49: CUDA availability does NOT
         # imply NVENC works (driver/ffmpeg ABI mismatch). "auto" (None) probes
         # the actual encoder with a tiny synthetic encode and falls back to
@@ -840,6 +955,55 @@ class StreamingPipeline:
             depth_dir,
         )
 
+    def _feather_plan_for(self, eye_frame: np.ndarray) -> _FeatherPlan:
+        """Return the feather plan for eye frames of *eye_frame*'s size (F-1, #261).
+
+        Built once and cached; rebuilt only if the eye size changes.  The alpha
+        plane is derived exactly like the batch path's FOV side-car
+        (``run_pipeline._save_equirect_alpha``): one ``map_single(with_alpha=True)``
+        on the mapper's active path, tiled for both eyes — geometry only, so
+        any frame of the right size will do.
+        """
+        plan = self._feather_plan
+        eye_shape = (int(eye_frame.shape[0]), int(eye_frame.shape[1]))
+        if plan is not None and plan.eye_shape == eye_shape:
+            return plan
+        assert self.edge_feather is not None
+        start, end = self.edge_feather
+        t0 = time.perf_counter()
+        alpha_eye = self.eq_mapper.map_single(eye_frame, with_alpha=True)[:, :, 3]
+        alpha_sbs = np.concatenate([alpha_eye, alpha_eye], axis=1)
+        weights = sbs_edge_feather_weights(alpha_sbs, start, end)
+        plan = _build_feather_plan(weights, alpha_sbs, eye_shape)
+        self._feather_plan = plan
+        log.info(
+            "Edge feather %.1f°→%.1f° (streaming): weights built once in %.2f s — %.1f%% of pixels darkened, "
+            "applied per frame inside %d box(es) covering %.1f%% of the SBS frame",
+            start,
+            end,
+            time.perf_counter() - t0,
+            plan.touched_pct,
+            len(plan.rois),
+            plan.roi_pct,
+        )
+        return plan
+
+    def _project_sbs(self, left: np.ndarray, right: np.ndarray, timer: _StageTimer) -> np.ndarray:
+        """Stage 3 for one frame: equirect map, then the edge feather if enabled (F-1, #261).
+
+        The per-frame feather multiply is timed inside ``equirect`` (it is part
+        of producing the projected frame); the one-time plan build is not, so
+        a short acceptance run does not book the set-up cost against the
+        per-frame stage.
+        """
+        plan = self._feather_plan_for(left) if self.edge_feather is not None else None
+        timer.start("equirect")
+        sbs = self.eq_mapper.map_stereo_pair(left, right)
+        if plan is not None:
+            sbs = _apply_feather_plan(sbs, plan)
+        timer.stop("equirect")
+        return sbs
+
     def _write_sbs_frame(
         self,
         proc: subprocess.Popen,
@@ -976,6 +1140,8 @@ class StreamingPipeline:
             self.depth_backend_name,
             self.stereo_backend_name,
         )
+        if self.edge_feather is not None:
+            log.info("🎚️  Edge feather: %.1f°→%.1f° (F-1 #261, applied per frame)", *self.edge_feather)
 
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
@@ -1062,9 +1228,7 @@ class StreamingPipeline:
                     # Whole-clip stereo (StereoCrafter): L/R precomputed, skip
                     # depth + stereo-render; just map → encode per frame.
                     for left, right in zip(precomp_left, precomp_right, strict=False):
-                        timer.start("equirect")
-                        sbs = self.eq_mapper.map_stereo_pair(left, right)
-                        timer.stop("equirect")
+                        sbs = self._project_sbs(left, right, timer)
                         self._write_sbs_frame(proc, sbs, frame_idx, out_w, out_h)
                         del sbs
                         frame_idx += 1
@@ -1118,10 +1282,8 @@ class StreamingPipeline:
                         left, right = self.stereo_renderer.render(rgb, depth)
                         timer.stop("stereo")
 
-                        # --- Stage 3: Equirectangular mapping ---
-                        timer.start("equirect")
-                        sbs = self.eq_mapper.map_stereo_pair(left, right)
-                        timer.stop("equirect")
+                        # --- Stage 3: Equirectangular mapping (+ edge feather, #261) ---
+                        sbs = self._project_sbs(left, right, timer)
 
                         self._write_sbs_frame(proc, sbs, frame_idx, out_w, out_h)
 
