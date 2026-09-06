@@ -26,6 +26,7 @@ import argparse
 import datetime
 import json
 import logging
+import math
 import os
 import platform
 import shutil
@@ -74,6 +75,7 @@ from pipeline.stereo_crafter import StereoCrafterRenderer  # noqa: E402
 from pipeline.stereo_renderer import StereoRenderer  # noqa: E402
 from pipeline.streaming_pipeline import (  # noqa: E402
     DEFAULT_QUALITY,
+    DEFAULT_SPHERE_RADIAL_SCALE,
     StreamingPipeline,
     resolve_quality,
     scaled_bitrate_mbps,
@@ -713,6 +715,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "only --edge-feather-start is given). Must satisfy 0 <= start <= end <= 180; anything else is "
         "rejected at parse time.",
     )
+    # F-7 (#274): temporal spherical accumulation (F-2 #262/#263) on the
+    # streaming path.  OFF by default — the default stream is byte-identical.
+    parser.add_argument(
+        "--sphere-accumulate",
+        choices=["off", "on"],
+        default="off",
+        help="F-7 (#274): fill the 126->180 outer ring with what earlier frames showed before the content "
+        "flowed out of the frame (SphereAccumulator, one per eye; streaming path only). off (default) "
+        "changes nothing; on replaces each eye with the accumulated hemisphere, faded 165->180 (or the "
+        "--edge-feather-* angles) once by the accumulator — the per-frame edge feather is not applied on "
+        "top, and --outpaint gradient is skipped with a warning. Needs a square per-eye canvas.",
+    )
+    parser.add_argument(
+        "--sphere-radial-scale",
+        type=float,
+        default=DEFAULT_SPHERE_RADIAL_SCALE,
+        metavar="SCALE",
+        help="F-7 (#274): per-frame radial expansion of the remembered content (a constant for now; > 1 = "
+        "flying forward, <= 1 = composite only, ring stays black). Only used with --sphere-accumulate on; "
+        f"must be a finite positive number (default: {DEFAULT_SPHERE_RADIAL_SCALE}).",
+    )
 
     return parser
 
@@ -726,6 +749,11 @@ def parse_args(argv: list[str] | None = None):
         resolve_edge_feather(args.edge_feather_start, args.edge_feather_end)
     except ValueError as e:
         parser.error(str(e))
+    # F-7 (#274): same rule for the radial scale (only meaningful with --sphere-accumulate on).
+    if args.sphere_accumulate == "on" and not (
+        math.isfinite(args.sphere_radial_scale) and args.sphere_radial_scale > 0
+    ):
+        parser.error(f"--sphere-radial-scale must be a finite positive number, got {args.sphere_radial_scale}")
     return args
 
 
@@ -2152,6 +2180,10 @@ _STREAMING_SUPPORTED: dict[str, str] = {
     # on the streaming path (StreamingPipeline._project_sbs).
     "edge_feather_start": "edge feather start angle",
     "edge_feather_end": "edge feather end angle",
+    # F-7 (#274): SphereAccumulator per eye on the streaming path
+    # (StreamingPipeline._accumulate_sbs); off by default.
+    "sphere_accumulate": "sphere accumulate mode",
+    "sphere_radial_scale": "sphere radial scale",
     # V-3 manifest / cross-machine flags — the streaming branch rejects them
     # (they force the batch path), so they are documented here but never
     # silently honoured by the stream.
@@ -2861,6 +2893,12 @@ def main():
             # map (both None = off ⇒ bytes unchanged).
             edge_feather_start=getattr(args, "edge_feather_start", None),
             edge_feather_end=getattr(args, "edge_feather_end", None),
+            # F-7 (#274): --sphere-accumulate {off,on} / --sphere-radial-scale.
+            # "off" (default) never instantiates the accumulator ⇒ bytes
+            # unchanged; "on" runs one SphereAccumulator per eye after the
+            # equirect map (it owns the fade — see StreamingPipeline).
+            sphere_accumulate=getattr(args, "sphere_accumulate", "off"),
+            sphere_radial_scale=getattr(args, "sphere_radial_scale", DEFAULT_SPHERE_RADIAL_SCALE),
             # K-21 (#224): hand the caller-owned --temp-dir into the streaming
             # path so depth products land under <temp-dir>/depth/ (the layout
             # make_comparison's depth-dir resolver globs) instead of a

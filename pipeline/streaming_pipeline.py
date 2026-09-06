@@ -8,6 +8,7 @@ No frame buffers accumulate in RAM.
 import contextlib
 import dataclasses
 import logging
+import math
 import os
 import subprocess
 import tempfile
@@ -20,11 +21,14 @@ from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import resolve_device
 from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.outpainter import (
+    DEFAULT_EDGE_FEATHER_END,
+    DEFAULT_EDGE_FEATHER_START,
     _gradient_outpaint_single,
     alpha_to_fill_mask,
     resolve_edge_feather,
     sbs_edge_feather_weights,
 )
+from pipeline.sphere_accumulator import SphereAccumulator
 from pipeline.stereo_renderer import StereoRenderer
 
 log = logging.getLogger("vr180-streaming")
@@ -54,6 +58,15 @@ _NVENC_PROBE_CACHE: dict[str, tuple[bool, str]] = {}
 
 # How many bytes of stderr tail to keep for diagnostics.
 STDERR_TAIL_BYTES = 4096
+
+# F-7 (#274): ``--sphere-accumulate`` modes.  ``off`` (default) leaves the
+# stream byte-identical and never instantiates a SphereAccumulator; ``on``
+# runs one accumulator per eye (see the F-7 block above ``_BoundaryPlan``).
+SPHERE_ACCUMULATE_MODES: tuple[str, ...] = ("off", "on")
+# Per-frame radial expansion handed to ``SphereAccumulator.update`` while
+# ``--sphere-accumulate on`` — a constant for this card (no per-frame motion
+# estimate yet); 1.05 is the value the #263 fixtures were tuned on.
+DEFAULT_SPHERE_RADIAL_SCALE = 1.05
 
 
 # ---------------------------------------------------------------------------
@@ -499,11 +512,45 @@ def _load_video_frames(video_path: str) -> list[np.ndarray]:
 #   * ``ai`` has no backend wired into the per-frame fuse loop: it warns once
 #     at construction and degrades to ``none`` (never silently).
 #
-# Cost: the gradient filler is a full-SBS-frame float pass plus a vertical
-# Gaussian (kernel ≈ H/16) — ~1.25 s/frame at 2880²/eye against ~0.18 s for
-# the v360 map.  That is intrinsic to the reused function (the batch path
-# pays the same per frame); it is opt-in (``--outpaint gradient``) and, like
-# the feather, booked inside ``equirect``.
+# Cost: the gradient filler is a strip-vectorised smear plus a vertical
+# Gaussian (kernel ≈ H/16) limited to the hole rows — ~0.15 s/frame at
+# 2880²/eye since #273 (1.18–1.35 s → 149–162 ms per 5760×2880 call on the
+# RTX 4070S host, byte-exact; +0.13–0.15 s/frame of ``equirect`` on a
+# 24-frame real run) against ~0.18 s for the v360 map.  It is opt-in
+# (``--outpaint gradient``) and, like the feather, booked inside ``equirect``.
+#
+# F-7 (#274): temporal spherical accumulation on the streaming path.
+#
+# ``pipeline.sphere_accumulator.SphereAccumulator`` (F-2 #262 / PR #263) fills
+# the 126°→180° outer ring with what earlier frames really showed before the
+# content flowed out of the frame.  ``--sphere-accumulate on`` wires it in;
+# ``off`` (default) never instantiates it and the bytes are unchanged:
+#
+#   * one accumulator **per eye**, created fresh at the start of every
+#     ``process_stream`` (a new clip must not inherit the previous ring);
+#   * the current frame's valid region is the mapper's alpha plane
+#     (``map_single(with_alpha=True)``) — geometry-only, so it is derived once
+#     per stream by the same ``_BoundaryPlan`` the fill and feather use, and
+#     tiled with each eye's RGB into the RGBA frame ``update`` expects;
+#   * the accumulator's output (RGB on black + its own ``fade_start →
+#     fade_end`` fade at the *accumulated* edge, output-only — the #263
+#     convention) replaces the eye.  The fade takes the ``--edge-feather-*``
+#     angles when given (165→180 otherwise) and the external feather plan is
+#     **not** built, so a feathered run is attenuated exactly once;
+#   * ``--outpaint gradient`` has nothing to add — the accumulator ignores the
+#     RGB under ``alpha == 0`` and its output overwrites the ring — so the
+#     fill is skipped with one WARNING at construction instead of costing
+#     0.15 s/frame for no visible change;
+#   * the radial scale is a constant (``--sphere-radial-scale``, default 1.05)
+#     for this card; a per-frame motion estimate is a later card.  ``<= 1``
+#     composites only (no expansion — the ring stays black, #263 semantics);
+#   * the canvas must be square (``output_width == output_height``, the VR180
+#     per-eye default): the accumulator rejects anything else, so the
+#     constructor rejects it first.
+#
+# Cost is the accumulator itself (a ``cv2.remap`` of the float32 RGBA buffer
+# plus a premultiplied composite, per eye), booked inside ``equirect`` like
+# the fill and the feather.
 # ---------------------------------------------------------------------------
 
 
@@ -596,12 +643,16 @@ class _BoundaryPlan:
     ``fill_mask`` is the ``(H, 2W)`` uint8 hole mask (255 = fill) handed to
     the gradient filler, or ``None`` when there is nothing to fill (mode
     ``none``, or the source already covers the hemisphere).  ``feather`` is
-    the sparse per-frame feather plan, or ``None`` when the feather is off.
+    the sparse per-frame feather plan, or ``None`` when the feather is off —
+    or when the accumulator owns the fade (F-7 #274).  ``alpha_eye`` is the
+    ``(H, W)`` uint8 alpha plane of one eye (the current frame's valid region
+    for the accumulator), or ``None`` when ``--sphere-accumulate`` is off.
     """
 
     eye_shape: tuple[int, int]
     fill_mask: np.ndarray | None
     feather: _FeatherPlan | None
+    alpha_eye: np.ndarray | None = None
 
 
 class StreamingPipeline:
@@ -612,7 +663,9 @@ class StreamingPipeline:
       2. Reads one frame at a time
       3. Runs depth estimation → stereo rendering → equirectangular mapping
          (→ outpaint fill when enabled, F-4 #267 → edge feather when
-         enabled, F-1 #261 — the batch Stage 3.5 order)
+         enabled, F-1 #261 — the batch Stage 3.5 order; with
+         ``--sphere-accumulate on`` (F-7 #274) a per-eye SphereAccumulator
+         replaces the eye instead and owns the fade)
       4. Pipes the processed frame directly into ffmpeg for encoding
       5. Releases intermediate tensors after each frame
 
@@ -671,6 +724,15 @@ class StreamingPipeline:
         # Outpainter / the CLI parser).
         edge_feather_start: float | None = None,
         edge_feather_end: float | None = None,
+        # F-7 (#274): temporal spherical accumulation (F-2 #262/#263) on the
+        # streaming path.  ``"off"`` (default) never instantiates a
+        # SphereAccumulator and leaves the bytes unchanged; ``"on"`` runs one
+        # accumulator per eye after the equirect map and lets it own the fade
+        # (the ``--edge-feather-*`` angles when given, else 165→180 — never
+        # applied a second time).  ``sphere_radial_scale`` is the constant
+        # per-frame expansion handed to ``update`` (only used when on).
+        sphere_accumulate: str = "off",
+        sphere_radial_scale: float = DEFAULT_SPHERE_RADIAL_SCALE,
         # I-5 (#120): injectable depth/stereo backends.  When None the defaults
         # (Depth-Anything V2 per-frame + StereoRenderer depth-shift) are used,
         # so pre-I-5 behaviour is bit-exact.  The CLI streaming branch injects
@@ -735,6 +797,40 @@ class StreamingPipeline:
             self._fill_mode = outpaint
         # F-1 (#261): ``(start, end)`` degrees or None (off).
         self.edge_feather = resolve_edge_feather(edge_feather_start, edge_feather_end)
+        # F-7 (#274): sphere accumulation.  Validated here — before any backend
+        # is built — with the rules the accumulator itself enforces.
+        if sphere_accumulate not in SPHERE_ACCUMULATE_MODES:
+            raise ValueError(f"Unknown sphere_accumulate mode: {sphere_accumulate!r}.  Choose 'off' or 'on'.")
+        self.sphere_accumulate = sphere_accumulate
+        self.sphere_radial_scale = float(sphere_radial_scale)
+        self._accumulate = sphere_accumulate == "on"
+        # The accumulator's own fade ``(start, end)``: the operator's feather
+        # angles when given, else the #263 default 165→180.  None when off.
+        self._sphere_fade: tuple[float, float] | None = None
+        # One SphereAccumulator per eye ``(left, right)`` while a stream runs;
+        # created fresh in process_stream so a new clip starts empty.
+        self._accumulators: tuple[SphereAccumulator, SphereAccumulator] | None = None
+        if self._accumulate:
+            if output_width != output_height:
+                raise ValueError(
+                    "sphere_accumulate='on' needs a square per-eye canvas (output_width == output_height); "
+                    f"got {output_width}×{output_height}"
+                )
+            if not (math.isfinite(self.sphere_radial_scale) and self.sphere_radial_scale > 0.0):
+                raise ValueError(f"sphere_radial_scale must be a finite positive number, got {sphere_radial_scale!r}")
+            self._sphere_fade = self.edge_feather or (DEFAULT_EDGE_FEATHER_START, DEFAULT_EDGE_FEATHER_END)
+            if self._fill_mode != "none":
+                # The accumulator ignores the RGB under alpha == 0 and its
+                # output overwrites the ring, so a gradient fill would cost
+                # ~0.15 s/frame (#273) for no visible change.  Degrade loudly,
+                # once, like ``--outpaint ai``.
+                log.warning(
+                    "⚠️  --outpaint %s is not combined with --sphere-accumulate on: the accumulator fills the "
+                    "outer ring from earlier frames and overwrites the fill — skipping the outpaint fill for "
+                    "this run.",
+                    self._fill_mode,
+                )
+                self._fill_mode = "none"
         # F-4 (#267) / F-1 (#261): the fill mask and the feather plan are
         # built lazily from the first eye frame (needs its size) and cached —
         # see _boundary_plan_for.
@@ -1031,8 +1127,8 @@ class StreamingPipeline:
 
     @property
     def _stage35_enabled(self) -> bool:
-        """True when Stage 3.5 (F-4 #267 fill and/or F-1 #261 feather) has work for this stream."""
-        return self._fill_mode != "none" or self.edge_feather is not None
+        """True when Stage 3.5 (F-4 #267 fill, F-1 #261 feather and/or F-7 #274 accumulation) has work."""
+        return self._fill_mode != "none" or self.edge_feather is not None or self._accumulate
 
     def _boundary_plan_for(self, eye_frame: np.ndarray) -> _BoundaryPlan:
         """Return the Stage 3.5 plan (fill mask + feather) for eye frames of *eye_frame*'s size.
@@ -1042,7 +1138,9 @@ class StreamingPipeline:
         (``run_pipeline._save_equirect_alpha``): one ``map_single(with_alpha=True)``
         on the mapper's active path, tiled for both eyes — geometry only, so
         any frame of the right size will do.  That single plane feeds both the
-        fill mask (F-4 #267) and the feather weights (F-1 #261).
+        fill mask (F-4 #267) and the feather weights (F-1 #261) — and, with
+        ``--sphere-accumulate on`` (F-7 #274), is kept as the accumulator's
+        per-frame valid region while the external feather plan is not built.
         """
         plan = self._boundary_plan
         eye_shape = (int(eye_frame.shape[0]), int(eye_frame.shape[1]))
@@ -1066,7 +1164,7 @@ class StreamingPipeline:
                 log.info("Outpaint fill gradient (streaming): source covers the hemisphere — nothing to fill")
 
         feather: _FeatherPlan | None = None
-        if self.edge_feather is not None:
+        if self.edge_feather is not None and not self._accumulate:
             start, end = self.edge_feather
             # #259 rule (Outpainter.process): after a fill the hemisphere is,
             # by construction, fully covered, so the feather anchors at the
@@ -1089,7 +1187,25 @@ class StreamingPipeline:
                 " (anchored at the 180° rim: the fill precedes it)" if filled else "",
             )
 
-        plan = _BoundaryPlan(eye_shape=eye_shape, fill_mask=fill_mask, feather=feather)
+        alpha_keep: np.ndarray | None = None
+        if self._accumulate:
+            # F-7 (#274): the accumulator owns the fade — the external feather
+            # plan above is deliberately not built (single attenuation).
+            alpha_keep = np.ascontiguousarray(alpha_eye)
+            fade_start, fade_end = self._sphere_fade
+            log.info(
+                "Sphere accumulate (streaming): alpha plane derived once in %.2f s (%.1f%% of the eye is source "
+                "content); fade %.1f°→%.1f° is applied once, by the accumulator%s",
+                time.perf_counter() - t0,
+                100.0 * float(np.count_nonzero(alpha_eye)) / alpha_eye.size,
+                fade_start,
+                fade_end,
+                " (the --edge-feather-* angles; the per-frame feather is not applied on top)"
+                if self.edge_feather is not None
+                else "",
+            )
+
+        plan = _BoundaryPlan(eye_shape=eye_shape, fill_mask=fill_mask, feather=feather, alpha_eye=alpha_keep)
         self._boundary_plan = plan
         return plan
 
@@ -1097,8 +1213,11 @@ class StreamingPipeline:
         """Stage 3 for one frame: equirect map, then Stage 3.5 in the batch order — fill, then feather.
 
         F-4 (#267): the gradient fill (``--outpaint gradient``) runs on the
-        mapped SBS frame first; F-1 (#261): the edge feather follows.  Both
-        are timed inside ``equirect`` (they are part of producing the
+        mapped SBS frame first; F-1 (#261): the edge feather follows.  F-7
+        (#274): with ``--sphere-accumulate on`` each eye goes through its
+        SphereAccumulator instead (the fill is degraded to ``none`` and the
+        feather plan is not built — the accumulator owns the fade).  All of
+        it is timed inside ``equirect`` (it is part of producing the
         projected frame); the one-time plan build (alpha plane, mask, weights)
         is not, so a short acceptance run does not book the set-up cost
         against the per-frame stage.
@@ -1109,9 +1228,32 @@ class StreamingPipeline:
         if plan is not None:
             if plan.fill_mask is not None:
                 sbs = _gradient_outpaint_single(sbs, plan.fill_mask)
+            if plan.alpha_eye is not None:
+                sbs = self._accumulate_sbs(sbs, plan.alpha_eye)
             if plan.feather is not None:
                 sbs = _apply_feather_plan(sbs, plan.feather)
         timer.stop("equirect")
+        return sbs
+
+    def _accumulate_sbs(self, sbs: np.ndarray, alpha_eye: np.ndarray) -> np.ndarray:
+        """F-7 (#274): run each eye through its SphereAccumulator and return the SBS frame.
+
+        *alpha_eye* (``(H, W)`` uint8, 0 = hole) marks the current frame's
+        valid region; each eye's RGB is tiled with it into the RGBA frame
+        ``update`` expects, and the accumulator's output (RGB on black with
+        its own fade) replaces that eye in place.
+        """
+        if self._accumulators is None:
+            raise RuntimeError("sphere accumulate: no live accumulators — they are created by process_stream")
+        h, w = alpha_eye.shape
+        if sbs.shape != (h, 2 * w, 3):
+            raise RuntimeError(
+                f"sphere accumulate: SBS frame shape {sbs.shape} does not match the alpha plane geometry {(h, 2 * w)}"
+            )
+        sbs = np.ascontiguousarray(sbs, dtype=np.uint8)
+        for acc, x0 in zip(self._accumulators, (0, w), strict=True):
+            rgba = np.dstack((sbs[:, x0 : x0 + w], alpha_eye))
+            sbs[:, x0 : x0 + w] = acc.update(rgba, self.sphere_radial_scale)
         return sbs
 
     def _write_sbs_frame(
@@ -1252,8 +1394,22 @@ class StreamingPipeline:
         )
         if self._fill_mode != "none":
             log.info("🎚️  Outpaint fill: %s (F-4 #267, applied per frame after the equirect map)", self._fill_mode)
-        if self.edge_feather is not None:
+        if self.edge_feather is not None and not self._accumulate:
             log.info("🎚️  Edge feather: %.1f°→%.1f° (F-1 #261, applied per frame)", *self.edge_feather)
+        if self._accumulate:
+            fade_start, fade_end = self._sphere_fade
+            log.info(
+                "🎚️  Sphere accumulate: on (F-7 #274) — radial scale %.3f/frame, fade %.1f°→%.1f° by the "
+                "accumulator, one accumulator per eye, applied per frame after the equirect map",
+                self.sphere_radial_scale,
+                fade_start,
+                fade_end,
+            )
+            # Fresh per stream: a new clip must not inherit the previous ring.
+            self._accumulators = (
+                SphereAccumulator(self.output_width, fade_start, fade_end),
+                SphereAccumulator(self.output_width, fade_start, fade_end),
+            )
 
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
