@@ -55,3 +55,5 @@ ruff check . && ruff format --check . && pytest tests/ -m "not slow" -q
 - push 前自检 `git log --oneline origin/main..HEAD`：**输出为空就不要建 PR**，
   先回头查为什么 commit 没落地。
 - 如果发现自己「已经写了很多代码但一次都没 commit」，**立刻停下来先提交**。
+- **全量 pytest 必须在前台跑完、亲眼看到 `N passed` 那一行再提交/退出。** 不要把它丢到后台"等通知"——
+  会话在等待期间结束的话，你所有未提交的改动一起消失。09-06 两个 agent 连续因此丢工作，其中一次是零 commit。
