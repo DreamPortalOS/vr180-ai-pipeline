@@ -221,15 +221,194 @@ def _smear_weights(distance: np.ndarray, band: np.ndarray | float) -> np.ndarray
     return np.clip(1.5 * (1.0 - distance / np.maximum(band, 1.0)), 0.0, 1.0)
 
 
-def _smear_columns(out: np.ndarray, src_col: int, cols: range) -> None:
-    """Smear column *src_col* of *out* (in place) across *cols*, fading with distance.
+#: Column strip for the vectorised filler (#271).  One 5760-wide SBS row is
+#: 17 KB, so the 181-row window of the vertical Gaussian (2880²/eye) thrashes
+#: L2 when the whole frame is filtered in one call; 512-column strips keep it
+#: cache-resident (~4× cheaper per pixel, identical output — the kernel is
+#: purely vertical, so columns are independent).
+_GRADIENT_STRIP_COLS = 512
+#: Row chunk for the smears — bounds the float64 temporaries (32 × 512 × 3 ×
+#: 8 B ≈ 400 KB) so every numpy pass stays in cache.
+_GRADIENT_SMEAR_ROWS = 32
+#: Row block for the per-column content-bounds scan.
+_GRADIENT_BOUNDS_ROWS = 32
 
-    The fade reaches black at the column of *cols* farthest from *src_col*
-    (the frame border, or the midpoint of an interior gap).
+
+def _true_runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    """Inclusive ``(start, end)`` pairs of the maximal ``True`` runs of a 1-D bool array."""
+    padded = np.concatenate(([False], flags, [False]))
+    starts = np.flatnonzero(padded[1:] & ~padded[:-1])
+    ends = np.flatnonzero(padded[:-1] & ~padded[1:]) - 1
+    return list(zip(starts.tolist(), ends.tolist(), strict=True))
+
+
+def _column_content_bounds(mask_bool: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-column ``(has_content, first_content_row, last_content_row)``.
+
+    Same values as ``content.argmax(axis=0)`` / the reversed argmax (``0`` and
+    ``h - 1`` for columns without content), without the strided axis-0 scans
+    that cost ~50 ms each at 5760×2880: a row-blocked ``all`` locates the block
+    holding the edge, a small gather refines the row inside it.
     """
-    band = float(max(abs(c - src_col) for c in cols))
-    for c in cols:
-        out[:, c] = out[:, src_col] * _smear_weights(float(abs(c - src_col)), band)
+    h, w = mask_bool.shape
+    B = _GRADIENT_BOUNDS_ROWS
+    n_full, rem = divmod(h, B)
+    n_blk = n_full + (1 if rem else 0)
+    blk_has = np.empty((n_blk, w), dtype=bool)  # True where the block holds content
+    if n_full:
+        np.logical_not(mask_bool[: n_full * B].reshape(n_full, B, w).all(axis=1), out=blk_has[:n_full])
+    if rem:
+        np.logical_not(mask_bool[n_full * B :].all(axis=0), out=blk_has[n_full])
+    col_has = blk_has.any(axis=0)
+    cols = np.arange(w)[None, :]
+    k = np.arange(B)[:, None]
+
+    first_blk = blk_has.argmax(axis=0)
+    rows = np.minimum(first_blk[None, :] * B + k, h - 1)
+    first = first_blk * B + (~mask_bool[rows, cols]).argmax(axis=0)
+
+    last_blk = n_blk - 1 - blk_has[::-1].argmax(axis=0)
+    rows = last_blk[None, :] * B + k
+    content_rows = ~mask_bool[np.minimum(rows, h - 1), cols] & (rows < h)
+    last = last_blk * B + (B - 1 - content_rows[::-1].argmax(axis=0))
+    return col_has, np.where(col_has, first, 0), np.where(col_has, last, h - 1)
+
+
+def _smear_band(
+    out: np.ndarray,
+    frame: np.ndarray,
+    anchor: np.ndarray,
+    band: np.ndarray,
+    col_has: np.ndarray,
+    *,
+    top: bool,
+) -> None:
+    """Vertical pass for one side, written straight into the uint8 *out*.
+
+    For every content column the pixel at row ``anchor[c]`` is copied into the
+    rows before it (*top*) or after it, with :func:`_smear_weights` over the
+    distance and the ``band[c]``-deep hole.  Arithmetic is the reference row
+    loop's: float64 weights × the float64-promoted source pixel, rounded to
+    float32 (the old float32 frame), then ``rint`` — same bytes.
+    """
+    h, w = out.shape[:2]
+    src_u8 = frame[anchor, np.arange(w)]  # (W, C) anchor pixel per column
+    src64 = np.ascontiguousarray(src_u8.T, dtype=np.float64)  # (C, W)
+    anchor64 = anchor.astype(np.float64)
+    band64 = band.astype(np.float64)
+    strip, chunk = _GRADIENT_STRIP_COLS, _GRADIENT_SMEAR_ROWS
+    for c0 in range(0, w, strip):
+        c1 = min(w, c0 + strip)
+        has = col_has[c0:c1]
+        if not has.any():
+            continue
+        edge = anchor[c0:c1][has]
+        r_start, r_stop = (0, int(edge.max())) if top else (int(edge.min()) + 1, h)
+        anc, bnd = anchor64[None, c0:c1], band64[None, c0:c1]
+        src, src_row = src64[:, None, c0:c1], src_u8[None, c0:c1]
+        for r0 in range(r_start, r_stop, chunk):
+            r1 = min(r_stop, r0 + chunk)
+            rows = np.arange(r0, r1, dtype=np.float64)[:, None]
+            d = anc - rows if top else rows - anc
+            sel = (d > 0) & has[None, :]
+            if not sel.any():
+                continue
+            weights = _smear_weights(d, bnd)  # (rows, cols) float64, unselected cells clip to 1
+            dst = out[r0:r1, c0:c1]
+            if weights.min() == 1.0:
+                # Inner third of every band: weight exactly 1 → the anchor pixel byte-exact.
+                if sel.all():
+                    dst[...] = src_row
+                else:
+                    cv2.copyTo(np.ascontiguousarray(np.broadcast_to(src_row, dst.shape)), sel.view(np.uint8), dst)
+                continue
+            vals = (src * weights[None, :, :]).astype(np.float32)  # (C, rows, cols): f64 product → f32
+            np.rint(vals, out=vals)
+            block = cv2.merge(list(vals.astype(np.uint8)))  # channels-last (rows, cols, C)
+            if sel.all():
+                dst[...] = block
+            else:
+                cv2.copyTo(block, sel.view(np.uint8), dst)
+
+
+def _smeared_column_f32(frame: np.ndarray, c: int, first_c: int, last_c: int) -> np.ndarray:
+    """Column *c* as the float32 frame held it after the vertical pass — ``(C, H)``.
+
+    Source column of the horizontal pass: content rows are the frame bytes,
+    the rows beyond ``first_c`` / ``last_c`` carry the (unrounded) vertical
+    smear exactly as :func:`_smear_band` computes it.
+    """
+    h = frame.shape[0]
+    col = frame[:, c].astype(np.float32)  # (H, C)
+    if first_c > 0:
+        d = np.arange(first_c, 0, -1, dtype=np.float64)  # first_c - r for r = 0 .. first_c-1
+        col[:first_c] = col[first_c].astype(np.float64)[None, :] * _smear_weights(d, float(first_c))[:, None]
+    depth = h - 1 - last_c
+    if depth > 0:
+        d = np.arange(1, depth + 1, dtype=np.float64)  # r - last_c for r = last_c+1 .. h-1
+        col[last_c + 1 :] = col[last_c].astype(np.float64)[None, :] * _smear_weights(d, float(depth))[:, None]
+    return np.ascontiguousarray(col.T)
+
+
+def _smear_run(out: np.ndarray, col_t: np.ndarray, src_col: int, c_start: int, c_stop: int) -> None:
+    """Horizontal pass: fill columns ``[c_start, c_stop)`` from *col_t* (``(C, H)`` float32,
+    the vertically smeared column *src_col*), fading with distance.
+
+    The fade reaches black at the column farthest from *src_col* (the frame
+    border, or the midpoint of an interior gap).  The reference multiplied the
+    float32 column by a float64 *scalar* weight, which NumPy 1.x performs in
+    float32 — hence the explicit float32 weights here.
+    """
+    h = out.shape[0]
+    dist = np.abs(np.arange(c_start, c_stop, dtype=np.float64) - src_col)
+    w32 = _smear_weights(dist, float(dist.max())).astype(np.float32)
+    chunk = _GRADIENT_SMEAR_ROWS
+    for r0 in range(0, h, chunk):
+        r1 = min(h, r0 + chunk)
+        vals = col_t[:, r0:r1, None] * w32[None, None, :]  # (C, rows, cols) float32
+        np.rint(vals, out=vals)
+        out[r0:r1, c_start:c_stop] = cv2.merge(list(vals.astype(np.uint8)))
+
+
+def _blur_hole(out: np.ndarray, mask_bool: np.ndarray) -> None:
+    """Vertical Gaussian over the hole, written back to the masked pixels only.
+
+    The kernel is ``(1, K)`` — purely vertical — so each column strip is
+    filtered independently, and only the row bands within ``K // 2`` of a
+    masked row are filtered at all.  Reflection at the true frame border is
+    preserved because a band is only ever clamped *at* that border.  Bands
+    closer than ``h // 2`` are merged: OpenCV's per-call overhead with a tall
+    kernel outweighs the rows saved.
+    """
+    h, w = mask_bool.shape
+    ksize = (1, max(3, h // 32 * 2 + 1))  # odd height, as before
+    sigma_y = h / 16.0
+    radius = ksize[1] // 2
+    merge_gap = h // 2
+    mask_u8 = mask_bool.view(np.uint8)
+    strip = _GRADIENT_STRIP_COLS
+    for c0 in range(0, w, strip):
+        c1 = min(w, c0 + strip)
+        runs = _true_runs(mask_bool[:, c0:c1].any(axis=1))
+        if not runs:
+            continue
+        groups: list[list[tuple[int, int]]] = [[runs[0]]]
+        for run in runs[1:]:
+            if run[0] - groups[-1][-1][1] - 1 <= merge_gap:
+                groups[-1].append(run)
+            else:
+                groups.append([run])
+        blurred = []
+        for grp in groups:
+            r0, r1 = max(0, grp[0][0] - radius), min(h, grp[-1][1] + 1 + radius)
+            if r1 - r0 < ksize[1]:  # clamped at a border: keep one full kernel of real rows
+                r1 = min(h, r0 + ksize[1])
+                r0 = max(0, r1 - ksize[1])
+            blurred.append((r0, cv2.GaussianBlur(out[r0:r1, c0:c1], ksize, sigmaX=0, sigmaY=sigma_y)))
+        # Write back only after every band of the strip has been read (in place).
+        for grp, (r0, blk) in zip(groups, blurred, strict=True):
+            for ra, rb in grp:
+                cv2.copyTo(blk[ra - r0 : rb + 1 - r0], mask_u8[ra : rb + 1, c0:c1], out[ra : rb + 1, c0:c1])
 
 
 def _gradient_outpaint_single(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -249,68 +428,52 @@ def _gradient_outpaint_single(frame: np.ndarray, mask: np.ndarray) -> np.ndarray
     rectangle, not two horizontal bands — the pre-#244 version read column 0
     as "the" row mask, so a fully-masked column 0 was mistaken for "mask
     covers the whole frame" and nothing was filled.
+
+    Vectorised in #271 (1.25 s → well under 0.25 s per 5760×2880 frame) with
+    **byte-identical output**: the smears are computed per column strip / row
+    chunk in the same float64-then-float32 arithmetic the old row and column
+    loops used, the frame is never converted to float as a whole, the blur is
+    limited to the rows around the hole (per 512-column strip), and only the
+    masked pixels are written back.  ``frame`` is an RGB uint8 array; *mask*
+    is ``> 0`` where the frame needs filling.
     """
-    mask_bool = mask > 0
-    if not np.any(mask_bool):
+    mask_bool = np.ascontiguousarray(mask > 0)
+    if not mask_bool.any():
         return frame.copy()
-    content = ~mask_bool
-    if not np.any(content):
+    if mask_bool.all():
         log.warning("Mask covers entire frame — cannot outpaint")
         return frame.copy()
+    if frame.dtype != np.uint8:
+        frame = frame.astype(np.uint8)
 
     h, w = mask_bool.shape
-    cols = np.arange(w)
-    out = frame.astype(np.float32)
+    col_has, first, last = _column_content_bounds(mask_bool)
+    out = frame.copy()
 
-    # --- Vertical pass (per column, row loop keeps memory O(W)) ---
-    col_has = content.any(axis=0)
-    first = np.where(col_has, content.argmax(axis=0), 0)
-    last = np.where(col_has, h - 1 - content[::-1, :].argmax(axis=0), h - 1)
-    src_first = out[first, cols]  # (W, 3) first content pixel per column
-    src_last = out[last, cols]
-    band_top = first.astype(np.float32)
-    band_bot = (h - 1 - last).astype(np.float32)
-
-    for r in range(int(first[col_has].max())):
-        d = first - r
-        sel = col_has & (d > 0)
-        if sel.any():
-            out[r, sel] = src_first[sel] * _smear_weights(d[sel], band_top[sel])[:, None]
-    for r in range(int(last[col_has].min()) + 1, h):
-        d = r - last
-        sel = col_has & (d > 0)
-        if sel.any():
-            out[r, sel] = src_last[sel] * _smear_weights(d[sel], band_bot[sel])[:, None]
+    # --- Vertical pass ---
+    _smear_band(out, frame, first, first, col_has, top=True)
+    _smear_band(out, frame, last, h - 1 - last, col_has, top=False)
 
     # --- Horizontal pass (runs of columns without any content) ---
     # Edge runs fade to black at the frame border; an *interior* run (e.g. the
     # two side holes meeting between the eyes of an SBS frame) is split at its
     # midpoint and each half is smeared from its own side.
     if not col_has.all():
-        padded = np.concatenate([[True], col_has, [True]])
-        run_starts = np.flatnonzero(padded[:-1] & ~padded[1:])
-        run_ends = np.flatnonzero(~padded[:-1] & padded[1:]) - 1
-        for a, b in zip(run_starts, run_ends, strict=True):
+        for a, b in _true_runs(~col_has):
             if a == 0 and b == w - 1:
                 continue  # no content column at all — nothing to smear from
             if a == 0:
-                _smear_columns(out, src_col=b + 1, cols=range(a, b + 1))
+                _smear_run(out, _smeared_column_f32(frame, b + 1, first[b + 1], last[b + 1]), b + 1, a, b + 1)
             elif b == w - 1:
-                _smear_columns(out, src_col=a - 1, cols=range(a, b + 1))
+                _smear_run(out, _smeared_column_f32(frame, a - 1, first[a - 1], last[a - 1]), a - 1, a, b + 1)
             else:
                 mid = (a + b) // 2
-                _smear_columns(out, src_col=a - 1, cols=range(a, mid + 1))
-                _smear_columns(out, src_col=b + 1, cols=range(mid + 1, b + 1))
+                _smear_run(out, _smeared_column_f32(frame, a - 1, first[a - 1], last[a - 1]), a - 1, a, mid + 1)
+                _smear_run(out, _smeared_column_f32(frame, b + 1, first[b + 1], last[b + 1]), b + 1, mid + 1, b + 1)
 
-    out_u8 = np.clip(np.rint(out), 0, 255).astype(np.uint8)
-
-    # Vertical Gaussian blur to smooth the transition seam
-    blur_ksize = (1, max(3, h // 32 * 2 + 1))  # odd height
-    out_u8 = cv2.GaussianBlur(out_u8, blur_ksize, sigmaX=0, sigmaY=h / 16.0)
-
-    # Restore original non-masked pixels
-    out_u8[content] = frame[content]
-    return out_u8
+    # --- Vertical Gaussian blur over the hole; non-masked pixels never change ---
+    _blur_hole(out, mask_bool)
+    return out
 
 
 # ---------------------------------------------------------------------------
