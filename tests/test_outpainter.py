@@ -7,7 +7,9 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
+import cv2
 import numpy as np
 import pytest
 
@@ -676,3 +678,231 @@ class TestRunPipelineWiring:
         args.streaming, args.stage, args.edge_feather_start = True, "all", 165.0
         warned = _capture_warnings("vr180-pipeline", lambda: rp._warn_streaming_unsupported_args(args))
         assert not any("--edge-feather" in m for m in warned), warned
+
+
+# ===========================================================================
+#  Issue #271 — the vectorised gradient filler is byte-exact vs the pre-#271
+#  row/column loops (shared by batch ``Outpainter`` and ``StreamingPipeline``)
+# ===========================================================================
+
+
+def _ref_smear_weights(distance, band):
+    return np.clip(1.5 * (1.0 - distance / np.maximum(band, 1.0)), 0.0, 1.0)
+
+
+def _ref_smear_columns(out, src_col, cols):
+    band = float(max(abs(c - src_col) for c in cols))
+    for c in cols:
+        out[:, c] = out[:, src_col] * _ref_smear_weights(float(abs(c - src_col)), band)
+
+
+def _reference_gradient_outpaint_single(frame, mask):
+    """Pre-#271 ``pipeline.outpainter._gradient_outpaint_single`` (git e5fa036), verbatim.
+
+    Kept here so the tests pin the *bytes* of the vectorised version against
+    the original arithmetic (float32 frame, float64 vertical weights, float64
+    scalar column weights, full-frame Gaussian, boolean restore).
+    """
+    mask_bool = mask > 0
+    if not np.any(mask_bool):
+        return frame.copy()
+    content = ~mask_bool
+    if not np.any(content):
+        return frame.copy()
+
+    h, w = mask_bool.shape
+    cols = np.arange(w)
+    out = frame.astype(np.float32)
+
+    col_has = content.any(axis=0)
+    first = np.where(col_has, content.argmax(axis=0), 0)
+    last = np.where(col_has, h - 1 - content[::-1, :].argmax(axis=0), h - 1)
+    src_first = out[first, cols]
+    src_last = out[last, cols]
+    band_top = first.astype(np.float32)
+    band_bot = (h - 1 - last).astype(np.float32)
+
+    for r in range(int(first[col_has].max())):
+        d = first - r
+        sel = col_has & (d > 0)
+        if sel.any():
+            out[r, sel] = src_first[sel] * _ref_smear_weights(d[sel], band_top[sel])[:, None]
+    for r in range(int(last[col_has].min()) + 1, h):
+        d = r - last
+        sel = col_has & (d > 0)
+        if sel.any():
+            out[r, sel] = src_last[sel] * _ref_smear_weights(d[sel], band_bot[sel])[:, None]
+
+    if not col_has.all():
+        padded = np.concatenate([[True], col_has, [True]])
+        run_starts = np.flatnonzero(padded[:-1] & ~padded[1:])
+        run_ends = np.flatnonzero(~padded[:-1] & padded[1:]) - 1
+        for a, b in zip(run_starts, run_ends, strict=True):
+            if a == 0 and b == w - 1:
+                continue
+            if a == 0:
+                _ref_smear_columns(out, src_col=b + 1, cols=range(a, b + 1))
+            elif b == w - 1:
+                _ref_smear_columns(out, src_col=a - 1, cols=range(a, b + 1))
+            else:
+                mid = (a + b) // 2
+                _ref_smear_columns(out, src_col=a - 1, cols=range(a, mid + 1))
+                _ref_smear_columns(out, src_col=b + 1, cols=range(mid + 1, b + 1))
+
+    out_u8 = np.clip(np.rint(out), 0, 255).astype(np.uint8)
+    blur_ksize = (1, max(3, h // 32 * 2 + 1))
+    out_u8 = cv2.GaussianBlur(out_u8, blur_ksize, sigmaX=0, sigmaY=h / 16.0)
+    out_u8[content] = frame[content]
+    return out_u8
+
+
+def _noise_frame(h, w, seed, channels=3):
+    return np.random.default_rng(seed).integers(0, 256, size=(h, w, channels), dtype=np.uint8)
+
+
+def _pinhole_hole_mask_sbs(eye, hfov_deg, aspect=16 / 9):
+    """Analytic VR180 SBS fill mask of a pinhole source: a rounded-rectangle hole per eye.
+
+    Same spherical convention as ``EquirectangularMapper`` (longitude across the
+    eye width, colatitude down the height, evaluated at pixel centres); a
+    direction is covered when it meets the source plane inside ±hfov/2 × ±vfov/2.
+    """
+    lon = ((np.arange(eye) + 0.5) / eye - 0.5) * np.pi
+    colat = (np.arange(eye) + 0.5) / eye * np.pi
+    sin_colat = np.sin(colat)[:, None]
+    x = np.sin(lon)[None, :] * sin_colat
+    y = np.broadcast_to(np.cos(colat)[:, None], (eye, eye))
+    z = np.cos(lon)[None, :] * sin_colat
+    tan_h = math.tan(math.radians(hfov_deg) / 2)
+    tan_v = tan_h / aspect
+    with np.errstate(divide="ignore", invalid="ignore"):
+        covered = (z > 0) & (np.abs(x / z) <= tan_h) & (np.abs(y / z) <= tan_v)
+    eye_mask = np.where(covered, 0, 255).astype(np.uint8)
+    return np.concatenate([eye_mask, eye_mask], axis=1)
+
+
+def _holed(frame, mask):
+    """Black out the hole, as the mapper renders ``alpha == 0``."""
+    out = frame.copy()
+    out[mask > 0] = 0
+    return out
+
+
+def _rect_hole_mask(h, w, r0, r1, c0, c1):
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[r0:r1, c0:c1] = 255
+    return mask
+
+
+def _equivalence_cases():
+    """``(name, frame, mask)`` — ≥3 mask shapes × several sizes, odd sizes, both mask dtypes, 3/4 channels."""
+    cases = []
+    # rectangular interior hole: content columns whose masked pixels sit *between* first/last
+    m = _rect_hole_mask(256, 640, 80, 176, 200, 440)
+    cases.append(("rect-hole", _holed(_noise_frame(256, 640, 1), m), m))
+    # rectangular hole + top/bottom bands, odd size (interior masked pixels AND the vertical smear)
+    m = _rect_hole_mask(193, 777, 60, 120, 300, 500)
+    m[:23] = 255
+    m[-31:] = 255
+    cases.append(("rect-hole+bands-odd", _holed(_noise_frame(193, 777, 2), m), m))
+    # black-row fallback mask (full-width bands)
+    f = _make_frame(192, 768)
+    cases.append(("black-row-bands", f, detect_black_boundary_mask(f, threshold=10, top_ratio=0.3, bottom_ratio=0.3)))
+    # real mapper alpha hole (126° and 90° pinhole), noisy content
+    for hfov in (126.0, 90.0):
+        sbs, alpha = _mapped_sbs(use_ffmpeg=False, src_hfov=hfov)
+        m = alpha_to_fill_mask(alpha)
+        cases.append((f"mapper-{int(hfov)}", _holed(_noise_frame(*sbs.shape[:2], 3), m), m))
+    # analytic 126° hole at an odd per-eye size spanning several 512-column strips
+    m = _pinhole_hole_mask_sbs(901, 126.0)
+    cases.append(("analytic-126-odd-multistrip", _holed(_noise_frame(901, 1802, 4), m), m))
+    # bool mask dtype, hole touching the top border only
+    m = _rect_hole_mask(128, 256, 0, 40, 0, 256) > 0
+    cases.append(("bool-mask-top-band", _holed(_noise_frame(128, 256, 5), m), m))
+    # full hemisphere — no hole at all
+    sbs, alpha = _full_sbs()
+    cases.append(("no-hole", sbs, alpha_to_fill_mask(alpha)))
+    # hole everywhere — degenerate, nothing to source from
+    cases.append(("all-hole", _noise_frame(64, 128, 6), np.full((64, 128), 255, np.uint8)))
+    # four channels (the reference is channel-count agnostic)
+    m = _pinhole_hole_mask_sbs(96, 126.0)
+    cases.append(("rgba-126", _holed(_noise_frame(96, 192, 7, channels=4), m), m))
+    # side holes only, content touching the top and bottom borders (no vertical smear at all)
+    m = np.zeros((160, 900), np.uint8)
+    m[:, :140] = 255
+    m[:, 700:] = 255
+    cases.append(("side-runs-only", _holed(_noise_frame(160, 900, 8), m), m))
+    return cases
+
+
+class TestGradientOutpaintVectorisedIsByteExact:
+    @pytest.mark.parametrize("case", _equivalence_cases(), ids=lambda c: c[0])
+    def test_matches_pre_271_reference(self, case):
+        _name, frame, mask = case
+        expected = _reference_gradient_outpaint_single(frame, mask)
+        got = _gradient_outpaint_single(frame, mask)
+        assert got.dtype == expected.dtype and got.shape == expected.shape
+        assert np.array_equal(got, expected)
+        assert np.array_equal(got[mask == 0], frame[mask == 0]), "content pixels are never touched"
+
+    def test_input_frame_and_mask_are_not_modified(self):
+        m = _pinhole_hole_mask_sbs(128, 126.0)
+        frame = _holed(_noise_frame(128, 256, 9), m)
+        frame_copy, mask_copy = frame.copy(), m.copy()
+        out = _gradient_outpaint_single(frame, m)
+        assert out is not frame and not np.shares_memory(out, frame)
+        assert np.array_equal(frame, frame_copy) and np.array_equal(m, mask_copy)
+
+    def test_batch_path_sees_the_same_bytes(self):
+        """``Outpainter`` (and ``StreamingPipeline``) call ``_gradient_outpaint_single`` per frame."""
+        sbs, alpha = _mapped_sbs(use_ffmpeg=False, src_hfov=126.0)
+        mask = alpha_to_fill_mask(alpha)
+        frame = _holed(_noise_frame(*sbs.shape[:2], 10), mask)
+        via_class = Outpainter(mode="gradient").process([frame], alpha=alpha)[0]
+        assert np.array_equal(via_class, _reference_gradient_outpaint_single(frame, mask))
+
+
+# --- 5760×2880 (2880²/eye, ``--quality standard``): byte-exact and fast ------
+
+_PROD_EYE = 2880
+_IS_CI = bool(os.environ.get("CI"))
+# Card: ≤ 0.25 s measured, asserted with head-room at 0.4 s.  GitHub-hosted
+# runners have 2 vCPUs and OpenCV's Gaussian is multi-threaded, so the absolute
+# budgets are relaxed there; the relative bound against the reference on the
+# same machine holds everywhere.
+_FULL_FRAME_BUDGET_S = 2.0 if _IS_CI else 0.4
+_NO_HOLE_BUDGET_S = 0.2 if _IS_CI else 0.02
+
+
+def _min_time(fn, repeats):
+    best = float("inf")
+    result = None
+    for _ in range(repeats):
+        t0 = time.perf_counter()
+        result = fn()
+        best = min(best, time.perf_counter() - t0)
+    return best, result
+
+
+@pytest.fixture(scope="module")
+def production_frame_and_mask():
+    mask = _pinhole_hole_mask_sbs(_PROD_EYE, 126.0)
+    return _holed(_noise_frame(_PROD_EYE, 2 * _PROD_EYE, 271), mask), mask
+
+
+class TestGradientOutpaintProductionSize:
+    def test_5760x2880_is_byte_exact_and_at_least_3x_faster(self, production_frame_and_mask):
+        frame, mask = production_frame_and_mask
+        assert frame.shape == (2880, 5760, 3) and 0.6 < (mask > 0).mean() < 0.75, "the 126° hole covers ~68%"
+        t_ref, expected = _min_time(lambda: _reference_gradient_outpaint_single(frame, mask), repeats=1)
+        t_new, got = _min_time(lambda: _gradient_outpaint_single(frame, mask), repeats=3)
+        assert np.array_equal(got, expected)
+        assert t_new <= _FULL_FRAME_BUDGET_S, f"{t_new:.3f} s > {_FULL_FRAME_BUDGET_S} s budget"
+        assert t_new * 3 <= t_ref, f"only {t_ref / t_new:.1f}× faster than the reference ({t_ref:.2f} s)"
+
+    def test_no_hole_returns_fast(self, production_frame_and_mask):
+        frame, _ = production_frame_and_mask
+        no_hole = np.zeros(frame.shape[:2], np.uint8)
+        t, out = _min_time(lambda: _gradient_outpaint_single(frame, no_hole), repeats=5)
+        assert out is not frame and np.array_equal(out, frame)
+        assert t <= _NO_HOLE_BUDGET_S, f"{t * 1000:.1f} ms > {_NO_HOLE_BUDGET_S * 1000:.0f} ms budget"
