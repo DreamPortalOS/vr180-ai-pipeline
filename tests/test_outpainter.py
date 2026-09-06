@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 import cv2
@@ -15,16 +16,24 @@ import pytest
 
 from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.outpainter import (
+    _FEATHER_CACHE_MAXSIZE,
+    _GEOMETRY_CACHE,
+    _WEIGHTS_CACHE,
     DEFAULT_EDGE_FEATHER_END,
     DEFAULT_EDGE_FEATHER_START,
     AIOutpaintBackend,
     MockAIOutpaintBackend,
     Outpainter,
+    _clear_feather_caches,
+    _geometry_tables,
     _gradient_outpaint_single,
+    _weights_cache_key,
     alpha_to_fill_mask,
+    compute_edge_feather_weights,
     content_edge_angles,
     detect_black_boundary_mask,
     resolve_edge_feather,
+    sbs_edge_feather_weights,
 )
 
 # ---------------------------------------------------------------------------
@@ -906,3 +915,321 @@ class TestGradientOutpaintProductionSize:
         t, out = _min_time(lambda: _gradient_outpaint_single(frame, no_hole), repeats=5)
         assert out is not frame and np.array_equal(out, frame)
         assert t <= _NO_HOLE_BUDGET_S, f"{t * 1000:.1f} ms > {_NO_HOLE_BUDGET_S * 1000:.0f} ms budget"
+
+
+# ===========================================================================
+#  Issue #264 — feather caches: byte-exact against the pre-#264 code, fast on
+#  a hit, bounded, LRU, thread-safe.  The reference below is the previous
+#  implementation copied verbatim (git 997bc51) so every assertion is against
+#  the bytes the pipeline produced before this change.
+# ===========================================================================
+
+
+def _ref_hemisphere_pixel_angles(h, w):
+    """Pre-#264 ``pipeline.outpainter._hemisphere_pixel_angles`` (git 997bc51), verbatim."""
+    lon = ((np.arange(w, dtype=np.float64) + 0.5) / w - 0.5) * np.pi
+    colat = (np.arange(h, dtype=np.float64) + 0.5) / h * np.pi
+    sin_colat = np.sin(colat)[:, None]
+    x = np.sin(lon)[None, :] * sin_colat
+    y = np.broadcast_to(np.cos(colat)[:, None], (h, w))
+    z = np.cos(lon)[None, :] * sin_colat
+    theta = np.degrees(np.arccos(np.clip(z, -1.0, 1.0)))
+    psi = np.mod(np.arctan2(y, x), 2.0 * np.pi)
+    return theta.astype(np.float32), psi.astype(np.float32)
+
+
+def _ref_content_edge_angles(alpha_eye, n_psi=1440):
+    """Pre-#264 ``pipeline.outpainter.content_edge_angles`` (git 997bc51), verbatim."""
+    h, w = alpha_eye.shape
+    covered = alpha_eye > 0
+    n_theta = max(h, w) + 1
+    theta = np.linspace(0.0, np.pi / 2.0, n_theta)[:, None]
+    psi = np.linspace(0.0, 2.0 * np.pi, n_psi, endpoint=False)[None, :]
+    sin_t = np.sin(theta)
+    x = sin_t * np.cos(psi)
+    y = sin_t * np.sin(psi)
+    z = np.broadcast_to(np.cos(theta), x.shape)
+    lon = np.arctan2(x, z)
+    colat = np.arccos(np.clip(y, -1.0, 1.0))
+    u = np.clip(np.floor((lon / np.pi + 0.5) * w).astype(np.int64), 0, w - 1)
+    v = np.clip(np.floor(colat / np.pi * h).astype(np.int64), 0, h - 1)
+    hole = ~covered[v, u]
+    hole[-1, :] = True
+    first = hole.argmax(axis=0)
+    return np.degrees(theta[first, 0]).astype(np.float32)
+
+
+def _ref_compute_edge_feather_weights(alpha_eye, start_deg, end_deg):
+    """Pre-#264 ``pipeline.outpainter.compute_edge_feather_weights`` (git 997bc51), verbatim."""
+    if alpha_eye.ndim == 3:
+        alpha_eye = alpha_eye[:, :, -1]
+    h, w = alpha_eye.shape
+    covered = alpha_eye > 0
+    if not covered.any():
+        return np.zeros((h, w), dtype=np.float32)
+
+    theta_p, psi_p = _ref_hemisphere_pixel_angles(h, w)
+    edge = _ref_content_edge_angles(alpha_eye)
+    n = edge.shape[0]
+    pos = psi_p.astype(np.float64) / (2.0 * np.pi) * n
+    i0 = np.floor(pos).astype(np.int64) % n
+    frac = (pos - np.floor(pos)).astype(np.float32)
+    theta_edge = edge[i0] * (1.0 - frac) + edge[(i0 + 1) % n] * frac
+
+    px_deg = 180.0 / h
+    s, e = start_deg / 2.0, end_deg / 2.0
+    e_eff = np.minimum(e, theta_edge) - px_deg
+    width = np.maximum(np.minimum(e - s, e_eff), 1e-6)
+    weights = np.clip((e_eff - theta_p) / width, 0.0, 1.0).astype(np.float32)
+
+    inner = cv2.erode(
+        covered.astype(np.uint8), np.ones((3, 3), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0
+    )
+    weights[inner == 0] = 0.0
+    return weights
+
+
+def _fov_mask(h, w, half_angle_deg):
+    """Coverage of a pinhole source: pixels within *half_angle_deg* of the forward axis."""
+    theta, _ = _ref_hemisphere_pixel_angles(h, w)
+    return (theta < half_angle_deg).astype(np.uint8) * 255
+
+
+def _timed(fn):
+    t0 = time.perf_counter()
+    result = fn()
+    return time.perf_counter() - t0, result
+
+
+def _feather_cases():
+    """(name, alpha, start, end) — sizes × masks × angles, incl. RGBA and a real mapper alpha."""
+    rng = np.random.default_rng(264)
+    rgba = np.zeros((64, 64, 4), np.uint8)
+    rgba[..., 3] = _fov_mask(64, 64, 60.0)
+    _, mapper_alpha = _mapped_sbs(use_ffmpeg=False, src_hfov=126.0)
+    return [
+        ("64x64_full_165_180", np.full((64, 64), 255, np.uint8), 165.0, 180.0),
+        ("96x128_fov126_165_180", _fov_mask(96, 128, 63.0), 165.0, 180.0),
+        ("128x96_fov90_110_180", _fov_mask(128, 96, 45.0), 110.0, 180.0),
+        ("80x80_fov126_hard_cut_150", _fov_mask(80, 80, 63.0), 150.0, 150.0),
+        ("72x72_ragged_noise", (rng.random((72, 72)) > 0.3).astype(np.uint8) * 255, 165.0, 180.0),
+        ("64x64_rgba_165_180", rgba, 165.0, 180.0),
+        ("mapper_eye_fov126_noncontiguous", mapper_alpha[:, :_EYE], 165.0, 180.0),
+    ]
+
+
+@pytest.fixture
+def fresh_feather_caches():
+    _clear_feather_caches()
+    yield
+    _clear_feather_caches()
+
+
+class TestFeatherCacheIsByteExact:
+    @pytest.mark.parametrize("case", _feather_cases(), ids=lambda c: c[0])
+    def test_cold_and_warm_calls_match_pre_264_reference(self, case, fresh_feather_caches):
+        _name, alpha, start, end = case
+        expected = _ref_compute_edge_feather_weights(alpha, start, end)
+        cold = compute_edge_feather_weights(alpha, start, end)  # geometry + weights both miss
+        warm = compute_edge_feather_weights(alpha, start, end)  # weights hit
+        for got in (cold, warm):
+            assert got.dtype == expected.dtype and got.shape == expected.shape
+            assert np.array_equal(got, expected)
+        assert _WEIGHTS_CACHE.hits == 1 and len(_WEIGHTS_CACHE) == 1
+
+    @pytest.mark.parametrize("case", _feather_cases(), ids=lambda c: c[0])
+    def test_same_size_new_mask_reuses_geometry_and_matches_reference(self, case, fresh_feather_caches):
+        """The SphereAccumulator case: the mask advances every frame, so only the
+        size-keyed geometry tables can hit — the result must still be byte-exact."""
+        _name, alpha, start, end = case
+        compute_edge_feather_weights(alpha, start, end)  # warm the geometry tables
+        plane = alpha[..., -1] if alpha.ndim == 3 else alpha
+        other = np.ascontiguousarray(plane).copy()
+        h, w = other.shape
+        other[h // 3 : h // 2, w // 4 : w // 2] = 0  # punch a hole: new edge, new guard ring
+        geo_hits, weights_hits = _GEOMETRY_CACHE.hits, _WEIGHTS_CACHE.hits
+        got = compute_edge_feather_weights(other, start, end)
+        assert _GEOMETRY_CACHE.hits == geo_hits + 1 and len(_GEOMETRY_CACHE) == 1
+        assert _WEIGHTS_CACHE.hits == weights_hits, "a changed mask must never be served from the weights cache"
+        assert np.array_equal(got, _ref_compute_edge_feather_weights(other, start, end))
+
+    @pytest.mark.parametrize("n_psi", [1440, 360, 7])
+    def test_content_edge_angles_matches_reference_for_any_ray_count(self, n_psi, fresh_feather_caches):
+        alpha = _fov_mask(90, 120, 55.0)
+        expected = _ref_content_edge_angles(alpha, n_psi)
+        assert np.array_equal(content_edge_angles(alpha, n_psi), expected)
+        assert np.array_equal(content_edge_angles(alpha, n_psi), expected), "from cached tables"
+        assert [k[2] for k in _GEOMETRY_CACHE.ordered_keys()] == [n_psi]
+
+    def test_sbs_and_outpainter_paths_see_the_same_bytes(self, fresh_feather_caches):
+        sbs, alpha = _mapped_sbs(use_ffmpeg=False, src_hfov=126.0)
+        w = alpha.shape[1] // 2
+        expected = np.concatenate(
+            [
+                _ref_compute_edge_feather_weights(alpha[:, :w], 165.0, 180.0),
+                _ref_compute_edge_feather_weights(alpha[:, w:], 165.0, 180.0),
+            ],
+            axis=1,
+        )
+        assert np.array_equal(sbs_edge_feather_weights(alpha, 165.0, 180.0), expected)
+        assert np.array_equal(sbs_edge_feather_weights(alpha, 165.0, 180.0), expected)
+        via_class = Outpainter(edge_feather_start=165, edge_feather_end=180).process([sbs], alpha=alpha)[0]
+        assert np.array_equal(
+            via_class, Outpainter(edge_feather_start=165, edge_feather_end=180).process([sbs], alpha=alpha)[0]
+        )
+
+    def test_empty_mask_returns_zeros_and_is_not_cached(self, fresh_feather_caches):
+        out = compute_edge_feather_weights(np.zeros((40, 50), np.uint8), 165.0, 180.0)
+        assert out.shape == (40, 50) and out.dtype == np.float32 and not out.any()
+        assert len(_WEIGHTS_CACHE) == 0 and len(_GEOMETRY_CACHE) == 0
+
+
+class TestFeatherCacheIsolation:
+    def test_returned_array_is_a_private_writable_copy(self, fresh_feather_caches):
+        alpha = _fov_mask(64, 64, 60.0)
+        expected = _ref_compute_edge_feather_weights(alpha, 165.0, 180.0)
+        first = compute_edge_feather_weights(alpha, 165.0, 180.0)
+        assert first.flags.writeable
+        first[:] = -1.0  # a caller scribbling on its result...
+        second = compute_edge_feather_weights(alpha, 165.0, 180.0)
+        assert second is not first and not np.shares_memory(second, first)
+        assert np.array_equal(second, expected), "...cannot poison the cache"
+        second[:] = -1.0
+        assert np.array_equal(compute_edge_feather_weights(alpha, 165.0, 180.0), expected)
+
+    def test_input_alpha_is_not_modified(self, fresh_feather_caches):
+        alpha = _fov_mask(64, 64, 60.0)
+        keep = alpha.copy()
+        compute_edge_feather_weights(alpha, 165.0, 180.0)
+        compute_edge_feather_weights(alpha, 165.0, 180.0)
+        assert np.array_equal(alpha, keep)
+
+    def test_mutating_the_callers_alpha_after_a_call_does_not_alias_the_cache(self, fresh_feather_caches):
+        alpha = _fov_mask(64, 64, 60.0)
+        compute_edge_feather_weights(alpha, 165.0, 180.0)
+        alpha[20:30, 20:30] = 0
+        got = compute_edge_feather_weights(alpha, 165.0, 180.0)
+        assert np.array_equal(got, _ref_compute_edge_feather_weights(alpha, 165.0, 180.0))
+
+    def test_digest_collision_is_caught_by_the_exact_check(self, fresh_feather_caches):
+        """The dict key is a ::4 sub-sample at 256²; a change off that grid must
+        still be detected (``np.array_equal`` confirm) and recomputed."""
+        alpha = _fov_mask(256, 256, 60.0)
+        base = compute_edge_feather_weights(alpha, 165.0, 180.0)
+        tweaked = alpha.copy()
+        tweaked[101, 101] = 0  # 101 % 4 != 0 → invisible to the sub-sample digest
+        assert _weights_cache_key(tweaked, 165.0, 180.0) == _weights_cache_key(alpha, 165.0, 180.0)
+        misses = _WEIGHTS_CACHE.misses
+        got = compute_edge_feather_weights(tweaked, 165.0, 180.0)
+        assert _WEIGHTS_CACHE.misses == misses + 1
+        assert np.array_equal(got, _ref_compute_edge_feather_weights(tweaked, 165.0, 180.0))
+        assert not np.array_equal(got, base)
+
+    def test_different_angles_are_different_entries(self, fresh_feather_caches):
+        alpha = _fov_mask(64, 64, 60.0)
+        a = compute_edge_feather_weights(alpha, 165.0, 180.0)
+        b = compute_edge_feather_weights(alpha, 110.0, 180.0)
+        assert len(_WEIGHTS_CACHE) == 2 and not np.array_equal(a, b)
+        assert np.array_equal(b, _ref_compute_edge_feather_weights(alpha, 110.0, 180.0))
+
+    def test_geometry_tables_are_read_only_and_shared(self, fresh_feather_caches):
+        t1 = _geometry_tables(60, 70, 1440)
+        assert _geometry_tables(60, 70, 1440) is t1
+        assert all(not a.flags.writeable for a in t1)
+        with pytest.raises(ValueError):
+            t1.theta_p[0, 0] = 0.0
+
+
+# Timing: ~0.25 s cold on a desktop CPU; a weights hit is a digest + one
+# ``np.array_equal`` + one copy (a few ms).  Card: hits < 5 % of the cold call.
+# Percentiles rather than every single sample so a GC pause / scheduler tick
+# cannot flake the assertion; the worst case is still pinned far below "recomputed".
+_FEATHER_TIMING_EYE = 1536
+
+
+class TestFeatherCacheTiming:
+    def test_100_calls_same_size_same_mask_hit_under_5_percent_of_cold(self, fresh_feather_caches):
+        alpha = _fov_mask(_FEATHER_TIMING_EYE, _FEATHER_TIMING_EYE, 63.0)
+        t_cold, cold = _timed(lambda: compute_edge_feather_weights(alpha, 165.0, 180.0))
+        hits = []
+        for _ in range(99):
+            t, got = _timed(lambda: compute_edge_feather_weights(alpha, 165.0, 180.0))
+            hits.append(t)
+            assert np.array_equal(got, cold)
+        assert _WEIGHTS_CACHE.hits == 99
+        hits.sort()
+        median, p95, worst = hits[len(hits) // 2], hits[int(len(hits) * 0.95)], hits[-1]
+        budget = 0.05 * t_cold
+        msg = f"cold {t_cold * 1e3:.0f} ms; hits median {median * 1e3:.1f} / p95 {p95 * 1e3:.1f} / max {worst * 1e3:.1f} ms"
+        assert median < budget, msg
+        assert p95 < (budget * 3 if _IS_CI else budget), msg
+        assert worst < 0.25 * t_cold, msg
+
+    def test_same_size_new_mask_reuses_geometry_and_is_at_least_2x_faster(self, fresh_feather_caches):
+        n = _FEATHER_TIMING_EYE
+        a1, a2 = _fov_mask(n, n, 63.0), _fov_mask(n, n, 62.0)
+        t_cold, _ = _timed(lambda: compute_edge_feather_weights(a1, 165.0, 180.0))
+        geo_hits = _GEOMETRY_CACHE.hits
+        t_new, got = _timed(lambda: compute_edge_feather_weights(a2, 165.0, 180.0))
+        assert _GEOMETRY_CACHE.hits == geo_hits + 1 and len(_GEOMETRY_CACHE) == 1
+        assert t_new * 2 <= t_cold, f"new-mask call {t_new:.3f} s vs cold {t_cold:.3f} s"
+        assert np.array_equal(got, _ref_compute_edge_feather_weights(a2, 165.0, 180.0))
+
+
+class TestFeatherCacheIsBounded:
+    def test_ten_sizes_keep_at_most_four_entries_and_evict_lru(self, fresh_feather_caches):
+        sizes = [(32 + 4 * i, 40 + 4 * i) for i in range(10)]
+        for h, w in sizes:
+            compute_edge_feather_weights(_fov_mask(h, w, 60.0), 165.0, 180.0)
+            assert len(_GEOMETRY_CACHE) <= _FEATHER_CACHE_MAXSIZE == 4
+            assert len(_WEIGHTS_CACHE) <= _FEATHER_CACHE_MAXSIZE
+        assert [k[:2] for k in _GEOMETRY_CACHE.ordered_keys()] == sizes[-4:], "four most recent survive, oldest first"
+        assert [k[:2] for k in _WEIGHTS_CACHE.ordered_keys()] == sizes[-4:]
+        # An evicted size is rebuilt (miss) and is still byte-exact.
+        misses = _GEOMETRY_CACHE.misses
+        old = _fov_mask(*sizes[0], 60.0)
+        got = compute_edge_feather_weights(old, 165.0, 180.0)
+        assert np.array_equal(got, _ref_compute_edge_feather_weights(old, 165.0, 180.0))
+        assert _GEOMETRY_CACHE.misses == misses + 1 and len(_GEOMETRY_CACHE) == 4
+
+    def test_a_weights_hit_keeps_that_sizes_geometry_most_recently_used(self, fresh_feather_caches):
+        a = _fov_mask(48, 48, 60.0)
+        compute_edge_feather_weights(a, 165.0, 180.0)  # size A
+        for h in (52, 56, 60):
+            compute_edge_feather_weights(_fov_mask(h, h, 60.0), 165.0, 180.0)  # B, C, D → cache full
+        compute_edge_feather_weights(a, 165.0, 180.0)  # weights hit on A → A becomes most recent
+        compute_edge_feather_weights(_fov_mask(64, 64, 60.0), 165.0, 180.0)  # E evicts B, not A
+        kept = {k[:2] for k in _GEOMETRY_CACHE.ordered_keys()}
+        assert (48, 48) in kept and (52, 52) not in kept and len(kept) == 4
+
+
+class TestFeatherCacheThreadSafety:
+    def test_concurrent_callers_get_exact_results_and_the_caches_stay_bounded(self, fresh_feather_caches):
+        masks = [
+            _fov_mask(96, 96, 60.0),
+            _fov_mask(96, 96, 50.0),
+            _fov_mask(80, 112, 63.0),
+            _fov_mask(112, 80, 63.0),
+            _fov_mask(64, 64, 45.0),
+            _fov_mask(72, 72, 55.0),
+        ]
+        expected = [_ref_compute_edge_feather_weights(m, 165.0, 180.0) for m in masks]
+        errors = []
+
+        def worker(seed):
+            rng = np.random.default_rng(seed)
+            try:
+                for _ in range(40):
+                    i = int(rng.integers(len(masks)))
+                    if not np.array_equal(compute_edge_feather_weights(masks[i], 165.0, 180.0), expected[i]):
+                        errors.append(f"thread {seed}: mask {i} mismatch")
+            except Exception as exc:
+                errors.append(f"thread {seed}: {exc!r}")
+
+        threads = [threading.Thread(target=worker, args=(s,)) for s in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+        assert len(_GEOMETRY_CACHE) <= _FEATHER_CACHE_MAXSIZE and len(_WEIGHTS_CACHE) <= _FEATHER_CACHE_MAXSIZE

@@ -33,6 +33,9 @@ Usage:
 import abc
 import logging
 import math
+import threading
+from collections import OrderedDict
+from typing import NamedTuple
 
 import cv2
 import numpy as np
@@ -499,6 +502,186 @@ DEFAULT_EDGE_FEATHER_END = 180.0
 #: Azimuth samples used to trace the content edge around the forward axis.
 _EDGE_AZIMUTH_SAMPLES = 1440
 
+# ---------------------------------------------------------------------------
+#  Issue #264 — feather caches.
+#
+#  ``compute_edge_feather_weights`` used to rebuild the whole per-pixel angle
+#  table and re-trace 1440 azimuth rays on every call (~0.7 s at 2880²/eye,
+#  every frame on the streaming / SphereAccumulator paths).  Two bounded,
+#  process-local LRUs now remove that work:
+#
+#  * ``_GEOMETRY_CACHE`` — keyed by canvas size only.  Holds the per-pixel
+#    angular-distance table, the azimuth ray-index / interpolation tables and
+#    the ray sampling table.  Hits on every call at a known size, whether or
+#    not the mask changes (the accumulator advances its mask every frame).
+#  * ``_WEIGHTS_CACHE`` — keyed by the mask.  A cheap sub-sampled digest is
+#    the dict key (fast rejection); a hit is confirmed with ``np.array_equal``
+#    against a stored copy of the alpha, so a stale result can never be
+#    returned.  Hits when the mask is static (the streaming path).
+#
+#  Both are in-memory only (never persisted, never written to disk), capped at
+#  ``_FEATHER_CACHE_MAXSIZE`` entries, lock-guarded, and byte-transparent: a
+#  cached call returns exactly the bytes an uncached call would.
+# ---------------------------------------------------------------------------
+
+#: Upper bound on entries per feather cache (distinct canvas sizes / masks).
+_FEATHER_CACHE_MAXSIZE = 4
+
+
+class _LRUCache:
+    """Tiny bounded LRU.  Every operation takes the lock, so a cache may be
+    shared between threads; values are computed *outside* the lock, so two
+    threads racing on one key may both compute it (same bytes, last writer
+    wins).  ``hits``/``misses`` are key-level counters for tests."""
+
+    def __init__(self, maxsize: int) -> None:
+        self.maxsize = int(maxsize)
+        self._data: OrderedDict = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key):
+        with self._lock:
+            try:
+                value = self._data[key]
+            except KeyError:
+                self.misses += 1
+                return None
+            self._data.move_to_end(key)
+            self.hits += 1
+            return value
+
+    def touch(self, key) -> None:
+        """Mark *key* most recently used if present (no hit/miss accounting)."""
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+
+    def put(self, key, value) -> None:
+        with self._lock:
+            self._data[key] = value
+            self._data.move_to_end(key)
+            while len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
+
+    def note_false_hit(self) -> None:
+        """A key matched but the exact check rejected it: count it as a miss."""
+        with self._lock:
+            self.hits -= 1
+            self.misses += 1
+
+    def ordered_keys(self) -> list:
+        """Snapshot of the keys, least recently used first."""
+        with self._lock:
+            return list(self._data)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+            self.hits = self.misses = 0
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+
+#: ``(H, W, n_psi)`` -> :class:`_FeatherTables` (depend on the canvas size only).
+_GEOMETRY_CACHE = _LRUCache(_FEATHER_CACHE_MAXSIZE)
+#: ``(H, W, dtype, start, end, mask digest)`` -> ``(alpha copy, weights)``.
+_WEIGHTS_CACHE = _LRUCache(_FEATHER_CACHE_MAXSIZE)
+
+
+def _clear_feather_caches() -> None:
+    """Drop every cached feather table (tests / benchmarks)."""
+    _GEOMETRY_CACHE.clear()
+    _WEIGHTS_CACHE.clear()
+
+
+class _FeatherTables(NamedTuple):
+    """Size-only tables for one ``(H, W, n_psi)``; every array is read-only."""
+
+    theta_p: np.ndarray  # (H, W) float32 — angular distance of each pixel from the forward axis
+    i0: np.ndarray  # (H, W) int64 — azimuth ray index below each pixel
+    i1: np.ndarray  # (H, W) int64 — the next ray (wraps)
+    frac: np.ndarray  # (H, W) float32 — interpolation weight towards ``i1``
+    omf: np.ndarray  # (H, W) float32 — ``1 - frac``
+    ray_flat: np.ndarray  # (n_theta, n_psi) int64 — flat pixel index sampled by each ray step
+    ray_theta_deg: np.ndarray  # (n_theta,) float32 — angle of each ray step
+
+
+def _geometry_tables(h: int, w: int, n_psi: int) -> _FeatherTables:
+    """Tables that depend only on ``(H, W, n_psi)``, built once per size.
+
+    The arithmetic is the PR #259 code verbatim (same dtypes, same operation
+    order) so the tables — and everything derived from them — are bit-identical
+    to the previous per-call evaluation.
+    """
+    key = (int(h), int(w), int(n_psi))
+    tables = _GEOMETRY_CACHE.get(key)
+    if tables is not None:
+        return tables
+
+    theta_p, psi_p = _hemisphere_pixel_angles(h, w)
+    pos = psi_p.astype(np.float64) / (2.0 * np.pi) * n_psi
+    i0 = np.floor(pos).astype(np.int64) % n_psi
+    frac = (pos - np.floor(pos)).astype(np.float32)
+    i1 = (i0 + 1) % n_psi
+    omf = 1.0 - frac
+
+    n_theta = max(h, w) + 1
+    theta = np.linspace(0.0, np.pi / 2.0, n_theta)[:, None]
+    psi = np.linspace(0.0, 2.0 * np.pi, n_psi, endpoint=False)[None, :]
+    sin_t = np.sin(theta)
+    x = sin_t * np.cos(psi)
+    y = sin_t * np.sin(psi)
+    z = np.broadcast_to(np.cos(theta), x.shape)
+    lon = np.arctan2(x, z)
+    colat = np.arccos(np.clip(y, -1.0, 1.0))
+    u = np.clip(np.floor((lon / np.pi + 0.5) * w).astype(np.int64), 0, w - 1)
+    v = np.clip(np.floor(colat / np.pi * h).astype(np.int64), 0, h - 1)
+    ray_flat = v * w + u
+    ray_theta_deg = np.degrees(theta[:, 0]).astype(np.float32)
+
+    tables = _FeatherTables(theta_p, i0, i1, frac, omf, ray_flat, ray_theta_deg)
+    for arr in tables:
+        arr.setflags(write=False)
+    _GEOMETRY_CACHE.put(key, tables)
+    return tables
+
+
+def _edge_from_covered(covered: np.ndarray, tables: _FeatherTables) -> np.ndarray:
+    """Content-edge angle per azimuth ray from a boolean coverage mask."""
+    hole = ~np.take(np.ascontiguousarray(covered).reshape(-1), tables.ray_flat)
+    hole[-1, :] = True  # the rim terminates every ray
+    first = hole.argmax(axis=0)
+    return tables.ray_theta_deg[first]
+
+
+def _weights_cache_key(alpha_eye: np.ndarray, start_deg: float, end_deg: float) -> tuple:
+    """Cheap mask digest: size, dtype, angles and a ≤65×65 sub-sample of the alpha.
+
+    Deliberately *not* a hash of the whole plane (that alone costs a sizeable
+    fraction of the work being saved).  The digest only has to reject
+    different masks quickly; a match is always confirmed against the stored
+    alpha with ``np.array_equal`` in :func:`_cached_weights`.
+    """
+    h, w = alpha_eye.shape
+    step = max(1, max(h, w) // 64)
+    digest = np.ascontiguousarray(alpha_eye[::step, ::step]).tobytes()
+    return (h, w, alpha_eye.dtype.str, float(start_deg), float(end_deg), digest)
+
+
+def _cached_weights(key: tuple, alpha_eye: np.ndarray) -> np.ndarray | None:
+    """Weights previously computed for exactly this alpha plane, or ``None``."""
+    entry = _WEIGHTS_CACHE.get(key)
+    if entry is None:
+        return None
+    if np.array_equal(entry[0], alpha_eye):
+        return entry[1]
+    _WEIGHTS_CACHE.note_false_hit()  # digest collision: recompute, never trust it
+    return None
+
 
 def resolve_edge_feather(start: float | None, end: float | None) -> tuple[float, float] | None:
     """Validate the edge-feather angles.
@@ -556,21 +739,7 @@ def content_edge_angles(alpha_eye: np.ndarray, n_psi: int = _EDGE_AZIMUTH_SAMPLE
     """
     h, w = alpha_eye.shape
     covered = alpha_eye > 0
-    n_theta = max(h, w) + 1
-    theta = np.linspace(0.0, np.pi / 2.0, n_theta)[:, None]
-    psi = np.linspace(0.0, 2.0 * np.pi, n_psi, endpoint=False)[None, :]
-    sin_t = np.sin(theta)
-    x = sin_t * np.cos(psi)
-    y = sin_t * np.sin(psi)
-    z = np.broadcast_to(np.cos(theta), x.shape)
-    lon = np.arctan2(x, z)
-    colat = np.arccos(np.clip(y, -1.0, 1.0))
-    u = np.clip(np.floor((lon / np.pi + 0.5) * w).astype(np.int64), 0, w - 1)
-    v = np.clip(np.floor(colat / np.pi * h).astype(np.int64), 0, h - 1)
-    hole = ~covered[v, u]
-    hole[-1, :] = True  # the rim terminates every ray
-    first = hole.argmax(axis=0)
-    return np.degrees(theta[first, 0]).astype(np.float32)
+    return _edge_from_covered(covered, _geometry_tables(h, w, n_psi))
 
 
 def compute_edge_feather_weights(alpha_eye: np.ndarray, start_deg: float, end_deg: float) -> np.ndarray:
@@ -593,6 +762,12 @@ def compute_edge_feather_weights(alpha_eye: np.ndarray, start_deg: float, end_de
       touching the hole/frame border are exactly 0, so the ramp reaches black
       with no residual step.
 
+    Issue #264: the size-only tables come from ``_GEOMETRY_CACHE`` and the
+    final weights for an unchanged mask from ``_WEIGHTS_CACHE`` (see the
+    section comment above ``_LRUCache``).  The result is bit-identical with or
+    without a cache hit, and the returned array is always a fresh, writable
+    copy that shares no memory with the caches.
+
     Args:
         alpha_eye: (H, W) alpha plane of one hemisphere (or (H, W, 4) RGBA).
         start_deg: Angle (0–180 FOV scale) where darkening starts.
@@ -601,29 +776,35 @@ def compute_edge_feather_weights(alpha_eye: np.ndarray, start_deg: float, end_de
     if alpha_eye.ndim == 3:
         alpha_eye = alpha_eye[:, :, -1]
     h, w = alpha_eye.shape
+    key = _weights_cache_key(alpha_eye, start_deg, end_deg)
+    cached = _cached_weights(key, alpha_eye)
+    if cached is not None:
+        _GEOMETRY_CACHE.touch((h, w, _EDGE_AZIMUTH_SAMPLES))  # keep this size's tables warm too
+        return cached.copy()
+
     covered = alpha_eye > 0
     if not covered.any():
         return np.zeros((h, w), dtype=np.float32)
 
-    theta_p, psi_p = _hemisphere_pixel_angles(h, w)
-    edge = content_edge_angles(alpha_eye)
-    n = edge.shape[0]
-    pos = psi_p.astype(np.float64) / (2.0 * np.pi) * n
-    i0 = np.floor(pos).astype(np.int64) % n
-    frac = (pos - np.floor(pos)).astype(np.float32)
-    theta_edge = edge[i0] * (1.0 - frac) + edge[(i0 + 1) % n] * frac
+    t = _geometry_tables(h, w, _EDGE_AZIMUTH_SAMPLES)
+    edge = _edge_from_covered(covered, t)
+    theta_edge = edge[t.i0] * t.omf + edge[t.i1] * t.frac
 
     px_deg = 180.0 / h  # angular size of one pixel at the centre
     s, e = start_deg / 2.0, end_deg / 2.0
     e_eff = np.minimum(e, theta_edge) - px_deg
     width = np.maximum(np.minimum(e - s, e_eff), 1e-6)
-    weights = np.clip((e_eff - theta_p) / width, 0.0, 1.0).astype(np.float32)
+    weights = np.clip((e_eff - t.theta_p) / width, 0.0, 1.0).astype(np.float32)
 
     # Guard: anything touching the hole or the frame border goes fully black.
     inner = cv2.erode(
         covered.astype(np.uint8), np.ones((3, 3), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0
     )
     weights[inner == 0] = 0.0
+
+    stored = weights.copy()
+    stored.setflags(write=False)
+    _WEIGHTS_CACHE.put(key, (np.array(alpha_eye, copy=True), stored))
     return weights
 
 
