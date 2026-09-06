@@ -227,9 +227,11 @@ def _smear_weights(distance: np.ndarray, band: np.ndarray | float) -> np.ndarray
 #: cache-resident (~4× cheaper per pixel, identical output — the kernel is
 #: purely vertical, so columns are independent).
 _GRADIENT_STRIP_COLS = 512
-#: Row chunk for the smears — bounds the float64 temporaries (32 × 512 × 3 ×
-#: 8 B ≈ 400 KB) so every numpy pass stays in cache.
-_GRADIENT_SMEAR_ROWS = 32
+#: Row chunk for the smears — bounds the per-chunk temporaries (float64
+#: weights 64 × 512 × 8 B ≈ 260 KB, float32 product ≈ 390 KB) so every numpy
+#: pass stays in cache; larger chunks measured slower, smaller ones pay more
+#: per-call overhead.
+_GRADIENT_SMEAR_ROWS = 64
 #: Row block for the per-column content-bounds scan.
 _GRADIENT_BOUNDS_ROWS = 32
 
@@ -292,11 +294,13 @@ def _smear_band(
     float32 (the old float32 frame), then ``rint`` — same bytes.
     """
     h, w = out.shape[:2]
+    n_ch = out.shape[2]
     src_u8 = frame[anchor, np.arange(w)]  # (W, C) anchor pixel per column
     src64 = np.ascontiguousarray(src_u8.T, dtype=np.float64)  # (C, W)
     anchor64 = anchor.astype(np.float64)
     band64 = band.astype(np.float64)
     strip, chunk = _GRADIENT_STRIP_COLS, _GRADIENT_SMEAR_ROWS
+    vals = np.empty((n_ch, chunk, strip), dtype=np.float32)
     for c0 in range(0, w, strip):
         c1 = min(w, c0 + strip)
         has = col_has[c0:c1]
@@ -304,28 +308,36 @@ def _smear_band(
             continue
         edge = anchor[c0:c1][has]
         r_start, r_stop = (0, int(edge.max())) if top else (int(edge.min()) + 1, h)
+        # Rows before (top) / after (bottom) the nearest edge of the strip are selected in
+        # every content column; the mask is only needed past that point.
+        all_rows_end = int(edge.min()) if top else h
+        all_rows_start = 0 if top else int(edge.max()) + 1
         anc, bnd = anchor64[None, c0:c1], band64[None, c0:c1]
         src, src_row = src64[:, None, c0:c1], src_u8[None, c0:c1]
+        strip_all_content = bool(has.all())
         for r0 in range(r_start, r_stop, chunk):
             r1 = min(r_stop, r0 + chunk)
             rows = np.arange(r0, r1, dtype=np.float64)[:, None]
             d = anc - rows if top else rows - anc
-            sel = (d > 0) & has[None, :]
-            if not sel.any():
+            full = strip_all_content and all_rows_start <= r0 and r1 <= all_rows_end
+            sel = None if full else (d > 0) & has[None, :]
+            if sel is not None and not sel.any():
                 continue
             weights = _smear_weights(d, bnd)  # (rows, cols) float64, unselected cells clip to 1
             dst = out[r0:r1, c0:c1]
             if weights.min() == 1.0:
                 # Inner third of every band: weight exactly 1 → the anchor pixel byte-exact.
-                if sel.all():
+                if full or sel.all():
                     dst[...] = src_row
                 else:
                     cv2.copyTo(np.ascontiguousarray(np.broadcast_to(src_row, dst.shape)), sel.view(np.uint8), dst)
                 continue
-            vals = (src * weights[None, :, :]).astype(np.float32)  # (C, rows, cols): f64 product → f32
-            np.rint(vals, out=vals)
-            block = cv2.merge(list(vals.astype(np.uint8)))  # channels-last (rows, cols, C)
-            if sel.all():
+            v = vals[:, : r1 - r0, : c1 - c0]
+            # float64 product, rounded once to float32 on output — as the old float32 frame took it
+            np.multiply(src, weights[None, :, :], out=v)
+            np.rint(v, out=v)
+            block = cv2.merge(list(v.astype(np.uint8)))  # channels-last (rows, cols, C)
+            if full or sel.all():
                 dst[...] = block
             else:
                 cv2.copyTo(block, sel.view(np.uint8), dst)
