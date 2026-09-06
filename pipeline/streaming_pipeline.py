@@ -19,7 +19,12 @@ import numpy as np
 from pipeline.depth_estimator import DepthEstimator
 from pipeline.device_utils import resolve_device
 from pipeline.equirectangular_mapper import EquirectangularMapper
-from pipeline.outpainter import resolve_edge_feather, sbs_edge_feather_weights
+from pipeline.outpainter import (
+    _gradient_outpaint_single,
+    alpha_to_fill_mask,
+    resolve_edge_feather,
+    sbs_edge_feather_weights,
+)
 from pipeline.stereo_renderer import StereoRenderer
 
 log = logging.getLogger("vr180-streaming")
@@ -472,6 +477,33 @@ def _load_video_frames(video_path: str) -> list[np.ndarray]:
 #   and multiplies just that box in place with OpenCV (``cv2.multiply`` with
 #   ``dtype=CV_8U`` = float32 product + round-to-nearest, bit-identical to
 #   ``apply_edge_feather``'s ``rint``).  ~18 ms/frame at 2880²/eye.
+#
+# F-4 (#267): outpaint fill on the streaming path.
+#
+# ``--outpaint`` reached StreamingPipeline in #243 but was only *stored*, so
+# ``--quality standard --outpaint gradient`` (the production route) silently
+# changed nothing.  The fill is now applied per frame between the equirect
+# map and the feather — the batch Stage 3.5 order (fill → feather):
+#
+#   * the mask is the alpha hole (``alpha_to_fill_mask``) derived once from
+#     the same ``map_single(with_alpha=True)`` call the feather uses — one
+#     alpha plane per geometry, shared by both (``_BoundaryPlan``);
+#   * the per-frame primitive is ``pipeline.outpainter._gradient_outpaint_single``
+#     itself (imported, not re-implemented — the batch ``Outpainter`` calls the
+#     same function per frame, so the stream is bit-exact with the batch path).
+#     ``Outpainter.process`` is not called per frame because it would rebuild
+#     the mask, count changed pixels and log at INFO on every frame;
+#   * after a fill the hemisphere is fully covered, so the feather anchors at
+#     the physical 180° rim instead of the alpha edge (the #259 rule) —
+#     otherwise it would black out what the filler just painted;
+#   * ``ai`` has no backend wired into the per-frame fuse loop: it warns once
+#     at construction and degrades to ``none`` (never silently).
+#
+# Cost: the gradient filler is a full-SBS-frame float pass plus a vertical
+# Gaussian (kernel ≈ H/16) — ~1.25 s/frame at 2880²/eye against ~0.18 s for
+# the v360 map.  That is intrinsic to the reused function (the batch path
+# pays the same per frame); it is opt-in (``--outpaint gradient``) and, like
+# the feather, booked inside ``equirect``.
 # ---------------------------------------------------------------------------
 
 
@@ -553,6 +585,25 @@ def _apply_feather_plan(sbs: np.ndarray, plan: _FeatherPlan) -> np.ndarray:
     return sbs
 
 
+@dataclasses.dataclass(frozen=True)
+class _BoundaryPlan:
+    """Constant Stage 3.5 work (F-4 #267 fill → F-1 #261 feather) for one eye-frame size.
+
+    Both parts are geometry-only and derive from a single alpha plane
+    (``map_single(with_alpha=True)``, tiled for both eyes) — built once per
+    stream and reused for every frame.
+
+    ``fill_mask`` is the ``(H, 2W)`` uint8 hole mask (255 = fill) handed to
+    the gradient filler, or ``None`` when there is nothing to fill (mode
+    ``none``, or the source already covers the hemisphere).  ``feather`` is
+    the sparse per-frame feather plan, or ``None`` when the feather is off.
+    """
+
+    eye_shape: tuple[int, int]
+    fill_mask: np.ndarray | None
+    feather: _FeatherPlan | None
+
+
 class StreamingPipeline:
     """Stream-based VR180 conversion with O(1) memory footprint.
 
@@ -560,7 +611,8 @@ class StreamingPipeline:
       1. Opens the input video with cv2.VideoCapture
       2. Reads one frame at a time
       3. Runs depth estimation → stereo rendering → equirectangular mapping
-         (→ edge feather when enabled, F-1 #261)
+         (→ outpaint fill when enabled, F-4 #267 → edge feather when
+         enabled, F-1 #261 — the batch Stage 3.5 order)
       4. Pipes the processed frame directly into ffmpeg for encoding
       5. Releases intermediate tensors after each frame
 
@@ -602,9 +654,11 @@ class StreamingPipeline:
         use_ffmpeg: bool = True,
         # K-22 / #243 (P0-2): --outpaint and its sub-params were previously
         # silently dropped on the streaming path (same anti-pattern as #120).
-        # They are stored as attributes so downstream streaming outpaint logic
-        # can honour them; defaults match the CLI argparse defaults so existing
-        # callers that omit them are unaffected and behaviour is unchanged.
+        # F-4 (#267): ``gradient`` is now really applied per frame (after the
+        # equirect map, before the feather); ``ai`` warns once and degrades to
+        # ``none``; an unknown mode raises ValueError (same rule as Outpainter).
+        # Defaults match the CLI argparse defaults so existing callers that
+        # omit them are unaffected and the default stream is byte-identical.
         outpaint: str = "none",
         outpaint_mask_threshold: int = 10,
         outpaint_mask_top_ratio: float = 0.25,
@@ -652,19 +706,39 @@ class StreamingPipeline:
         # the equirect mapper below instead of being hard-coded to True.
         self.use_ffmpeg = use_ffmpeg
         # K-22 / #243 (P0-2): outpaint fill settings forwarded from the CLI
-        # (--outpaint / --outpaint-mask-*).  ``outpaint == "none"`` is the
-        # default and is a no-op (matching run_outpaint_stage's contract), so
-        # storing them without further work changes nothing about the existing
-        # default streaming run.
+        # (--outpaint / --outpaint-mask-*).  ``self.outpaint`` keeps the
+        # requested mode; ``self._fill_mode`` is what the stream applies.
+        # F-4 (#267): ``none`` (default) is a no-op — the bytes handed to
+        # ffmpeg are exactly the mapper's (+ feather) output, as before.
+        if outpaint not in ("none", "gradient", "ai"):
+            raise ValueError(f"Unknown outpaint mode: {outpaint!r}.  Choose 'none', 'gradient', or 'ai'.")
         self.outpaint = outpaint
+        # The ``--outpaint-mask-*`` knobs drive the black-row *fallback* mask
+        # (frames without an alpha plane).  The stream always derives the
+        # alpha plane from the mapper (see _boundary_plan_for), so that
+        # fallback never runs here; the knobs are kept for constructor / CLI
+        # parity with the batch path.
         self.outpaint_mask_threshold = outpaint_mask_threshold
         self.outpaint_mask_top_ratio = outpaint_mask_top_ratio
         self.outpaint_mask_bottom_ratio = outpaint_mask_bottom_ratio
-        # F-1 (#261): ``(start, end)`` degrees or None (off).  The per-frame
-        # plan is built lazily from the first eye frame (needs its size) and
-        # cached — see _feather_plan_for.
+        if outpaint == "ai":
+            # F-4 (#267): no AI outpaint backend is wired into the per-frame
+            # fuse loop (the batch Outpainter needs an ``ai_backend`` too).
+            # Degrade loudly, once, instead of silently doing nothing.
+            log.warning(
+                "⚠️  --outpaint ai is not available on the streaming path (no AI outpaint backend is wired "
+                "into the per-frame fuse loop) — degrading to --outpaint none for this run. "
+                "Use --outpaint gradient for a model-free fill."
+            )
+            self._fill_mode = "none"
+        else:
+            self._fill_mode = outpaint
+        # F-1 (#261): ``(start, end)`` degrees or None (off).
         self.edge_feather = resolve_edge_feather(edge_feather_start, edge_feather_end)
-        self._feather_plan: _FeatherPlan | None = None
+        # F-4 (#267) / F-1 (#261): the fill mask and the feather plan are
+        # built lazily from the first eye frame (needs its size) and cached —
+        # see _boundary_plan_for.
+        self._boundary_plan: _BoundaryPlan | None = None
         # Hardware (NVENC) encoding — issue #49: CUDA availability does NOT
         # imply NVENC works (driver/ffmpeg ABI mismatch). "auto" (None) probes
         # the actual encoder with a tiny synthetic encode and falls back to
@@ -955,52 +1029,88 @@ class StreamingPipeline:
             depth_dir,
         )
 
-    def _feather_plan_for(self, eye_frame: np.ndarray) -> _FeatherPlan:
-        """Return the feather plan for eye frames of *eye_frame*'s size (F-1, #261).
+    @property
+    def _stage35_enabled(self) -> bool:
+        """True when Stage 3.5 (F-4 #267 fill and/or F-1 #261 feather) has work for this stream."""
+        return self._fill_mode != "none" or self.edge_feather is not None
+
+    def _boundary_plan_for(self, eye_frame: np.ndarray) -> _BoundaryPlan:
+        """Return the Stage 3.5 plan (fill mask + feather) for eye frames of *eye_frame*'s size.
 
         Built once and cached; rebuilt only if the eye size changes.  The alpha
         plane is derived exactly like the batch path's FOV side-car
         (``run_pipeline._save_equirect_alpha``): one ``map_single(with_alpha=True)``
         on the mapper's active path, tiled for both eyes — geometry only, so
-        any frame of the right size will do.
+        any frame of the right size will do.  That single plane feeds both the
+        fill mask (F-4 #267) and the feather weights (F-1 #261).
         """
-        plan = self._feather_plan
+        plan = self._boundary_plan
         eye_shape = (int(eye_frame.shape[0]), int(eye_frame.shape[1]))
         if plan is not None and plan.eye_shape == eye_shape:
             return plan
-        assert self.edge_feather is not None
-        start, end = self.edge_feather
         t0 = time.perf_counter()
         alpha_eye = self.eq_mapper.map_single(eye_frame, with_alpha=True)[:, :, 3]
         alpha_sbs = np.concatenate([alpha_eye, alpha_eye], axis=1)
-        weights = sbs_edge_feather_weights(alpha_sbs, start, end)
-        plan = _build_feather_plan(weights, alpha_sbs, eye_shape)
-        self._feather_plan = plan
-        log.info(
-            "Edge feather %.1f°→%.1f° (streaming): weights built once in %.2f s — %.1f%% of pixels darkened, "
-            "applied per frame inside %d box(es) covering %.1f%% of the SBS frame",
-            start,
-            end,
-            time.perf_counter() - t0,
-            plan.touched_pct,
-            len(plan.rois),
-            plan.roi_pct,
-        )
+
+        fill_mask: np.ndarray | None = None
+        if self._fill_mode == "gradient":
+            mask = alpha_to_fill_mask(alpha_sbs)
+            if np.any(mask > 0):
+                fill_mask = mask
+                log.info(
+                    "Outpaint fill gradient (streaming): mask from alpha covers %.1f%% of the SBS frame — "
+                    "filled per frame after the equirect map, before the feather",
+                    100.0 * float(np.count_nonzero(mask)) / mask.size,
+                )
+            else:
+                log.info("Outpaint fill gradient (streaming): source covers the hemisphere — nothing to fill")
+
+        feather: _FeatherPlan | None = None
+        if self.edge_feather is not None:
+            start, end = self.edge_feather
+            # #259 rule (Outpainter.process): after a fill the hemisphere is,
+            # by construction, fully covered, so the feather anchors at the
+            # physical 180° rim instead of the alpha edge — otherwise it would
+            # black out what the filler just painted.  Keyed on the mode, not
+            # on the mask, exactly like the batch path.
+            filled = self._fill_mode != "none"
+            feather_alpha = np.full_like(alpha_sbs, 255) if filled else alpha_sbs
+            weights = sbs_edge_feather_weights(feather_alpha, start, end)
+            feather = _build_feather_plan(weights, feather_alpha, eye_shape)
+            log.info(
+                "Edge feather %.1f°→%.1f° (streaming): weights built once in %.2f s — %.1f%% of pixels darkened, "
+                "applied per frame inside %d box(es) covering %.1f%% of the SBS frame%s",
+                start,
+                end,
+                time.perf_counter() - t0,
+                feather.touched_pct,
+                len(feather.rois),
+                feather.roi_pct,
+                " (anchored at the 180° rim: the fill precedes it)" if filled else "",
+            )
+
+        plan = _BoundaryPlan(eye_shape=eye_shape, fill_mask=fill_mask, feather=feather)
+        self._boundary_plan = plan
         return plan
 
     def _project_sbs(self, left: np.ndarray, right: np.ndarray, timer: _StageTimer) -> np.ndarray:
-        """Stage 3 for one frame: equirect map, then the edge feather if enabled (F-1, #261).
+        """Stage 3 for one frame: equirect map, then Stage 3.5 in the batch order — fill, then feather.
 
-        The per-frame feather multiply is timed inside ``equirect`` (it is part
-        of producing the projected frame); the one-time plan build is not, so
-        a short acceptance run does not book the set-up cost against the
-        per-frame stage.
+        F-4 (#267): the gradient fill (``--outpaint gradient``) runs on the
+        mapped SBS frame first; F-1 (#261): the edge feather follows.  Both
+        are timed inside ``equirect`` (they are part of producing the
+        projected frame); the one-time plan build (alpha plane, mask, weights)
+        is not, so a short acceptance run does not book the set-up cost
+        against the per-frame stage.
         """
-        plan = self._feather_plan_for(left) if self.edge_feather is not None else None
+        plan = self._boundary_plan_for(left) if self._stage35_enabled else None
         timer.start("equirect")
         sbs = self.eq_mapper.map_stereo_pair(left, right)
         if plan is not None:
-            sbs = _apply_feather_plan(sbs, plan)
+            if plan.fill_mask is not None:
+                sbs = _gradient_outpaint_single(sbs, plan.fill_mask)
+            if plan.feather is not None:
+                sbs = _apply_feather_plan(sbs, plan.feather)
         timer.stop("equirect")
         return sbs
 
@@ -1140,6 +1250,8 @@ class StreamingPipeline:
             self.depth_backend_name,
             self.stereo_backend_name,
         )
+        if self._fill_mode != "none":
+            log.info("🎚️  Outpaint fill: %s (F-4 #267, applied per frame after the equirect map)", self._fill_mode)
         if self.edge_feather is not None:
             log.info("🎚️  Edge feather: %.1f°→%.1f° (F-1 #261, applied per frame)", *self.edge_feather)
 
@@ -1282,7 +1394,7 @@ class StreamingPipeline:
                         left, right = self.stereo_renderer.render(rgb, depth)
                         timer.stop("stereo")
 
-                        # --- Stage 3: Equirectangular mapping (+ edge feather, #261) ---
+                        # --- Stage 3: Equirectangular mapping (+ outpaint fill #267, + edge feather #261) ---
                         sbs = self._project_sbs(left, right, timer)
 
                         self._write_sbs_frame(proc, sbs, frame_idx, out_w, out_h)
