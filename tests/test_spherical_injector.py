@@ -22,6 +22,7 @@ from pipeline.spherical_injector import (
     _STEREO_MONO,
     _STEREO_TOP_BOTTOM,
     _box4,
+    _box_header_len,
     _build_st3d,
     _build_sv3d,
     _bump_box_size,
@@ -31,6 +32,7 @@ from pipeline.spherical_injector import (
     _find_visual_sample_entry,
     _full_box,
     _inject_via_python_isobmff,
+    _read_box_header,
     _rewrite_projection_bounds,
     _spatialmedia_bounds_arg,
     _spherical_structure_problems,
@@ -1264,4 +1266,347 @@ class TestProjectionBounds:
         monkeypatch.setattr(si, "_inject_via_python_isobmff", real_writer)
         inject_spherical_metadata(str(src), str(ref), stereo_mode="sbs")
         assert _equi_box_bytes(out) == _equi_box_bytes(ref)
+        assert _ffmpeg_decode(out)[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# issue #282: largesize / size-0 boxes and 32-bit chunk-offset overflow.
+#
+# ffmpeg writes ``mdat`` with a 64-bit largesize once it passes 4 GiB — ten
+# seconds of 8K HEVC.  No such file is needed here: every layout below is a
+# few hundred bytes assembled with struct.pack, and only the *headers* say
+# "huge".  The writer is driven directly (_inject_via_python_isobmff) because
+# the payloads are not decodable media; the last class forces the co64
+# widening on genuine ffmpeg clips by lowering the 32-bit limit, so the splice
+# logic is also proven against a real decoder.
+# ---------------------------------------------------------------------------
+
+_U32_MAX = 0xFFFF_FFFF
+
+
+def _plain_box(box_type: bytes, payload: bytes = b"") -> bytes:
+    return struct.pack(">I", 8 + len(payload)) + box_type + payload
+
+
+def _large_box(box_type: bytes, payload: bytes = b"") -> bytes:
+    """size == 1: the real length is the 64-bit largesize after the type (16-byte header)."""
+    return struct.pack(">I", 1) + box_type + struct.pack(">Q", 16 + len(payload)) + payload
+
+
+def _open_box(box_type: bytes, payload: bytes = b"") -> bytes:
+    """size == 0: the box runs to the end of the file."""
+    return struct.pack(">I", 0) + box_type + payload
+
+
+def _stco(values: list[int]) -> bytes:
+    return _full_box(b"stco", 0, 0, _u32(len(values)) + struct.pack(f">{len(values)}I", *values))
+
+
+def _video_trak(stco_values: list[int], *, box=_plain_box) -> bytes:
+    """trak > mdia > minf > stbl > {stsd > hvc1 > hvcC, stco}; *box* builds the four containers."""
+    entry = _plain_box(b"hvc1", b"\x00" * 78 + _plain_box(b"hvcC", b"\x01\x02\x03"))
+    stsd = _plain_box(b"stsd", b"\x00\x00\x00\x00" + _u32(1) + entry)
+    return box(b"trak", box(b"mdia", box(b"minf", box(b"stbl", stsd + _stco(stco_values)))))
+
+
+_MDAT_PAYLOAD = bytes(range(1, 61))  # 60 distinct bytes: an offset is checked by the byte it addresses
+_CHUNK_STARTS = (0, 20, 40)  # relative to the mdat payload
+_CHUNK_BYTES = [1, 21, 41]  # the payload bytes at those starts
+_FTYP = _plain_box(b"ftyp", b"isom")
+_MDAT_BUILDERS = {"plain": _plain_box, "large": _large_box, "open": _open_box}
+_ENTRY_DELTA = len(_build_st3d("sbs")) + len(_build_sv3d(7680, 1920, "sbs"))  # what one injection adds
+
+
+def _layout(mdat_kind: str, *, moov_first: bool) -> bytes:
+    """ftyp + moov + mdat (or ftyp + mdat + moov); stco entries address chunk starts inside mdat."""
+    mdat = _MDAT_BUILDERS[mdat_kind](b"mdat", _MDAT_PAYLOAD)
+    mdat_header = 16 if mdat_kind == "large" else 8
+
+    def moov_at(mdat_off: int) -> bytes:
+        return _plain_box(b"moov", _video_trak([mdat_off + mdat_header + rel for rel in _CHUNK_STARTS]))
+
+    if moov_first:
+        mdat_off = len(_FTYP) + len(moov_at(0))  # moov's length does not depend on the values
+        return _FTYP + moov_at(mdat_off) + mdat
+    assert mdat_kind != "open", "a size-0 box must be the last box in the file"
+    return _FTYP + mdat + moov_at(len(_FTYP))
+
+
+def _layout_with_values(values: list[int], *, box=_plain_box) -> bytes:
+    """ftyp + moov (containers built by *box*) + plain mdat; stco holds *values* verbatim."""
+    return _FTYP + _plain_box(b"moov", _video_trak(values, box=box)) + _plain_box(b"mdat", _MDAT_PAYLOAD)
+
+
+def _inject_bytes(tmp_path: Path, data: bytes, mode: str = "sbs") -> bytes:
+    path = tmp_path / "synthetic.mp4"
+    path.write_bytes(data)
+    _inject_via_python_isobmff(str(path), mode)
+    return path.read_bytes()
+
+
+def _box_by_type(data: bytes, box_type: bytes) -> tuple[int, int]:
+    """(offset, size) of the first top-level *box_type*."""
+    return next((o, s) for o, t, s in _walk_boxes(bytearray(data), 0, len(data)) if t == box_type)
+
+
+def _chain_growth(before: bytes, after: bytes) -> dict[bytes, int]:
+    """{ancestor type: size growth} for moov..stsd around the visual sample entry."""
+    _e0, _s0, chain0 = _find_visual_sample_entry(bytearray(before))
+    _e1, _s1, chain1 = _find_visual_sample_entry(bytearray(after))
+    growth = {}
+    for (o0, sz0, t0), (o1, sz1, t1) in zip(chain0, chain1, strict=True):
+        assert (t1, o1) == (t0, o0)
+        growth[t1] = sz1 - sz0
+    return growth
+
+
+class TestBoxSizeForms:
+    """_walk_boxes (and every walker built on it) on the three ISOBMFF size encodings."""
+
+    def test_largesize_mdat_is_reported_with_its_64_bit_length(self):
+        mdat = _large_box(b"mdat", b"\xaa" * 40)
+        buf = bytearray(_FTYP + mdat + _plain_box(b"moov"))
+        # pre-#282 the walker read the size field (1) as "< 8" and stopped after ftyp
+        assert list(_walk_boxes(buf, 0, len(buf))) == [
+            (0, b"ftyp", len(_FTYP)),
+            (len(_FTYP), b"mdat", 16 + 40),
+            (len(_FTYP) + len(mdat), b"moov", 8),
+        ]
+        assert _box_header_len(buf, len(_FTYP)) == 16
+        assert _box_header_len(buf, 0) == 8
+
+    def test_largesize_field_is_read_as_64_bit(self):
+        """A 5 GiB largesize must come back as 5 GiB, not its low 32 bits."""
+        five_gib = 5 * 2**30 + 7
+        header = bytearray(struct.pack(">I", 1) + b"mdat" + struct.pack(">Q", five_gib))
+        assert _read_box_header(header, 0, five_gib) == (five_gib, b"mdat", 16)
+        # ...and the header alone (file cut short) is not a box at all
+        assert _read_box_header(header, 0, len(header)) is None
+
+    def test_size_zero_box_extends_to_end_of_file(self):
+        buf = bytearray(_layout("open", moov_first=True))
+        mdat_off, mdat_sz = _box_by_type(buf, b"mdat")
+        assert mdat_off + mdat_sz == len(buf)
+        assert mdat_sz == 8 + len(_MDAT_PAYLOAD)
+        assert _box_header_len(buf, mdat_off) == 8
+
+    def test_size_zero_box_extends_to_end_of_enclosing_range(self):
+        inner = _open_box(b"free", b"\x00" * 5)
+        outer = _plain_box(b"moov", _plain_box(b"mvhd", b"\x01") + inner)
+        buf = bytearray(outer + _plain_box(b"mdat", b"\xff" * 9))
+        kids = list(_walk_boxes(buf, 8, len(outer)))
+        assert kids == [(8, b"mvhd", 9), (17, b"free", len(inner))]
+        assert kids[-1][0] + kids[-1][2] == len(outer)
+
+    @pytest.mark.parametrize(
+        ("header", "why"),
+        [
+            (struct.pack(">I", 5) + b"mdat", "size 2..7 is not a box"),
+            (struct.pack(">I", 1) + b"mdat" + struct.pack(">Q", 12), "largesize below its own 16-byte header"),
+            (struct.pack(">I", 1) + b"mdat" + struct.pack(">Q", 1000), "largesize past the end of the buffer"),
+            (struct.pack(">I", 1) + b"mdat" + b"\x00\x00\x00\x00", "largesize field cut short"),
+            (struct.pack(">I", 200) + b"mdat", "32-bit size past the end of the buffer"),
+        ],
+    )
+    def test_malformed_header_stops_the_walk(self, header, why):
+        buf = bytearray(_FTYP + header + b"\x00" * 8)
+        assert list(_walk_boxes(buf, 0, len(buf))) == [(0, b"ftyp", len(_FTYP))], why
+
+    def test_recursive_search_descends_largesize_containers(self):
+        st3d = _plain_box(b"st3d", b"\x00\x00\x00\x00\x02")
+        entry = _plain_box(b"hvc1", b"\x00" * 78 + st3d)
+        stsd = _plain_box(b"stsd", b"\x00\x00\x00\x00" + _u32(1) + entry)
+        stbl = _plain_box(b"stbl", stsd)
+        buf = bytearray(_large_box(b"moov", _large_box(b"trak", _plain_box(b"mdia", _plain_box(b"minf", stbl)))))
+        off = _find_box_recursive(buf, b"st3d", 0, len(buf))
+        # moov(16) trak(16) mdia(8) minf(8) stbl(8) stsd(16) hvc1 header + fixed fields (86)
+        assert off == 16 + 16 + 8 + 8 + 8 + 16 + 86
+        assert bytes(buf[off + 4 : off + 8]) == b"st3d"
+
+    def test_visual_sample_entry_chain_through_largesize_containers(self):
+        buf = bytearray(_layout_with_values([100, 200], box=_large_box))
+        entry_off, _entry_sz, chain = _find_visual_sample_entry(buf)
+        assert bytes(buf[entry_off + 4 : entry_off + 8]) == b"hvc1"
+        assert [t for _o, _s, t in chain] == [b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"]
+        for off, size, _t in chain[1:5]:  # trak/mdia/minf/stbl were built largesize
+            assert struct.unpack_from(">I", buf, off)[0] == 1
+            assert struct.unpack_from(">Q", buf, off + 8)[0] == size
+
+    def test_bump_box_size_writes_the_largesize_field(self):
+        buf = bytearray(_large_box(b"moov", b"x" * 10))
+        _bump_box_size(buf, 0, 5)
+        assert struct.unpack_from(">I", buf, 0)[0] == 1  # still flagged largesize
+        assert struct.unpack_from(">Q", buf, 8)[0] == 16 + 10 + 5
+
+    def test_bump_box_size_leaves_size_zero_alone(self):
+        buf = bytearray(_open_box(b"mdat", b"x" * 10))
+        _bump_box_size(buf, 0, 5)
+        assert bytes(buf[:4]) == b"\x00\x00\x00\x00"
+
+
+class TestInjectionAcrossSizeForms:
+    """After injection every chunk offset must still address the same media byte,
+    whatever header form mdat uses and whichever side of moov it sits on."""
+
+    @pytest.mark.parametrize("mdat_kind", ["plain", "large", "open"])
+    def test_moov_first_offsets_follow_the_grown_moov(self, tmp_path, mdat_kind):
+        before = _layout(mdat_kind, moov_first=True)
+        after = _inject_bytes(tmp_path, before)
+        delta = len(after) - len(before)
+        assert delta == _ENTRY_DELTA
+
+        (mdat_off0, mdat_sz0), (mdat_off1, mdat_sz1) = _box_by_type(before, b"mdat"), _box_by_type(after, b"mdat")
+        assert (mdat_off1, mdat_sz1) == (mdat_off0 + delta, mdat_sz0)  # moved intact
+        assert after[mdat_off1:] == before[mdat_off0:]  # header form and payload untouched
+        assert _box_header_len(bytearray(after), mdat_off1) == (16 if mdat_kind == "large" else 8)
+        assert _box_by_type(after, b"moov")[1] == _box_by_type(before, b"moov")[1] + delta
+
+        [(t0, offs0)], [(t1, offs1)] = _chunk_tables(before), _chunk_tables(after)
+        assert t0 == t1 == b"stco"
+        assert offs1 == [o + delta for o in offs0]
+        assert [after[o] for o in offs1] == [before[o] for o in offs0] == _CHUNK_BYTES
+        assert _spherical_structure_problems(bytearray(after)) == []
+
+    @pytest.mark.parametrize("mdat_kind", ["plain", "large"])
+    def test_mdat_first_is_stepped_over_and_offsets_stay(self, tmp_path, mdat_kind):
+        """moov behind a largesize mdat: pre-#282 the walker stopped at mdat and
+        the writer raised 'no injectable visual sample entry'."""
+        before = _layout(mdat_kind, moov_first=False)
+        after = _inject_bytes(tmp_path, before)
+        delta = len(after) - len(before)
+        assert delta == _ENTRY_DELTA
+
+        mdat_off, mdat_sz = _box_by_type(before, b"mdat")
+        assert after[: mdat_off + mdat_sz] == before[: mdat_off + mdat_sz]  # nothing before moov moved
+        assert _chunk_tables(after) == _chunk_tables(before)
+        assert [after[o] for _t, offs in _chunk_tables(after) for o in offs] == _CHUNK_BYTES
+        assert _box_by_type(after, b"moov")[1] == _box_by_type(before, b"moov")[1] + delta
+        assert _spherical_structure_problems(bytearray(after)) == []
+
+    def test_largesize_containers_get_their_64_bit_sizes_bumped(self, tmp_path):
+        before = _layout_with_values([100, 200], box=_large_box)
+        after = _inject_bytes(tmp_path, before)
+        delta = len(after) - len(before)
+        assert set(_chain_growth(before, after).values()) == {delta}
+        buf = bytearray(after)
+        for off, _sz, t in _find_visual_sample_entry(buf)[2][1:5]:
+            assert struct.unpack_from(">I", buf, off)[0] == 1, t  # still largesize, not rewritten as 32-bit
+        assert read_projection_bounds(tmp_path / "synthetic.mp4") == _EQUI_BOUNDS_VR180
+        assert _spherical_structure_problems(buf) == []
+
+
+class TestStcoOverflowWidensToCo64:
+    """A moved offset that no longer fits 32 bits gets a co64 table — never a truncated value."""
+
+    def test_offset_near_4gib_is_widened(self, tmp_path):
+        values = [_U32_MAX - 300, _U32_MAX - 200, _U32_MAX - 1]  # the last one overflows once moov grows
+        before = _layout_with_values(values)
+        after = _inject_bytes(tmp_path, before)
+        delta = _ENTRY_DELTA + 4 * len(values)  # entry growth + 4 bytes per widened entry
+        assert len(after) - len(before) == delta
+
+        assert _chunk_tables(after) == [(b"co64", [v + delta for v in values])]
+        assert _chunk_tables(after)[0][1][-1] == _U32_MAX - 1 + delta > _U32_MAX  # a real 33-bit value
+        # stsd grew by the entry only; stbl and above by the entry plus the widened table
+        assert _chain_growth(before, after) == {
+            b"moov": delta,
+            b"trak": delta,
+            b"mdia": delta,
+            b"minf": delta,
+            b"stbl": delta,
+            b"stsd": _ENTRY_DELTA,
+        }
+        boxes = list(_walk_boxes(bytearray(after), 0, len(after)))
+        assert [t for _o, t, _s in boxes] == [b"ftyp", b"moov", b"mdat"]
+        assert sum(s for _o, _t, s in boxes) == len(after)  # every byte accounted for
+        assert _box_by_type(after, b"mdat")[0] == _box_by_type(before, b"mdat")[0] + delta
+        assert _spherical_structure_problems(bytearray(after)) == []
+
+    def test_offset_that_still_fits_stays_stco(self, tmp_path):
+        values = [_U32_MAX - _ENTRY_DELTA]  # lands exactly on the 32-bit limit
+        before = _layout_with_values(values)
+        after = _inject_bytes(tmp_path, before)
+        assert len(after) - len(before) == _ENTRY_DELTA
+        assert _chunk_tables(after) == [(b"stco", [_U32_MAX])]
+
+    def test_widening_one_track_can_overflow_another(self, tmp_path):
+        """Fixed point: track B overflows on its own; the 8 bytes its widening
+        adds to moov push track A (safe by itself) over the limit as well."""
+        a_values = [_U32_MAX - _ENTRY_DELTA - 4]  # + entry delta: 4 below the limit; + 8 more: over
+        b_values = [_U32_MAX - 10, _U32_MAX - 1]
+        moov = _plain_box(b"moov", _video_trak(a_values) + _video_trak(b_values))
+        before = _FTYP + moov + _plain_box(b"mdat", _MDAT_PAYLOAD)
+        after = _inject_bytes(tmp_path, before)
+        delta = _ENTRY_DELTA + 4 * (len(a_values) + len(b_values))
+        assert len(after) - len(before) == delta
+        assert _chunk_tables(after) == [
+            (b"co64", [v + delta for v in a_values]),
+            (b"co64", [v + delta for v in b_values]),
+        ]
+        assert _spherical_structure_problems(bytearray(after)) == []
+
+    def test_in_place_write_refuses_to_truncate(self):
+        """The guard at the write site: a 33-bit value into an stco raises instead of wrapping."""
+        buf = bytearray(_layout_with_values([1]))
+        moov_off, moov_sz = _box_by_type(buf, b"moov")
+        [table] = si._iter_chunk_tables(buf, moov_off + 8, moov_off + moov_sz)
+        with pytest.raises(RuntimeError, match="co64"):
+            si._write_chunk_offsets(buf, table, [_U32_MAX + 1])
+        assert _chunk_tables(buf) == [(b"stco", [1])]
+
+
+class TestForcedWideningOnRealClips:
+    """Lower the 32-bit limit so every moved offset 'overflows': genuine ffmpeg
+    clips must come out with co64 tables that ffmpeg decodes."""
+
+    def test_faststart_clip_decodes_with_co64(self, sample_dir, tmp_path, monkeypatch):
+        monkeypatch.setattr(si, "_STCO_MAX_OFFSET", 0)
+        src = _sample(sample_dir, "h264", True)
+        out = tmp_path / "co64.mp4"
+        shutil.copy2(src, out)
+        _inject_via_python_isobmff(str(out), "sbs")
+        before, after = src.read_bytes(), out.read_bytes()
+
+        [(t0, offs0)], [(t1, offs1)] = _chunk_tables(before), _chunk_tables(after)
+        assert (t0, t1) == (b"stco", b"co64")
+        delta = len(after) - len(before)
+        assert delta == _ENTRY_DELTA + 4 * len(offs0)
+        assert offs1 == [o + delta for o in offs0]
+        assert _box_by_type(after, b"moov")[1] == _box_by_type(before, b"moov")[1] + delta
+        rc, err = _ffmpeg_decode(out)
+        assert rc == 0, err
+        _verify_injection(str(out))
+
+    def test_audio_first_clip_widens_both_tables(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(si, "_STCO_MAX_OFFSET", 0)
+        src = tmp_path / "audio_first.mp4"
+        _encode_testsrc(src, "h264", True, audio_first=True)
+        out = tmp_path / "co64.mp4"
+        shutil.copy2(src, out)
+        _inject_via_python_isobmff(str(out), "sbs")
+        before, after = src.read_bytes(), out.read_bytes()
+
+        tables0, tables1 = _chunk_tables(before), _chunk_tables(after)
+        assert [t for t, _ in tables0] == [b"stco", b"stco"]
+        assert [t for t, _ in tables1] == [b"co64", b"co64"]
+        delta = len(after) - len(before)
+        assert delta == _ENTRY_DELTA + 4 * sum(len(offs) for _t, offs in tables0)
+        for (_t0, offs0), (_t1, offs1) in zip(tables0, tables1, strict=True):
+            assert offs1 == [o + delta for o in offs0]
+        (_ha, audio0), (_hv, video0) = _traks(before)
+        (_ha, audio1), (_hv, video1) = _traks(after)
+        assert audio1 == audio0 + 4 * len(tables0[0][1])  # only its own table widened
+        assert video1 == video0 + _ENTRY_DELTA + 4 * len(tables0[1][1])
+        rc, err = _ffmpeg_decode(out)
+        assert rc == 0, err
+
+    def test_mdat_first_clip_is_never_widened(self, sample_dir, tmp_path, monkeypatch):
+        """Nothing moves when moov follows mdat, so even a zero limit widens nothing."""
+        monkeypatch.setattr(si, "_STCO_MAX_OFFSET", 0)
+        src = _sample(sample_dir, "h264", False)
+        out = tmp_path / "out.mp4"
+        shutil.copy2(src, out)
+        _inject_via_python_isobmff(str(out), "sbs")
+        assert _chunk_tables(out.read_bytes()) == _chunk_tables(src.read_bytes())
+        assert _chunk_tables(out.read_bytes())[0][0] == b"stco"
         assert _ffmpeg_decode(out)[0] == 0
