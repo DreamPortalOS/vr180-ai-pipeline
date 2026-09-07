@@ -644,6 +644,6 @@ celery -A workers.celery_app worker &
 # 下载模型权重
 python scripts/download_models.py
 
-# 运行完整 pipeline（CLI）
+# 运行完整 pipeline（CLI）—— VR180 出片默认带 165°→180° 边缘羽化（F-9 #285），--no-edge-feather 关闭
 python scripts/run_pipeline.py --input video.mp4 --output vr180.mp4
 ```
