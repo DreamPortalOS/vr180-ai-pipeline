@@ -19,6 +19,13 @@ which is why the filter-string tests below ban ``id_fov`` and ``h_fov``/
 The ffmpeg path is exercised only when ffmpeg + v360 are present (so CI stays
 green on a minimal runner); the OpenCV fallback is always exercised, and the
 geometry assertions run against **both** so the two cannot drift apart.
+
+K-27 (#302) added the non-square half of that story.  ``ih_fov``/``iv_fov`` are
+per-axis angles, so writing the *same* number into both — as this module did
+until #302 — describes an ellipse the moment ``width != height``, and no lens
+forms one.  ``TestNonSquareVerticalFovConvention`` measures a 16:9 source and
+holds the vertical landing to 2 px; the tables in the class docstring are, as
+above, measurements taken before the assertions were written.
 """
 
 from __future__ import annotations
@@ -321,6 +328,160 @@ def test_ffmpeg_and_opencv_paths_agree(fov):
     src = _smooth_fisheye()
     a = _mapper(use_ffmpeg=True, fov=fov).map_single(src).astype(int)
     b = _mapper(use_ffmpeg=False, fov=fov).map_single(src).astype(int)
+    diff = np.abs(a - b)
+    assert float(diff.mean()) < 4.0, f"mean |diff| = {diff.mean()}"
+    assert float(np.percentile(diff, 99)) < 30.0, f"p99 |diff| = {np.percentile(diff, 99)}"
+
+
+# --------------------------------------------------------------------------- #
+# K-27 (#302): a non-square source reads its vertical axis from the aspect
+# --------------------------------------------------------------------------- #
+
+#: A 16:9 analysis frame (the calibrator's own default operating point) and the
+#: horizontal span its image circle is built at.
+_NSW, _NSH, _NS_FOV = 640, 360, 100.0
+
+#: Polar angle of the ring that has to land correctly on **both** axes.  The
+#: vertical half-span of the frame above is only ``100/2 * 360/640`` = 28.1°,
+#: so 20° is inside it with room to spare, while the 40° ring below exists to
+#: prove the horizontal axis was not quietly traded away for the vertical one.
+_NS_INNER, _NS_OUTER = 20.0, 40.0
+
+
+def _non_square_fisheye(width: int = _NSW, height: int = _NSH, hfov: float = _NS_FOV) -> np.ndarray:
+    """An *isotropic* equidistant fisheye on a non-square frame — a real lens.
+
+    Built in numpy, not by ffmpeg, so the ring radii are ground truth rather
+    than a second opinion: an image circle has the same degrees per pixel on
+    both axes, so ``r = k*θ`` with ``k = (width/2) / (hfov/2)``.  The frame is a
+    *crop* of that circle — which is what a full-frame fisheye on a 16:9 sensor
+    produces, and the case ``ih_fov = iv_fov`` cannot describe.
+    """
+    k = (width / 2.0) / (hfov / 2.0)  # px per degree, same on both axes
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float64)
+    dx, dy = (xx + 0.5) - width / 2.0, (yy + 0.5) - height / 2.0
+    polar = np.hypot(dx, dy) / k
+    img = np.full((height, width, 3), _GREY, dtype=np.uint8)
+    img[np.abs(polar - _NS_INNER) < 0.35] = (0, 255, 0)
+    img[np.abs(polar - _NS_OUTER) < 0.35] = (255, 0, 255)
+    img[np.hypot(dx, dy) <= 4] = (255, 0, 0)
+    return img
+
+
+def _magenta_run_centres(row: np.ndarray) -> list[float]:
+    r, g, b = row[:, 0].astype(int), row[:, 1].astype(int), row[:, 2].astype(int)
+    hit = (r > 140) & (b > 140) & (g < 110)
+    centres: list[float] = []
+    run: list[int] = []
+    for x, on in enumerate(hit):
+        if on:
+            run.append(x)
+        elif run:
+            centres.append(sum(run) / len(run))
+            run = []
+    if run:
+        centres.append(sum(run) / len(run))
+    return centres
+
+
+def _hequirect_landing(polar_deg: float) -> tuple[float, float]:
+    """Where a marker at ``polar_deg`` must land on the centre row / column.
+
+    A 180° hequirect spans ±90° across its width and its height, so an angle
+    ``p`` off the forward axis sits ``p/180`` of the frame either side of the
+    centre.  This is pure projection arithmetic — no ffmpeg opinion in it.
+    """
+    return _S * (0.5 - polar_deg / 180.0), _S * (0.5 + polar_deg / 180.0)
+
+
+class TestNonSquareVerticalFovConvention:
+    """The mapper must read ``--fisheye-fov`` the way ``calibrate_hfov`` writes it.
+
+    Before #302 the fisheye head emitted ``iv_fov = ih_fov`` for every aspect,
+    stretching the image circle into an ellipse whenever ``width != height``.
+    Measured on the 640x360 / 100° source above, mapped to 512²:
+
+    ==================================  ===================  ==================
+    reading                             20° ring, centre row  ... centre column
+    ==================================  ===================  ==================
+    theory                              198.5 / 312.9        198.5 / 312.9
+    ``iv_fov = ih_fov`` (pre-#302)      198.5 / 312.5   ✔    154.0 / 357.0  ✘
+    ``iv_fov = ih_fov * h/w`` (#302)    198.5 / 312.5   ✔    198.5 / 312.5  ✔
+    ==================================  ===================  ==================
+
+    45 px on a 512-px hemisphere is ~16° of angular misregistration — and the
+    horizontal axis was right either way, which is exactly why nobody saw it.
+    """
+
+    def test_vertical_fov_scales_with_the_aspect(self):
+        m = _mapper(use_ffmpeg=True, fov=_NS_FOV)
+        assert m._fisheye_vertical_fov(_NSW, _NSH) == pytest.approx(_NS_FOV * _NSH / _NSW)
+        assert m._fisheye_vertical_fov(_NSW, _NSH) == pytest.approx(56.25)
+
+    def test_vertical_fov_of_a_square_frame_is_the_fisheye_fov_itself(self):
+        """The square case must not merely be close — existing behaviour is
+        pinned bit-exactly, since ``h / w`` is exactly 1.0 there."""
+        for fov in (180.0, 150.0, 220.5):
+            m = _mapper(use_ffmpeg=True, fov=fov)
+            assert m._fisheye_vertical_fov(_S, _S) == fov
+
+    def test_filter_string_carries_the_derived_vertical_fov(self):
+        args = _v360_args(_mapper(use_ffmpeg=True, fov=_NS_FOV)._v360_filter(_NSW, _NSH))
+        assert args["ih_fov"] == "100"
+        assert args["iv_fov"] == "56.25"
+
+    def test_filter_string_is_unchanged_for_a_square_source(self):
+        """Guards the #294 contract: square sources keep ``ih_fov == iv_fov``."""
+        args = _v360_args(_mapper(use_ffmpeg=True, fov=150.0)._v360_filter(_S, _S))
+        assert args["ih_fov"] == args["iv_fov"] == "150"
+
+    def test_rejects_a_degenerate_source_size(self):
+        with pytest.raises(ValueError, match="source size"):
+            _mapper(use_ffmpeg=True)._fisheye_vertical_fov(0, 360)
+
+    @pytest.mark.parametrize("use_ffmpeg", [pytest.param(True, marks=_FFMPEG), False])
+    def test_ring_lands_within_2px_on_the_vertical_axis(self, use_ffmpeg):
+        """**The** regression: 45 px off before #302, ~0.6 px after."""
+        out = _mapper(use_ffmpeg, fov=_NS_FOV).map_single(_non_square_fisheye())
+        lo, hi = _hequirect_landing(_NS_INNER)
+        centres = _green_run_centres(out[:, _S // 2])
+        assert len(centres) == 2, f"expected two 20° crossings on the centre column, got {centres}"
+        assert abs(centres[0] - lo) <= 2.0, centres
+        assert abs(centres[1] - hi) <= 2.0, centres
+
+    @pytest.mark.parametrize("use_ffmpeg", [pytest.param(True, marks=_FFMPEG), False])
+    def test_ring_still_lands_within_2px_on_the_horizontal_axis(self, use_ffmpeg):
+        """The axis that was already right must stay right."""
+        out = _mapper(use_ffmpeg, fov=_NS_FOV).map_single(_non_square_fisheye())
+        row = out[_S // 2]
+        for polar, centres in ((_NS_INNER, _green_run_centres(row)), (_NS_OUTER, _magenta_run_centres(row))):
+            lo, hi = _hequirect_landing(polar)
+            assert len(centres) == 2, f"{polar}°: expected two crossings, got {centres}"
+            assert abs(centres[0] - lo) <= 2.0, (polar, centres)
+            assert abs(centres[1] - hi) <= 2.0, (polar, centres)
+
+    @pytest.mark.parametrize("use_ffmpeg", [pytest.param(True, marks=_FFMPEG), False])
+    def test_a_portrait_source_is_handled_the_same_way(self, use_ffmpeg):
+        """9:16 is the mirror error case; ``iv_fov`` grows past ``ih_fov`` here
+        (100 * 640/360 = 177.8), so a hard-coded equality cannot fake it.
+        """
+        src = _non_square_fisheye(width=_NSH, height=_NSW)
+        out = _mapper(use_ffmpeg, fov=_NS_FOV).map_single(src)
+        lo, hi = _hequirect_landing(_NS_INNER)
+        for centres in (_green_run_centres(out[_S // 2]), _green_run_centres(out[:, _S // 2])):
+            assert len(centres) == 2, centres
+            assert abs(centres[0] - lo) <= 2.0, centres
+            assert abs(centres[1] - hi) <= 2.0, centres
+
+
+@_FFMPEG
+def test_ffmpeg_and_opencv_paths_agree_on_a_non_square_source():
+    """Both branches must derive the vertical span identically, not just the
+    horizontal one — otherwise #302 could be fixed on one path alone.
+    """
+    src = _non_square_fisheye()
+    a = _mapper(use_ffmpeg=True, fov=_NS_FOV).map_single(src).astype(int)
+    b = _mapper(use_ffmpeg=False, fov=_NS_FOV).map_single(src).astype(int)
     diff = np.abs(a - b)
     assert float(diff.mean()) < 4.0, f"mean |diff| = {diff.mean()}"
     assert float(np.percentile(diff, 99)) < 30.0, f"p99 |diff| = {np.percentile(diff, 99)}"

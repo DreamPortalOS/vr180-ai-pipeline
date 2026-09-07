@@ -40,6 +40,20 @@ The card's five acceptance criteria, in order:
 5. **Subprocess hygiene.**  Every ``subprocess.run`` in the module is checked at
    the AST level: list form, never ``shell=True``, never an f-string command.
 
+…and the handoff itself (K-27, #302)
+------------------------------------
+Naming the right flag is only half of it: the receiving end has to read the
+number the same way.  It did not.  ``calibrate_hfov`` builds its chain with
+``iv_fov = ih_fov * h/w`` (isotropic, the way an image circle works), while the
+mapper hard-coded ``iv_fov = ih_fov``.  Identical on a square frame, so the
+disagreement was invisible until someone measured a 16:9 clip — where the
+vertical axis then landed 45 px (~16°) out on a 512² hemisphere with the
+horizontal axis still perfect.  ``test_recommendation_feeds_fisheye_fov_on_a_
+non_square_source`` walks the operator's real chain end to end and holds the
+landing to 2 px on **both** axes; ``test_calibrator_chain_and_mapper_chain_
+read_the_same_vertical_fov`` pins the two modules to one relation so they
+cannot drift apart again.
+
 Everything outside the ffmpeg-gated block runs without ffmpeg: the round trip
 is injected as a fake rectifier that draws deliberately bowed lines, so the
 real scoring, aggregation and confidence logic are exercised with no
@@ -94,6 +108,8 @@ from scripts.calibrate_hfov import (
     straight_segments,
     straightness_score,
 )
+
+from pipeline.equirectangular_mapper import EquirectangularMapper
 
 SOURCE_PATH = Path(__file__).resolve().parent.parent / "scripts" / "calibrate_hfov.py"
 
@@ -1111,3 +1127,117 @@ def test_coverage_mask_excludes_the_uncovered_border():
     assert 0.0 < covered <= 1.0
     assert len(rectified) == 1
     assert rectified[0].shape == (180, 320)
+
+
+# ===========================================================================
+# K-27 (#302) — the recommendation survives the handoff to --fisheye-fov
+# ===========================================================================
+
+#: Output edge for the mapper leg below.  Square, so one output pixel is
+#: 180/512 degrees on both axes and the two assertions are directly comparable.
+HANDOFF_OUT = 512
+
+#: Polar angle of the marker ring.  The 16:9 source's vertical half-span at
+#: ``TRUE_HFOV`` is only ``100/2 * 360/640`` = 28.1°, so 20° is comfortably
+#: inside it — the ring exists on the centre column as well as the centre row,
+#: which is the whole point of the test.
+HANDOFF_RING = 20.0
+
+
+def ring_fisheye(hfov: float, width: int = SYNTH_W, height: int = SYNTH_H) -> np.ndarray:
+    """A 16:9 equidistant fisheye carrying one ring at a *known* polar angle.
+
+    Built in numpy rather than by ``forward_warp``, so the ring radius is
+    ground truth and not a second ffmpeg opinion: equidistant means the same
+    degrees per pixel on both axes, i.e. ``r = k*θ`` with
+    ``k = (width/2) / (hfov/2)``.  That is the identical model
+    :func:`~scripts.calibrate_hfov.equidistant_vfov` encodes, which is what
+    makes this frame "an equidistant fisheye of ``hfov`` degrees" in exactly
+    the sense the calibrator measures and ``--fisheye-fov`` consumes.
+    """
+    k = (width / 2.0) / (hfov / 2.0)
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float64)
+    polar = np.hypot((xx + 0.5) - width / 2.0, (yy + 0.5) - height / 2.0) / k
+    img = np.full((height, width, 3), (200, 200, 200), np.uint8)
+    img[np.abs(polar - HANDOFF_RING) < 0.35] = (0, 255, 0)
+    return img
+
+
+def green_run_centres(vec: np.ndarray) -> list[float]:
+    """Centres of the green-dominant runs along an RGB row or column."""
+    r, g, b = vec[:, 0].astype(int), vec[:, 1].astype(int), vec[:, 2].astype(int)
+    hit = (g > 140) & (g > r + 60) & (g > b + 60)
+    centres: list[float] = []
+    run: list[int] = []
+    for i, on in enumerate(hit):
+        if on:
+            run.append(i)
+        elif run:
+            centres.append(sum(run) / len(run))
+            run = []
+    if run:
+        centres.append(sum(run) / len(run))
+    return centres
+
+
+@_FFMPEG
+def test_recommendation_feeds_fisheye_fov_on_a_non_square_source(synthetic_hfov_100):
+    """K-27 / #302, end to end: 16:9 in, ``--fisheye-fov`` out, ≤2 px on **both** axes.
+
+    The reason this card exists.  ``calibrate_hfov`` builds its round trip with
+    ``iv_fov = ih_fov * h/w`` (isotropic — a real lens's image circle), while
+    the mapper used to hard-code ``iv_fov = ih_fov``.  On a square frame those
+    are the same number, so the disagreement only ever showed on a non-square
+    source, and only vertically: measured here at 640x360 / 100° before #302,
+    the 20° ring landed at 154.0 / 357.0 on the centre column against a theory
+    of 198.5 / 312.9 — 45 px, ~16° of angular misregistration — while the
+    centre row was correct to half a pixel.  Nothing looked broken until you
+    turned your head up or down.
+
+    The chain asserted here is the operator's real one: calibrate a 16:9
+    equidistant source of known fov, take ``recommended_fisheye_fov``, hand it
+    straight to ``--fisheye-fov``, and check where a marker of known polar
+    angle actually lands.  ``theory`` is pure projection arithmetic — a 180°
+    hequirect spans ±90° across both its width and its height, so an angle
+    ``p`` sits ``p/180`` of the frame from centre.
+    """
+    _, result = synthetic_hfov_100
+    recommended = result.recommended_fisheye_fov
+    assert recommended == TRUE_HFOV, (
+        f"the calibrator no longer recovers the truth on this fixture (got {recommended}); "
+        "the handoff assertion below would be measuring the wrong angle"
+    )
+
+    # The operator's next command, verbatim: --input-projection fisheye --fisheye-fov <recommended>
+    mapper = EquirectangularMapper(
+        output_width=HANDOFF_OUT,
+        output_height=HANDOFF_OUT,
+        use_ffmpeg=True,
+        input_projection="fisheye",
+        fisheye_fov=recommended,
+    )
+    with mapper:
+        out = mapper.map_single(ring_fisheye(TRUE_HFOV))
+
+    lo = HANDOFF_OUT * (0.5 - HANDOFF_RING / 180.0)
+    hi = HANDOFF_OUT * (0.5 + HANDOFF_RING / 180.0)
+    for axis, centres in (
+        ("row (horizontal)", green_run_centres(out[HANDOFF_OUT // 2])),
+        ("column (vertical)", green_run_centres(out[:, HANDOFF_OUT // 2])),
+    ):
+        assert len(centres) == 2, f"{axis}: expected two {HANDOFF_RING:g}° crossings, got {centres}"
+        assert abs(centres[0] - lo) <= 2.0, f"{axis}: {centres} vs theory {lo:.1f}/{hi:.1f}"
+        assert abs(centres[1] - hi) <= 2.0, f"{axis}: {centres} vs theory {lo:.1f}/{hi:.1f}"
+
+
+@_FFMPEG
+def test_calibrator_chain_and_mapper_chain_read_the_same_vertical_fov():
+    """The two modules must not merely land in the same place by luck — the
+    number they each put in ``iv_fov`` has to be literally the same.
+    """
+    for width, height in ((SYNTH_W, SYNTH_H), (512, 512), (SYNTH_H, SYNTH_W)):
+        mapper = EquirectangularMapper(input_projection="fisheye", fisheye_fov=TRUE_HFOV)
+        assert mapper._fisheye_vertical_fov(width, height) == pytest.approx(equidistant_vfov(TRUE_HFOV, width, height))
+        # ... and the calibrator's chain really does use that relation.
+        chain = build_roundtrip_filter(TRUE_HFOV, width, height)
+        assert f"iv_fov={equidistant_vfov(TRUE_HFOV, width, height):.4f}" in chain
