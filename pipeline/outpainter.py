@@ -527,6 +527,12 @@ _EDGE_AZIMUTH_SAMPLES = 1440
 #: Upper bound on entries per feather cache (distinct canvas sizes / masks).
 _FEATHER_CACHE_MAXSIZE = 4
 
+#: Issue #276 — the integer index tables in :class:`_FeatherTables` are stored
+#: as int32.  Every ``ray_flat`` entry is ``< H*W`` and every ``i0``/``i1``
+#: entry is ``< n_psi``, so the narrowing is lossless while both bounds stay
+#: ``<= 2**31``; :func:`_geometry_tables` refuses larger inputs up front.
+_INT32_INDEX_LIMIT = int(np.iinfo(np.int32).max) + 1
+
 
 class _LRUCache:
     """Tiny bounded LRU.  Every operation takes the lock, so a cache may be
@@ -602,11 +608,11 @@ class _FeatherTables(NamedTuple):
     """Size-only tables for one ``(H, W, n_psi)``; every array is read-only."""
 
     theta_p: np.ndarray  # (H, W) float32 — angular distance of each pixel from the forward axis
-    i0: np.ndarray  # (H, W) int64 — azimuth ray index below each pixel
-    i1: np.ndarray  # (H, W) int64 — the next ray (wraps)
+    i0: np.ndarray  # (H, W) int32 — azimuth ray index below each pixel
+    i1: np.ndarray  # (H, W) int32 — the next ray (wraps)
     frac: np.ndarray  # (H, W) float32 — interpolation weight towards ``i1``
     omf: np.ndarray  # (H, W) float32 — ``1 - frac``
-    ray_flat: np.ndarray  # (n_theta, n_psi) int64 — flat pixel index sampled by each ray step
+    ray_flat: np.ndarray  # (n_theta, n_psi) int32 — flat pixel index sampled by each ray step
     ray_theta_deg: np.ndarray  # (n_theta,) float32 — angle of each ray step
 
 
@@ -615,12 +621,19 @@ def _geometry_tables(h: int, w: int, n_psi: int) -> _FeatherTables:
 
     The arithmetic is the PR #259 code verbatim (same dtypes, same operation
     order) so the tables — and everything derived from them — are bit-identical
-    to the previous per-call evaluation.
+    to the previous per-call evaluation.  The three integer index tables are
+    computed in int64 exactly as before and only *stored* as int32 (#276):
+    same values, half the resident bytes per cached size.
     """
     key = (int(h), int(w), int(n_psi))
     tables = _GEOMETRY_CACHE.get(key)
     if tables is not None:
         return tables
+    if key[0] * key[1] > _INT32_INDEX_LIMIT or key[2] > _INT32_INDEX_LIMIT:
+        raise ValueError(
+            f"feather geometry tables index with int32: need H*W <= 2**31 and n_psi <= 2**31, "
+            f"got H*W={key[0] * key[1]} and n_psi={key[2]}"
+        )
 
     theta_p, psi_p = _hemisphere_pixel_angles(h, w)
     pos = psi_p.astype(np.float64) / (2.0 * np.pi) * n_psi
@@ -643,7 +656,16 @@ def _geometry_tables(h: int, w: int, n_psi: int) -> _FeatherTables:
     ray_flat = v * w + u
     ray_theta_deg = np.degrees(theta[:, 0]).astype(np.float32)
 
-    tables = _FeatherTables(theta_p, i0, i1, frac, omf, ray_flat, ray_theta_deg)
+    # Values are bounded by the guard above, so the int64 -> int32 narrowing is exact.
+    tables = _FeatherTables(
+        theta_p,
+        i0.astype(np.int32),
+        i1.astype(np.int32),
+        frac,
+        omf,
+        ray_flat.astype(np.int32),
+        ray_theta_deg,
+    )
     for arr in tables:
         arr.setflags(write=False)
     _GEOMETRY_CACHE.put(key, tables)
