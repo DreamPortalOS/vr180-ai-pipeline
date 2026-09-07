@@ -264,10 +264,18 @@ class EquirectangularMapper:
     **Source projection** (C-2, issue #294).  ``input_projection="rectilinear"``
     (default) treats the source as a pinhole image of ``src_hfov`` degrees.
     ``input_projection="fisheye"`` treats it as a circular **equidistant**
-    fisheye (r ∝ θ) inscribed in the frame, spanning ``fisheye_fov`` degrees
-    across the full frame width *and* height — the RESEARCH_COVERAGE_V2 §QB
-    route: a 180° image circle gives uniform px/deg over the whole hemisphere.
-    ``src_hfov`` is not consulted in fisheye mode.
+    fisheye (r ∝ θ) whose image circle spans ``fisheye_fov`` degrees across the
+    full frame **width** — the RESEARCH_COVERAGE_V2 §QB route: a 180° image
+    circle gives uniform px/deg over the whole hemisphere.  ``src_hfov`` is not
+    consulted in fisheye mode.
+
+    ``fisheye_fov`` is the *same quantity* ``scripts/calibrate_hfov.py``
+    measures and reports as ``recommended_fisheye_fov`` (K-27, issue #302): an
+    equidistant **horizontal** span, with the vertical span following from the
+    aspect via :meth:`_fisheye_vertical_fov` (``fisheye_fov * height / width``,
+    the same relation as ``calibrate_hfov.equidistant_vfov``).  On a square
+    frame the two axes coincide and ``fisheye_fov`` is exactly the inscribed
+    image circle.
     """
 
     #: Accepted ``input_projection`` values (``equirect`` sources never reach
@@ -300,9 +308,14 @@ class EquirectangularMapper:
             use_ffmpeg: Prefer ffmpeg v360 filter when available.
             input_projection: ``"rectilinear"`` (pinhole, default) or
                 ``"fisheye"`` (equidistant circular fisheye, C-2 #294).
-            fisheye_fov: Full angular span of the fisheye frame in degrees
-                (``ih_fov`` = ``iv_fov``; 180 = the inscribed circle covers the
-                whole hemisphere).  Only used with ``input_projection="fisheye"``.
+            fisheye_fov: Angular span of the equidistant fisheye across the
+                frame **width**, in degrees (180 = the image circle covers the
+                whole hemisphere).  The vertical span follows isotropically
+                from the aspect (``fisheye_fov * height / width``), so on a
+                square frame this is the inscribed image circle.  This is the
+                number ``scripts/calibrate_hfov.py`` reports as
+                ``recommended_fisheye_fov`` — the same quantity (#302).
+                Only used with ``input_projection="fisheye"``.
         """
         if input_projection not in self.INPUT_PROJECTIONS:
             raise ValueError(f"input_projection must be one of {self.INPUT_PROJECTIONS}, got {input_projection!r}")
@@ -434,14 +447,16 @@ class EquirectangularMapper:
         ``v360`` head.
 
         Args:
-            src_width: Source frame width (px), for the vertical-FOV solve.
+            src_width: Source frame width (px), for the vertical-FOV solve —
+                pinhole via :meth:`_calc_vertical_fov`, equidistant via
+                :meth:`_fisheye_vertical_fov`.
             src_height: Source frame height (px).
             with_alpha: Terminate the chain in ``rgba`` (keeping the alpha
                 mask, 0 outside the FOV) instead of ``rgb24``. The RGB planes
                 are identical either way.
         """
         if self.input_projection == "fisheye":
-            v360 = self._v360_fisheye_head()
+            v360 = self._v360_fisheye_head(src_width, src_height)
         else:
             src_vfov = self._calc_vertical_fov(src_width, src_height)
             v360 = (
@@ -454,15 +469,41 @@ class EquirectangularMapper:
         pix_fmt = "rgba" if with_alpha else "rgb24"
         return f"{v360},{self._BLACK_COMPOSITE},format={pix_fmt}"
 
-    def _v360_fisheye_head(self) -> str:
+    def _fisheye_vertical_fov(self, src_width: int, src_height: int) -> float:
+        """Vertical span of an equidistant fisheye frame (K-27, issue #302).
+
+        Equidistant means radius is proportional to angle, so a real lens's
+        image circle puts the **same degrees per pixel on both axes**; the
+        vertical span is therefore just the aspect-scaled horizontal one —
+        ``fisheye_fov * height / width``, no ``tan`` anywhere (unlike the
+        pinhole :meth:`_calc_vertical_fov`).
+
+        This is bit-for-bit the relation ``scripts/calibrate_hfov.py`` uses
+        (``equidistant_vfov``) when it builds its round-trip chain, which is
+        what makes its ``recommended_fisheye_fov`` and this mapper's
+        ``fisheye_fov`` **the same quantity**.  Before #302 this branch emitted
+        ``iv_fov = ih_fov`` unconditionally; that is an *ellipse* on a
+        non-square frame — no lens forms one — and it moved a 20° ring 45 px
+        (≈16°) off on a 16:9 100° source while leaving the horizontal axis
+        perfect, i.e. it failed silently.  ``height == width`` gives
+        ``height / width == 1.0`` exactly, so square sources are untouched.
+        """
+        if src_width <= 0 or src_height <= 0:
+            raise ValueError(f"source size must be positive, got {src_width}x{src_height}")
+        return self.fisheye_fov * (src_height / src_width)
+
+    def _v360_fisheye_head(self, src_width: int, src_height: int) -> str:
         """The ``v360`` term for an equidistant fisheye source (C-2, issue #294).
 
         Geometry, verified against ffmpeg's ``vf_v360.c`` and empirically on a
         synthetic 512² target (docs/RESEARCH_COVERAGE_V2.md §QB):
 
         * ``input=fisheye`` is **equidistant** (r ∝ θ).  ``ih_fov``/``iv_fov``
-          are the full angle spanned by the frame width / height, so a square
-          frame whose inscribed circle covers 180° is ``ih_fov=iv_fov=180``.
+          are the full angle spanned by the frame width / height, so they are
+          *not* interchangeable on a non-square frame: ``fisheye_fov`` names
+          the width span and :meth:`_fisheye_vertical_fov` derives the height
+          span isotropically from it (K-27 #302).  A square frame whose
+          inscribed circle covers 180° is still ``ih_fov=iv_fov=180``.
         * ``id_fov`` is deliberately **not** used: it is the *diagonal* angle,
           and on a square frame ``id_fov=180`` collapses to 127.3° per axis —
           the 45° circle lands ~37 px off and the frame corners (outside the
@@ -479,10 +520,9 @@ class EquirectangularMapper:
           circle and the frame edge are sampled as-is, so a sub-180° source
           must already be black outside its circle.
         """
-        fov = f"{self.fisheye_fov:g}"
         return (
             f"v360=input=fisheye:output=hequirect:"
-            f"ih_fov={fov}:iv_fov={fov}:"
+            f"ih_fov={self.fisheye_fov:g}:iv_fov={self._fisheye_vertical_fov(src_width, src_height):g}:"
             f"w={self.output_width}:h={self.output_height}:"
             f"interp=lanczos:alpha_mask=1"
         )
@@ -712,17 +752,25 @@ class EquirectangularMapper:
 
         Mirrors ffmpeg's ``v360 input=fisheye`` so both mapper paths agree:
         the polar angle θ from the forward axis grows linearly with the image
-        radius (r ∝ θ), and ``fisheye_fov`` is the full angle spanned by the
-        frame width *and* height, i.e. the frame edge sits at
-        θ = ``fisheye_fov`` / 2 on both axes (a square frame → the inscribed
-        image circle).  Callers apply the frame-bounds visibility rule.
+        radius (r ∝ θ), and ``fisheye_fov`` is the angle spanned across the
+        frame **width**, so the left/right frame edge sits at
+        θ = ``fisheye_fov`` / 2.
+
+        The scale is *isotropic* — the same ``width / 2`` half-extent drives
+        both axes (K-27 #302), which is what an image circle means and what
+        ``_fisheye_vertical_fov`` encodes for the ffmpeg branch.  Using
+        ``src_height / 2`` for ``sy`` (the pre-#302 code) stretched the circle
+        into an ellipse on non-square sources.  On a square frame the two are
+        the same number, so square behaviour is unchanged.  Callers apply the
+        frame-bounds visibility rule.
         """
         polar = np.arccos(np.clip(ray_z, -1.0, 1.0))  # 0 = forward, π/2 = the 180° rim
         azimuth = np.arctan2(-ray_y, ray_x)  # ray_y is up, image y is down
-        r_norm = polar / (math.radians(self.fisheye_fov) / 2.0)  # 1.0 at the frame edge
+        r_norm = polar / (math.radians(self.fisheye_fov) / 2.0)  # 1.0 at the left/right frame edge
         cx, cy = src_width / 2.0, src_height / 2.0
-        sx = cx + r_norm * np.cos(azimuth) * (src_width / 2.0)
-        sy = cy + r_norm * np.sin(azimuth) * (src_height / 2.0)
+        half = src_width / 2.0  # isotropic px/deg: one half-extent for both axes
+        sx = cx + r_norm * np.cos(azimuth) * half
+        sy = cy + r_norm * np.sin(azimuth) * half
         return sx, sy
 
     def map_stereo_pair(self, left_frame: np.ndarray, right_frame: np.ndarray) -> np.ndarray:

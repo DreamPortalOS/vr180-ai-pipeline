@@ -65,14 +65,22 @@ camera calibrator (GeoCalib / AnyCalib) or eyeball a few candidates by hand with
 ``v360 output=flat``.  See ``--min-margin``, :data:`LOW_CONFIDENCE_TEXT` and
 :data:`NEAR_PINHOLE_TEXT`.
 
-Known caveat when handing the number to the pipeline
-....................................................
-This script models the source with an *isotropic* angular scale
-(``iv_fov = ih_fov * height / width``, i.e. the same degrees per pixel on both
-axes), while ``run_pipeline.py --fisheye-fov N`` sets ``ih_fov = iv_fov = N``
-(#294).  The horizontal span therefore transfers exactly; on a non-square frame
-the two differ in how they read the *vertical* axis.  Nothing here changes that
-— it is recorded so the number is not over-trusted vertically.
+The number and ``--fisheye-fov`` are the same quantity (K-27, #302)
+..................................................................
+Both sides read the source as an equidistant frame with an *isotropic* angular
+scale — the same degrees per pixel on both axes, which is what a real lens's
+image circle is.  So one number, the span across the frame **width**, fixes
+the whole model, and the vertical span is always
+``iv_fov = ih_fov * height / width`` (:func:`equidistant_vfov` here,
+``EquirectangularMapper._fisheye_vertical_fov`` there).  On a square frame the
+two axes coincide and the number is simply the inscribed image circle.
+
+This used to disagree: the mapper emitted ``ih_fov = iv_fov = --fisheye-fov``
+unconditionally (#294), which is an *ellipse* on a non-square frame.  The
+horizontal axis matched either way, so nothing looked wrong — but on a 16:9
+100° source a marker at 20° polar landed 45 px (≈16°) off vertically.  #302
+made the mapper derive ``iv_fov`` the way this script always has; the
+recommendation now transfers on **both** axes.
 
 Score
 -----
@@ -219,6 +227,12 @@ def equidistant_vfov(hfov_deg: float, width: int, height: int) -> float:
     Equidistant means radius is proportional to angle, so the angular scale is
     isotropic and the vertical fov is just the aspect-scaled horizontal one —
     no ``tan`` anywhere, unlike :func:`pinhole_vfov`.
+
+    This is the **same relation**
+    :meth:`pipeline.equirectangular_mapper.EquirectangularMapper._fisheye_vertical_fov`
+    applies to ``--fisheye-fov`` (K-27, #302), which is what makes
+    ``recommended_fisheye_fov`` and ``--fisheye-fov`` one quantity rather than
+    two that merely agree on square frames.
     """
     if width <= 0 or height <= 0:
         raise ValueError(f"width/height must be positive, got {width}x{height}")
@@ -326,6 +340,10 @@ def build_roundtrip_filter(
     rendering ``hfov_deg`` wide; stage 2 renders a rectilinear window back out.
     Composition is a genuine warp (not a homography), so straightness of the
     result is evidence about ``hfov_deg``.
+
+    Stage 1's ``iv_fov`` comes from :func:`equidistant_vfov`, i.e. the isotropic
+    reading the mapper also uses for ``--fisheye-fov`` (K-27, #302) — so what is
+    measured here is exactly what is consumed there, on both axes.
     """
     equi = _even(width * equirect_scale)
     return (
