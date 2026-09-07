@@ -9,7 +9,7 @@ Why
 ---
 A planar source projected onto a 180° hemisphere never fills it: at 126°
 horizontal FOV the outer ~27° of the per-eye equirectangular canvas is an
-``alpha == 0`` hole (see ``SOURCE_SPEC.md``).  Forward flight, however, has a
+``alpha == 0`` hole (see ``docs/equirectangular-projection.md``).  Forward flight, however, has a
 property no other camera motion has: content flows **radially outward** from
 the canvas centre and eventually leaves the frame — so the patch of sphere
 that is *outside* the current FOV was really seen a few frames ago.  The
