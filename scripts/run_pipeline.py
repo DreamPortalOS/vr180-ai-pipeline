@@ -698,40 +698,58 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.25,
         help="Fraction of height scanned from bottom for black boundaries (default: 0.25)",
     )
-    # P0-3 (#244): angle-weighted edge feather.  Independent of --outpaint and
-    # OFF unless one of the two flags is given (both default None → behaviour
-    # byte-identical to before).
+    # P0-3 (#244): angle-weighted edge feather.  Independent of --outpaint.
+    # F-9 (#285): ON by default for --projection vr180 output (165 -> 180, the
+    # owner's 09-07 headset verdict); --no-edge-feather is the explicit off
+    # switch.  Both angle flags still default to None at the argparse level so
+    # parse_args() and the batch run_outpaint_stage gate stay byte-identical —
+    # the VR180 default is resolved at the streaming call site in main() by
+    # resolve_cli_edge_feather().  --projection fulldome never sees these flags.
     parser.add_argument(
         "--edge-feather-start",
         type=float,
         default=None,
         metavar="DEG",
-        help="P0-3 (#244): angle (0-180 FOV scale, 0 = forward axis) where the content starts fading to "
-        "black towards the edge. Off unless --edge-feather-start or --edge-feather-end is given; the "
-        "omitted one defaults to 165 / 180. The fade is anchored at the source-FOV (alpha) edge, so "
-        "165->180 works for a 126-degree source as well as a full 180-degree one; use e.g. 110 for a "
-        "wide 'peripheral vision' fall-off (Plan C).",
+        help="P0-3 (#244) / F-9 (#285): angle (0-180 FOV scale, 0 = forward axis) where the content starts "
+        "fading to black towards the edge. VR180 output is feathered 165->180 by default (owner's 09-07 "
+        "headset verdict); give one of the two flags to override it (the omitted one keeps 165 / 180) or "
+        "--no-edge-feather to switch the fade off. The fade is anchored at the source-FOV (alpha) edge, so "
+        "165->180 works for a 126-degree source as well as a full 180-degree one; use e.g. 110 for a wide "
+        "'peripheral vision' fall-off (Plan C). Not used by --projection fulldome.",
     )
     parser.add_argument(
         "--edge-feather-end",
         type=float,
         default=None,
         metavar="DEG",
-        help="P0-3 (#244): angle (0-180 FOV scale) at which the content is fully black (default 180 when "
-        "only --edge-feather-start is given). Must satisfy 0 <= start <= end <= 180; anything else is "
-        "rejected at parse time.",
+        help="P0-3 (#244) / F-9 (#285): angle (0-180 FOV scale) at which the content is fully black "
+        "(180 unless overridden). Must satisfy 0 <= start <= end <= 180; anything else is rejected at "
+        "parse time.",
+    )
+    parser.add_argument(
+        "--no-edge-feather",
+        action="store_true",
+        default=False,
+        help="F-9 (#285): switch the VR180 edge feather off — a hard content edge, exactly the pre-#285 "
+        "default output. Cannot be combined with --edge-feather-start/--edge-feather-end.",
     )
     # F-7 (#274): temporal spherical accumulation (F-2 #262/#263) on the
     # streaming path.  OFF by default — the default stream is byte-identical.
+    # F-9 (#285): DEPRECATED — the owner's 09-07 headset test found duplicated
+    # / stretched artefacts in the outer ring, so `feather` won.  The flag is
+    # kept (behaviour unchanged) and `on` logs a DEPRECATED warning in main().
     parser.add_argument(
         "--sphere-accumulate",
         choices=["off", "on"],
         default="off",
-        help="F-7 (#274): fill the 126->180 outer ring with what earlier frames showed before the content "
-        "flowed out of the frame (SphereAccumulator, one per eye; streaming path only). off (default) "
-        "changes nothing; on replaces each eye with the accumulated hemisphere, faded 165->180 (or the "
-        "--edge-feather-* angles) once by the accumulator — the per-frame edge feather is not applied on "
-        "top, and --outpaint gradient is skipped with a warning. Needs a square per-eye canvas.",
+        help="[DEPRECATED: owner 实测伪影，勿用] F-7 (#274): fill the 126->180 outer ring with what earlier "
+        "frames showed before the content flowed out of the frame (SphereAccumulator, one per eye; "
+        "streaming path only). off (default) changes nothing; on replaces each eye with the accumulated "
+        "hemisphere, faded 165->180 (or the --edge-feather-* angles) once by the accumulator — the "
+        "per-frame edge feather is not applied on top, and --outpaint gradient is skipped with a warning. "
+        "Needs a square per-eye canvas. F-9 (#285): superseded by the default edge feather after the "
+        "owner's 09-07 headset test showed duplicated / stretched artefacts in the outer ring; on still "
+        "runs exactly as before but logs a DEPRECATED warning.",
     )
     parser.add_argument(
         "--sphere-radial-scale",
@@ -763,7 +781,45 @@ def parse_args(argv: list[str] | None = None):
         math.isfinite(args.sphere_radial_scale) and args.sphere_radial_scale > 0
     ):
         parser.error(f"--sphere-radial-scale must be a finite positive number, got {args.sphere_radial_scale}")
+    # F-9 (#285): --no-edge-feather is the explicit off switch; pairing it with
+    # an explicit angle is contradictory, so reject it up front like the rest.
+    if args.no_edge_feather and (args.edge_feather_start is not None or args.edge_feather_end is not None):
+        parser.error("--no-edge-feather cannot be combined with --edge-feather-start/--edge-feather-end")
     return args
+
+
+# F-9 (#285): the VR180 default edge feather (owner's 09-07 headset verdict):
+# content fades to black over 165 -> 180 degrees on the 0-180 FOV scale.
+DEFAULT_VR180_EDGE_FEATHER: tuple[float, float] = (165.0, 180.0)
+
+
+def resolve_cli_edge_feather(args) -> tuple[float | None, float | None]:
+    """F-9 (#285): the ``(edge_feather_start, edge_feather_end)`` a VR180 render should use.
+
+    * ``--no-edge-feather`` -> ``(None, None)``: the feather is off and the
+      stream renders exactly the pre-#285 default (byte-identical path).
+    * an explicit ``--edge-feather-start`` / ``--edge-feather-end`` always
+      wins and is forwarded untouched (the omitted bound keeps its #244
+      default inside :func:`pipeline.outpainter.resolve_edge_feather`).
+    * nothing given and ``--projection vr180`` -> :data:`DEFAULT_VR180_EDGE_FEATHER`.
+    * any other projection (fulldome) -> the flags exactly as parsed, i.e.
+      ``(None, None)`` unless the operator typed them: fulldome has no
+      feather layer and must not grow one here.
+
+    The argparse defaults stay ``None`` on purpose: ``parse_args()`` and the
+    batch ``run_outpaint_stage`` gate are pinned byte-identical by their
+    existing tests, so only the streaming call site in :func:`main` applies
+    this policy.  ``is True`` (not truthiness) so a MagicMock ``args`` used by
+    the older wiring tests -- where every unset attribute is a truthy Mock --
+    does not read as "feather off".
+    """
+    if getattr(args, "no_edge_feather", False) is True:
+        return None, None
+    start = getattr(args, "edge_feather_start", None)
+    end = getattr(args, "edge_feather_end", None)
+    if start is None and end is None and getattr(args, "projection", None) == "vr180":
+        return DEFAULT_VR180_EDGE_FEATHER
+    return start, end
 
 
 def read_frames(video_path: str, max_frames: int | None = None):
@@ -2228,6 +2284,9 @@ _STREAMING_SUPPORTED: dict[str, str] = {
     # on the streaming path (StreamingPipeline._project_sbs).
     "edge_feather_start": "edge feather start angle",
     "edge_feather_end": "edge feather end angle",
+    # F-9 (#285): the explicit off switch for the VR180 default feather is
+    # honoured by the stream (it hands the constructor None/None).
+    "no_edge_feather": "edge feather off switch",
     # F-7 (#274): SphereAccumulator per eye on the streaming path
     # (StreamingPipeline._accumulate_sbs); off by default.
     "sphere_accumulate": "sphere accumulate mode",
@@ -2906,6 +2965,26 @@ def main():
         # doing the wrong thing (the #243 defect: --outpaint and
         # --no-ffmpeg-v360 were both silently dropped here).
         _warn_streaming_unsupported_args(args)
+        # F-9 (#285): VR180 output is feathered 165->180 by default (owner's
+        # 09-07 headset verdict).  --no-edge-feather hands the stream the
+        # pre-#285 None/None, an explicit --edge-feather-* wins, fulldome is
+        # untouched.  Resolved here rather than in parse_args() so the parser
+        # defaults and the batch outpaint gate stay byte-identical.
+        edge_feather_start, edge_feather_end = resolve_cli_edge_feather(args)
+        feather = resolve_edge_feather(edge_feather_start, edge_feather_end)
+        if feather is None:
+            log.info("🪶 Edge feather: off")
+        else:
+            log.info("🪶 Edge feather: %g°→%g° (VR180 default since F-9 #285; --no-edge-feather disables)", *feather)
+        # F-9 (#285): --sphere-accumulate on is DEPRECATED — the owner's 09-07
+        # headset test found duplicated / stretched artefacts in the outer
+        # ring.  Kept runnable for reference: warn loudly, change nothing.
+        if getattr(args, "sphere_accumulate", "off") == "on":
+            log.warning(
+                "⚠️  DEPRECATED: --sphere-accumulate on — the owner's 09-07 headset test found duplicated / "
+                "stretched artefacts in the outer ring (F-9 #285). It still runs exactly as before, but VR180 "
+                "output should rely on the default 165°→180° edge feather instead; this flag may be removed."
+            )
         # I-5 (#120): the streaming path previously hard-coded Depth-Anything +
         # StereoRenderer and *silently ignored* --depth-model/--stereo-model.
         # Build the requested backends via the shared factory (same construction
@@ -2949,9 +3028,11 @@ def main():
             # F-1 (#261): --edge-feather-start/--edge-feather-end used to be
             # reported by the swallowed-arg detector above and ignored; the
             # stream now applies the #244 feather per frame after the equirect
-            # map (both None = off ⇒ bytes unchanged).
-            edge_feather_start=getattr(args, "edge_feather_start", None),
-            edge_feather_end=getattr(args, "edge_feather_end", None),
+            # map (both None = off ⇒ bytes unchanged).  F-9 (#285): the values
+            # come from resolve_cli_edge_feather above — 165/180 by default
+            # for VR180, None/None under --no-edge-feather.
+            edge_feather_start=edge_feather_start,
+            edge_feather_end=edge_feather_end,
             # F-7 (#274): --sphere-accumulate {off,on} / --sphere-radial-scale.
             # "off" (default) never instantiates the accumulator ⇒ bytes
             # unchanged; "on" runs one SphereAccumulator per eye after the
