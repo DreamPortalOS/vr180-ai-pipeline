@@ -1,9 +1,21 @@
-"""Tests for the source-hfov calibrator (scripts/calibrate_hfov.py, C-1 #291).
+"""Tests for the source-fov calibrator (scripts/calibrate_hfov.py, C-1 #291).
 
-The tool answers one question: *what ``--src-hfov`` should this clip be given?*
-It answers it by pushing each frame through a ``v360`` sphere round trip at
-every candidate hfov and scoring how straight the result comes out — only the
+The tool answers one question: *if this clip is an equidistant fisheye, how wide
+is it?*  It answers by pushing each frame through a ``v360`` sphere round trip
+at every candidate fov and scoring how straight the result comes out — only the
 correct candidate un-bends the picture.
+
+Which flag the answer belongs to is not cosmetic, and is pinned here
+------------------------------------------------------------------
+The round trip's first stage is ``input=fisheye`` (equidistant) and the
+synthetic footage below is built as a genuine equidistant render, so the
+measured quantity is an *equidistant fisheye* fov.  Its consumer is
+``--input-projection fisheye --fisheye-fov`` (#294).  It is **not**
+``--src-hfov``, which is the pinhole parameter
+(``v360=input=flat:ih_fov=<src_hfov>``) — feeding an equidistant angle to a
+pinhole model is precisely the angular misregistration the card exists to
+prevent.  ``test_format_report_labels_the_result_as_a_fisheye_fov`` and friends
+hold the wording to that.
 
 What is covered, and how
 ------------------------
@@ -18,9 +30,13 @@ The card's five acceptance criteria, in order:
    and 130°.  Asserted as a *relative* ordering; the score's absolute units are
    an implementation detail and are never pinned.
 3. **Honest abstention.**  A pure-noise frame has no straight lines to measure,
-   so the report must say 置信度低 rather than invent a number.
+   so the report must say 置信度低 rather than invent a number — and, since a
+   flat curve is also what a near-pinhole source produces, name the fallback
+   (GeoCalib / AnyCalib, or a manual ``v360 output=flat`` comparison).
 4. **``--json``.**  Machine-readable output must survive ``json.loads`` and
-   carry ``recommended_hfov`` / ``scores`` / ``confidence``.
+   carry ``recommended_fisheye_fov`` / ``scores`` / ``confidence``.  (The card
+   wrote ``recommended_hfov``; the key was renamed on review because the old
+   name read as a ``--src-hfov``, which is the wrong lens model.)
 5. **Subprocess hygiene.**  Every ``subprocess.run`` in the module is checked at
    the AST level: list form, never ``shell=True``, never an f-string command.
 
@@ -50,12 +66,15 @@ import cv2
 import numpy as np
 import pytest
 from scripts.calibrate_hfov import (
+    CONSUMER_FLAGS,
     DEFAULT_FRAMES,
     DEFAULT_GRID,
     DEFAULT_MIN_LINE_FRAC,
     DEFAULT_OUT_FOV,
     HOUGH_MIN_GAP_PX,
     LOW_CONFIDENCE_TEXT,
+    NEAR_PINHOLE_TEXT,
+    NOT_SRC_HFOV_TEXT,
     CalibrationResult,
     CandidateScore,
     V360Rectifier,
@@ -414,7 +433,7 @@ def test_edge_map_clips_to_the_mask():
 def test_calibrate_recovers_the_injected_truth():
     frames = [np.zeros((240, 320), np.uint8)]
     result = calibrate(frames, parse_grid("60:150:5"), rectifier=bow_rectifier(100.0))
-    assert result.recommended_hfov == 100.0
+    assert result.recommended_fisheye_fov == 100.0
     assert result.is_confident
 
 
@@ -430,7 +449,7 @@ def test_calibrate_reports_two_runners_up():
     frames = [np.zeros((240, 320), np.uint8)]
     result = calibrate(frames, parse_grid("60:150:5"), rectifier=bow_rectifier(100.0))
     assert len(result.runners_up) == 2
-    assert result.recommended_hfov not in result.runners_up
+    assert result.recommended_fisheye_fov not in result.runners_up
 
 
 def test_calibrate_scores_every_candidate():
@@ -448,7 +467,7 @@ def test_calibrate_flat_curve_is_not_confident():
 
 def test_calibrate_without_any_line_evidence_recommends_nothing():
     result = calibrate([np.zeros((240, 320), np.uint8)], parse_grid("60:150:5"), rectifier=blank_rectifier())
-    assert result.recommended_hfov is None
+    assert result.recommended_fisheye_fov is None
     assert result.confidence == "low"
     assert result.notes
     assert all(row.score is None for row in result.scores)
@@ -457,15 +476,49 @@ def test_calibrate_without_any_line_evidence_recommends_nothing():
 def test_calibrate_flags_a_recommendation_on_the_grid_edge():
     """A winner at the boundary probably means the true value is off-grid."""
     result = calibrate([np.zeros((240, 320), np.uint8)], parse_grid("100:150:10"), rectifier=bow_rectifier(100.0))
-    assert result.recommended_hfov == 100.0
+    assert result.recommended_fisheye_fov == 100.0
     assert result.confidence == "low"
     assert any("网格" in note for note in result.notes)
+
+
+def test_calibrate_calls_out_a_probable_near_pinhole_source():
+    """Monotone curve bottoming out on the *low* edge ⇒ likely nothing to measure.
+
+    That is the shape a rectilinear source makes: pinhole → sphere → pinhole is
+    a homography, so no candidate bends anything and the score only ever leans.
+    The operator must be told to switch method, not to take the edge value.
+    """
+    result = calibrate([np.zeros((240, 320), np.uint8)], parse_grid("60:150:10"), rectifier=bow_rectifier(50.0))
+    assert result.recommended_fisheye_fov == 60.0
+    assert NEAR_PINHOLE_TEXT in result.notes
+    assert NEAR_PINHOLE_TEXT in format_report(result)
+
+
+def test_near_pinhole_note_points_at_another_method():
+    assert "针孔" in NEAR_PINHOLE_TEXT
+    assert "GeoCalib" in NEAR_PINHOLE_TEXT and "AnyCalib" in NEAR_PINHOLE_TEXT
+    assert "v360 output=flat" in NEAR_PINHOLE_TEXT
+
+
+def test_calibrate_does_not_cry_pinhole_on_a_genuine_minimum():
+    """A dip *inside* the grid is evidence, not the absence of it."""
+    result = calibrate([np.zeros((240, 320), np.uint8)], parse_grid("60:150:5"), rectifier=bow_rectifier(100.0))
+    assert result.notes == []
+    assert NEAR_PINHOLE_TEXT not in format_report(result)
+
+
+def test_calibrate_does_not_cry_pinhole_on_the_high_grid_edge():
+    """Bottoming out on the *upper* edge means the truth is off-grid, not absent."""
+    result = calibrate([np.zeros((240, 320), np.uint8)], parse_grid("60:150:10"), rectifier=bow_rectifier(200.0))
+    assert result.recommended_fisheye_fov == 150.0
+    assert any("网格" in note for note in result.notes)
+    assert NEAR_PINHOLE_TEXT not in result.notes
 
 
 def test_calibrate_respects_a_custom_min_margin():
     frames = [np.zeros((240, 320), np.uint8)]
     strict = calibrate(frames, parse_grid("60:150:5"), rectifier=bow_rectifier(100.0), min_margin=0.99)
-    assert strict.recommended_hfov == 100.0
+    assert strict.recommended_fisheye_fov == 100.0
     assert strict.confidence == "low"
 
 
@@ -508,11 +561,31 @@ def _demo_result() -> CalibrationResult:
 
 
 def test_result_dict_carries_the_contract_keys():
-    """``recommended_hfov`` / ``scores`` / ``confidence`` are the card's ask."""
+    """``recommended_fisheye_fov`` / ``scores`` / ``confidence`` are the card's ask."""
     payload = _demo_result().to_dict()
-    assert {"recommended_hfov", "scores", "confidence"} <= payload.keys()
-    assert payload["recommended_hfov"] == 100.0
+    assert {"recommended_fisheye_fov", "scores", "confidence"} <= payload.keys()
+    assert payload["recommended_fisheye_fov"] == 100.0
     assert payload["confidence"] in {"high", "low"}
+
+
+def test_result_dict_names_the_lens_model_and_its_consumer():
+    """The payload has to carry *what the number is*, not just the number.
+
+    A machine consumer that only saw a bare angle could hand it to
+    ``--src-hfov``; ``measured_model`` / ``consumer_flags`` make that a
+    deliberate misreading rather than an easy mistake.
+    """
+    payload = _demo_result().to_dict()
+    assert payload["measured_model"] == "equidistant_fisheye"
+    assert payload["consumer_flags"] == CONSUMER_FLAGS
+    assert "--fisheye-fov" in payload["consumer_flags"]
+    assert "--input-projection fisheye" in payload["consumer_flags"]
+    assert payload["not_src_hfov"] is True
+
+
+def test_result_dict_does_not_resurrect_the_old_hfov_key():
+    """``recommended_hfov`` read like a ``--src-hfov``; it must not come back."""
+    assert "recommended_hfov" not in _demo_result().to_dict()
 
 
 def test_result_dict_scores_are_rows_of_hfov_and_score():
@@ -537,8 +610,43 @@ def test_format_report_lists_every_candidate_and_marks_the_winner():
     report = format_report(result)
     for row in result.scores:
         assert f"{row.hfov:6.1f}" in report
-    assert "recommended --src-hfov : 100" in report
+    assert "recommended fisheye fov (等距鱼眼视场) : 100" in report
     assert "runners-up" in report
+
+
+def test_format_report_labels_the_result_as_a_fisheye_fov():
+    """The verdict must name the equidistant model and the flags that eat it."""
+    report = format_report(_demo_result())
+    assert "等距鱼眼视场" in report
+    assert "--input-projection fisheye --fisheye-fov 100" in report
+
+
+def test_format_report_never_calls_the_result_a_src_hfov():
+    """``--src-hfov`` may appear only inside the warning that it is the wrong flag.
+
+    The old report printed ``recommended --src-hfov : 100`` — an equidistant
+    measurement labelled as a pinhole parameter.  Any line that *offers* the
+    number must talk about ``--fisheye-fov``.
+    """
+    report = format_report(_demo_result())
+    assert "recommended --src-hfov" not in report
+    offers = [line for line in report.splitlines() if "100" in line and ("recommended" in line or "consume" in line)]
+    assert offers
+    assert all("--src-hfov" not in line for line in offers)
+
+
+def test_format_report_hedges_the_consume_line_when_not_confident():
+    """A low-confidence winner is still shown, but not as an instruction."""
+    result = calibrate([np.zeros((240, 320), np.uint8)], parse_grid("60:150:10"), rectifier=bow_rectifier(50.0))
+    report = format_report(result)
+    assert "would consume as (置信度低，先别用)" in report
+    assert "consume as : run_pipeline.py" not in report
+
+
+def test_format_report_spells_out_that_this_is_not_src_hfov():
+    report = format_report(_demo_result())
+    assert NOT_SRC_HFOV_TEXT in report
+    assert "不是 --src-hfov" in report
 
 
 def test_format_report_stays_silent_about_confidence_when_confident():
@@ -552,10 +660,23 @@ def test_format_report_prints_the_low_confidence_notice():
     assert LOW_CONFIDENCE_TEXT in report
 
 
+def test_low_confidence_notice_names_an_actionable_next_step():
+    """Abstaining is only useful if it says what to do instead.
+
+    A flat curve has two readings — no line evidence, or a source that is
+    already near-pinhole and therefore unmeasurable this way — and both lead to
+    the same fallback: a single-image calibrator, or a manual comparison.
+    """
+    assert "置信度低" in LOW_CONFIDENCE_TEXT
+    assert "针孔" in LOW_CONFIDENCE_TEXT
+    assert "GeoCalib" in LOW_CONFIDENCE_TEXT and "AnyCalib" in LOW_CONFIDENCE_TEXT
+    assert "v360 output=flat" in LOW_CONFIDENCE_TEXT
+
+
 def test_format_report_handles_a_result_with_no_recommendation():
     result = calibrate([np.zeros((240, 320), np.uint8)], parse_grid("60:150:5"), rectifier=blank_rectifier())
     report = format_report(result)
-    assert "recommended --src-hfov : (none)" in report
+    assert "recommended fisheye fov (等距鱼眼视场) : (none)" in report
     assert "置信度低" in report
 
 
@@ -566,7 +687,7 @@ def test_render_plot_writes_a_readable_png(tmp_path):
 
 
 def test_render_plot_refuses_a_curve_with_nothing_on_it():
-    empty = CalibrationResult(recommended_hfov=None, confidence="low", margin=0.0, scores=[])
+    empty = CalibrationResult(recommended_fisheye_fov=None, confidence="low", margin=0.0, scores=[])
     with pytest.raises(ValueError, match="nothing to plot"):
         render_plot(empty, "unused.png")
 
@@ -776,6 +897,29 @@ def test_parser_defaults_match_the_module_constants():
     assert args.plot is None
 
 
+def test_parser_help_sends_the_reader_to_fisheye_fov():
+    """``--help`` is where an operator learns which flag the answer belongs in."""
+    help_text = build_parser().format_help()
+    assert "--input-projection fisheye --fisheye-fov" in help_text
+    assert "equidistant" in help_text.lower()
+    assert "NOT --src-hfov" in help_text
+
+
+def test_parser_help_documents_the_json_key():
+    help_text = build_parser().format_help()
+    assert "recommended_fisheye_fov" in help_text
+
+
+def test_module_docstring_states_the_consumer_and_the_non_consumer():
+    """The prose at the top of the script is the first thing a reader trusts."""
+    import scripts.calibrate_hfov as module
+
+    doc = module.__doc__ or ""
+    assert "--input-projection fisheye --fisheye-fov" in doc
+    assert "not** ``--src-hfov``" in doc
+    assert "equidistant" in doc
+
+
 def test_parser_treats_bare_json_as_stdout():
     assert build_parser().parse_args(["clip.mp4", "--json"]).json == "-"
 
@@ -804,8 +948,8 @@ def stubbed_pipeline(monkeypatch):
 def test_cli_json_to_stdout_parses_and_carries_the_contract_keys(stubbed_pipeline, capsys):
     assert main(["clip.mp4", "--grid", "60:150:5", "--json", "--quiet"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert {"recommended_hfov", "scores", "confidence"} <= payload.keys()
-    assert payload["recommended_hfov"] == 100.0
+    assert {"recommended_fisheye_fov", "scores", "confidence"} <= payload.keys()
+    assert payload["recommended_fisheye_fov"] == 100.0
     assert isinstance(payload["scores"], list) and payload["scores"]
 
 
@@ -813,7 +957,7 @@ def test_cli_json_stdout_stays_clean_of_the_report(stubbed_pipeline, capsys):
     """Bare ``--json`` must emit JSON and nothing else, so it can be piped."""
     main(["clip.mp4", "--grid", "60:150:5", "--json", "--quiet"])
     out = capsys.readouterr().out
-    assert "recommended --src-hfov" not in out
+    assert "recommended fisheye fov" not in out
     json.loads(out)
 
 
@@ -821,8 +965,19 @@ def test_cli_json_path_writes_a_file_and_still_prints_the_report(stubbed_pipelin
     target = tmp_path / "nested" / "hfov.json"
     assert main(["clip.mp4", "--grid", "60:150:5", "--json", str(target), "--quiet"]) == 0
     payload = json.loads(target.read_text(encoding="utf-8"))
-    assert payload["recommended_hfov"] == 100.0
-    assert "recommended --src-hfov : 100" in capsys.readouterr().out
+    assert payload["recommended_fisheye_fov"] == 100.0
+    printed = capsys.readouterr().out
+    assert "recommended fisheye fov (等距鱼眼视场) : 100" in printed
+    assert "--input-projection fisheye --fisheye-fov 100" in printed
+
+
+def test_cli_json_names_the_consumer_flags(stubbed_pipeline, capsys):
+    """The piped payload must be self-describing about which flag it feeds."""
+    main(["clip.mp4", "--grid", "60:150:5", "--json", "--quiet"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["measured_model"] == "equidistant_fisheye"
+    assert "--fisheye-fov" in payload["consumer_flags"]
+    assert "recommended_hfov" not in payload
 
 
 def test_cli_records_the_source_and_analysis_size(stubbed_pipeline, capsys):
@@ -894,8 +1049,8 @@ def test_forward_warp_actually_bends_the_grid(synthetic_hfov_100):
 def test_synthetic_recommendation_lands_within_five_degrees(synthetic_hfov_100):
     """Card criterion 1: known hfov=100 → recommendation inside 100 ± 5."""
     _, result = synthetic_hfov_100
-    assert result.recommended_hfov is not None
-    assert abs(result.recommended_hfov - TRUE_HFOV) <= 5.0
+    assert result.recommended_fisheye_fov is not None
+    assert abs(result.recommended_fisheye_fov - TRUE_HFOV) <= 5.0
 
 
 @_FFMPEG
@@ -940,8 +1095,8 @@ def test_cli_end_to_end_on_a_synthetic_still(tmp_path, capsys):
     assert main([str(still), "--grid", "70:130:30", "--json", "--quiet"]) == 0
 
     payload = json.loads(capsys.readouterr().out)
-    assert {"recommended_hfov", "scores", "confidence"} <= payload.keys()
-    assert abs(payload["recommended_hfov"] - TRUE_HFOV) <= 5.0
+    assert {"recommended_fisheye_fov", "scores", "confidence"} <= payload.keys()
+    assert abs(payload["recommended_fisheye_fov"] - TRUE_HFOV) <= 5.0
     assert [row["hfov"] for row in payload["scores"]] == [70.0, 100.0, 130.0]
 
 

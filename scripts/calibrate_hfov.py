@@ -1,14 +1,29 @@
 #!/usr/bin/env python3
-"""Estimate a source clip's horizontal FOV from how straight its lines unwarp.
+"""Measure a source clip's **equidistant fisheye** fov from how straight its lines unwarp.
+
+What the number is (read this before using the output)
+------------------------------------------------------
+The recommendation is an **equidistant (fisheye) horizontal field of view**, so
+its one correct consumer is::
+
+    python scripts/run_pipeline.py ... --input-projection fisheye --fisheye-fov <N>
+
+It is **not** ``--src-hfov``.  ``--src-hfov`` is the *pinhole* parameter — the
+pipeline feeds it to ``v360=input=flat:ih_fov=<src_hfov>`` — and a pinhole model
+is a different lens from the equidistant one measured here.  Pasting this number
+into ``--src-hfov`` is exactly the angular misregistration this tool exists to
+prevent.
 
 Why
 ---
-``run_pipeline.py --src-hfov`` decides how wide the source content is spread
-over the sphere.  Nobody has ever *measured* it: a generation prompt that says
-"ultra wide / 16mm / fisheye" is a style hint, not a lens spec, so today the
-owner eyeballs a number per clip.  Ten degrees of error is not a cosmetic white
-edge — it is angular misregistration (turn your head 50° and the object is no
-longer at 50°).  This script turns that guess into a measurement.
+Whichever source model the pipeline is told to assume, the angle decides how
+wide the content is spread over the sphere.  Nobody has ever *measured* it: a
+generation prompt that says "ultra wide / 16mm / fisheye" is a style hint, not a
+lens spec, so today the owner eyeballs a number per clip.  Ten degrees of error
+is not a cosmetic white edge — it is angular misregistration (turn your head 50°
+and the object is no longer at 50°).  This script turns that guess into a
+measurement — for equidistant sources, which is the only case it *can* measure
+(see the corollary below).
 
 Principle (zero new dependencies — ffmpeg ``v360`` + OpenCV only)
 ----------------------------------------------------------------
@@ -35,9 +50,29 @@ real wide lenses actually look like.  Everything else — the two-stage round
 trip through ``hequirect``, the candidate grid, the straightness score — is as
 the card specifies.
 
-The honest corollary: a source that really is a clean pinhole render carries no
-fov evidence at all.  Then the score curve *is* flat, and this script says
-"置信度低" instead of inventing a number.  See ``--min-margin``.
+The honest corollary — and why the answer can only ever be a ``--fisheye-fov``
+.............................................................................
+Because pinhole → sphere → pinhole is a homography, a source that really *is* a
+clean pinhole render carries no fov evidence at all: no round-trip method,
+this one included, can recover its hfov.  So the tool cannot produce a
+``--src-hfov`` even in principle — it measures an equidistant span, and that
+span is what ``--fisheye-fov`` consumes.
+
+When that is the case here — a flat curve, or a curve that just slides
+monotonically down onto the bottom grid edge — the script says "置信度低" and
+names the next step instead of inventing a number: reach for a single-image
+camera calibrator (GeoCalib / AnyCalib) or eyeball a few candidates by hand with
+``v360 output=flat``.  See ``--min-margin``, :data:`LOW_CONFIDENCE_TEXT` and
+:data:`NEAR_PINHOLE_TEXT`.
+
+Known caveat when handing the number to the pipeline
+....................................................
+This script models the source with an *isotropic* angular scale
+(``iv_fov = ih_fov * height / width``, i.e. the same degrees per pixel on both
+axes), while ``run_pipeline.py --fisheye-fov N`` sets ``ih_fov = iv_fov = N``
+(#294).  The horizontal span therefore transfers exactly; on a non-square frame
+the two differ in how they read the *vertical* axis.  Nothing here changes that
+— it is recorded so the number is not over-trusted vertically.
 
 Score
 -----
@@ -57,6 +92,9 @@ Usage
     python scripts/calibrate_hfov.py clip.mp4 --json out/hfov.json --plot out/hfov.png
 
 The input may be a video or a still image; a still is scored as a single frame.
+The JSON result reports the recommendation under ``recommended_fisheye_fov``
+(deliberately *not* ``recommended_hfov``, which read as if it were a
+``--src-hfov``) alongside ``consumer_flags``, which spells the destination out.
 """
 
 from __future__ import annotations
@@ -128,8 +166,32 @@ _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", "
 #: Printed verbatim when the curve is too flat to trust — the card requires the
 #: literal string, and the operator needs the fallback instruction with it.
 LOW_CONFIDENCE_TEXT = (
-    "置信度低：评分曲线过平，画面里没有足够的直线证据。"
-    "不要直接采用推荐值，请人工用 v360 output=flat 目视比对几档 hfov 后再定。"
+    "置信度低：评分曲线过平——画面里没有足够的直线证据，或该源本就接近针孔（rectilinear），"
+    "而针孔源的 hfov 用往返直线度法在原理上就测不出来。不要直接采用推荐值。"
+    "下一步：改用单图相机标定（GeoCalib / AnyCalib），或人工用 v360 output=flat "
+    "目视比对几档后手工决定——这两条路估的是相机内参（针孔），对应的参数是 --src-hfov。"
+)
+
+#: Appended when the curve slides monotonically onto the bottom grid edge.  That
+#: shape is not "a wide source just outside the grid" — it is the signature of a
+#: source with no equidistant bow to measure, i.e. a near-pinhole render, since
+#: pinhole → sphere → pinhole is a homography (see the module docstring).
+NEAR_PINHOLE_TEXT = (
+    "评分曲线单调递增、推荐值贴着网格下沿：该源很可能本来就接近针孔（rectilinear）渲染，"
+    "此法测不了针孔 hfov，不要硬取这个数。改用 GeoCalib / AnyCalib 单图标定，"
+    "或人工用 v360 output=flat 目视比对几档后手工决定 --src-hfov。"
+)
+
+#: The one correct destination of the recommended value.  ``--src-hfov`` is the
+#: *pinhole* parameter (``v360=input=flat:ih_fov=<src_hfov>``) and is a
+#: different lens model; see the module docstring.
+CONSUMER_FLAGS = "--input-projection fisheye --fisheye-fov <N>"
+
+#: Spelled out next to every recommendation so the number cannot be
+#: copy-pasted into the wrong flag.
+NOT_SRC_HFOV_TEXT = (
+    "注意：这是等距鱼眼视场，不是 --src-hfov"
+    "（--src-hfov 是针孔参数 v360=input=flat:ih_fov=<src_hfov>，喂错即几何错位）。"
 )
 
 
@@ -407,9 +469,15 @@ class CandidateScore:
 
 @dataclass
 class CalibrationResult:
-    """Everything the CLI prints, serialises or plots."""
+    """Everything the CLI prints, serialises or plots.
 
-    recommended_hfov: float | None
+    ``recommended_fisheye_fov`` is an **equidistant fisheye** span, consumed by
+    ``--input-projection fisheye --fisheye-fov``.  The name carries the model on
+    purpose: an earlier ``recommended_hfov`` read like a ``--src-hfov``, which is
+    the *pinhole* parameter and a different lens entirely.
+    """
+
+    recommended_fisheye_fov: float | None
     confidence: str
     margin: float
     scores: list[CandidateScore]
@@ -431,7 +499,12 @@ class CalibrationResult:
             "frames": self.frames,
             "analysis_size": list(self.analysis_size),
             "out_fov": self.out_fov,
-            "recommended_hfov": self.recommended_hfov,
+            "recommended_fisheye_fov": self.recommended_fisheye_fov,
+            # What the number *is* and where it goes, carried in the payload so
+            # a machine consumer cannot mistake it for a pinhole --src-hfov.
+            "measured_model": "equidistant_fisheye",
+            "consumer_flags": CONSUMER_FLAGS,
+            "not_src_hfov": True,
             "confidence": self.confidence,
             "margin": round(self.margin, 6),
             "min_margin": self.min_margin,
@@ -473,6 +546,20 @@ def _grid_step(scores: Sequence[CandidateScore]) -> float:
     return min(abs(b.hfov - a.hfov) for a, b in pairwise(scores)) or 0.0
 
 
+def _slides_onto_the_low_edge(scores: Sequence[CandidateScore], best: CandidateScore) -> bool:
+    """True when the curve only ever rises with hfov and bottoms out at the edge.
+
+    Reporting only — the recommendation and the confidence rule are untouched.
+    A genuine minimum sits *inside* the grid; a curve that just leans, with its
+    lowest point pinned to the first candidate, is the shape a source with no
+    equidistant bow to measure produces (see :data:`NEAR_PINHOLE_TEXT`).
+    """
+    valid = [s for s in scores if s.score is not None]
+    if len(valid) < 3 or best.hfov != valid[0].hfov:
+        return False
+    return all(a.score <= b.score for a, b in pairwise(valid))
+
+
 def calibrate(
     frames: Sequence[np.ndarray],
     candidates: Sequence[float],
@@ -481,7 +568,11 @@ def calibrate(
     min_margin: float = DEFAULT_MIN_MARGIN,
     progress: Callable[[float, float | None], None] | None = None,
 ) -> CalibrationResult:
-    """Score every candidate hfov and pick the straightest.
+    """Score every candidate *equidistant fisheye* fov and pick the straightest.
+
+    The winner lands in :attr:`CalibrationResult.recommended_fisheye_fov`, i.e.
+    an argument for ``--input-projection fisheye --fisheye-fov``, never for the
+    pinhole ``--src-hfov``.
 
     ``rectifier`` is injectable so the scoring/summary logic is testable
     without ffmpeg; it defaults to the real :class:`V360Rectifier`.
@@ -515,7 +606,7 @@ def calibrate(
     if not valid:
         notes.append("没有任何候选档位找到可用的直线证据（画面可能无直线、过暗或过糊）。")
         return CalibrationResult(
-            recommended_hfov=None,
+            recommended_fisheye_fov=None,
             confidence="low",
             margin=0.0,
             scores=rows,
@@ -532,8 +623,10 @@ def calibrate(
     if best.hfov in (rows[0].hfov, rows[-1].hfov):
         notes.append(f"推荐值落在候选网格边界 {best.hfov:g}°，真实值可能在网格之外，建议用 --grid 扩大范围。")
         confidence = "low"
+    if _slides_onto_the_low_edge(rows, best):
+        notes.append(NEAR_PINHOLE_TEXT)
     return CalibrationResult(
-        recommended_hfov=best.hfov,
+        recommended_fisheye_fov=best.hfov,
         confidence=confidence,
         margin=margin,
         scores=rows,
@@ -645,26 +738,38 @@ def load_frames(
 
 
 def format_report(result: CalibrationResult) -> str:
-    """The human-readable score table + verdict."""
+    """The human-readable score table + verdict.
+
+    The verdict block names the lens model and the destination flags in full:
+    the measured quantity is an equidistant fisheye span, and the one mistake
+    that would undo the whole exercise is pasting it into ``--src-hfov``.
+    """
     w, h = result.analysis_size
     lines = [
         f"source          : {result.source}",
         f"frames analysed : {result.frames} @ {w}x{h}",
         f"round-trip window: {result.out_fov:g}°  (v360 fisheye→hequirect→flat)",
         "",
+        "  candidates are equidistant fisheye fovs (v360 input=fisheye:ih_fov)",
+        "",
         "  hfov      score   segments   frames",
         "  " + "-" * 36,
     ]
-    best = result.recommended_hfov
+    best = result.recommended_fisheye_fov
     for row in result.scores:
         marker = "*" if row.hfov == best else " "
         score = "     --" if row.score is None else f"{row.score:7.3f}"
         lines.append(f" {marker}{row.hfov:6.1f}  {score}   {row.segments:8d}  {row.frames_scored:7d}")
     lines.append("")
     if best is None:
-        lines.append("recommended --src-hfov : (none)")
+        lines.append("recommended fisheye fov (等距鱼眼视场) : (none)")
     else:
-        lines.append(f"recommended --src-hfov : {best:g}")
+        lines.append(f"recommended fisheye fov (等距鱼眼视场) : {best:g}")
+        # A low-confidence winner is still printed — the score table is useful —
+        # but it must not read like an instruction to go and use it.
+        lead = "consume as" if result.is_confident else "would consume as (置信度低，先别用)"
+        lines.append(f"  {lead} : run_pipeline.py --input-projection fisheye --fisheye-fov {best:g}")
+        lines.append(f"  {NOT_SRC_HFOV_TEXT}")
         if result.runners_up:
             lines.append("runners-up             : " + ", ".join(f"{v:g}°" for v in result.runners_up))
     lines.append(f"margin                 : {result.margin * 100:.1f}% (need >= {result.min_margin * 100:.1f}%)")
@@ -705,7 +810,7 @@ def render_plot(result: CalibrationResult, path: str | Path, size: tuple[int, in
     cv2.polylines(canvas, [pts], False, (180, 90, 40), 2, cv2.LINE_AA)
     for px, py in pts:
         cv2.circle(canvas, (int(px), int(py)), 3, (180, 90, 40), -1, cv2.LINE_AA)
-    if result.recommended_hfov is not None:
+    if result.recommended_fisheye_fov is not None:
         best = min(valid, key=lambda r: r.score)
         bx, by = to_px(best.hfov, best.score)
         cv2.circle(canvas, (bx, by), 7, (40, 40, 200), 2, cv2.LINE_AA)
@@ -714,10 +819,10 @@ def render_plot(result: CalibrationResult, path: str | Path, size: tuple[int, in
     font, fs = cv2.FONT_HERSHEY_SIMPLEX, 0.45
     cv2.putText(canvas, f"{lo_x:g}", (x0 - 10, y1 + 20), font, fs, (60, 60, 60), 1, cv2.LINE_AA)
     cv2.putText(canvas, f"{hi_x:g}", (x1 - 20, y1 + 20), font, fs, (60, 60, 60), 1, cv2.LINE_AA)
-    cv2.putText(canvas, "src hfov (deg)", ((x0 + x1) // 2 - 50, y1 + 38), font, fs, (60, 60, 60), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "fisheye fov (deg)", ((x0 + x1) // 2 - 55, y1 + 38), font, fs, (60, 60, 60), 1, cv2.LINE_AA)
     cv2.putText(canvas, f"{hi_y:.2f}", (8, y0 + 6), font, fs, (60, 60, 60), 1, cv2.LINE_AA)
     cv2.putText(canvas, f"{lo_y:.2f}", (8, y1), font, fs, (60, 60, 60), 1, cv2.LINE_AA)
-    title = f"straightness vs hfov  ->  {result.recommended_hfov:g} deg ({result.confidence})"
+    title = f"straightness vs fisheye fov  ->  --fisheye-fov {result.recommended_fisheye_fov:g} ({result.confidence})"
     cv2.putText(canvas, title, (x0, y0 - 14), font, 0.55, (30, 30, 30), 1, cv2.LINE_AA)
 
     out = Path(path)
@@ -735,14 +840,30 @@ def render_plot(result: CalibrationResult, path: str | Path, size: tuple[int, in
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="calibrate_hfov",
-        description="Estimate a source clip's horizontal FOV via a v360 round trip + line straightness.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Measure a source clip's EQUIDISTANT FISHEYE fov (等距鱼眼视场) via a v360 round trip + line straightness."
+        ),
+        epilog=(
+            "The recommended value is an equidistant fisheye field of view.  Feed it to:\n"
+            "    run_pipeline.py --input-projection fisheye --fisheye-fov <N>\n"
+            "\n"
+            "It is NOT --src-hfov.  --src-hfov is the pinhole parameter\n"
+            "(v360=input=flat:ih_fov=<src_hfov>); a pinhole source's hfov cannot be\n"
+            "measured this way at all, because pinhole -> sphere -> pinhole is a\n"
+            "homography and leaves the straightness score flat.  When that happens the\n"
+            "tool reports 置信度低 and points at GeoCalib / AnyCalib or a manual\n"
+            "'v360 output=flat' comparison instead of guessing.\n"
+        ),
     )
     parser.add_argument("source", help="video or still image to measure")
     parser.add_argument(
         "--frames", type=int, default=DEFAULT_FRAMES, help=f"frames to sample (default {DEFAULT_FRAMES})"
     )
     parser.add_argument(
-        "--grid", default=DEFAULT_GRID, help=f"candidate hfovs start:stop:step (default {DEFAULT_GRID})"
+        "--grid",
+        default=DEFAULT_GRID,
+        help=f"candidate equidistant fisheye fovs, start:stop:step (default {DEFAULT_GRID})",
     )
     parser.add_argument(
         "--out-fov",
@@ -768,7 +889,12 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         const="-",
         metavar="PATH",
-        help="emit JSON; bare --json prints to stdout, --json PATH writes a file",
+        help=(
+            "emit JSON; bare --json prints to stdout, --json PATH writes a file. "
+            "The recommendation is keyed 'recommended_fisheye_fov' (an equidistant "
+            "fisheye fov for --fisheye-fov, never a pinhole --src-hfov) and comes "
+            "with 'measured_model' / 'consumer_flags' saying so"
+        ),
     )
     parser.add_argument("--plot", metavar="PATH", help="write the score curve to a PNG")
     parser.add_argument("--quiet", action="store_true", help="suppress the per-candidate progress lines")
