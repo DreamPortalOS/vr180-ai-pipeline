@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-09-07T20:30:00+08:00",
+  "updated_at": "2026-09-07T23:05:00+08:00",
   "tasks": [
     {
       "id": "290",
@@ -31,13 +31,13 @@
       "id": "292",
       "issue": 292,
       "title": "10-bit HEVC e2e",
-      "status": "running",
+      "status": "ready-for-review",
       "worktree": "D:/Github/vr180-ai-pipeline/.claude/worktrees/agent-a763b87c888ce7342",
       "branch": "feat/issue-292-e2e-10bit",
       "head": "04bbd7f",
       "expected_commit": "04bbd7f",
-      "last_checked_at": "2026-09-07T20:30:00+08:00",
-      "next_check": "wait for Claude review verdict",
+      "last_checked_at": "2026-09-07T23:05:00+08:00",
+      "next_check": "manual diff review and full CI; Claude review hit max turns",
       "tests": "pytest tests/test_e2e_smoke.py -q; ruff check scripts/e2e_smoke.py tests/test_e2e_smoke.py"
     },
     {
