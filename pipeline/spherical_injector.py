@@ -13,6 +13,12 @@ patched in place should a spatial-media build still write the all-zero 360
 default, and the self-check refuses anything but the RFC values.
 :func:`read_projection_bounds` exposes the fields for tests and QA.
 
+Box headers come in three forms (ISO/IEC 14496-12 §4.2): a 32-bit size, a
+64-bit ``largesize`` (what ffmpeg writes for an ``mdat`` past 4 GiB — ten
+seconds of 8K HEVC) and size 0 ("to end of file").  Every walker here handles
+all three, and a 32-bit ``stco`` that can no longer hold its shifted offsets
+is widened to ``co64`` rather than truncated (issue #282).
+
 References:
 - Google spatial-media: https://github.com/google/spatial-media
 - Spherical Video V2 RFC: docs/spherical-video-v2-rfc.md in that repo
@@ -27,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 # ─── ISOBMFF constants ────────────────────────────────────────────────────────
 
@@ -100,8 +107,11 @@ _FIXED_0_32_QUARTER = 0x40000000  # 0.25 in 0.32 fixed point
 _EQUI_BOUNDS_VR180 = (0, 0, _FIXED_0_32_QUARTER, _FIXED_0_32_QUARTER)  # top, bottom, left, right
 
 # equi is a FullBox: size(4) type(4) version/flags(4) then the four u32 bounds.
+# The offset/size below assume the compact 8-byte header both writers emit;
+# :func:`_equi_bounds_at` handles a (legal, never seen) largesize header too.
 _EQUI_BOUNDS_OFFSET = 12
-_EQUI_BOX_SIZE = _EQUI_BOUNDS_OFFSET + 4 * 4
+_EQUI_BOUNDS_SIZE = 4 * 4
+_EQUI_BOX_SIZE = _EQUI_BOUNDS_OFFSET + _EQUI_BOUNDS_SIZE
 
 # Projection data boxes a proj box may carry (exactly one, right after prhd).
 _PROJECTION_DATA_BOXES = frozenset({b"equi", b"cbmp", b"mshp"})
@@ -141,96 +151,148 @@ def _build_sv3d(width: int, height: int, stereo_mode: str) -> bytes:
     return _box4(b"sv3d", _build_svhd() + _build_proj())
 
 
-def _find_box_at(buf: bytearray, box_type: bytes, start: int, end: int) -> int:
-    """Find an ISOBMFF box by type in a buffer range.
+# ─── ISOBMFF box headers ──────────────────────────────────────────────────────
+#
+# ISO/IEC 14496-12 §4.2 encodes a box's length in one of three ways (#282):
+#
+#   size >= 8   the box is ``size`` bytes long; header = size(4) + type(4)
+#   size == 1   a 64-bit ``largesize`` follows the type; header = 16 bytes —
+#               what ffmpeg writes for an ``mdat`` past 4 GiB (ten seconds of
+#               8K HEVC), and what the pre-#282 walker misread as "size < 8".
+#   size == 0   the box runs to the end of the file (or of the enclosing range)
+#
+# Every function that walks boxes goes through _read_box_header / _iter_boxes so
+# the three forms are handled identically for locating, sizing and shifting.
 
-    Returns the byte offset of the box, or -1 if not found.
+_BOX_HEADER_SIZE = 8
+_LARGE_BOX_HEADER_SIZE = 16
+
+
+def _read_box_header(buf: bytearray, pos: int, end: int) -> tuple[int, bytes, int] | None:
+    """Parse the box header at *pos*, bounded by *end*: ``(size, box_type, header_len)``.
+
+    ``size`` is the full box length including its header, so ``pos + size`` is
+    the next box.  Returns None when the header is truncated, the size field is
+    malformed (2..7, or a largesize below 16) or the box would overrun *end* —
+    walkers stop there instead of mis-reading whatever follows.
+    """
+    if pos + _BOX_HEADER_SIZE > end:
+        return None
+    size = struct.unpack_from(">I", buf, pos)[0]
+    box_type = bytes(buf[pos + 4 : pos + 8])
+    header_len = _BOX_HEADER_SIZE
+    if size == 1:
+        if pos + _LARGE_BOX_HEADER_SIZE > end:
+            return None
+        size = struct.unpack_from(">Q", buf, pos + 8)[0]
+        header_len = _LARGE_BOX_HEADER_SIZE
+    elif size == 0:
+        size = end - pos
+    if size < header_len or pos + size > end:
+        return None
+    return size, box_type, header_len
+
+
+def _box_header_len(buf: bytearray, pos: int) -> int:
+    """Header length of the box at *pos*: 16 when it carries a largesize field, else 8."""
+    return _LARGE_BOX_HEADER_SIZE if struct.unpack_from(">I", buf, pos)[0] == 1 else _BOX_HEADER_SIZE
+
+
+def _iter_boxes(buf: bytearray, start: int, end: int):
+    """Yield ``(offset, box_type, size, header_len)`` for every box in [start, end).
+
+    Stops at the first malformed or overrunning header (see :func:`_read_box_header`).
     """
     pos = start
-    while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos : pos + 4])[0]
-        if size < 8:
+    while pos < end:
+        header = _read_box_header(buf, pos, end)
+        if header is None:
             break
-        if buf[pos + 4 : pos + 8] == box_type:
-            return pos
+        size, box_type, header_len = header
+        yield pos, box_type, size, header_len
         pos += size
-    return -1
-
-
-# Plain container boxes: child boxes start right after the 8-byte header.
-_PLAIN_CONTAINERS = frozenset({b"moov", b"trak", b"mdia", b"minf", b"stbl"})
-
-# stsd is a FullBox: version/flags(4) + entry_count(4) precede the sample entries.
-_STSD_HEADER_SIZE = 16
-
-# Visual sample entries (avc1/hvc1/...) carry 78 bytes of fixed fields after the
-# 8-byte box header before any child boxes (sv3d/st3d live here per Spherical V2).
-_VISUAL_SAMPLE_ENTRIES = frozenset({b"avc1", b"avc3", b"hvc1", b"hev1", b"av01", b"vp09", b"mp4v"})
-_SAMPLE_ENTRY_HEADER_SIZE = 8 + 78
-
-
-def _find_box_recursive(buf: bytearray, box_type: bytes, start: int, end: int) -> int:
-    """Recursively search for an ISOBMFF box inside containers.
-
-    Searches top-level boxes, and recurses into containers (moov, trak, mdia,
-    minf, stbl), into stsd (FullBox + entry_count), and into visual sample
-    entries (avc1/hvc1/... — where Spherical V2 sv3d/st3d actually live).
-    Returns byte offset of the found box, or -1.
-    """
-    pos = start
-    while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos : pos + 4])[0]
-        if size < 8 or pos + size > end:
-            break
-        btype = bytes(buf[pos + 4 : pos + 8])
-        if btype == box_type:
-            return pos
-        if btype in _PLAIN_CONTAINERS:
-            inner_start = pos + 8
-        elif btype == b"stsd":
-            inner_start = pos + _STSD_HEADER_SIZE
-        elif btype in _VISUAL_SAMPLE_ENTRIES:
-            inner_start = pos + _SAMPLE_ENTRY_HEADER_SIZE
-        else:
-            pos += size
-            continue
-        # Bounds check: skip boxes whose declared header overruns the buffer
-        # instead of raising on a truncated/corrupt file.
-        if inner_start <= pos + size:
-            found = _find_box_recursive(buf, box_type, inner_start, pos + size)
-            if found != -1:
-                return found
-        pos += size
-    return -1
-
-
-def _header_size(box_type: bytes) -> int:
-    """Number of bytes before child boxes start, for known container kinds.
-
-    Plain containers: 8 (size + type).
-    stsd is a FullBox: 8 + 4 (version/flags) + 4 (entry_count) = 16.
-    Visual sample entries: 8 + 78 fixed fields = 86.
-    0 means "leaf / not descended into".
-    """
-    if box_type in _PLAIN_CONTAINERS:
-        return 8
-    if box_type == b"stsd":
-        return _STSD_HEADER_SIZE
-    if box_type in _VISUAL_SAMPLE_ENTRIES:
-        return _SAMPLE_ENTRY_HEADER_SIZE
-    return 0
 
 
 def _walk_boxes(buf: bytearray, start: int, end: int):
-    """Yield (offset, box_type, size) for every top-level box in [start, end)."""
-    pos = start
-    while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos : pos + 4])[0]
-        if size < 8 or pos + size > end:
-            break
-        btype = buf[pos + 4 : pos + 8]
-        yield pos, bytes(btype), size
-        pos += size
+    """Yield ``(offset, box_type, size)`` for every box in [start, end).
+
+    ``size`` includes the box's own 8- or 16-byte header, so ``offset + size``
+    is always the next box; the payload starts at ``offset +
+    _box_header_len(buf, offset)``.  A ``size == 0`` box reports the distance
+    to *end*.
+    """
+    for off, box_type, size, _header_len in _iter_boxes(buf, start, end):
+        yield off, box_type, size
+
+
+def _locate_box_at(buf: bytearray, box_type: bytes, start: int, end: int) -> tuple[int, int, int] | None:
+    """``(offset, size, header_len)`` of the first *box_type* directly inside [start, end), or None."""
+    for off, btype, size, header_len in _iter_boxes(buf, start, end):
+        if btype == box_type:
+            return off, size, header_len
+    return None
+
+
+def _find_box_at(buf: bytearray, box_type: bytes, start: int, end: int) -> int:
+    """Byte offset of the first *box_type* directly inside [start, end), or -1 if not found."""
+    found = _locate_box_at(buf, box_type, start, end)
+    return -1 if found is None else found[0]
+
+
+# Plain container boxes: child boxes start right after the box header.
+_PLAIN_CONTAINERS = frozenset({b"moov", b"trak", b"mdia", b"minf", b"stbl"})
+
+# stsd is a FullBox: version/flags(4) + entry_count(4) precede the sample entries.
+_STSD_FIXED_FIELDS = 8
+_STSD_HEADER_SIZE = _BOX_HEADER_SIZE + _STSD_FIXED_FIELDS
+
+# Visual sample entries (avc1/hvc1/...) carry 78 bytes of fixed fields after the
+# box header before any child boxes (sv3d/st3d live here per Spherical V2).
+_VISUAL_SAMPLE_ENTRIES = frozenset({b"avc1", b"avc3", b"hvc1", b"hev1", b"av01", b"vp09", b"mp4v"})
+_SAMPLE_ENTRY_FIXED_FIELDS = 78
+_SAMPLE_ENTRY_HEADER_SIZE = _BOX_HEADER_SIZE + _SAMPLE_ENTRY_FIXED_FIELDS
+
+
+def _children_start(box_type: bytes, box_off: int, header_len: int) -> int | None:
+    """Offset of the first child box of the container at *box_off*, or None for a leaf.
+
+    *header_len* is the box's own header (8, or 16 for largesize).  Plain
+    containers: children right after it.  stsd: after version/flags +
+    entry_count.  Visual sample entries: after their 78 fixed fields.
+    """
+    if box_type in _PLAIN_CONTAINERS:
+        return box_off + header_len
+    if box_type == b"stsd":
+        return box_off + header_len + _STSD_FIXED_FIELDS
+    if box_type in _VISUAL_SAMPLE_ENTRIES:
+        return box_off + header_len + _SAMPLE_ENTRY_FIXED_FIELDS
+    return None
+
+
+def _locate_box_recursive(buf: bytearray, box_type: bytes, start: int, end: int) -> tuple[int, int, int] | None:
+    """``(offset, size, header_len)`` of the first *box_type* found depth-first in [start, end), or None.
+
+    Descends into containers (moov, trak, mdia, minf, stbl), into stsd
+    (FullBox + entry_count) and into visual sample entries (avc1/hvc1/... —
+    where Spherical V2 sv3d/st3d actually live).
+    """
+    for off, btype, size, header_len in _iter_boxes(buf, start, end):
+        if btype == box_type:
+            return off, size, header_len
+        inner = _children_start(btype, off, header_len)
+        # Bounds check: skip boxes whose declared header overruns the box
+        # (truncated/corrupt file) instead of raising.
+        if inner is not None and inner <= off + size:
+            found = _locate_box_recursive(buf, box_type, inner, off + size)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_box_recursive(buf: bytearray, box_type: bytes, start: int, end: int) -> int:
+    """Byte offset of the first *box_type* found by :func:`_locate_box_recursive`, or -1."""
+    found = _locate_box_recursive(buf, box_type, start, end)
+    return -1 if found is None else found[0]
 
 
 def _find_visual_sample_entry(buf: bytearray) -> tuple[int, int, list[tuple[int, int, bytes]]] | None:
@@ -242,25 +304,18 @@ def _find_visual_sample_entry(buf: bytearray) -> tuple[int, int, list[tuple[int,
     (offset, size, box_type) in root->parent order: moov first, then trak,
     mdia, minf, stbl and finally stsd (the entry's immediate parent).  Only
     containers that actually own the entry are in the chain.  Returns None if
-    no such entry is reachable.
+    no such entry is reachable.  A largesize ``mdat`` ahead of moov (mdat-first
+    layout past 4 GiB) is stepped over like any other box.
     """
-    # Walk top-level boxes to find moov.
-    for moov_off, moov_type, moov_sz in _walk_boxes(buf, 0, len(buf)):
+    for moov_off, moov_type, moov_sz, moov_hl in _iter_boxes(buf, 0, len(buf)):
         if moov_type != b"moov":
             continue
         chain: list[tuple[int, int, bytes]] = [(moov_off, moov_sz, moov_type)]
-        try:
-            entry_off, entry_sz = _descend_to_entry(buf, moov_off + 8, moov_off + moov_sz, chain)
-        except _DescendError:
-            continue
+        entry_off, entry_sz = _descend_to_entry(buf, moov_off + moov_hl, moov_off + moov_sz, chain)
         if entry_off is None:
             continue
         return entry_off, entry_sz, chain
     return None
-
-
-class _DescendError(Exception):
-    """Raised when the expected moov->...->stsd box path is not found."""
 
 
 def _descend_to_entry(
@@ -269,39 +324,41 @@ def _descend_to_entry(
     """Recursively descend moov->trak->mdia->minf->stbl->stsd -> visual entry.
 
     Appends each container box to *chain* as we descend (so the caller gets the
-    full ancestor stack in parent->root order). Returns (entry_offset,
+    full ancestor stack in root->parent order). Returns (entry_offset,
     entry_size) of the first visual sample entry found, or (None, 0).
     """
-    pos = start
-    while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos : pos + 4])[0]
-        if size < 8 or pos + size > end:
-            break
-        btype = bytes(buf[pos + 4 : pos + 8])
+    for off, btype, size, header_len in _iter_boxes(buf, start, end):
         if btype in _VISUAL_SAMPLE_ENTRIES:
-            return pos, size
-        hs = _header_size(btype)
-        if hs == 0:
-            pos += size
+            return off, size
+        inner = _children_start(btype, off, header_len)
+        if inner is None or inner > off + size:
             continue
         tracked = btype in (b"trak", b"mdia", b"minf", b"stbl", b"stsd")
         if tracked:
-            chain.append((pos, size, btype))
-        inner = _descend_to_entry(buf, pos + hs, pos + size, chain)
-        if inner[0] is not None:
-            return inner
+            chain.append((off, size, btype))
+        found = _descend_to_entry(buf, inner, off + size, chain)
+        if found[0] is not None:
+            return found
         if tracked:
             # Backtrack: this container (e.g. an audio trak that precedes the
             # video trak) does not own the entry and must not get its size bumped.
             chain.pop()
-        pos += size
     return (None, 0)
 
 
 def _bump_box_size(buf: bytearray, offset: int, delta: int) -> None:
-    """Atomically add *delta* to the 4-byte big-endian size field at *offset*."""
-    old = struct.unpack(">I", buf[offset : offset + 4])[0]
-    struct.pack_into(">I", buf, offset, old + delta)
+    """Add *delta* to the size of the box at *offset*.
+
+    Writes the 32-bit size field, or the 64-bit largesize field when the box
+    uses one (size == 1).  A size-0 box runs to the end of the file and needs
+    no update.
+    """
+    size = struct.unpack_from(">I", buf, offset)[0]
+    if size == 1:
+        large = struct.unpack_from(">Q", buf, offset + 8)[0]
+        struct.pack_into(">Q", buf, offset + 8, large + delta)
+    elif size != 0:
+        struct.pack_into(">I", buf, offset, size + delta)
 
 
 def inject_spherical_metadata(
@@ -369,22 +426,29 @@ def _inject_via_python_isobmff(output_path: str, stereo_mode: str) -> None:
 
     1. Read the whole MP4 into a bytearray and locate the first visual sample
        entry (avc1/hvc1/...) via moov->trak->mdia->minf->stbl->stsd, together
-       with that chain of ancestor boxes.
-    2. Rebuild the sample entry: keep its 8+78 byte header and every existing
-       child box except a previous st3d/sv3d, then append fresh st3d + sv3d
-       (st3d first, as the spec asks).  Replacing rather than appending keeps a
-       re-injection idempotent — ffmpeg ``-c copy`` (audio remux) carries a
-       valid sv3d/st3d through, and ffmpeg rejects a sample entry with two st3d.
-    3. ``delta`` = new entry length - old entry length (0 or negative when the
-       boxes being replaced were at least as large).
-    4. Shift every ``stco``/``co64`` entry of **every** trak that points at or
-       past the end of the old entry by ``delta`` — those are the bytes that
-       physically moved.  With ``+faststart`` (moov before mdat) that is all of
-       them; with moov after mdat none qualify and the same code path leaves
-       them untouched.  The pre-#279 writer added delta unconditionally, which
-       is what corrupted the mdat-first layout.
-    5. Splice the new entry in and bump the size field of each ancestor
-       (stsd, stbl, minf, mdia, trak, moov) by ``delta``.
+       with that chain of ancestor boxes.  Boxes of every size form (32-bit,
+       largesize, size 0) are stepped over correctly (#282).
+    2. Rebuild the sample entry: keep its header + 78 fixed bytes and every
+       existing child box except a previous st3d/sv3d, then append fresh st3d
+       + sv3d (st3d first, as the spec asks).  Replacing rather than appending
+       keeps a re-injection idempotent — ffmpeg ``-c copy`` (audio remux)
+       carries a valid sv3d/st3d through, and ffmpeg rejects a sample entry
+       with two st3d.
+    3. ``entry_delta`` = new entry length - old entry length (0 or negative
+       when the boxes being replaced were at least as large).
+    4. Plan the chunk-offset shift: every ``stco``/``co64`` entry of **every**
+       trak that points at or past the end of the old entry moves by the total
+       growth of moov — those are the bytes that physically moved.  With
+       ``+faststart`` (moov before mdat) that is all of them; with moov after
+       mdat none qualify and the tables are left untouched.  (The pre-#279
+       writer added the delta unconditionally, which corrupted the mdat-first
+       layout.)  A 32-bit ``stco`` whose shifted values would not fit is
+       widened to ``co64`` — never truncated (#282); widening grows moov by 4
+       bytes per entry, so :func:`_plan_chunk_offset_shift` settles the total.
+    5. Apply: patch the tables that keep their width in place, then splice the
+       new sample entry and every widened table in from the highest offset
+       down, bumping each one's ancestors (stsd/stbl/minf/mdia/trak/moov for
+       the entry, stbl/minf/mdia/trak/moov for a table) by its own growth.
 
     Raises:
         RuntimeError: if no injectable visual sample entry is found or a chunk
@@ -402,15 +466,33 @@ def _inject_via_python_isobmff(output_path: str, stereo_mode: str) -> None:
     # st3d is the sibling that precedes sv3d.
     payload = _build_st3d(stereo_mode) + _build_sv3d(7680, 1920, stereo_mode)
     new_entry = _rebuild_sample_entry(buf, entry_off, entry_sz, payload)
-    delta = len(new_entry) - entry_sz
+    entry_delta = len(new_entry) - entry_sz
 
-    # Chunk offsets are patched on the *unmodified* buffer so every coordinate
-    # (threshold and box positions) is still expressed in original-file terms.
-    _shift_chunk_offsets(buf, moov_off, moov_sz, threshold=old_entry_end, delta=delta)
+    # Everything below is planned on the *unmodified* buffer so every coordinate
+    # (threshold, box positions, ancestor size fields) is in original-file terms.
+    tables = list(_iter_chunk_tables(buf, moov_off + _box_header_len(buf, moov_off), moov_off + moov_sz))
+    delta, widen = _plan_chunk_offset_shift(tables, threshold=old_entry_end, entry_delta=entry_delta)
 
-    buf[entry_off:old_entry_end] = new_entry
-    for anc_off, _anc_sz, _anc_type in chain:
-        _bump_box_size(buf, anc_off, delta)
+    # Splices (replacements that change a box's length) are applied from the
+    # highest offset down: the other splice points and every ancestor's size
+    # field all sit *before* the bytes they own, so they stay valid throughout.
+    splices: list[tuple[int, int, bytes, tuple[int, ...]]] = [
+        (entry_off, entry_sz, new_entry, tuple(off for off, _sz, _type in chain)),
+    ]
+    for table in tables:
+        shifted = [value + delta if value >= old_entry_end else value for value in table.values]
+        if table.offset in widen:
+            print(
+                f"[Metadata] stco at offset {table.offset} widened to co64: {len(shifted)} chunk offsets "
+                f"would exceed 4 GiB after moov grew by {delta} bytes"
+            )
+            splices.append((table.offset, table.size, _build_co64(shifted), (moov_off, *table.ancestors)))
+        else:
+            _write_chunk_offsets(buf, table, shifted)
+    for off, old_size, new_bytes, ancestors in sorted(splices, key=lambda splice: splice[0], reverse=True):
+        buf[off : off + old_size] = new_bytes
+        for ancestor in ancestors:
+            _bump_box_size(buf, ancestor, len(new_bytes) - old_size)
 
     Path(output_path).write_bytes(bytes(buf))
 
@@ -420,68 +502,137 @@ def _rebuild_sample_entry(buf: bytearray, entry_off: int, entry_sz: int, new_chi
 
     Existing child boxes other than st3d/sv3d (avcC/hvcC, pasp, colr, ...) are
     kept in order; any unparseable tail bytes are preserved after the new boxes
-    so a quirky-but-working file is not made worse.  The size field of the
-    returned entry is already correct.
+    so a quirky-but-working file is not made worse.  The entry is always
+    emitted with the compact 8-byte header (a largesize sample entry is legal
+    but pointless) and its size field is already correct.
     """
     entry_end = entry_off + entry_sz
-    head_end = entry_off + _SAMPLE_ENTRY_HEADER_SIZE
-    if head_end > entry_end:
+    header_len = _box_header_len(buf, entry_off)
+    fields_end = entry_off + header_len + _SAMPLE_ENTRY_FIXED_FIELDS
+    if fields_end > entry_end:
         raise RuntimeError(
-            f"visual sample entry at offset {entry_off} is shorter than its {_SAMPLE_ENTRY_HEADER_SIZE}-byte header"
+            f"visual sample entry at offset {entry_off} is shorter than its "
+            f"{header_len + _SAMPLE_ENTRY_FIXED_FIELDS}-byte header"
         )
 
     kept = bytearray()
-    consumed = head_end
-    for off, btype, size in _walk_boxes(buf, head_end, entry_end):
+    consumed = fields_end
+    for off, btype, size in _walk_boxes(buf, fields_end, entry_end):
         if btype not in (b"st3d", b"sv3d"):
             kept += buf[off : off + size]
         consumed = off + size
 
-    new_entry = bytearray(buf[entry_off:head_end]) + kept + new_children + buf[consumed:entry_end]
-    struct.pack_into(">I", new_entry, 0, len(new_entry))
-    return bytes(new_entry)
+    body = bytes(buf[entry_off + header_len : fields_end]) + bytes(kept) + new_children + bytes(buf[consumed:entry_end])
+    return _box4(bytes(buf[entry_off + 4 : entry_off + 8]), body)
 
+
+# ─── Chunk offset tables (stco / co64) ───────────────────────────────────────
 
 # Containers to descend through when looking for chunk-offset tables.
 _CHUNK_OFFSET_PARENTS = frozenset({b"trak", b"mdia", b"minf", b"stbl"})
 
+_U32_MAX = 0xFFFF_FFFF
 
-def _iter_chunk_offset_boxes(buf: bytearray, start: int, end: int):
-    """Yield (offset, box_type, size) for every stco/co64 box under [start, end)."""
-    for off, btype, size in _walk_boxes(buf, start, end):
-        if btype in (b"stco", b"co64"):
-            yield off, btype, size
-        elif btype in _CHUNK_OFFSET_PARENTS:
-            yield from _iter_chunk_offset_boxes(buf, off + 8, off + size)
+#: Largest file offset a 32-bit ``stco`` entry may hold after the shift.  A
+#: table that would have to point past it once moov has grown is rewritten as
+#: ``co64`` (#282); tests lower this to force the widening on small clips.
+_STCO_MAX_OFFSET = _U32_MAX
+
+# stco/co64 are FullBoxes: header, version+flags(4), entry_count(4), then the
+# 32-bit (stco) or 64-bit (co64) absolute file offsets.
+_CHUNK_TABLE_FIXED_FIELDS = 8
 
 
-def _shift_chunk_offsets(buf: bytearray, moov_off: int, moov_sz: int, *, threshold: int, delta: int) -> int:
-    """Add *delta* to every stco/co64 entry >= *threshold* in every trak of the moov.
+class _ChunkTable(NamedTuple):
+    """One stco/co64 box as found in the unmodified file."""
 
-    stco/co64 are FullBoxes: size(4) type(4) version+flags(4) entry_count(4)
-    followed by 32-bit (stco) or 64-bit (co64) absolute file offsets.  Only
-    offsets at/after *threshold* — the bytes that actually moved — are shifted.
-    Returns the number of entries shifted.
+    offset: int
+    box_type: bytes
+    size: int
+    header_len: int
+    ancestors: tuple[int, ...]  # offsets of the trak/mdia/minf/stbl boxes owning it, outermost first
+    values: list[int]  # chunk offsets as stored
+
+
+def _chunk_offset_format(box_type: bytes, count: int) -> str:
+    return f">{count}{'I' if box_type == b'stco' else 'Q'}"
+
+
+def _read_chunk_offsets(buf: bytearray, off: int, box_type: bytes, size: int, header_len: int) -> list[int]:
+    """The chunk offsets stored in the stco/co64 box at *off*.
 
     Raises:
-        RuntimeError: if a table's entry_count does not fit inside its box.
+        RuntimeError: if the table's entry_count does not fit inside its box.
     """
-    shifted = 0
-    for off, btype, size in _iter_chunk_offset_boxes(buf, moov_off + 8, moov_off + moov_sz):
-        fmt, width = (">I", 4) if btype == b"stco" else (">Q", 8)
-        count = struct.unpack(">I", buf[off + 12 : off + 16])[0]
-        table = off + 16
-        if table + count * width > off + size:
-            raise RuntimeError(
-                f"malformed {btype.decode('ascii')} box at offset {off}: entry_count {count} does not fit in size {size}"
+    width = 4 if box_type == b"stco" else 8
+    count = struct.unpack_from(">I", buf, off + header_len + 4)[0]
+    table = off + header_len + _CHUNK_TABLE_FIXED_FIELDS
+    if table + count * width > off + size:
+        raise RuntimeError(
+            f"malformed {box_type.decode('ascii')} box at offset {off}: entry_count {count} does not fit in size {size}"
+        )
+    return list(struct.unpack_from(_chunk_offset_format(box_type, count), buf, table))
+
+
+def _iter_chunk_tables(buf: bytearray, start: int, end: int, ancestors: tuple[int, ...] = ()):
+    """Yield a :class:`_ChunkTable` for every stco/co64 box under [start, end), in file order."""
+    for off, btype, size, header_len in _iter_boxes(buf, start, end):
+        if btype in (b"stco", b"co64"):
+            yield _ChunkTable(
+                off, btype, size, header_len, ancestors, _read_chunk_offsets(buf, off, btype, size, header_len)
             )
-        for i in range(count):
-            at = table + i * width
-            (value,) = struct.unpack(fmt, buf[at : at + width])
-            if value >= threshold:
-                struct.pack_into(fmt, buf, at, value + delta)
-                shifted += 1
-    return shifted
+        elif btype in _CHUNK_OFFSET_PARENTS:
+            yield from _iter_chunk_tables(buf, off + header_len, off + size, (*ancestors, off))
+
+
+def _write_chunk_offsets(buf: bytearray, table: _ChunkTable, values: list[int]) -> None:
+    """Overwrite the offsets of *table* in place (same count, same width).
+
+    Raises:
+        RuntimeError: if a value does not fit a 32-bit stco entry — the planner
+                      must have widened that table; nothing is ever truncated.
+    """
+    if table.box_type == b"stco" and any(value > _U32_MAX for value in values):
+        raise RuntimeError(
+            f"stco at offset {table.offset} cannot hold a chunk offset past 4 GiB; it must be widened to co64"
+        )
+    at = table.offset + table.header_len + _CHUNK_TABLE_FIXED_FIELDS
+    struct.pack_into(_chunk_offset_format(table.box_type, len(values)), buf, at, *values)
+
+
+def _build_co64(values: list[int]) -> bytes:
+    """A ``co64`` FullBox(v0) holding *values* as 64-bit chunk offsets."""
+    return _full_box(
+        b"co64", 0, 0, _u32(len(values)) + struct.pack(_chunk_offset_format(b"co64", len(values)), *values)
+    )
+
+
+def _plan_chunk_offset_shift(
+    tables: list[_ChunkTable], *, threshold: int, entry_delta: int
+) -> tuple[int, frozenset[int]]:
+    """Settle how far the media moves and which stco tables must become co64.
+
+    Every chunk offset at/after *threshold* moves by the total growth of moov:
+    *entry_delta* plus 4 bytes per entry of every stco widened to co64.  A
+    32-bit table is widened when any of its moved offsets would exceed
+    :data:`_STCO_MAX_OFFSET`.  Widening one table grows moov, which can push
+    another table over the limit, so this iterates to a fixed point (at most
+    one round per stco table).  Returns ``(delta, offsets of tables to widen)``.
+    """
+    widen: set[int] = set()
+    delta = entry_delta
+    while True:
+        overflowing = {
+            table.offset
+            for table in tables
+            if table.box_type == b"stco"
+            and table.offset not in widen
+            and any(value >= threshold and value + delta > _STCO_MAX_OFFSET for value in table.values)
+        }
+        if not overflowing:
+            return delta, frozenset(widen)
+        widen |= overflowing
+        delta = entry_delta + sum(4 * len(table.values) for table in tables if table.offset in widen)
 
 
 # ffmpeg stderr fragments that mean the file is broken even when the process
@@ -532,33 +683,34 @@ def _spherical_structure_problems(buf: bytearray) -> list[str]:
     problems: list[str] = []
     if _find_box_recursive(buf, b"st3d", 0, len(buf)) == -1:
         problems.append("missing st3d box")
-    sv3d_off = _find_box_recursive(buf, b"sv3d", 0, len(buf))
-    if sv3d_off == -1:
+    sv3d = _locate_box_recursive(buf, b"sv3d", 0, len(buf))
+    if sv3d is None:
         problems.append("missing sv3d box")
         return problems
 
-    sv3d_sz = struct.unpack(">I", buf[sv3d_off : sv3d_off + 4])[0]
-    sv3d_children = list(_walk_boxes(buf, sv3d_off + 8, sv3d_off + sv3d_sz))
-    sv3d_types = [btype for _off, btype, _sz in sv3d_children]
+    sv3d_off, sv3d_sz, sv3d_hl = sv3d
+    sv3d_children = list(_iter_boxes(buf, sv3d_off + sv3d_hl, sv3d_off + sv3d_sz))
+    sv3d_types = [btype for _off, btype, _sz, _hl in sv3d_children]
     if sv3d_types[:1] != [b"svhd"]:
         problems.append(f"sv3d must start with svhd, found {sv3d_types}")
     if len(sv3d_types) < 2 or sv3d_types[1] != b"proj":
         problems.append(f"sv3d must carry proj right after svhd, found {sv3d_types}")
         return problems
 
-    proj_off, _proj_type, proj_sz = sv3d_children[1]
-    proj_children = list(_walk_boxes(buf, proj_off + 8, proj_off + proj_sz))
-    proj_types = [btype for _off, btype, _sz in proj_children]
+    proj_off, _proj_type, proj_sz, proj_hl = sv3d_children[1]
+    proj_children = list(_iter_boxes(buf, proj_off + proj_hl, proj_off + proj_sz))
+    proj_types = [btype for _off, btype, _sz, _hl in proj_children]
     if proj_types[:1] != [b"prhd"]:
         problems.append(f"proj must start with prhd, found {proj_types}")
     if len(proj_types) < 2 or proj_types[1] not in _PROJECTION_DATA_BOXES:
         problems.append(f"proj must carry one of equi/cbmp/mshp after prhd, found {proj_types}")
         return problems
 
-    equi_off, equi_type, equi_sz = proj_children[1]
+    equi_off, equi_type, equi_sz, equi_hl = proj_children[1]
     if equi_type == b"equi":
-        if equi_sz < _EQUI_BOX_SIZE:
-            problems.append(f"equi box is {equi_sz} bytes, expected at least {_EQUI_BOX_SIZE}")
+        equi_min_size = equi_hl + (_EQUI_BOX_SIZE - _BOX_HEADER_SIZE)
+        if equi_sz < equi_min_size:
+            problems.append(f"equi box is {equi_sz} bytes, expected at least {equi_min_size}")
         else:
             bounds = _unpack_equi_bounds(buf, equi_off)
             if bounds != _EQUI_BOUNDS_VR180:
@@ -573,23 +725,28 @@ def _spherical_structure_problems(buf: bytearray) -> list[str]:
 
 def _find_equi_offset(buf: bytearray) -> int:
     """Byte offset of the ``equi`` box under ``sv3d -> proj``, or -1 when any of the three is missing."""
-    sv3d_off = _find_box_recursive(buf, b"sv3d", 0, len(buf))
-    if sv3d_off == -1:
+    sv3d = _locate_box_recursive(buf, b"sv3d", 0, len(buf))
+    if sv3d is None:
         return -1
-    sv3d_sz = struct.unpack_from(">I", buf, sv3d_off)[0]
-    proj_off = _find_box_at(buf, b"proj", sv3d_off + 8, sv3d_off + sv3d_sz)
-    if proj_off == -1:
+    sv3d_off, sv3d_sz, sv3d_hl = sv3d
+    proj = _locate_box_at(buf, b"proj", sv3d_off + sv3d_hl, sv3d_off + sv3d_sz)
+    if proj is None:
         return -1
-    proj_sz = struct.unpack_from(">I", buf, proj_off)[0]
-    equi_off = _find_box_at(buf, b"equi", proj_off + 8, proj_off + proj_sz)
-    if equi_off == -1 or equi_off + _EQUI_BOX_SIZE > len(buf):
+    proj_off, proj_sz, proj_hl = proj
+    equi = _locate_box_at(buf, b"equi", proj_off + proj_hl, proj_off + proj_sz)
+    if equi is None or _equi_bounds_at(buf, equi[0]) + _EQUI_BOUNDS_SIZE > len(buf):
         return -1
-    return equi_off
+    return equi[0]
+
+
+def _equi_bounds_at(buf: bytearray, equi_off: int) -> int:
+    """Offset of the four bounds fields: past the box header (8, or 16 for largesize) and version/flags."""
+    return equi_off + _box_header_len(buf, equi_off) + 4
 
 
 def _unpack_equi_bounds(buf: bytearray, equi_off: int) -> tuple[int, int, int, int]:
     """(top, bottom, left, right) u32 fields of the equi box at *equi_off*."""
-    top, bottom, left, right = struct.unpack_from(">IIII", buf, equi_off + _EQUI_BOUNDS_OFFSET)
+    top, bottom, left, right = struct.unpack_from(">IIII", buf, _equi_bounds_at(buf, equi_off))
     return top, bottom, left, right
 
 
@@ -629,7 +786,7 @@ def _rewrite_projection_bounds(path: str | os.PathLike[str], bounds: tuple[int, 
     if equi_off == -1:
         return False
     packed = struct.pack(">IIII", *bounds)
-    at = equi_off + _EQUI_BOUNDS_OFFSET
+    at = _equi_bounds_at(buf, equi_off)
     if buf[at : at + len(packed)] == packed:
         return False
     with open(path, "r+b") as fh:
