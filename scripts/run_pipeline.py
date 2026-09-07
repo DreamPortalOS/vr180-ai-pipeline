@@ -373,7 +373,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-width", type=int, default=None, help="Equirectangular output width per eye")
     parser.add_argument("--output-height", type=int, default=None, help="Equirectangular output height per eye")
-    parser.add_argument("--src-hfov", type=float, default=70.0, help="Source camera horizontal FOV (degrees)")
+    parser.add_argument("--src-hfov", type=float, default=None, help="Source camera horizontal FOV (degrees)")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of frames (for testing)")
     parser.add_argument(
         "--chunk-size",
@@ -510,6 +510,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # Phase 2: Smart SBS detection (Task 1.1)
     parser.add_argument(
         "--force-sbs", action="store_true", help="Force treat input as SBS stereo (skip depth/stereo stages)"
+    )
+    parser.add_argument(
+        "--input-projection",
+        choices=["rectilinear", "equirect"],
+        default="rectilinear",
+        help="Input projection: rectilinear (default) or equirect (skip source-to-equirect mapping)",
     )
 
     # R-5: Fulldome projection
@@ -762,6 +768,9 @@ def parse_args(argv: list[str] | None = None):
     """Parse CLI arguments.  Accept optional *argv* for testing."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+    args._src_hfov_explicit = args.src_hfov is not None
+    if args.src_hfov is None:
+        args.src_hfov = 70.0
     # P0-3 (#244): reject impossible feather angles here, not after depth/stereo ran.
     try:
         resolve_edge_feather(args.edge_feather_start, args.edge_feather_end)
@@ -2069,6 +2078,44 @@ def load_checkpoint(temp_dir: str):
 
 STAGE_ORDER = ["upscale", "depth", "stereo", "equirect", "outpaint", "metadata"]
 STAGE_ORDER_SBS = ["upscale", "equirect", "outpaint", "metadata"]  # Skip depth & stereo for SBS input
+STAGE_ORDER_EQUIRECT = ["upscale", "depth", "stereo", "outpaint", "metadata"]
+
+
+def validate_input_projection(args) -> None:
+    """Warn about options and dimensions that do not fit equirect input."""
+    if getattr(args, "input_projection", "rectilinear") != "equirect":
+        return
+
+    if getattr(args, "_src_hfov_explicit", False):
+        log.warning("--src-hfov is ignored for equirect input; source camera FOV does not apply")
+
+    cap = cv2.VideoCapture(args.input)
+    if not cap.isOpened():
+        return
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if width and height and width != height:
+        log.warning(
+            "Equirect input is %dx%d; 180°x180° equirect input should be square, "
+            "otherwise the spherical image will be distorted",
+            width,
+            height,
+        )
+
+
+def run_equirect_passthrough_stage(args, left_frames, right_frames):
+    """Join stereo equirectangular eyes without applying another projection."""
+    out_dir = get_temp_dir(args, "equirect")
+    sbs_frames = []
+    for index, (left, right) in enumerate(zip(left_frames, right_frames, strict=True)):
+        combined = np.concatenate((left, right), axis=1)
+        sbs_frames.append(combined)
+        cv2.imwrite(
+            os.path.join(out_dir, f"equirect_{index:06d}.png"),
+            cv2.cvtColor(combined, cv2.COLOR_RGB2BGR),
+        )
+    return sbs_frames
 
 
 def detect_sbs_input(video_path: str, force_sbs: bool = False) -> bool:
@@ -2113,16 +2160,17 @@ def detect_sbs_input(video_path: str, force_sbs: bool = False) -> bool:
     return is_sbs
 
 
-def get_resume_start_stage(temp_dir: str):
+def get_resume_start_stage(temp_dir: str, stage_order=None):
     """Determine which stage to resume from based on checkpoint."""
+    stage_order = stage_order or STAGE_ORDER
     ckpt = load_checkpoint(temp_dir)
     if not ckpt:
         return 0  # start from beginning
     last = ckpt.get("last_completed_stage", "")
-    if last in STAGE_ORDER:
-        idx = STAGE_ORDER.index(last) + 1
-        if idx < len(STAGE_ORDER):
-            log.info(f"📂 Resuming after stage '{last}' → starting '{STAGE_ORDER[idx]}'")
+    if last in stage_order:
+        idx = stage_order.index(last) + 1
+        if idx < len(stage_order):
+            log.info(f"📂 Resuming after stage '{last}' → starting '{stage_order[idx]}'")
             return idx
     return 0
 
@@ -2628,13 +2676,16 @@ def _stage_all_body(args, temp_dir, is_sbs, manifest, manifest_skip, manifest_st
     The logic inside is bit-for-bit identical to the pre-K-18 inline block;
     see the original inline version for the per-stage rationale comments.
     """
+    # Use an already-equirectangular input directly after stereo rendering.
+    base_order = (
+        STAGE_ORDER_EQUIRECT if args.input_projection == "equirect" else STAGE_ORDER_SBS if is_sbs else STAGE_ORDER
+    )
+
     # Determine resume point
     start_idx = 0
     if args.resume:
-        start_idx = get_resume_start_stage(temp_dir)
+        start_idx = get_resume_start_stage(temp_dir, base_order)
 
-    # Use SBS stage order if input is already stereo
-    base_order = STAGE_ORDER_SBS if is_sbs else STAGE_ORDER
     need_frames = start_idx == 0
     stages_to_run = base_order[start_idx:] if start_idx > 0 else base_order
 
@@ -2721,6 +2772,8 @@ def _stage_all_body(args, temp_dir, is_sbs, manifest, manifest_skip, manifest_st
             left_frames, right_frames = run_stereo_stage(args, frames, depths)
             save_checkpoint(temp_dir, "stereo", {"num_frames": len(left_frames)})
             _record("stereo")
+            if args.input_projection == "equirect":
+                sbs_frames = run_equirect_passthrough_stage(args, left_frames, right_frames)
 
         elif stage == "equirect":
             if stage in _fused_done:
@@ -2865,6 +2918,8 @@ def main():
                 _manifest_record_stage(manifest, args, "upscale")
                 manifest_touched.add("upscale")
 
+    validate_input_projection(args)
+
     # Handle --validate-input mode
     if args.validate_input:
         validate_input_format(args.input)
@@ -2893,6 +2948,10 @@ def main():
     # the pre-P-4b pipeline unless the operator opts into 'strict' or
     # switches it 'off'.
     _run_preflight(args)
+
+    if args.input_projection == "equirect" and args.streaming:
+        log.warning("--streaming is disabled for equirect input; the batch path must skip source projection")
+        args.streaming = False
 
     # Streaming pipeline mode (PRD §7.2).  V-3: the streaming path is a
     # single fused run — it cannot be split across machines, so --stages /
