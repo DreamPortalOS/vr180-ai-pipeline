@@ -705,6 +705,13 @@ class StreamingPipeline:
         # lets the OpenCV fallback path be selected when the operator disables
         # ffmpeg v360 — the default True keeps pre-#243 behaviour bit-exact.
         use_ffmpeg: bool = True,
+        # C-2 (#294): source projection, forwarded verbatim to the mapper.
+        # ``"rectilinear"`` (default) keeps the pinhole ``src_hfov`` model, so
+        # existing callers are bit-exact; ``"fisheye"`` switches to the
+        # equidistant model whose span is ``fisheye_fov`` (``src_hfov`` is then
+        # unused).  Validation lives in EquirectangularMapper.__init__.
+        input_projection: str = "rectilinear",
+        fisheye_fov: float = 180.0,
         # K-22 / #243 (P0-2): --outpaint and its sub-params were previously
         # silently dropped on the streaming path (same anti-pattern as #120).
         # F-4 (#267): ``gradient`` is now really applied per frame (after the
@@ -882,6 +889,10 @@ class StreamingPipeline:
             # K-22 / #243 (P0-2): was hard-coded to True, which silently
             # ignored --no-ffmpeg-v360 on the streaming path.
             use_ffmpeg=use_ffmpeg,
+            # C-2 (#294): pass the source projection through rather than
+            # letting the stream silently fall back to rectilinear.
+            input_projection=input_projection,
+            fisheye_fov=fisheye_fov,
         )
 
     def _build_ffmpeg_cmd(self, output_path: str, width: int, height: int) -> list[str]:

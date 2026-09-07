@@ -35,6 +35,7 @@ Usage:
 
 import contextlib
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -259,7 +260,19 @@ class EquirectangularMapper:
     additionally keeps the alpha plane (0 outside the FOV) for callers that
     need a real mask for feathering/compositing.  The RGB planes are identical
     either way.
+
+    **Source projection** (C-2, issue #294).  ``input_projection="rectilinear"``
+    (default) treats the source as a pinhole image of ``src_hfov`` degrees.
+    ``input_projection="fisheye"`` treats it as a circular **equidistant**
+    fisheye (r ∝ θ) inscribed in the frame, spanning ``fisheye_fov`` degrees
+    across the full frame width *and* height — the RESEARCH_COVERAGE_V2 §QB
+    route: a 180° image circle gives uniform px/deg over the whole hemisphere.
+    ``src_hfov`` is not consulted in fisheye mode.
     """
+
+    #: Accepted ``input_projection`` values (``equirect`` sources never reach
+    #: the mapper — run_pipeline joins those eyes without projecting, #286).
+    INPUT_PROJECTIONS: tuple[str, ...] = ("rectilinear", "fisheye")
 
     def __init__(
         self,
@@ -267,6 +280,8 @@ class EquirectangularMapper:
         output_height: int = 1920,
         src_hfov: float = 90.0,
         use_ffmpeg: bool = True,
+        input_projection: str = "rectilinear",
+        fisheye_fov: float = 180.0,
     ):
         """Configure the equirectangular mapper.
 
@@ -281,12 +296,24 @@ class EquirectangularMapper:
                 footage. Higher (e.g. 120°) fills more of the 180° dome but
                 introduces more peripheral stretch. Lower (e.g. 70°) gives a
                 "binoculars" feel with less stretch but worse immersion.
+                Ignored when ``input_projection="fisheye"``.
             use_ffmpeg: Prefer ffmpeg v360 filter when available.
+            input_projection: ``"rectilinear"`` (pinhole, default) or
+                ``"fisheye"`` (equidistant circular fisheye, C-2 #294).
+            fisheye_fov: Full angular span of the fisheye frame in degrees
+                (``ih_fov`` = ``iv_fov``; 180 = the inscribed circle covers the
+                whole hemisphere).  Only used with ``input_projection="fisheye"``.
         """
+        if input_projection not in self.INPUT_PROJECTIONS:
+            raise ValueError(f"input_projection must be one of {self.INPUT_PROJECTIONS}, got {input_projection!r}")
+        if not (math.isfinite(fisheye_fov) and 0.0 < fisheye_fov <= 360.0):
+            raise ValueError(f"fisheye_fov must be a finite angle in (0, 360] degrees, got {fisheye_fov!r}")
         self.output_width = output_width
         self.output_height = output_height
         self.src_hfov = src_hfov
         self.use_ffmpeg = use_ffmpeg
+        self.input_projection = input_projection
+        self.fisheye_fov = float(fisheye_fov)
         self._mesh: tuple[np.ndarray, np.ndarray] | None = None
         # Persistent ffmpeg workers, keyed by (src_w, src_h, with_alpha) — issue #256.
         self._pipes: dict[tuple[int, int, bool], _FfmpegV360Pipe] = {}
@@ -369,8 +396,6 @@ class EquirectangularMapper:
 
         For a pinhole camera: vfov = 2 * atan(tan(hfov/2) * height/width)
         """
-        import math
-
         hfov_rad = math.radians(self.src_hfov)
         vfov_rad = 2.0 * math.atan(math.tan(hfov_rad / 2.0) * src_height / src_width)
         return math.degrees(vfov_rad)
@@ -400,11 +425,13 @@ class EquirectangularMapper:
     )
 
     def _v360_filter(self, src_width: int, src_height: int, with_alpha: bool = False) -> str:
-        """Build the perspective → half-equirectangular filter chain.
+        """Build the source → half-equirectangular filter chain.
 
         The chain is ``v360=...:alpha_mask=1`` followed by
         :attr:`_BLACK_COMPOSITE`, so out-of-FOV pixels come back as real black
-        RGB rather than v360's edge smear (issue #255).
+        RGB rather than v360's edge smear (issue #255).  Both source
+        projections share that tail — the fisheye branch only swaps the
+        ``v360`` head.
 
         Args:
             src_width: Source frame width (px), for the vertical-FOV solve.
@@ -413,16 +440,52 @@ class EquirectangularMapper:
                 mask, 0 outside the FOV) instead of ``rgb24``. The RGB planes
                 are identical either way.
         """
-        src_vfov = self._calc_vertical_fov(src_width, src_height)
-        v360 = (
-            f"v360=input=flat:output=hequirect:"
-            f"ih_fov={self.src_hfov}:iv_fov={src_vfov:.2f}:"
-            f"h_fov=180:v_fov=180:"
-            f"w={self.output_width}:h={self.output_height}:"
-            f"alpha_mask=1"
-        )
+        if self.input_projection == "fisheye":
+            v360 = self._v360_fisheye_head()
+        else:
+            src_vfov = self._calc_vertical_fov(src_width, src_height)
+            v360 = (
+                f"v360=input=flat:output=hequirect:"
+                f"ih_fov={self.src_hfov}:iv_fov={src_vfov:.2f}:"
+                f"h_fov=180:v_fov=180:"
+                f"w={self.output_width}:h={self.output_height}:"
+                f"alpha_mask=1"
+            )
         pix_fmt = "rgba" if with_alpha else "rgb24"
         return f"{v360},{self._BLACK_COMPOSITE},format={pix_fmt}"
+
+    def _v360_fisheye_head(self) -> str:
+        """The ``v360`` term for an equidistant fisheye source (C-2, issue #294).
+
+        Geometry, verified against ffmpeg's ``vf_v360.c`` and empirically on a
+        synthetic 512² target (docs/RESEARCH_COVERAGE_V2.md §QB):
+
+        * ``input=fisheye`` is **equidistant** (r ∝ θ).  ``ih_fov``/``iv_fov``
+          are the full angle spanned by the frame width / height, so a square
+          frame whose inscribed circle covers 180° is ``ih_fov=iv_fov=180``.
+        * ``id_fov`` is deliberately **not** used: it is the *diagonal* angle,
+          and on a square frame ``id_fov=180`` collapses to 127.3° per axis —
+          the 45° circle lands ~37 px off and the frame corners (outside the
+          image circle) leak into the output.
+        * ``h_fov``/``v_fov`` are deliberately **not** passed: ``hequirect``
+          output ignores them (fixed ±90°; output is bit-identical with or
+          without ``h_fov=100:v_fov=100``), so writing them would only suggest
+          a control that does not exist.
+        * ``alpha_mask=1`` marks output pixels whose sample falls outside the
+          source *frame* (relevant when ``fisheye_fov`` < 180); the shared
+          :attr:`_BLACK_COMPOSITE` tail turns them into real black (#258).
+          Note that v360's visibility test is the square frame, not the image
+          circle: for ``fisheye_fov`` < 180 the frame corners between the
+          circle and the frame edge are sampled as-is, so a sub-180° source
+          must already be black outside its circle.
+        """
+        fov = f"{self.fisheye_fov:g}"
+        return (
+            f"v360=input=fisheye:output=hequirect:"
+            f"ih_fov={fov}:iv_fov={fov}:"
+            f"w={self.output_width}:h={self.output_height}:"
+            f"interp=lanczos:alpha_mask=1"
+        )
 
     def _map_via_ffmpeg(self, frame: np.ndarray, with_alpha: bool = False) -> np.ndarray:
         """Use ffmpeg v360 filter for equirectangular mapping.
@@ -583,9 +646,11 @@ class EquirectangularMapper:
 
         Pixels outside the source camera's FOV are marked as -1
         and filled with black instead of being stretched.
-        """
-        import math
 
+        With ``input_projection="fisheye"`` step 2 is the equidistant
+        fisheye model instead of the pinhole one (see
+        :meth:`_fisheye_source_coords`).
+        """
         W_out, H_out = self.output_width, self.output_height
 
         # Output pixel grid
@@ -602,6 +667,15 @@ class EquirectangularMapper:
         ray_x = np.sin(theta) * np.sin(phi)
         ray_y = np.cos(phi)
         ray_z = np.cos(theta) * np.sin(phi)
+
+        if self.input_projection == "fisheye":
+            sx, sy = self._fisheye_source_coords(ray_x, ray_y, ray_z, src_width, src_height)
+            # Same visibility rule as v360's alpha_mask: the source *frame*.
+            in_bounds = (sx >= 0) & (sx < src_width) & (sy >= 0) & (sy < src_height)
+            sx = np.where(in_bounds, sx, -1.0)
+            sy = np.where(in_bounds, sy, -1.0)
+            self._mesh = (sx.astype(np.float32), sy.astype(np.float32))
+            return
 
         # Project onto source camera plane (pinhole model)
         hfov_rad = math.radians(self.src_hfov)
@@ -625,6 +699,31 @@ class EquirectangularMapper:
         sy = np.where(in_bounds, sy, -1.0)
 
         self._mesh = (sx.astype(np.float32), sy.astype(np.float32))
+
+    def _fisheye_source_coords(
+        self,
+        ray_x: np.ndarray,
+        ray_y: np.ndarray,
+        ray_z: np.ndarray,
+        src_width: int,
+        src_height: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Equidistant fisheye lookup for the OpenCV path (C-2, issue #294).
+
+        Mirrors ffmpeg's ``v360 input=fisheye`` so both mapper paths agree:
+        the polar angle θ from the forward axis grows linearly with the image
+        radius (r ∝ θ), and ``fisheye_fov`` is the full angle spanned by the
+        frame width *and* height, i.e. the frame edge sits at
+        θ = ``fisheye_fov`` / 2 on both axes (a square frame → the inscribed
+        image circle).  Callers apply the frame-bounds visibility rule.
+        """
+        polar = np.arccos(np.clip(ray_z, -1.0, 1.0))  # 0 = forward, π/2 = the 180° rim
+        azimuth = np.arctan2(-ray_y, ray_x)  # ray_y is up, image y is down
+        r_norm = polar / (math.radians(self.fisheye_fov) / 2.0)  # 1.0 at the frame edge
+        cx, cy = src_width / 2.0, src_height / 2.0
+        sx = cx + r_norm * np.cos(azimuth) * (src_width / 2.0)
+        sy = cy + r_norm * np.sin(azimuth) * (src_height / 2.0)
+        return sx, sy
 
     def map_stereo_pair(self, left_frame: np.ndarray, right_frame: np.ndarray) -> np.ndarray:
         """Map left+right views into a SBS equirectangular frame.

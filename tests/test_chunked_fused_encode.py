@@ -169,6 +169,11 @@ def _fused_args(run_pipeline, tmp_path, chunk_size, overlap=0):
     args.output_width = 32
     args.output_height = 32
     args.src_hfov = 70.0
+    # C-2 (#294): the fused path forwards these to EquirectangularMapper, which
+    # validates them strictly.  A bare MagicMock attribute is not a valid
+    # projection name, so pin the defaults this suite actually exercises.
+    args.input_projection = "rectilinear"
+    args.fisheye_fov = 180.0
     args.no_ffmpeg_v360 = True  # force OpenCV equirect path (CPU, deterministic)
     args.codec = "h264"
     args.crf = 23

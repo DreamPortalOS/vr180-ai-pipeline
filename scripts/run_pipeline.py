@@ -513,9 +513,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--input-projection",
-        choices=["rectilinear", "equirect"],
+        choices=["rectilinear", "equirect", "fisheye"],
         default="rectilinear",
-        help="Input projection: rectilinear (default) or equirect (skip source-to-equirect mapping)",
+        help="Input projection: rectilinear (default), equirect (skip source-to-equirect mapping), "
+        "or fisheye (equidistant circular fisheye source, r ∝ θ; span set by --fisheye-fov)",
+    )
+    # C-2 (#294): the fisheye source's angular span.  This is the FULL angle
+    # across the frame width *and* height (v360 ih_fov/iv_fov), so the default
+    # 180 means the inscribed image circle covers the whole hemisphere.
+    parser.add_argument(
+        "--fisheye-fov",
+        type=float,
+        default=180.0,
+        help="Full angular span of a --input-projection fisheye source, in degrees "
+        "(default: 180, i.e. the inscribed image circle spans the whole hemisphere)",
     )
 
     # R-5: Fulldome projection
@@ -771,6 +782,18 @@ def parse_args(argv: list[str] | None = None):
     args._src_hfov_explicit = args.src_hfov is not None
     if args.src_hfov is None:
         args.src_hfov = 70.0
+    # C-2 (#294): a fisheye source's coverage is set by --fisheye-fov; the
+    # pinhole --src-hfov has no meaning under the equidistant model.  Accepting
+    # both would silently honour one and drop the other, so this is a hard
+    # error (exit 2) rather than a warning.
+    if args.input_projection == "fisheye":
+        if args._src_hfov_explicit:
+            parser.error(
+                "--src-hfov cannot be combined with --input-projection fisheye: "
+                "a fisheye source's angular span is set by --fisheye-fov (default 180)"
+            )
+        if not (math.isfinite(args.fisheye_fov) and 0.0 < args.fisheye_fov <= 360.0):
+            parser.error(f"--fisheye-fov must be a finite angle in (0, 360] degrees, got {args.fisheye_fov}")
     # P0-3 (#244): reject impossible feather angles here, not after depth/stereo ran.
     try:
         resolve_edge_feather(args.edge_feather_start, args.edge_feather_end)
@@ -1521,6 +1544,9 @@ def run_equirect_stage(args, left_frames, right_frames):
         output_height=args.output_height,
         src_hfov=args.src_hfov,
         use_ffmpeg=not args.no_ffmpeg_v360,
+        # C-2 (#294): rectilinear (pinhole/src_hfov) vs fisheye (equidistant).
+        input_projection=args.input_projection,
+        fisheye_fov=args.fisheye_fov,
     )
 
     out_dir = get_temp_dir(args, "equirect")
@@ -1718,6 +1744,9 @@ def run_chunked_fused_stage(args, frames, depths):
         output_height=args.output_height,
         src_hfov=args.src_hfov,
         use_ffmpeg=not args.no_ffmpeg_v360,
+        # C-2 (#294): same source-projection contract as the per-stage path.
+        input_projection=args.input_projection,
+        fisheye_fov=args.fisheye_fov,
     )
 
     output_path = get_output_path(args)
@@ -2082,11 +2111,22 @@ STAGE_ORDER_EQUIRECT = ["upscale", "depth", "stereo", "outpaint", "metadata"]
 
 
 def validate_input_projection(args) -> None:
-    """Warn about options and dimensions that do not fit equirect input."""
-    if getattr(args, "input_projection", "rectilinear") != "equirect":
+    """Warn about options and dimensions that do not fit the source projection.
+
+    Both non-rectilinear sources want a square frame: equirect because a
+    180°x180° half-sphere is square, fisheye (C-2, #294) because the image
+    circle is inscribed in the frame and ``ih_fov``/``iv_fov`` share one angle
+    — a non-square fisheye frame turns that circle into an ellipse and the
+    equidistant mapping silently skews.
+
+    The fisheye + ``--src-hfov`` conflict is a hard error, not a warning, and
+    is raised earlier in :func:`parse_args` where the parser can exit non-zero.
+    """
+    projection = getattr(args, "input_projection", "rectilinear")
+    if projection not in ("equirect", "fisheye"):
         return
 
-    if getattr(args, "_src_hfov_explicit", False):
+    if projection == "equirect" and getattr(args, "_src_hfov_explicit", False):
         log.warning("--src-hfov is ignored for equirect input; source camera FOV does not apply")
 
     cap = cv2.VideoCapture(args.input)
@@ -2096,12 +2136,21 @@ def validate_input_projection(args) -> None:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
     if width and height and width != height:
-        log.warning(
-            "Equirect input is %dx%d; 180°x180° equirect input should be square, "
-            "otherwise the spherical image will be distorted",
-            width,
-            height,
-        )
+        if projection == "equirect":
+            log.warning(
+                "Equirect input is %dx%d; 180°x180° equirect input should be square, "
+                "otherwise the spherical image will be distorted",
+                width,
+                height,
+            )
+        else:
+            log.warning(
+                "Fisheye input is %dx%d; a circular fisheye source should be square, "
+                "otherwise the image circle is an ellipse and --fisheye-fov cannot "
+                "describe both axes at once",
+                width,
+                height,
+            )
 
 
 def run_equirect_passthrough_stage(args, left_frames, right_frames):
@@ -2246,6 +2295,10 @@ _STREAMING_SUPPORTED: dict[str, str] = {
     "output_width": "per-eye width",
     "output_height": "per-eye height",
     "src_hfov": "source horizontal FOV",
+    # C-2 (#294): both are forwarded to StreamingPipeline, which hands them to
+    # its EquirectangularMapper.  (``equirect`` still forces the batch path.)
+    "input_projection": "source projection",
+    "fisheye_fov": "fisheye source span",
     "max_frames": "frame cap",
     "quality": "quality preset",
     "model_size": "depth model size",
@@ -2495,6 +2548,11 @@ def _stage_artifacts(args, manifest_name):
             "output_height": args.output_height,
             "src_hfov": args.src_hfov,
             "outpaint": args.outpaint,
+            # C-2 (#294): the source projection changes the projected pixels,
+            # so it has to invalidate a resumed project stage like any other
+            # geometry knob.
+            "input_projection": args.input_projection,
+            "fisheye_fov": args.fisheye_fov,
         }
     elif manifest_name == "encode":
         outputs = [get_output_path(args)] if args.stage == "all" else []
@@ -3001,6 +3059,9 @@ def main():
             output_width=args.output_width,
             output_height=args.output_height,
             src_hfov=args.src_hfov,
+            # C-2 (#294): the stream honours the source projection too.
+            input_projection=args.input_projection,
+            fisheye_fov=args.fisheye_fov,
             codec=args.codec,
             crf=args.crf,
             fps=args.fps,
@@ -3314,6 +3375,14 @@ def _write_sidecar_from_args(
         preset = getattr(args, "preset", None)
         if preset:
             generation["preset"] = preset
+        # C-2 (#294): record how the source was interpreted.  The container
+        # cannot express it, and it is the one knob that decides whether the
+        # artefact's geometry is reproducible from the source file alone.
+        input_projection = getattr(args, "input_projection", None)
+        if input_projection:
+            generation["input_projection"] = input_projection
+            if input_projection == "fisheye":
+                generation["fisheye_fov"] = float(getattr(args, "fisheye_fov", 180.0))
 
     try:
         write_sidecar(output_path, immersive=normalize_immersive(immersive), generation=generation)
