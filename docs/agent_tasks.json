@@ -1,0 +1,44 @@
+{
+  "updated_at": "2026-09-07T20:00:00+08:00",
+  "tasks": [
+    {
+      "id": "290",
+      "issue": 290,
+      "title": "depth cache mtime",
+      "status": "done",
+      "worktree": "D:/Github/vr180-ai-pipeline/.claude/worktrees/agent-a73032682747a59cf",
+      "branch": "worktree-agent-a73032682747a59cf",
+      "head": "ab323ad",
+      "expected_commit": "ab323ad",
+      "last_checked_at": "2026-09-07T20:00:00+08:00",
+      "next_check": "merge review",
+      "tests": "pytest tests/test_depth_cache.py -q; ruff check tests/test_depth_cache.py"
+    },
+    {
+      "id": "291",
+      "issue": 291,
+      "title": "calibrate hfov",
+      "status": "blocked-needs-tests",
+      "worktree": "D:/Github/vr180-ai-pipeline/.claude/worktrees/agent-a2e2611ff427744cd",
+      "branch": "worktree-agent-a2e2611ff427744cd",
+      "head": "567b928",
+      "expected_commit": "567b928",
+      "last_checked_at": "2026-09-07T20:00:00+08:00",
+      "next_check": "add tests before review",
+      "tests": "pytest tests/test_calibrate_hfov.py -q; ruff check scripts/calibrate_hfov.py tests/test_calibrate_hfov.py"
+    },
+    {
+      "id": "292",
+      "issue": 292,
+      "title": "10-bit HEVC e2e",
+      "status": "ready-for-review",
+      "worktree": "D:/Github/vr180-ai-pipeline/.claude/worktrees/agent-a763b87c888ce7342",
+      "branch": "feat/issue-292-e2e-10bit",
+      "head": "04bbd7f",
+      "expected_commit": "04bbd7f",
+      "last_checked_at": "2026-09-07T20:00:00+08:00",
+      "next_check": "review then full CI",
+      "tests": "pytest tests/test_e2e_smoke.py -q; ruff check scripts/e2e_smoke.py tests/test_e2e_smoke.py"
+    }
+  ]
+}

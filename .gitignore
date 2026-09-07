@@ -52,6 +52,7 @@ htmlcov/
 .ipynb_checkpoints/
 
 # Video experiment artifacts (should not be tracked)
+video/
 video/*.md
 video/*.json
 # Mock-provider leakage — double-gate so test/CI artifacts never re-appear
