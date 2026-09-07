@@ -98,6 +98,20 @@ DEFAULT_WIDTH: int = 640
 #: Minimum Hough segment length, as a fraction of the frame's short side.
 DEFAULT_MIN_LINE_FRAC: float = 0.15
 
+#: ``HoughLinesP``'s ``maxLineGap``, as a fraction of the minimum segment
+#: length (never below :data:`HOUGH_MIN_GAP_PX`).  It has to scale with the
+#: frame.  A fixed few-pixel gap makes a *straight* line fail to register
+#: whenever anything interrupts its edge — a grid crossing, an occluder, a
+#: texture break — and because the correct candidate is precisely the one whose
+#: lines are long and therefore most interrupted, a tight gap penalises the
+#: right answer hardest.  Measured on the synthetic grid: at ``maxLineGap=4``
+#: the true 100° candidate scored *worst* (Hough found no segments at all at
+#: 480x480 and 640x480, so the recommendation ran away to the 150° grid edge).
+#: At these values 100° is recovered with a 0.44–0.68 relative margin across
+#: 320x180 → 640x360 and both line densities tried.
+HOUGH_GAP_FRAC: float = 0.35
+HOUGH_MIN_GAP_PX: float = 8.0
+
 #: Relative depth the winning score must have below the rest of the curve
 #: before the result is called trustworthy.  See :func:`_curve_margin`.
 DEFAULT_MIN_MARGIN: float = 0.15
@@ -313,6 +327,11 @@ def edge_map(gray: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
     return edges
 
 
+def hough_gap(min_length: float) -> float:
+    """``maxLineGap`` for a run of ``min_length`` px. See :data:`HOUGH_GAP_FRAC`."""
+    return max(HOUGH_MIN_GAP_PX, min_length * HOUGH_GAP_FRAC)
+
+
 def straight_segments(edges: np.ndarray, min_length: float) -> np.ndarray:
     """Lengths of the Hough segments at least ``min_length`` px long."""
     lines = cv2.HoughLinesP(
@@ -321,7 +340,7 @@ def straight_segments(edges: np.ndarray, min_length: float) -> np.ndarray:
         theta=np.pi / 180.0,
         threshold=max(10, int(min_length)),
         minLineLength=float(min_length),
-        maxLineGap=4,
+        maxLineGap=hough_gap(min_length),
     )
     if lines is None:
         return np.zeros(0, dtype=np.float64)
