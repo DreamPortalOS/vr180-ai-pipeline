@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-09-07T23:05:00+08:00",
+  "updated_at": "2026-09-07T23:25:00+08:00",
   "tasks": [
     {
       "id": "290",
@@ -23,8 +23,8 @@
       "branch": "worktree-agent-a2e2611ff427744cd",
       "head": "567b928",
       "expected_commit": "567b928",
-      "last_checked_at": "2026-09-07T20:30:00+08:00",
-      "next_check": "wait for Claude commit and focused tests",
+      "last_checked_at": "2026-09-07T23:25:00+08:00",
+      "next_check": "wait for narrow test-only commit; stop after max turns or disconnect",
       "tests": "pytest tests/test_calibrate_hfov.py -q; ruff check scripts/calibrate_hfov.py tests/test_calibrate_hfov.py"
     },
     {
