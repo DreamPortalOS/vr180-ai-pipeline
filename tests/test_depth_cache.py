@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 from pipeline.depth_crafter import (
     DepthCrafterBackend,
@@ -565,6 +566,28 @@ def test_hit_materialize_link_fallback_to_copy(tmp_path: Path, monkeypatch) -> N
 #: An mtime unambiguously older than any wall-clock "now" the test can observe.
 _STALE_MTIME = 946684800  # 2000-01-01 00:00:00 UTC
 
+#: Slack subtracted from the wall-clock "start" before comparing against
+#: ``st_mtime`` (issue #290, K-25).  ``time.time()`` and the filesystem's
+#: mtime are not the same clock: NTFS stores mtime at 100 ns granularity and
+#: ext4/tmpfs may truncate to the kernel tick, so a file written right after
+#: ``time.time()`` can legitimately report ``st_mtime`` a few tens of µs
+#: *earlier* than that reading and fail a bare ``>= start`` check (CI flaked
+#: on #289 this way).  One second is far below the "hours-old hard link" the
+#: K-24 gate exists to catch, so the assertion still fails for the real bug.
+_MTIME_SLACK_S = 1.0
+
+
+def _fresh_start() -> float:
+    """Wall-clock "now" minus :data:`_MTIME_SLACK_S`; take it *before* the call."""
+    return time.time() - _MTIME_SLACK_S
+
+
+def _assert_mtimes_fresh(files: list[Path], start: float, what: str) -> None:
+    """Every *file* must have ``st_mtime >= start`` (see :data:`_MTIME_SLACK_S`)."""
+    for p in files:
+        mtime = p.stat().st_mtime
+        assert mtime >= start, f"{p.name} mtime is stale {what}: {mtime} < {start}"
+
 
 def test_hit_materialized_files_get_fresh_mtime(tmp_path: Path) -> None:
     """Cache hit must stamp fresh mtimes even when the cached npy is old.
@@ -581,14 +604,14 @@ def test_hit_materialized_files_get_fresh_mtime(tmp_path: Path) -> None:
     for src in entry_dir.glob("depth_*.npy"):
         os.utime(src, (_STALE_MTIME, _STALE_MTIME))
 
-    start = time.time()
+    start = _fresh_start()
     est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
 
     assert backend.call_count == 0, "cache hit must not invoke the backend"
     materialized = _depth_npy_files(depth_dir)
     assert len(materialized) == len(cached_depths)
+    _assert_mtimes_fresh(materialized, start, "after cache hit")
     for i, p in enumerate(materialized):
-        assert p.stat().st_mtime >= start, f"{p.name} mtime is stale: {p.stat().st_mtime} < {start}"
         # Regression: stamping mtime must not touch the bytes.
         np.testing.assert_array_equal(np.load(str(p)), cached_depths[i])
 
@@ -608,14 +631,14 @@ def test_hit_materialize_copy_fallback_sets_fresh_mtime(tmp_path: Path, monkeypa
 
     monkeypatch.setattr("pipeline.depth_crafter.os.link", fake_link)
 
-    start = time.time()
+    start = _fresh_start()
     est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
 
     assert backend.call_count == 0
     materialized = _depth_npy_files(depth_dir)
     assert len(materialized) == len(cached_depths)
+    _assert_mtimes_fresh(materialized, start, "after copy fallback")
     for i, p in enumerate(materialized):
-        assert p.stat().st_mtime >= start, f"{p.name} mtime is stale after copy fallback"
         np.testing.assert_array_equal(np.load(str(p)), cached_depths[i])
 
 
@@ -632,11 +655,61 @@ def test_miss_path_files_get_fresh_mtime(tmp_path: Path) -> None:
     est = _make_estimator(backend, cache_dir=cache_dir)
     clip = _write_fake_video(tmp_path / "clip.mp4")
 
-    start = time.time()
+    start = _fresh_start()
     est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
 
     assert backend.call_count == 1, "fresh cache_dir → must be a miss"
     files = _depth_npy_files(depth_dir)
     assert len(files) == 2
-    for p in files:
-        assert p.stat().st_mtime >= start, f"{p.name} mtime is stale on the miss path"
+    _assert_mtimes_fresh(files, start, "on the miss path")
+
+
+# ---------------------------------------------------------------------------
+# Issue #290 (K-25) guard rails: the 1 s slack above must NOT have turned the
+# freshness check into "any time is fine".  Both tests below drive the exact
+# assertion the positive tests use and require it to go red.
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_mtime_check_rejects_hour_old_files(tmp_path: Path) -> None:
+    """Materialized files pushed back to 1 h ago must fail the freshness assert."""
+    est, backend, depth_dir, clip, _entry_dir, cached_depths = _seed_and_hit(tmp_path)
+
+    start = _fresh_start()
+    est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
+    assert backend.call_count == 0
+    materialized = _depth_npy_files(depth_dir)
+    assert len(materialized) == len(cached_depths)
+    _assert_mtimes_fresh(materialized, start, "sanity")  # genuinely fresh first
+
+    hour_ago = time.time() - 3600.0
+    for p in materialized:
+        os.utime(p, (hour_ago, hour_ago))
+
+    with pytest.raises(AssertionError, match="mtime is stale"):
+        _assert_mtimes_fresh(materialized, start, "after backdating 1h")
+
+
+def test_fresh_mtime_check_catches_unstamped_hard_links(tmp_path: Path, monkeypatch) -> None:
+    """If the implementation stops stamping, the hit test must go red (K-24 bug).
+
+    Neutralise ``os.utime`` inside the hit path so the hard links keep the
+    cache file's year-2000 mtime, exactly the state #235 fixed.
+    """
+    est, backend, depth_dir, clip, entry_dir, cached_depths = _seed_and_hit(tmp_path)
+    for src in entry_dir.glob("depth_*.npy"):
+        os.utime(src, (_STALE_MTIME, _STALE_MTIME))
+
+    def noop_utime(path, times=None, **kwargs):
+        return None
+
+    monkeypatch.setattr("pipeline.depth_crafter.os.utime", noop_utime)
+
+    start = _fresh_start()
+    est.estimate_video(input_path=str(clip), output_dir=str(depth_dir))
+    assert backend.call_count == 0
+    materialized = _depth_npy_files(depth_dir)
+    assert len(materialized) == len(cached_depths)
+
+    with pytest.raises(AssertionError, match="mtime is stale"):
+        _assert_mtimes_fresh(materialized, start, "with stamping disabled")
