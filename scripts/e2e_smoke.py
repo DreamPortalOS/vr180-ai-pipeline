@@ -707,17 +707,22 @@ def check_decodable(
     output_path: str,
     decoded: tuple[int, float] | None = None,
     expect_frames: int | None = None,
+    runner=subprocess.run,
+    ffmpeg: str = "ffmpeg",
 ) -> Check:
     """10bit-b. The product fully decodes AND is not all-black.
 
     "Decodable" is measured the hard way: ffmpeg decodes every frame to raw
     gray, we count them and take the mean luma.  A container ffprobe can
     describe but whose frames come out as zeros is exactly the silent
-    8-bit-assumption failure C-3 hunts.  ``decoded`` is injectable;
-    ``expect_frames`` (the profile's --max-frames) tightens the count.
+    8-bit-assumption failure C-3 hunts.  ``decoded`` is injectable (so is the
+    ``runner`` that drives ffmpeg); ``expect_frames`` (the profile's
+    --max-frames) tightens the count.
     """
     try:
-        frames, mean = decoded if decoded is not None else _decode_gray_frames(output_path)
+        frames, mean = (
+            decoded if decoded is not None else _decode_gray_frames(output_path, ffmpeg=ffmpeg, runner=runner)
+        )
     except (RuntimeError, OSError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
         return Check(
             "output decodable",
@@ -889,7 +894,16 @@ def run_tenbit_sample(
     result.checks.append(_tenbit(check_exit_code(proc.returncode)))
     result.checks.append(_tenbit(check_output_probe(str(tenbit_out), prof["quality"], eye=prof.get("eye"))))
     result.checks.append(_tenbit(check_metadata_bytes(str(tenbit_out))))
-    result.checks.append(_tenbit(check_decodable(str(tenbit_out), expect_frames=_profile_max_frames(prof["args"]))))
+    result.checks.append(
+        _tenbit(
+            check_decodable(
+                str(tenbit_out),
+                expect_frames=_profile_max_frames(prof["args"]),
+                runner=runner,
+                ffmpeg=ffmpeg,
+            )
+        )
+    )
     result.checks.append(_tenbit(check_qa_verdict(str(tenbit_out))))
     result.checks.append(_tenbit(check_sidecar(str(tenbit_out))))
     result.checks.append(_tenbit(check_sidecar_pix_fmt(str(tenbit_out), source_pix_fmt=result.source_pix_fmt)))
