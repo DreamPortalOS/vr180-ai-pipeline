@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-09-07T23:25:00+08:00",
+  "updated_at": "2026-09-07T23:45:00+08:00",
   "tasks": [
     {
       "id": "290",
@@ -18,13 +18,13 @@
       "id": "291",
       "issue": 291,
       "title": "calibrate hfov",
-      "status": "running",
+      "status": "blocked-needs-tests",
       "worktree": "D:/Github/vr180-ai-pipeline/.claude/worktrees/agent-a2e2611ff427744cd",
       "branch": "worktree-agent-a2e2611ff427744cd",
       "head": "567b928",
       "expected_commit": "567b928",
-      "last_checked_at": "2026-09-07T23:25:00+08:00",
-      "next_check": "wait for narrow test-only commit; stop after max turns or disconnect",
+      "last_checked_at": "2026-09-07T23:45:00+08:00",
+      "next_check": "manual test implementation or new agent with verified write access",
       "tests": "pytest tests/test_calibrate_hfov.py -q; ruff check scripts/calibrate_hfov.py tests/test_calibrate_hfov.py"
     },
     {
