@@ -44,13 +44,13 @@
       "id": "294",
       "issue": 294,
       "title": "fisheye input projection",
-      "status": "running",
+      "status": "blocked",
       "worktree": "D:/Github/vr180-ai-pipeline/.claude/worktrees/agent-af0e02abf75db4e04",
       "branch": "feat/issue-294-fisheye-input",
-      "head": "5332303",
-      "expected_commit": "5332303",
-      "last_checked_at": "2026-09-07T20:30:00+08:00",
-      "next_check": "preserve scratch and wait for focused tests",
+      "head": "979258e",
+      "expected_commit": "979258e",
+      "last_checked_at": "2026-09-07T23:35:00+08:00",
+      "next_check": "clean or explicitly exclude _scratch294, then review",
       "tests": "pytest tests/test_input_projection.py tests/test_run_pipeline_preflight.py -q; ruff check ."
     }
   ]
