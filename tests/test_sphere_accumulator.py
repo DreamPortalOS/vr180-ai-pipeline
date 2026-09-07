@@ -8,7 +8,9 @@ import cv2
 import numpy as np
 import pytest
 
-from pipeline.outpainter import Outpainter, apply_edge_feather, compute_edge_feather_weights
+import pipeline.outpainter as outpainter_mod
+import pipeline.sphere_accumulator as accumulator_mod
+from pipeline.outpainter import Outpainter, _clear_feather_caches, apply_edge_feather, compute_edge_feather_weights
 from pipeline.sphere_accumulator import (
     DEFAULT_SEAM_FEATHER_DEG,
     SphereAccumulator,
@@ -359,3 +361,86 @@ class TestValidation:
         acc.reset()
         assert acc.frames_seen == 0 and not acc.alpha.any()
         assert np.array_equal(acc.update(_flow_frame(0), SCALE), SphereAccumulator(SIZE).update(_flow_frame(0), SCALE))
+
+
+# ---------------------------------------------------------------------------
+#  Issue #276 — the fade-weights memo in front of the outpainter's cache.
+#
+#  The card proposed dropping ``_fade_weights``' whole-canvas ``array_equal``
+#  memo and relying on the outpainter's mask cache alone.  Measured at 2880²
+#  (numbers in PR #276's description): the memo costs 2 ms/frame while the mask
+#  grows, but once the mask is static (the steady state after the ring has
+#  filled, and any ``radial_scale <= 1`` sequence) it *saves* ~11 ms/frame —
+#  delegating would pay uint8 conversion + digest + exact confirm + a 33 MB
+#  copy on every hit.  The memo therefore stays.  These spies pin what it must
+#  do: compute an identical mask once, never serve stale weights, forget on
+#  reset — and its hit must be byte-identical to a fresh outpainter call.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_feather_caches():
+    _clear_feather_caches()
+    yield
+    _clear_feather_caches()
+
+
+def _spy(monkeypatch, module, name, counter, key):
+    real = getattr(module, name)
+
+    def wrapper(*args, **kwargs):
+        counter[key] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, wrapper)
+
+
+class TestFadeWeightsMemo:
+    def test_same_mask_on_consecutive_frames_computes_the_weights_once(self, monkeypatch, fresh_feather_caches):
+        """Two frames with an identical coverage mask: one call into the outpainter,
+        one ray trace inside it; the second frame is served by the memo before
+        the outpainter's own (digest + exact-confirm + copy) hit path runs."""
+        calls = {"weights": 0, "trace": 0}
+        _spy(monkeypatch, accumulator_mod, "compute_edge_feather_weights", calls, "weights")
+        _spy(monkeypatch, outpainter_mod, "_edge_from_covered", calls, "trace")
+
+        acc = SphereAccumulator(SIZE)
+        first = acc.update(_uniform_frame(), 1.0)
+        second = acc.update(_uniform_frame(), 1.0)  # static: identical coverage mask
+        assert calls == {"weights": 1, "trace": 1}
+        assert outpainter_mod._WEIGHTS_CACHE.hits == 0 and outpainter_mod._WEIGHTS_CACHE.misses == 1
+        assert np.array_equal(first, second)
+
+    def test_memo_hit_is_byte_identical_to_a_fresh_outpainter_call(self, fresh_feather_caches):
+        acc = SphereAccumulator(SIZE)
+        acc.update(_uniform_frame(), 1.0)
+        out = acc.update(_uniform_frame(), 1.0)  # memo hit
+        _clear_feather_caches()  # force the outpainter to recompute from scratch
+        weights = compute_edge_feather_weights((acc.alpha > 0).astype(np.uint8) * 255, 165.0, 180.0)
+        expected = apply_edge_feather(_uniform_frame()[:, :, :3] * _fov_mask()[:, :, None], weights)
+        assert np.array_equal(out, expected)
+
+    def test_a_changed_mask_is_recomputed_every_frame(self, monkeypatch, fresh_feather_caches):
+        """While the accumulated coverage grows no frame may reuse stale weights."""
+        calls = {"weights": 0, "trace": 0}
+        _spy(monkeypatch, accumulator_mod, "compute_edge_feather_weights", calls, "weights")
+        _spy(monkeypatch, outpainter_mod, "_edge_from_covered", calls, "trace")
+        acc = SphereAccumulator(SIZE)
+        _run(acc, SCALE, n=3)  # radial expansion: the coverage mask grows every frame
+        assert calls == {"weights": 3, "trace": 3}
+        assert outpainter_mod._WEIGHTS_CACHE.hits == 0
+
+    def test_reset_forgets_the_memo(self, monkeypatch, fresh_feather_caches):
+        calls = {"weights": 0}
+        _spy(monkeypatch, accumulator_mod, "compute_edge_feather_weights", calls, "weights")
+        acc = SphereAccumulator(SIZE)
+        acc.update(_uniform_frame(), 1.0)
+        acc.reset()
+        acc.update(_uniform_frame(), 1.0)
+        assert calls["weights"] == 2, "after reset the first frame goes back to the outpainter"
+
+    def test_fade_off_never_touches_the_outpainter(self, monkeypatch, fresh_feather_caches):
+        calls = {"weights": 0}
+        _spy(monkeypatch, accumulator_mod, "compute_edge_feather_weights", calls, "weights")
+        _run(SphereAccumulator(SIZE, None, None), SCALE, n=3)
+        assert calls["weights"] == 0 and len(outpainter_mod._WEIGHTS_CACHE) == 0
