@@ -1,11 +1,16 @@
-"""Inject Spherical Video V2 (sv3d) metadata into MP4 files.
+"""Inject Spherical Video V2 (st3d + sv3d) metadata into MP4 files.
 
-Uses Google's spatial-media CLI for reliable ISOBMFF metadata injection.
-Falls back to ffmpeg -movflags remux if spatialmedia is unavailable.
+Google's spatial-media CLI is tried first; when it is unavailable (it is not on
+PyPI) an in-process ISOBMFF writer splices spec-compliant boxes into the video
+track's visual sample entry and fixes up every affected size / chunk offset.
+Either way the result is verified structurally *and* by a real ffmpeg decode
+before it is handed back (issue #279: the old writer produced undecodable
+files and its self-check still said OK).
 
 References:
 - Google spatial-media: https://github.com/google/spatial-media
-- Google Spherical Video V2 spec
+- Spherical Video V2 RFC: docs/spherical-video-v2-rfc.md in that repo
+- ffmpeg parser: libavformat/mov.c ``mov_read_sv3d`` / ``mov_read_st3d``
 """
 
 import contextlib
@@ -63,45 +68,67 @@ def _build_st3d(stereo_mode: str) -> bytes:
     return _full_box(b"st3d", 0, 0, _u8(_stereo_mode_byte(stereo_mode)))
 
 
+# ─── Spherical Video V2 box layout ───────────────────────────────────────────
+#
+#   VisualSampleEntry (avc1 / hvc1 / ...)
+#     ├── st3d  FullBox(v0)  stereo_mode: u8
+#     └── sv3d  Box
+#           ├── svhd  FullBox(v0)  metadata_source: null-terminated UTF-8
+#           └── proj  Box
+#                 ├── prhd  FullBox(v0)  pose_yaw/pitch/roll: int32, 16.16 fixed
+#                 └── equi  FullBox(v0)  bounds top/bottom/left/right: u32, 0.32 fixed
+#
+# ffmpeg's mov_read_sv3d walks svhd -> proj -> prhd -> {equi|cbmp|mshp}
+# *sequentially* and logs "Missing projection box" when the box after svhd is
+# anything but proj — which is exactly what the pre-#279 writer emitted.
+
+_METADATA_SOURCE = b"vr180-ai-pipeline\x00"
+
+# equi projection bounds are 0.32 fixed-point *crop* proportions of the full
+# 360x180 sphere ("the proportion of projection cropped from each edge not
+# covered by the video frame").  Each eye of our SBS output is a 180x180
+# equirect (h_fov=180:v_fov=180 in equirectangular_mapper): the full vertical
+# range and the middle half of the horizontal range, i.e. crop 90/360 = 0.25
+# from the left and from the right, nothing from top/bottom.
+_FIXED_0_32_QUARTER = 0x40000000  # 0.25 in 0.32 fixed point
+_EQUI_BOUNDS_VR180 = (0, 0, _FIXED_0_32_QUARTER, _FIXED_0_32_QUARTER)  # top, bottom, left, right
+
+# Projection data boxes a proj box may carry (exactly one, right after prhd).
+_PROJECTION_DATA_BOXES = frozenset({b"equi", b"cbmp", b"mshp"})
+
+
 def _build_svhd() -> bytes:
-    """Build svhd box: metadata source string."""
-    return _full_box(b"svhd", 0, 0, b"vr180-ai-pipeline\x00")
+    """svhd: FullBox(v0) + null-terminated ``metadata_source`` string."""
+    return _full_box(b"svhd", 0, 0, _METADATA_SOURCE)
 
 
-def _build_proj_yaw_pitch_roll() -> bytes:
-    """Build svhd projection header."""
-    return _full_box(b"svhd", 0, 0, b"vr180-ai-pipeline\x00")
+def _build_prhd(yaw: int = 0, pitch: int = 0, roll: int = 0) -> bytes:
+    """prhd: FullBox(v0) + pose yaw / pitch / roll as int32 16.16 fixed-point degrees."""
+    return _full_box(b"prhd", 0, 0, struct.pack(">iii", yaw, pitch, roll))
 
 
-def _build_svproj(width: int, height: int) -> bytes:
-    """Build svproj box containing equirectangular projection data."""
-    # svproj (equirectangular): 4-byte projection type (0 = equirectangular)
-    proj_header = _u32(0)  # equirectangular
-    return _box4(b"svproj", proj_header)
+def _build_equi(bounds: tuple[int, int, int, int] = _EQUI_BOUNDS_VR180) -> bytes:
+    """equi: FullBox(v0) + projection_bounds top / bottom / left / right (u32, 0.32 fixed)."""
+    top, bottom, left, right = bounds
+    return _full_box(b"equi", 0, 0, struct.pack(">IIII", top, bottom, left, right))
 
 
-def _build_svv3d(width: int, height: int) -> bytes:
-    """Build svv3d box with stereo video viewport info."""
-    # Minimal svv3d: contains proj box
-    proj = _build_svproj(width, height)
-    return _box4(b"svv3d", proj)
-
-
-def _build_svmi(stereo_mode: str) -> bytes:
-    """Build svmi box (stereo video metadata indicator)."""
-    return _full_box(b"svmi", 0, 0, _u8(_stereo_mode_byte(stereo_mode)))
+def _build_proj(bounds: tuple[int, int, int, int] = _EQUI_BOUNDS_VR180) -> bytes:
+    """proj: plain Box holding prhd followed by exactly one projection data box (equi)."""
+    return _box4(b"proj", _build_prhd() + _build_equi(bounds))
 
 
 def _build_sv3d(width: int, height: int, stereo_mode: str) -> bytes:
-    """Build complete Google Spherical Video V2 sv3d ISOBMFF box.
+    """Build a spec-compliant ``sv3d { svhd, proj { prhd, equi } }`` box.
 
-    sv3d contains: svhd, svv3d (which contains proj), svmi.
-    st3d is a sibling, NOT nested inside sv3d.
+    ``width`` / ``height`` / ``stereo_mode`` are accepted for API compatibility
+    (existing callers and tests pass them).  The box content does not depend on
+    them: the stereo layout lives in the sibling ``st3d`` box, and the equi
+    bounds are fixed for the pipeline's 180x180-per-eye output.  ``stereo_mode``
+    is still validated so an unknown mode fails as early as it used to.
     """
-    svhd = _build_svhd()
-    svv3d = _build_svv3d(width, height)
-    svmi = _build_svmi(stereo_mode)
-    return _box4(b"sv3d", svhd + svv3d + svmi)
+    _stereo_mode_byte(stereo_mode)
+    return _box4(b"sv3d", _build_svhd() + _build_proj())
 
 
 def _find_box_at(buf: bytearray, box_type: bytes, start: int, end: int) -> int:
@@ -202,9 +229,10 @@ def _find_visual_sample_entry(buf: bytearray) -> tuple[int, int, list[tuple[int,
     boxes needed to bump sizes after insertion.
 
     Returns (entry_offset, entry_size, ancestor_chain) where each ancestor is
-    (offset, size, box_type) starting with the IMMEDIATE parent of the entry
-    (stsd) and ending with the outermost (moov). Returns None if no such
-    entry is reachable.
+    (offset, size, box_type) in root->parent order: moov first, then trak,
+    mdia, minf, stbl and finally stsd (the entry's immediate parent).  Only
+    containers that actually own the entry are in the chain.  Returns None if
+    no such entry is reachable.
     """
     # Walk top-level boxes to find moov.
     for moov_off, moov_type, moov_sz in _walk_boxes(buf, 0, len(buf)):
@@ -246,11 +274,16 @@ def _descend_to_entry(
         if hs == 0:
             pos += size
             continue
-        if btype in (b"trak", b"mdia", b"minf", b"stbl", b"stsd"):
+        tracked = btype in (b"trak", b"mdia", b"minf", b"stbl", b"stsd")
+        if tracked:
             chain.append((pos, size, btype))
         inner = _descend_to_entry(buf, pos + hs, pos + size, chain)
         if inner[0] is not None:
             return inner
+        if tracked:
+            # Backtrack: this container (e.g. an audio trak that precedes the
+            # video trak) does not own the entry and must not get its size bumped.
+            chain.pop()
         pos += size
     return (None, 0)
 
@@ -270,38 +303,37 @@ def inject_spherical_metadata(
 ) -> str:
     """Inject Google Spherical Video V2 metadata into an MP4 file.
 
-    Produces real ISOBMFF ``sv3d`` + ``st3d`` boxes inside the visual sample
-    entry (avc1/hvc1/...) of the video track, with every ancestor box's size
-    field bumped by the inserted payload length. The result is self-verified
-    via :func:`_find_box_recursive` — injection that does not survive the
-    scan raises :class:`RuntimeError` (no silent bad output).
+    Writes real ISOBMFF ``st3d`` + ``sv3d { svhd, proj { prhd, equi } }`` boxes
+    inside the visual sample entry (avc1/hvc1/...) of the video track.
 
-    Google's ``spatial-media`` CLI is tried first (it is the reference
-    implementation). When unavailable it is **not** treated as a failure: we
-    fall through to the in-process ISOBMFF writer, which is the reliable path.
+    Google's ``spatial-media`` CLI is tried first (the reference
+    implementation).  When it is unavailable or fails, the in-process ISOBMFF
+    writer (:func:`_inject_via_python_isobmff`) takes over.  Whichever path
+    wrote the file, :func:`_verify_injection` then checks the box structure and
+    runs a real ffmpeg decode; any failure raises instead of delivering a
+    broken file (issue #279: the old writer produced undecodable output and
+    its presence-only self-check still said OK).
 
     Args:
         input_path: Path to input MP4
         output_path: Path to output MP4 with sv3d+st3d atoms injected
-        width: Full panorama width in pixels (carried for API compatibility;
-               the sv3d box uses the frame dimensions per Spherical V2 spec)
-        height: Full panorama height in pixels
+        width: Full panorama width in pixels (carried for API compatibility)
+        height: Full panorama height in pixels (carried for API compatibility)
         stereo_mode: "sbs" (side-by-side) or "tb" (top-bottom)
 
     Returns:
         Path to output file
 
     Raises:
-        RuntimeError: if the injected sv3d/st3d boxes cannot be found again
-                      by :func:`_find_box_recursive` in the written file.
+        RuntimeError: if no injectable sample entry exists, or the written
+                      file fails the structural / decode verification.
     """
     if _inject_via_spatialmedia_cli(input_path, output_path, stereo_mode):
         _verify_injection(output_path)
         return output_path
 
-    # spatialmedia unavailable or failed -> use the in-process ISOBMFF writer.
-    # This is the reliable path: it writes real sv3d/st3d boxes with correct
-    # ancestor size bumps, and self-verifies via _find_box_recursive.
+    # spatialmedia unavailable or failed -> in-process ISOBMFF writer, verified
+    # the same way (structure + ffmpeg decode) before the file is handed back.
     print("[Metadata] injecting sv3d+st3d via in-process ISOBMFF writer")
     shutil.copy2(input_path, output_path)
     _inject_via_python_isobmff(output_path, stereo_mode)
@@ -311,137 +343,214 @@ def inject_spherical_metadata(
 
 
 def _inject_via_python_isobmff(output_path: str, stereo_mode: str) -> None:
-    """Insert sv3d + st3d ISOBMFF boxes into *output_path* in place.
+    """Insert (or replace) st3d + sv3d in the first visual sample entry, in place.
 
-    1. Read the whole MP4 into a bytearray.
-    2. Find the first visual sample entry via the moov->...->stsd path.
-    3. Build the st3d (sibling, first) and sv3d boxes.
-    4. Insert them right after the current children of the sample entry.
-    5. Bump the size field of every ancestor box (entry -> stsd -> stbl ->
-       minf -> mdia -> trak -> moov) by the inserted payload length.
-    6. Bump the **absolute** chunk offsets in the track's ``stco``/``co64``
-       boxes by the same delta, because the insertion sits before ``mdat``
-       and the mdat that the offsets point at has moved. (Without this bump
-       ffmpeg's -c copy demuxes the right number of packets but the muxer
-       writes 0 bytes — issue #91.)
-    7. Write the modified buffer back.
+    1. Read the whole MP4 into a bytearray and locate the first visual sample
+       entry (avc1/hvc1/...) via moov->trak->mdia->minf->stbl->stsd, together
+       with that chain of ancestor boxes.
+    2. Rebuild the sample entry: keep its 8+78 byte header and every existing
+       child box except a previous st3d/sv3d, then append fresh st3d + sv3d
+       (st3d first, as the spec asks).  Replacing rather than appending keeps a
+       re-injection idempotent — ffmpeg ``-c copy`` (audio remux) carries a
+       valid sv3d/st3d through, and ffmpeg rejects a sample entry with two st3d.
+    3. ``delta`` = new entry length - old entry length (0 or negative when the
+       boxes being replaced were at least as large).
+    4. Shift every ``stco``/``co64`` entry of **every** trak that points at or
+       past the end of the old entry by ``delta`` — those are the bytes that
+       physically moved.  With ``+faststart`` (moov before mdat) that is all of
+       them; with moov after mdat none qualify and the same code path leaves
+       them untouched.  The pre-#279 writer added delta unconditionally, which
+       is what corrupted the mdat-first layout.
+    5. Splice the new entry in and bump the size field of each ancestor
+       (stsd, stbl, minf, mdia, trak, moov) by ``delta``.
 
     Raises:
-        RuntimeError: if no injectable visual sample entry is found.
+        RuntimeError: if no injectable visual sample entry is found or a chunk
+                      offset table is malformed.
     """
     buf = bytearray(Path(output_path).read_bytes())
-
-    sv3d = _build_sv3d(7680, 1920, stereo_mode)
-    st3d = _build_st3d(stereo_mode)
-    payload = st3d + sv3d  # st3d is the sibling that precedes sv3d
 
     loc = _find_visual_sample_entry(buf)
     if loc is None:
         raise RuntimeError("no injectable visual sample entry (avc1/hvc1/...) found in moov tree")
-
     entry_off, entry_sz, chain = loc
+    moov_off, moov_sz, _moov_type = chain[0]
+    old_entry_end = entry_off + entry_sz
 
-    # Insertion point: immediately after the current contents of the sample entry.
-    insert_at = entry_off + entry_sz
+    # st3d is the sibling that precedes sv3d.
+    payload = _build_st3d(stereo_mode) + _build_sv3d(7680, 1920, stereo_mode)
+    new_entry = _rebuild_sample_entry(buf, entry_off, entry_sz, payload)
+    delta = len(new_entry) - entry_sz
 
-    # Shift everything from the insertion point to the end of the file down by
-    # len(payload) so we can splice the boxes in.
-    buf[insert_at:insert_at] = payload
-    delta = len(payload)
+    # Chunk offsets are patched on the *unmodified* buffer so every coordinate
+    # (threshold and box positions) is still expressed in original-file terms.
+    _shift_chunk_offsets(buf, moov_off, moov_sz, threshold=old_entry_end, delta=delta)
 
-    # Now bump the size field of the sample entry itself AND every ancestor,
-    # each by delta. Ancestors are in parent->root order, all with the same
-    # delta because the added bytes sit inside every one of them. The file has
-    # no top-level container size, so bumping moov is the outermost container
-    # size requirement.
-    struct.pack_into(">I", buf, entry_off, entry_sz + delta)
+    buf[entry_off:old_entry_end] = new_entry
     for anc_off, _anc_sz, _anc_type in chain:
         _bump_box_size(buf, anc_off, delta)
-
-    # Bump the chunk-offset table(s) of the SAME track that owns the sample
-    # entry we just extended.  stco stores 32-bit absolute file offsets; co64
-    # stores 64-bit ones.  Every offset they point at lies at or after mdat,
-    # which moved forward by delta, so each value must grow by delta.  Only
-    # offsets for the affected track must change; we locate that track's stbl
-    # (the stbl that is an ancestor of our sample entry) and patch only it.
-    stbl_off = next(off for off, _sz, btype in chain if btype == b"stbl")
-    stbl_sz = struct.unpack(">I", buf[stbl_off : stbl_off + 4])[0]
-    _bump_chunk_offsets(buf, stbl_off + 8, stbl_off + stbl_sz, delta)
 
     Path(output_path).write_bytes(bytes(buf))
 
 
-def _bump_chunk_offsets(buf: bytearray, start: int, end: int, delta: int) -> None:
-    """Add *delta* to every absolute file offset in ``stco`` / ``co64`` boxes
-    found at this container level (the stbl contents).
+def _rebuild_sample_entry(buf: bytearray, entry_off: int, entry_sz: int, new_children: bytes) -> bytes:
+    """Return the visual sample entry at *entry_off* with st3d/sv3d replaced by *new_children*.
 
-    Chunk offsets are absolute file offsets into ``mdat``.  Because the
-    sv3d/st3d payload is spliced *before* mdat, mdat moves forward by *delta*
-    and every chunk offset must grow by the same amount.
-
-    We detect the offset region length from the box's declared size (some
-    ffmpeg builds include the 4-byte ``reserved`` field in ``stco``, some do
-    not) and sanity-check it against the stored ``entry_count``.
+    Existing child boxes other than st3d/sv3d (avcC/hvcC, pasp, colr, ...) are
+    kept in order; any unparseable tail bytes are preserved after the new boxes
+    so a quirky-but-working file is not made worse.  The size field of the
+    returned entry is already correct.
     """
-    pos = start
-    while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos : pos + 4])[0]
-        if size < 8 or pos + size > end:
-            break
-        btype = buf[pos + 4 : pos + 8]
-        if btype == b"stco":
-            _bump_offsets(buf, pos, size, delta, entry_bytes=4)
-        elif btype == b"co64":
-            _bump_offsets(buf, pos, size, delta, entry_bytes=8)
-        pos += size
+    entry_end = entry_off + entry_sz
+    head_end = entry_off + _SAMPLE_ENTRY_HEADER_SIZE
+    if head_end > entry_end:
+        raise RuntimeError(
+            f"visual sample entry at offset {entry_off} is shorter than its {_SAMPLE_ENTRY_HEADER_SIZE}-byte header"
+        )
+
+    kept = bytearray()
+    consumed = head_end
+    for off, btype, size in _walk_boxes(buf, head_end, entry_end):
+        if btype not in (b"st3d", b"sv3d"):
+            kept += buf[off : off + size]
+        consumed = off + size
+
+    new_entry = bytearray(buf[entry_off:head_end]) + kept + new_children + buf[consumed:entry_end]
+    struct.pack_into(">I", new_entry, 0, len(new_entry))
+    return bytes(new_entry)
 
 
-def _bump_offsets(buf: bytearray, box_off: int, box_size: int, delta: int, entry_bytes: int) -> None:
-    """Add *delta* to each offset entry of a stco/co64 box.
+# Containers to descend through when looking for chunk-offset tables.
+_CHUNK_OFFSET_PARENTS = frozenset({b"trak", b"mdia", b"minf", b"stbl"})
 
-    The offset region is everything after the fixed prefix.  We try the two
-    known prefix lengths (with / without the reserved field) and pick the one
-    whose entry_count matches the region length.
+
+def _iter_chunk_offset_boxes(buf: bytearray, start: int, end: int):
+    """Yield (offset, box_type, size) for every stco/co64 box under [start, end)."""
+    for off, btype, size in _walk_boxes(buf, start, end):
+        if btype in (b"stco", b"co64"):
+            yield off, btype, size
+        elif btype in _CHUNK_OFFSET_PARENTS:
+            yield from _iter_chunk_offset_boxes(buf, off + 8, off + size)
+
+
+def _shift_chunk_offsets(buf: bytearray, moov_off: int, moov_sz: int, *, threshold: int, delta: int) -> int:
+    """Add *delta* to every stco/co64 entry >= *threshold* in every trak of the moov.
+
+    stco/co64 are FullBoxes: size(4) type(4) version+flags(4) entry_count(4)
+    followed by 32-bit (stco) or 64-bit (co64) absolute file offsets.  Only
+    offsets at/after *threshold* — the bytes that actually moved — are shifted.
+    Returns the number of entries shifted.
+
+    Raises:
+        RuntimeError: if a table's entry_count does not fit inside its box.
     """
-    body_end = box_off + box_size
-    candidates = [
-        (box_off + 12, box_off + 16),  # no reserved: entry_count@+12, offsets@+16
-        (box_off + 16, box_off + 20),  # with reserved:  entry_count@+16, offsets@+20
-    ]
-    for ec_off, off_start in candidates:
-        if off_start > body_end:
-            continue
-        region_len = body_end - off_start
-        if region_len < 0 or region_len % entry_bytes != 0:
-            continue
-        n_entries = struct.unpack(">I", buf[ec_off : ec_off + 4])[0]
-        if n_entries * entry_bytes == region_len:
-            for i in range(n_entries):
-                at = off_start + i * entry_bytes
-                if entry_bytes == 4:
-                    old = struct.unpack(">I", buf[at : at + 4])[0]
-                    struct.pack_into(">I", buf, at, old + delta)
-                else:
-                    old = struct.unpack(">Q", buf[at : at + 8])[0]
-                    struct.pack_into(">Q", buf, at, old + delta)
-            return
-    # Unrecognised layout — skip rather than corrupt offsets.
+    shifted = 0
+    for off, btype, size in _iter_chunk_offset_boxes(buf, moov_off + 8, moov_off + moov_sz):
+        fmt, width = (">I", 4) if btype == b"stco" else (">Q", 8)
+        count = struct.unpack(">I", buf[off + 12 : off + 16])[0]
+        table = off + 16
+        if table + count * width > off + size:
+            raise RuntimeError(
+                f"malformed {btype.decode('ascii')} box at offset {off}: entry_count {count} does not fit in size {size}"
+            )
+        for i in range(count):
+            at = table + i * width
+            (value,) = struct.unpack(fmt, buf[at : at + width])
+            if value >= threshold:
+                struct.pack_into(fmt, buf, at, value + delta)
+                shifted += 1
+    return shifted
+
+
+# ffmpeg stderr fragments that mean the file is broken even when the process
+# exits 0 (a malformed sv3d is logged at error level, then ffmpeg carries on).
+_FFMPEG_FATAL_PATTERNS = (
+    "Missing projection box",
+    "Missing spherical video header",
+    "Missing projection header box",
+    "Unknown projection type",
+    "Invalid NAL",
+)
+
+#: Seconds of media the decode check runs through.  The failure modes it guards
+#: against (malformed sv3d, chunk offsets pointing into garbage) surface in the
+#: header / first packets, and a uniform stco shift is either right for every
+#: chunk or wrong for every chunk — so a bounded decode catches them while
+#: keeping the check cheap on long 8K outputs.  ``None`` decodes the whole file.
+VERIFY_DECODE_SECONDS: float | None = 10.0
+_VERIFY_TIMEOUT_SECONDS = 600
 
 
 def _verify_injection(output_path: str) -> None:
-    """Self-check: both sv3d and st3d must be findable via the recursive scanner.
+    """Self-check the written file: compliant box structure AND a clean ffmpeg decode.
 
-    Raises :class:`RuntimeError` if either box is missing — this is the guard
-    against silent bad output (issue #91: logs printed success but the file
-    had no sv3d/st3d).
+    1. Structure: st3d present; sv3d present and shaped
+       ``sv3d { svhd, proj { prhd, equi|cbmp|mshp } }`` — what ffmpeg's
+       ``mov_read_sv3d`` requires.  (The pre-#279 writer passed a presence-only
+       scan while emitting ``sv3d { svhd, svv3d, svmi }``.)
+    2. Decode: ``ffmpeg -v error -i <file> -f null -`` must exit 0 and its
+       stderr must not contain any of :data:`_FFMPEG_FATAL_PATTERNS`.  When
+       ffmpeg is not installed this step degrades to a printed warning.
+
+    Raises:
+        RuntimeError: on any structural problem or decode failure — a broken
+                      file is never delivered silently (issues #91, #279).
     """
     buf = bytearray(Path(output_path).read_bytes())
-    missing = [bt for bt in (b"sv3d", b"st3d") if _find_box_recursive(buf, bt, 0, len(buf)) == -1]
-    if missing:
+    problems = _spherical_structure_problems(buf)
+    if problems:
+        raise RuntimeError(f"VR metadata injection FAILED self-check in {output_path}: {'; '.join(problems)}")
+    _ffmpeg_decode_check(output_path)
+
+
+def _spherical_structure_problems(buf: bytearray) -> list[str]:
+    """Return human-readable problems with the st3d/sv3d layout in *buf* (empty when compliant)."""
+    problems: list[str] = []
+    if _find_box_recursive(buf, b"st3d", 0, len(buf)) == -1:
+        problems.append("missing st3d box")
+    sv3d_off = _find_box_recursive(buf, b"sv3d", 0, len(buf))
+    if sv3d_off == -1:
+        problems.append("missing sv3d box")
+        return problems
+
+    sv3d_sz = struct.unpack(">I", buf[sv3d_off : sv3d_off + 4])[0]
+    sv3d_children = list(_walk_boxes(buf, sv3d_off + 8, sv3d_off + sv3d_sz))
+    sv3d_types = [btype for _off, btype, _sz in sv3d_children]
+    if sv3d_types[:1] != [b"svhd"]:
+        problems.append(f"sv3d must start with svhd, found {sv3d_types}")
+    if len(sv3d_types) < 2 or sv3d_types[1] != b"proj":
+        problems.append(f"sv3d must carry proj right after svhd, found {sv3d_types}")
+        return problems
+
+    proj_off, _proj_type, proj_sz = sv3d_children[1]
+    proj_types = [btype for _off, btype, _sz in _walk_boxes(buf, proj_off + 8, proj_off + proj_sz)]
+    if proj_types[:1] != [b"prhd"]:
+        problems.append(f"proj must start with prhd, found {proj_types}")
+    if len(proj_types) < 2 or proj_types[1] not in _PROJECTION_DATA_BOXES:
+        problems.append(f"proj must carry one of equi/cbmp/mshp after prhd, found {proj_types}")
+    return problems
+
+
+def _ffmpeg_decode_check(path: str) -> None:
+    """Run ``ffmpeg -v error -i <path> -f null -`` and raise unless it decodes cleanly."""
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-i", path]
+    if VERIFY_DECODE_SECONDS is not None:
+        cmd += ["-t", f"{VERIFY_DECODE_SECONDS:g}"]
+    cmd += ["-f", "null", "-"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=_VERIFY_TIMEOUT_SECONDS)
+    except FileNotFoundError:
+        print("[Metadata] WARNING: ffmpeg not found — sv3d/st3d verified structurally only, not by decoding")
+        return
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"VR metadata decode check timed out after {_VERIFY_TIMEOUT_SECONDS}s for {path}") from exc
+
+    stderr = result.stderr or ""
+    hits = [pattern for pattern in _FFMPEG_FATAL_PATTERNS if pattern in stderr]
+    if result.returncode != 0 or hits:
         raise RuntimeError(
-            f"VR metadata injection FAILED self-check: missing box(es) "
-            f"{[b.decode('ascii') for b in missing]} in {output_path} "
-            f"(injection produced a plain-2D file)"
+            f"VR metadata injection FAILED decode check for {path}: ffmpeg exit {result.returncode}, "
+            f"fatal patterns {hits}: {stderr.strip()[-600:]}"
         )
 
 
