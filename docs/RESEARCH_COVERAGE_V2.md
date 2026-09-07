@@ -112,11 +112,12 @@
 |---|---|---|---|
 | C-1 hfov 校准工具 | `scripts/calibrate_hfov.py`：对源片抽帧，用 `v360 output=flat` 扫 `ih_fov` + 直线度评分，输出推荐 `--src-hfov`；可选接 GeoCalib/AnyCalib（不下载，仅接口） | 新脚本 + 测试 | 无 |
 | C-2 鱼眼输入 | `--input-projection fisheye`（在 #286 的 `equirect` 之上加一档），`ih_fov/iv_fov` 参数，`alpha_mask` 圆掩码后处理 | `scripts/run_pipeline.py`、`pipeline/equirectangular_mapper.py` + 测试 | #286 合并后 |
-| C-3 10bit HEVC 解码冒烟 | Seedance 4k 输出 yuv420p10le，管线首次遇到；e2e 加一条 10bit 小样 | `scripts/e2e_smoke.py` + 测试 | 无 |
+| ~~C-3 10bit HEVC 解码冒烟~~ ✅ **已验证（#292/#298）** | CI 用 libx265 造真 10bit（ffprobe 确认 `yuv420p10le`）跑完整链路：exit 0、输出可解码、sv3d/st3d 齐、`vr180_qa` 通过（pass=4 warn=2 fail=0）。**结论：管线吃 10bit 源没问题，4k 档可以放心花额度** | `scripts/e2e_smoke.py` + 测试 | 无 |
 | C-4 QC 探针 | 用 `draft`/480p 一次实测"黑底 1:1 首帧会不会被画满"，结论回写本文 | 无代码（lead 或 owner 实测） | owner 额度许可 |
 
 ## 风险与退路
 
+- ~~管线能否吃 Seedance 4k 的 10bit HEVC~~ ✅ 已实证可以（#298，CI 每次都跑）。
 - 首选路线的最大不确定：**模型是否真听"持续前推 + 超广角"**（官方无 FOV 参数、无相机运动 API）。用 `draft` 先试，量光流再花 4k 额度。
 - hfov 不可信 → 必须校准（C-1），否则几何错位比白边更难受。
 - 若 1:1 宽视角效果不佳 → 备选鱼眼路线（QB）；若两者都不行 → QC 视频外扩探针。
