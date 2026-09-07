@@ -356,9 +356,16 @@ def straightness_score(
     """Score one rectified frame. Returns ``(score, segment_count, edge_pixels)``.
 
     ``score = edge_pixels * short_side / Σ length²``; lower means straighter.
-    ``None`` when the frame carries no usable line evidence at all (a noise or
-    blank frame), which the caller turns into low confidence rather than into a
-    flattering zero.
+    ``None`` when the frame carries no usable line evidence at all — a blank or
+    featureless frame — which the caller reports as low confidence rather than
+    as a flattering zero.
+
+    Noise is a *different* failure and is deliberately not caught here: Hough
+    will happily chain random edges into long "segments", so a noise frame does
+    get a score, and often a flattering one.  What it cannot do is get a
+    *different* score at different candidates — the round trip rearranges noise
+    into more noise.  So noise is rejected one level up, by the flat-curve
+    margin rule in :func:`_curve_margin`, not by this function.
     """
     h, w = gray.shape[:2]
     edges = edge_map(gray, mask)
