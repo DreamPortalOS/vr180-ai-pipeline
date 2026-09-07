@@ -1,6 +1,7 @@
 """Tests for pipeline.spherical_injector — ISOBMFF box building and injection."""
 
 import functools
+import importlib.util
 import os
 import shutil
 import struct
@@ -12,7 +13,9 @@ import pytest
 
 import pipeline.spherical_injector as si
 from pipeline.spherical_injector import (
+    _EQUI_BOUNDS_OFFSET,
     _EQUI_BOUNDS_VR180,
+    _EQUI_BOX_SIZE,
     _FIXED_0_32_QUARTER,
     _SAMPLE_ENTRY_HEADER_SIZE,
     _STEREO_LEFT_RIGHT,
@@ -24,9 +27,12 @@ from pipeline.spherical_injector import (
     _bump_box_size,
     _find_box_at,
     _find_box_recursive,
+    _find_equi_offset,
     _find_visual_sample_entry,
     _full_box,
     _inject_via_python_isobmff,
+    _rewrite_projection_bounds,
+    _spatialmedia_bounds_arg,
     _spherical_structure_problems,
     _stereo_mode_byte,
     _u8,
@@ -34,6 +40,7 @@ from pipeline.spherical_injector import (
     _verify_injection,
     _walk_boxes,
     inject_spherical_metadata,
+    read_projection_bounds,
 )
 
 
@@ -845,7 +852,7 @@ class TestLegacyWriterIsCaught:
 
 class TestSpatialmediaPathUnchanged:
     """Regression: when spatialmedia succeeds, the fallback writer is never run
-    and the CLI argv is exactly what it was."""
+    and the CLI argv is exactly what it was — plus the RFC VR180 bounds (#281)."""
 
     def test_cli_success_skips_fallback_writer(self, sample_dir, tmp_path, monkeypatch):
         src = _sample(sample_dir, "h264", True)
@@ -894,7 +901,9 @@ class TestSpatialmediaPathUnchanged:
         with pytest.raises(RuntimeError, match="missing st3d"):
             inject_spherical_metadata(str(src), str(out), stereo_mode="sbs")
 
-    def test_cli_argv_is_unchanged(self, monkeypatch, tmp_path):
+    def test_cli_argv_carries_rfc_bounds(self, monkeypatch, tmp_path):
+        """#281: ``-b top:bottom:left:right`` (0.32 fixed point) asks spatial-media
+        for the VR180 crop; without it the CLI writes all zeros (full 360)."""
         seen: list[list[str]] = []
 
         def fake_run(cmd, **kwargs):
@@ -914,10 +923,62 @@ class TestSpatialmediaPathUnchanged:
                 "left-right",
                 "-p",
                 "equirectangular",
+                "-b",
+                "0:0:1073741824:1073741824",
                 "in.mp4",
                 "out.mp4",
             ]
         ]
+        bounds_arg = seen[0][seen[0].index("-b") + 1]
+        assert bounds_arg == _spatialmedia_bounds_arg(_EQUI_BOUNDS_VR180)
+        # spatial-media's Metadata() parses each field with int(x, 0): must round-trip to the RFC tuple.
+        assert tuple(int(x, 0) for x in bounds_arg.split(":")) == _EQUI_BOUNDS_VR180 == (0, 0, 0x40000000, 0x40000000)
+
+    def test_cli_maps_tb_and_never_spawns_for_mono(self, monkeypatch):
+        """``-s`` knows none|top-bottom|left-right and ``none`` writes no st3d at
+        all, so ``mono`` (st3d 0) must go straight to the in-process writer."""
+        seen: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            seen.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+
+        monkeypatch.setattr(si.subprocess, "run", fake_run)
+        assert si._inject_via_spatialmedia_cli("in.mp4", "out.mp4", "tb") is False
+        assert seen[0][seen[0].index("-s") + 1] == "top-bottom"
+        seen.clear()
+        assert si._inject_via_spatialmedia_cli("in.mp4", "out.mp4", "mono") is False
+        assert seen == []
+
+    def test_mono_end_to_end_uses_fallback_writer(self, sample_dir, tmp_path, monkeypatch):
+        src = _sample(sample_dir, "h264", True)
+        out = tmp_path / "mono.mp4"
+        real_writer = si._inject_via_python_isobmff
+        calls: list[tuple] = []
+
+        def spy(path: str, mode: str) -> None:
+            calls.append((path, mode))
+            real_writer(path, mode)
+
+        monkeypatch.setattr(si, "_inject_via_python_isobmff", spy)
+        inject_spherical_metadata(str(src), str(out), stereo_mode="mono")
+        assert calls == [(str(out), "mono")]
+        data = out.read_bytes()
+        st3d_off = _find_box_recursive(bytearray(data), b"st3d", 0, len(data))
+        assert data[st3d_off + 12] == _STEREO_MONO
+        assert read_projection_bounds(out) == _EQUI_BOUNDS_VR180
+        assert _ffmpeg_decode(out)[0] == 0
+
+    def test_unknown_mode_raises_before_any_subprocess(self, sample_dir, tmp_path, monkeypatch):
+        def no_subprocess(*_a, **_k):
+            raise AssertionError("subprocess.run must not be reached for an unknown stereo mode")
+
+        monkeypatch.setattr(si.subprocess, "run", no_subprocess)
+        with pytest.raises(ValueError, match="diagonal"):
+            inject_spherical_metadata(
+                str(_sample(sample_dir, "h264", True)), str(tmp_path / "x.mp4"), stereo_mode="diagonal"
+            )
+        assert not (tmp_path / "x.mp4").exists()
 
 
 class TestVerifyInjection:
@@ -1031,3 +1092,176 @@ class TestMultiTrackAndReinject:
         st3d_off = _find_box_recursive(bytearray(data), b"st3d", 0, len(data))
         assert data[st3d_off + 12] == _STEREO_TOP_BOTTOM
         assert _ffmpeg_decode(second)[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# issue #281: both injection paths must leave the same RFC VR180 equi bounds
+#
+# The CLI path (spatial-media, owner's box) used to write all-zero bounds —
+# "this frame covers the full 360x180 sphere" — while the fallback (CI) wrote
+# the RFC's 0.25 left/right crop.  The tests below drive the CLI branch with a
+# stand-in that reproduces the old CLI output and prove the delivered file is
+# byte-identical to the fallback's; the last test runs the real CLI where it
+# is installed.
+# ---------------------------------------------------------------------------
+
+_RFC_VR180_BOUNDS = (0, 0, 0x40000000, 0x40000000)
+_FULL_SPHERE_BOUNDS = (0, 0, 0, 0)
+
+
+def _equi_box_bytes(path: Path) -> bytes:
+    """The whole equi box (header + version/flags + 4 bounds) as stored in *path*."""
+    data = bytearray(path.read_bytes())
+    off = _find_equi_offset(data)
+    assert off != -1, "equi not found"
+    return bytes(data[off : off + _EQUI_BOX_SIZE])
+
+
+def _pre_281_cli_stand_in(inp: str, outp: str, mode: str) -> bool:
+    """Stand-in for a pre-#281 spatial-media run: valid V2 boxes, all-zero equi bounds."""
+    shutil.copy2(inp, outp)
+    _inject_via_python_isobmff(outp, mode)
+    assert _rewrite_projection_bounds(outp, _FULL_SPHERE_BOUNDS)
+    return True
+
+
+class TestProjectionBounds:
+    @pytest.fixture
+    def injected(self, sample_dir, tmp_path) -> Path:
+        """A fallback-written file (RFC bounds) to poke at directly."""
+        out = tmp_path / "injected.mp4"
+        shutil.copy2(_sample(sample_dir, "h264", True), out)
+        _inject_via_python_isobmff(str(out), "sbs")
+        return out
+
+    def test_fallback_path_writes_rfc_bounds(self, sample_dir, tmp_path, force_fallback):
+        out = tmp_path / "fallback.mp4"
+        inject_spherical_metadata(str(_sample(sample_dir, "h264", True)), str(out), stereo_mode="sbs")
+        assert read_projection_bounds(out) == _RFC_VR180_BOUNDS == _EQUI_BOUNDS_VR180
+
+    def test_cli_path_ends_byte_identical_to_fallback(self, sample_dir, tmp_path, monkeypatch):
+        """Acceptance: the same source through both paths -> identical
+        read_projection_bounds and an identical equi box, even when the CLI
+        wrote the 360 default."""
+        src = _sample(sample_dir, "h264", True)
+        ref = tmp_path / "fallback.mp4"
+        monkeypatch.setattr(si, "_inject_via_spatialmedia_cli", lambda *_a, **_k: False)
+        inject_spherical_metadata(str(src), str(ref), stereo_mode="sbs")
+
+        out = tmp_path / "cli.mp4"
+        monkeypatch.setattr(si, "_inject_via_spatialmedia_cli", _pre_281_cli_stand_in)
+        inject_spherical_metadata(str(src), str(out), stereo_mode="sbs")
+
+        assert read_projection_bounds(out) == read_projection_bounds(ref) == _RFC_VR180_BOUNDS
+        assert _equi_box_bytes(out) == _equi_box_bytes(ref)
+        assert out.stat().st_size == ref.stat().st_size
+        assert out.read_bytes() == ref.read_bytes()
+        rc, err = _ffmpeg_decode(out)
+        assert rc == 0, err
+
+    def test_cli_output_with_rfc_bounds_is_not_touched(self, sample_dir, tmp_path, monkeypatch):
+        src = _sample(sample_dir, "h264", True)
+        out = tmp_path / "cli.mp4"
+        cli_bytes: list[bytes] = []
+
+        def compliant_cli(inp: str, outp: str, mode: str) -> bool:
+            shutil.copy2(inp, outp)
+            _inject_via_python_isobmff(outp, mode)
+            cli_bytes.append(Path(outp).read_bytes())
+            return True
+
+        rewrites: list[bool] = []
+        real_rewrite = si._rewrite_projection_bounds
+
+        def spy(path, bounds):
+            result = real_rewrite(path, bounds)
+            rewrites.append(result)
+            return result
+
+        monkeypatch.setattr(si, "_inject_via_spatialmedia_cli", compliant_cli)
+        monkeypatch.setattr(si, "_rewrite_projection_bounds", spy)
+        inject_spherical_metadata(str(src), str(out), stereo_mode="sbs")
+        assert rewrites == [False]
+        assert out.read_bytes() == cli_bytes[0]
+
+    def test_rewrite_changes_only_the_four_bounds_fields(self, injected):
+        before = injected.read_bytes()
+        equi_off = _find_equi_offset(bytearray(before))
+        fields = set(range(equi_off + _EQUI_BOUNDS_OFFSET, equi_off + _EQUI_BOX_SIZE))
+
+        assert _rewrite_projection_bounds(injected, _FULL_SPHERE_BOUNDS) is True
+        after = injected.read_bytes()
+
+        assert len(after) == len(before)
+        changed = {i for i, (a, b) in enumerate(zip(before, after, strict=True)) if a != b}
+        assert changed and changed <= fields, (changed, fields)
+        assert after[equi_off : equi_off + _EQUI_BOUNDS_OFFSET] == before[equi_off : equi_off + _EQUI_BOUNDS_OFFSET]
+        assert read_projection_bounds(injected) == _FULL_SPHERE_BOUNDS
+        # ...and back: the rewrite is its own inverse, byte for byte.
+        assert _rewrite_projection_bounds(injected, _EQUI_BOUNDS_VR180) is True
+        assert injected.read_bytes() == before
+
+    def test_rewrite_is_noop_when_bounds_already_match(self, injected):
+        before = injected.read_bytes()
+        assert _rewrite_projection_bounds(injected, _EQUI_BOUNDS_VR180) is False
+        assert injected.read_bytes() == before
+
+    def test_rewrite_leaves_file_without_equi_untouched(self, sample_dir, tmp_path):
+        plain = tmp_path / "plain.mp4"
+        shutil.copy2(_sample(sample_dir, "h264", True), plain)
+        before = plain.read_bytes()
+        assert _rewrite_projection_bounds(plain, _EQUI_BOUNDS_VR180) is False
+        assert plain.read_bytes() == before
+
+    def test_read_raises_without_equi(self, sample_dir):
+        with pytest.raises(RuntimeError, match="equi"):
+            read_projection_bounds(_sample(sample_dir, "h264", True))
+
+    def test_read_matches_the_raw_bytes(self, injected):
+        data = bytearray(injected.read_bytes())
+        equi_off = _find_equi_offset(data)
+        assert bytes(data[equi_off + 4 : equi_off + 8]) == b"equi"
+        raw = struct.unpack_from(">IIII", data, equi_off + _EQUI_BOUNDS_OFFSET)
+        assert read_projection_bounds(injected) == raw == _RFC_VR180_BOUNDS
+
+    def test_self_check_rejects_full_sphere_bounds(self, injected):
+        """The 360 default the CLI used to write must not pass _verify_injection."""
+        _rewrite_projection_bounds(injected, _FULL_SPHERE_BOUNDS)
+        problems = _spherical_structure_problems(bytearray(injected.read_bytes()))
+        assert any("bounds" in p for p in problems), problems
+        with pytest.raises(RuntimeError, match="bounds"):
+            _verify_injection(str(injected))
+
+    def test_self_check_accepts_rfc_bounds(self, injected):
+        assert _spherical_structure_problems(bytearray(injected.read_bytes())) == []
+
+    @pytest.mark.skipif(
+        importlib.util.find_spec("spatialmedia") is None,
+        reason="spatialmedia not installed here (CI has none; the owner's venv does)",
+    )
+    def test_real_spatialmedia_cli_writes_rfc_bounds(self, sample_dir, tmp_path, monkeypatch):
+        """Owner's box: the real CLI honours ``-b`` — neither the fallback writer
+        nor the in-place rewrite is needed, and the equi box equals the fallback's."""
+        src = _sample(sample_dir, "h264", True)
+        out = tmp_path / "real_cli.mp4"
+        real_writer = si._inject_via_python_isobmff
+        real_rewrite = si._rewrite_projection_bounds
+        rewrites: list[bool] = []
+
+        def spy(path, bounds):
+            result = real_rewrite(path, bounds)
+            rewrites.append(result)
+            return result
+
+        monkeypatch.setattr(si, "_inject_via_python_isobmff", lambda *_a: pytest.fail("fallback writer ran"))
+        monkeypatch.setattr(si, "_rewrite_projection_bounds", spy)
+        inject_spherical_metadata(str(src), str(out), stereo_mode="sbs")
+        assert rewrites == [False]
+        assert read_projection_bounds(out) == _RFC_VR180_BOUNDS
+
+        ref = tmp_path / "fallback.mp4"
+        monkeypatch.setattr(si, "_inject_via_spatialmedia_cli", lambda *_a, **_k: False)
+        monkeypatch.setattr(si, "_inject_via_python_isobmff", real_writer)
+        inject_spherical_metadata(str(src), str(ref), stereo_mode="sbs")
+        assert _equi_box_bytes(out) == _equi_box_bytes(ref)
+        assert _ffmpeg_decode(out)[0] == 0

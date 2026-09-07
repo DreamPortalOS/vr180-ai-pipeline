@@ -7,6 +7,12 @@ Either way the result is verified structurally *and* by a real ffmpeg decode
 before it is handed back (issue #279: the old writer produced undecodable
 files and its self-check still said OK).
 
+Both paths must leave a byte-identical ``equi`` box (issue #281): the CLI is
+asked for the RFC VR180 bounds via ``--bounds``, the four bounds fields are
+patched in place should a spatial-media build still write the all-zero 360
+default, and the self-check refuses anything but the RFC values.
+:func:`read_projection_bounds` exposes the fields for tests and QA.
+
 References:
 - Google spatial-media: https://github.com/google/spatial-media
 - Spherical Video V2 RFC: docs/spherical-video-v2-rfc.md in that repo
@@ -92,6 +98,10 @@ _METADATA_SOURCE = b"vr180-ai-pipeline\x00"
 # from the left and from the right, nothing from top/bottom.
 _FIXED_0_32_QUARTER = 0x40000000  # 0.25 in 0.32 fixed point
 _EQUI_BOUNDS_VR180 = (0, 0, _FIXED_0_32_QUARTER, _FIXED_0_32_QUARTER)  # top, bottom, left, right
+
+# equi is a FullBox: size(4) type(4) version/flags(4) then the four u32 bounds.
+_EQUI_BOUNDS_OFFSET = 12
+_EQUI_BOX_SIZE = _EQUI_BOUNDS_OFFSET + 4 * 4
 
 # Projection data boxes a proj box may carry (exactly one, right after prhd).
 _PROJECTION_DATA_BOXES = frozenset({b"equi", b"cbmp", b"mshp"})
@@ -314,21 +324,33 @@ def inject_spherical_metadata(
     broken file (issue #279: the old writer produced undecodable output and
     its presence-only self-check still said OK).
 
+    Both paths end with the same ``equi`` bytes (issue #281): the CLI is passed
+    the RFC VR180 bounds, and should it still write the all-zero 360 default,
+    :func:`_rewrite_projection_bounds` patches the four fields in place before
+    the self-check (which also insists on the RFC values).
+
     Args:
         input_path: Path to input MP4
         output_path: Path to output MP4 with sv3d+st3d atoms injected
         width: Full panorama width in pixels (carried for API compatibility)
         height: Full panorama height in pixels (carried for API compatibility)
-        stereo_mode: "sbs" (side-by-side) or "tb" (top-bottom)
+        stereo_mode: "sbs" (side-by-side), "tb" (top-bottom) or "mono"
 
     Returns:
         Path to output file
 
     Raises:
+        ValueError: on an unknown ``stereo_mode``.
         RuntimeError: if no injectable sample entry exists, or the written
                       file fails the structural / decode verification.
     """
+    _stereo_mode_byte(stereo_mode)  # fail early on an unknown mode, before any subprocess
+
     if _inject_via_spatialmedia_cli(input_path, output_path, stereo_mode):
+        if _rewrite_projection_bounds(output_path, _EQUI_BOUNDS_VR180):
+            print(
+                "[Metadata] equi bounds rewritten in place to the RFC VR180 values (spatial-media wrote the 360 default)"
+            )
         _verify_injection(output_path)
         return output_path
 
@@ -487,7 +509,9 @@ def _verify_injection(output_path: str) -> None:
     1. Structure: st3d present; sv3d present and shaped
        ``sv3d { svhd, proj { prhd, equi|cbmp|mshp } }`` — what ffmpeg's
        ``mov_read_sv3d`` requires.  (The pre-#279 writer passed a presence-only
-       scan while emitting ``sv3d { svhd, svv3d, svmi }``.)
+       scan while emitting ``sv3d { svhd, svv3d, svmi }``.)  An equi box must
+       carry exactly :data:`_EQUI_BOUNDS_VR180` (#281: the CLI path used to
+       ship the all-zero 360 default while the fallback wrote 0.25).
     2. Decode: ``ffmpeg -v error -i <file> -f null -`` must exit 0 and its
        stderr must not contain any of :data:`_FFMPEG_FATAL_PATTERNS`.  When
        ffmpeg is not installed this step degrades to a printed warning.
@@ -523,12 +547,95 @@ def _spherical_structure_problems(buf: bytearray) -> list[str]:
         return problems
 
     proj_off, _proj_type, proj_sz = sv3d_children[1]
-    proj_types = [btype for _off, btype, _sz in _walk_boxes(buf, proj_off + 8, proj_off + proj_sz)]
+    proj_children = list(_walk_boxes(buf, proj_off + 8, proj_off + proj_sz))
+    proj_types = [btype for _off, btype, _sz in proj_children]
     if proj_types[:1] != [b"prhd"]:
         problems.append(f"proj must start with prhd, found {proj_types}")
     if len(proj_types) < 2 or proj_types[1] not in _PROJECTION_DATA_BOXES:
         problems.append(f"proj must carry one of equi/cbmp/mshp after prhd, found {proj_types}")
+        return problems
+
+    equi_off, equi_type, equi_sz = proj_children[1]
+    if equi_type == b"equi":
+        if equi_sz < _EQUI_BOX_SIZE:
+            problems.append(f"equi box is {equi_sz} bytes, expected at least {_EQUI_BOX_SIZE}")
+        else:
+            bounds = _unpack_equi_bounds(buf, equi_off)
+            if bounds != _EQUI_BOUNDS_VR180:
+                problems.append(
+                    f"equi bounds {_format_bounds(bounds)} are not the RFC VR180 values {_format_bounds(_EQUI_BOUNDS_VR180)}"
+                )
     return problems
+
+
+# ─── equi projection bounds: read / patch in place ───────────────────────────
+
+
+def _find_equi_offset(buf: bytearray) -> int:
+    """Byte offset of the ``equi`` box under ``sv3d -> proj``, or -1 when any of the three is missing."""
+    sv3d_off = _find_box_recursive(buf, b"sv3d", 0, len(buf))
+    if sv3d_off == -1:
+        return -1
+    sv3d_sz = struct.unpack_from(">I", buf, sv3d_off)[0]
+    proj_off = _find_box_at(buf, b"proj", sv3d_off + 8, sv3d_off + sv3d_sz)
+    if proj_off == -1:
+        return -1
+    proj_sz = struct.unpack_from(">I", buf, proj_off)[0]
+    equi_off = _find_box_at(buf, b"equi", proj_off + 8, proj_off + proj_sz)
+    if equi_off == -1 or equi_off + _EQUI_BOX_SIZE > len(buf):
+        return -1
+    return equi_off
+
+
+def _unpack_equi_bounds(buf: bytearray, equi_off: int) -> tuple[int, int, int, int]:
+    """(top, bottom, left, right) u32 fields of the equi box at *equi_off*."""
+    top, bottom, left, right = struct.unpack_from(">IIII", buf, equi_off + _EQUI_BOUNDS_OFFSET)
+    return top, bottom, left, right
+
+
+def _format_bounds(bounds: tuple[int, int, int, int]) -> str:
+    return "(" + ", ".join(f"0x{b:08x}" for b in bounds) + ")"
+
+
+def read_projection_bounds(path: str | os.PathLike[str]) -> tuple[int, int, int, int]:
+    """Return the ``equi`` projection bounds ``(top, bottom, left, right)`` stored in *path*.
+
+    Each value is a 0.32 fixed-point crop proportion exactly as written in the
+    file (VR180 per the Spherical Video V2 RFC: ``(0, 0, 0x40000000,
+    0x40000000)``).  Meant for tests and QA tooling to compare what the two
+    injection paths actually wrote.
+
+    Raises:
+        RuntimeError: when the file has no ``sv3d -> proj -> equi`` box.
+    """
+    buf = bytearray(Path(path).read_bytes())
+    equi_off = _find_equi_offset(buf)
+    if equi_off == -1:
+        raise RuntimeError(f"no sv3d/proj/equi projection box found in {os.fspath(path)}")
+    return _unpack_equi_bounds(buf, equi_off)
+
+
+def _rewrite_projection_bounds(path: str | os.PathLike[str], bounds: tuple[int, int, int, int]) -> bool:
+    """Overwrite only the four bounds fields of the existing ``equi`` box, in place.
+
+    The box keeps its size, so no ancestor size or chunk offset changes and the
+    16 bytes are written with a seek instead of rewriting the file.  Returns
+    True when bytes changed, False when the file already carried *bounds* or
+    has no equi box at all (then it is left untouched — :func:`_verify_injection`
+    is where a missing box is reported).
+    """
+    buf = bytearray(Path(path).read_bytes())
+    equi_off = _find_equi_offset(buf)
+    if equi_off == -1:
+        return False
+    packed = struct.pack(">IIII", *bounds)
+    at = equi_off + _EQUI_BOUNDS_OFFSET
+    if buf[at : at + len(packed)] == packed:
+        return False
+    with open(path, "r+b") as fh:
+        fh.seek(at)
+        fh.write(packed)
+    return True
 
 
 def _ffmpeg_decode_check(path: str) -> None:
@@ -554,6 +661,15 @@ def _ffmpeg_decode_check(path: str) -> None:
         )
 
 
+# spatial-media ``-s`` vocabulary for the modes it can express (``mono`` is not one of them).
+_SPATIALMEDIA_STEREO_ARG = {"sbs": "left-right", "tb": "top-bottom"}
+
+
+def _spatialmedia_bounds_arg(bounds: tuple[int, int, int, int]) -> str:
+    """``-b`` value: ``top:bottom:left:right`` as decimal 0.32 fixed-point integers."""
+    return ":".join(str(b) for b in bounds)
+
+
 def _inject_via_spatialmedia_cli(
     input_path: str,
     output_path: str,
@@ -561,10 +677,19 @@ def _inject_via_spatialmedia_cli(
 ) -> bool:
     """Inject metadata using Google's spatial-media CLI tool.
 
-    Uses V2 spec (-2 flag) which injects sv3d + st3d ISOBMFF boxes.
+    Uses V2 spec (-2 flag) which injects sv3d + st3d ISOBMFF boxes, and passes
+    the RFC VR180 equi bounds via ``-b top:bottom:left:right`` (0.32 fixed
+    point; spatial-media parses each with ``int(x, 0)``).  Without ``-b`` the
+    CLI writes all-zero bounds, i.e. claims a full 360x180 sphere (#281).
+
+    ``mono`` cannot be expressed on this CLI: ``-s`` only accepts
+    ``none | top-bottom | left-right`` and ``none`` writes *no* st3d box, so the
+    caller's in-process writer (which does emit ``st3d`` mode 0) is used instead.
     """
+    if stereo_mode not in _SPATIALMEDIA_STEREO_ARG:
+        print(f"[Metadata] spatialmedia CLI has no st3d {stereo_mode!r} mode; using in-process writer")
+        return False
     try:
-        sm_stereo = "left-right" if stereo_mode == "sbs" else "top-bottom"
         cmd = [
             sys.executable,
             "-m",
@@ -572,9 +697,11 @@ def _inject_via_spatialmedia_cli(
             "-i",
             "-2",
             "-s",
-            sm_stereo,
+            _SPATIALMEDIA_STEREO_ARG[stereo_mode],
             "-p",
             "equirectangular",
+            "-b",
+            _spatialmedia_bounds_arg(_EQUI_BOUNDS_VR180),
             input_path,
             output_path,
         ]
