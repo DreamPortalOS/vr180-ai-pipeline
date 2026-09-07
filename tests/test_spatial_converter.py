@@ -4,21 +4,34 @@ Covers:
 - Enum and dataclass imports
 - Constructor edge cases (missing ffmpeg)
 - Supported formats listing
-- ISOBMFF metadata box injection (st3d, sv3d) for all 3 spatial modes
+- st3d/sv3d injection for all 3 spatial modes goes through the shared
+  pipeline.spherical_injector (#281): boxes inside moov, full proj tree with
+  the RFC VR180 equi bounds, file still decodes
 - ffmpeg command construction for SBS/MV-HEVC/SBS-mono paths (mocked)
 - Error handling (unknown format)
 
 Run with: pytest tests/test_spatial_converter.py -v
 """
 
+import inspect
 import os
 import shutil
-import struct
 import subprocess
 import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+from pipeline.spherical_injector import (
+    _EQUI_BOUNDS_VR180,
+    _STEREO_LEFT_RIGHT,
+    _STEREO_MONO,
+    _find_box_recursive,
+    _walk_boxes,
+    read_projection_bounds,
+)
+from tests.test_spherical_injector import _encode_testsrc, _ffmpeg_decode, _sv3d_tree
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -36,22 +49,6 @@ def _make_converter():
 def _has_ffmpeg() -> bool:
     """Check if ffmpeg is actually available on this system."""
     return shutil.which("ffmpeg") is not None
-
-
-def _parse_isobmff_boxes(file_path: str) -> list[tuple[str, bytes]]:
-    """Parse ISOBMFF top-level boxes from a binary file."""
-    with open(file_path, "rb") as f:
-        data = f.read()
-    boxes = []
-    pos = 0
-    while pos + 8 <= len(data):
-        size = struct.unpack(">I", data[pos : pos + 4])[0]
-        if size < 8:
-            break
-        box_type = data[pos + 4 : pos + 8].decode("ascii", errors="replace")
-        boxes.append((box_type, data[pos : pos + size]))
-        pos += size
-    return boxes
 
 
 def _make_dummy_file(tmp_dir: str, suffix: str = ".mp4") -> str:
@@ -159,73 +156,112 @@ class TestSupportedFormats:
 # ---------------------------------------------------------------------------
 
 
+# (converter method, st3d stereo_mode byte it must map to)
+_INJECT_CASES = [
+    pytest.param("_inject_mv_hevc_metadata", _STEREO_MONO, id="mv-hevc->mono"),
+    pytest.param("_inject_sbs_spatial_metadata", _STEREO_LEFT_RIGHT, id="sbs-spatial->sbs"),
+    pytest.param("_inject_sbs_mono_metadata", _STEREO_MONO, id="sbs-mono->mono"),
+]
+# st3d byte -> the pipeline.spherical_injector mode name the converter must pass
+_MODE_NAME = {_STEREO_MONO: "mono", _STEREO_LEFT_RIGHT: "sbs"}
+
+
 class TestMetadataInjection:
-    """Verify st3d and sv3d box bytes written by each _inject_*_metadata method."""
+    """#281: the converter no longer carries its own box writer.
+
+    Every ``_inject_*_metadata`` goes through ``pipeline.spherical_injector``,
+    so the boxes land *inside moov* (in the visual sample entry), carry the full
+    ``svhd / proj { prhd, equi }`` tree with the RFC VR180 bounds, and the file
+    still decodes.  The pre-#281 writer appended st3d/sv3d after the last
+    top-level box (invisible to any parser), emitted a proj without prhd/equi,
+    and tagged SBS as stereo_mode 1 — top-bottom per the RFC, not left-right.
+    """
 
     @pytest.fixture
     def converter(self):
         return _make_converter()
 
-    def test_mv_hevc_injection_contains_st3d_and_sv3d(self, converter, tmp_path):
-        """MV-HEVC metadata should write st3d + sv3d (with svhd + proj) boxes."""
-        file_path = os.path.join(tmp_path, "test.mp4")
-        with open(file_path, "wb") as f:
-            f.write(b"")
+    @pytest.fixture(scope="class")
+    def clip(self, tmp_path_factory) -> Path:
+        """One tiny ``-f lavfi testsrc`` H.264 clip per class; tests copy it."""
+        path = tmp_path_factory.mktemp("i281_converter") / "src.mp4"
+        _encode_testsrc(path, "h264", True)
+        return path
 
-        converter._inject_mv_hevc_metadata(file_path, 1920, 1920)
-        boxes = _parse_isobmff_boxes(file_path)
+    @pytest.mark.skipif(not _has_ffmpeg(), reason="ffmpeg not available on this system")
+    @pytest.mark.parametrize(("method", "stereo_byte"), _INJECT_CASES)
+    def test_boxes_live_inside_moov_with_full_proj_tree(self, converter, clip, tmp_path, method, stereo_byte):
+        file_path = str(tmp_path / "out.mp4")
+        shutil.copy2(clip, file_path)
 
-        box_types = [b[0] for b in boxes]
-        assert "st3d" in box_types, "MV-HEVC should contain st3d box"
-        assert "sv3d" in box_types, "MV-HEVC should contain sv3d box"
+        getattr(converter, method)(file_path, 256, 128)
 
-        # st3d should have stereo_mode = 0 (mono for MV-HEVC)
-        st3d_data = next(b[1] for b in boxes if b[0] == "st3d")
-        stereo_mode = st3d_data[12]
-        assert stereo_mode == 0, "MV-HEVC st3d mode should be 0 (mono)"
+        data = bytearray(Path(file_path).read_bytes())
+        top_level = list(_walk_boxes(data, 0, len(data)))
+        top_types = [t for _o, t, _s in top_level]
+        assert b"st3d" not in top_types and b"sv3d" not in top_types, top_types  # nothing appended to the file
+        moov_off, moov_sz = next((o, s) for o, t, s in top_level if t == b"moov")
+        for box in (b"st3d", b"sv3d"):
+            off = _find_box_recursive(data, box, 0, len(data))
+            assert moov_off < off < moov_off + moov_sz, box
+        assert _sv3d_tree(bytes(data)) == ([b"svhd", b"proj"], [b"prhd", b"equi"])
+        st3d_off = _find_box_recursive(data, b"st3d", 0, len(data))
+        assert data[st3d_off + 12] == stereo_byte
+        assert read_projection_bounds(file_path) == _EQUI_BOUNDS_VR180 == (0, 0, 0x40000000, 0x40000000)
+        rc, err = _ffmpeg_decode(Path(file_path))
+        assert rc == 0, err
+        assert not list(tmp_path.glob("*.vr.mp4"))  # temp file cleaned up
 
-        # sv3d should contain svhd + proj
-        sv3d_data = next(b[1] for b in boxes if b[0] == "sv3d")
-        assert b"svhd" in sv3d_data
-        assert b"proj" in sv3d_data
+    @pytest.mark.parametrize(("method", "stereo_byte"), _INJECT_CASES)
+    def test_mode_mapping_and_in_place_replace(self, converter, tmp_path, method, stereo_byte):
+        """No ffmpeg needed: the shared injector receives the mapped mode and
+        its output replaces the file in place, leaving no temp file behind."""
+        file_path = tmp_path / "out.mp4"
+        file_path.write_bytes(b"original")
+        seen: list[dict] = []
 
-    def test_sbs_spatial_injection_contains_st3d_and_sv3d(self, converter, tmp_path):
-        """SBS spatial metadata should write st3d(mode=1) + sv3d boxes."""
-        file_path = os.path.join(tmp_path, "test.mp4")
-        with open(file_path, "wb") as f:
-            f.write(b"")
+        def fake_inject(input_path, output_path, **kwargs):
+            seen.append({"input": input_path, "output": output_path, **kwargs})
+            Path(output_path).write_bytes(b"injected")
+            return output_path
 
-        converter._inject_sbs_spatial_metadata(file_path, 3840, 1920)
-        boxes = _parse_isobmff_boxes(file_path)
+        with patch("pipeline.spatial_converter.inject_spherical_metadata", fake_inject):
+            getattr(converter, method)(str(file_path), 3840, 1920)
 
-        box_types = [b[0] for b in boxes]
-        assert "st3d" in box_types
-        assert "sv3d" in box_types
+        assert len(seen) == 1
+        assert seen[0]["input"] == str(file_path)
+        assert seen[0]["output"] != str(file_path)
+        assert seen[0]["stereo_mode"] == _MODE_NAME[stereo_byte]
+        assert (seen[0]["width"], seen[0]["height"]) == (3840, 1920)
+        assert file_path.read_bytes() == b"injected"
+        assert not list(tmp_path.glob("*.vr.mp4"))
 
-        st3d_data = next(b[1] for b in boxes if b[0] == "st3d")
-        stereo_mode = st3d_data[12]
-        assert stereo_mode == 1, "SBS spatial st3d mode should be 1 (SBS)"
+    def test_injector_failure_propagates_and_cleans_up(self, converter, tmp_path):
+        file_path = tmp_path / "out.mp4"
+        file_path.write_bytes(b"original")
 
-        sv3d_data = next(b[1] for b in boxes if b[0] == "sv3d")
-        assert b"svhd" in sv3d_data
-        assert b"proj" in sv3d_data
+        def failing_inject(input_path, output_path, **kwargs):
+            Path(output_path).write_bytes(b"half-written")
+            raise RuntimeError("VR metadata injection FAILED self-check")
 
-    def test_sbs_mono_injection_contains_st3d_only(self, converter, tmp_path):
-        """SBS mono metadata should write only st3d(mode=0) box."""
-        file_path = os.path.join(tmp_path, "test.mp4")
-        with open(file_path, "wb") as f:
-            f.write(b"")
+        with (
+            patch("pipeline.spatial_converter.inject_spherical_metadata", failing_inject),
+            pytest.raises(RuntimeError, match="self-check"),
+        ):
+            converter._inject_sbs_spatial_metadata(str(file_path), 3840, 1920)
 
-        converter._inject_sbs_mono_metadata(file_path, 3840, 1920)
-        boxes = _parse_isobmff_boxes(file_path)
+        assert file_path.read_bytes() == b"original"
+        assert not list(tmp_path.glob("*.vr.mp4"))
 
-        box_types = [b[0] for b in boxes]
-        assert "st3d" in box_types
-        assert "sv3d" not in box_types, "SBS mono should NOT contain sv3d"
+    def test_no_private_box_writer_remains(self):
+        """Acceptance grep for #281: spatial_converter must not build sv3d/st3d bytes itself."""
+        import pipeline.spatial_converter as sc
+        import pipeline.spherical_injector as si
 
-        st3d_data = next(b[1] for b in boxes if b[0] == "st3d")
-        stereo_mode = st3d_data[12]
-        assert stereo_mode == 0, "SBS mono st3d mode should be 0"
+        source = inspect.getsource(sc)
+        for literal in ('b"sv3d"', "b'sv3d'", 'b"st3d"', "b'st3d'", "struct.pack"):
+            assert literal not in source, literal
+        assert sc.inject_spherical_metadata is si.inject_spherical_metadata
 
 
 # ---------------------------------------------------------------------------

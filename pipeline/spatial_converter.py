@@ -7,6 +7,8 @@ Supports:
 - SBS Mono (legacy fallback)
 
 Each output format includes proper ISOBMFF metadata boxes for spatial playback.
+The boxes are written by the shared :mod:`pipeline.spherical_injector` (issue
+#281) — this module only maps each format to a stereo mode.
 """
 
 from __future__ import annotations
@@ -15,12 +17,13 @@ import json
 import logging
 import os
 import shutil
-import struct
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+from pipeline.spherical_injector import inject_spherical_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -269,44 +272,29 @@ class SpatialConverter:
             "spatial_mode": "sbs-mono",
         }
 
+    # ------------------------------------------------------------------
+    # Spherical metadata (st3d + sv3d) — shared injector, mode mapping only
+    #
+    # Issue #281: this module used to carry its own writer that *appended*
+    # st3d/sv3d after the last top-level box (outside moov, invisible to any
+    # parser), emitted a proj without prhd/equi, and tagged SBS as
+    # stereo_mode 1 (top-bottom per the RFC; left-right is 2).  Each format
+    # now maps to a mode that pipeline.spherical_injector understands and
+    # the injector writes, fixes up and self-checks the boxes.
+    # ------------------------------------------------------------------
+
     def _inject_mv_hevc_metadata(
         self,
         file_path: str,
         eye_width: int,
         eye_height: int,
     ) -> None:
+        """Inject spherical metadata for the MV-HEVC output.
+
+        Stereo mode ``mono`` (st3d 0), as before: each eye is meant to be its
+        own view rather than a packed frame.
         """
-        Inject MV-HEVC spatial metadata into an MP4 file using ISOBMFF boxes.
-
-        Appends st3d (stereo mode), sv3d (supplemental video), svhd, proj boxes.
-        """
-        with open(file_path, "ab") as f:
-            # st3d box: stereo_mode = 0 (mono) for MV-HEVC (each eye is separate track)
-            st3d_data = struct.pack(">IB", 0, 0)
-            st3d_box = struct.pack(">I", 8 + len(st3d_data)) + b"st3d" + st3d_data
-
-            # svhd box: spherical video header
-            svhd_version = struct.pack(">B", 0)
-            svhd_flags = b"\x00\x00\x00"
-            svhd_metadata_source = b"VR180Studio\x00"
-            svhd_payload = svhd_version + svhd_flags + svhd_metadata_source
-            svhd_box = struct.pack(">I", 8 + len(svhd_payload)) + b"svhd" + svhd_payload
-
-            # proj box: projection box
-            proj_data = struct.pack(">I", 0)  # equirectangular
-            proj_box = struct.pack(">I", 8 + len(proj_data)) + b"proj" + proj_data
-
-            # sv3d box: contains svhd + proj
-            sv3d_payload = svhd_box + proj_box
-            sv3d_box = struct.pack(">I", 8 + len(sv3d_payload)) + b"sv3d" + sv3d_payload
-
-            f.write(st3d_box)
-            f.write(sv3d_box)
-
-        logger.info(
-            "Injected MV-HEVC metadata: st3d + sv3d (svhd, proj) into %s",
-            file_path,
-        )
+        self._inject_spherical_metadata(file_path, "mono", eye_width, eye_height)
 
     def _inject_sbs_spatial_metadata(
         self,
@@ -314,38 +302,8 @@ class SpatialConverter:
         width: int,
         height: int,
     ) -> None:
-        """
-        Inject SBS spatial metadata into an MP4 file.
-
-        Appends st3d (stereo_mode=1 for side-by-side), sv3d (svhd, proj) boxes.
-        """
-        with open(file_path, "ab") as f:
-            # st3d box: stereo_mode = 1 (side-by-side)
-            st3d_data = struct.pack(">IB", 0, 1)
-            st3d_box = struct.pack(">I", 8 + len(st3d_data)) + b"st3d" + st3d_data
-
-            # svhd box
-            svhd_version = struct.pack(">B", 0)
-            svhd_flags = b"\x00\x00\x00"
-            svhd_metadata_source = b"VR180Studio\x00"
-            svhd_payload = svhd_version + svhd_flags + svhd_metadata_source
-            svhd_box = struct.pack(">I", 8 + len(svhd_payload)) + b"svhd" + svhd_payload
-
-            # proj box
-            proj_data = struct.pack(">I", 0)
-            proj_box = struct.pack(">I", 8 + len(proj_data)) + b"proj" + proj_data
-
-            # sv3d box
-            sv3d_payload = svhd_box + proj_box
-            sv3d_box = struct.pack(">I", 8 + len(sv3d_payload)) + b"sv3d" + sv3d_payload
-
-            f.write(st3d_box)
-            f.write(sv3d_box)
-
-        logger.info(
-            "Injected SBS spatial metadata: st3d(mode=1) + sv3d into %s",
-            file_path,
-        )
+        """Inject spherical metadata for the SBS spatial output: stereo mode ``sbs`` (st3d 2, left-right)."""
+        self._inject_spherical_metadata(file_path, "sbs", width, height)
 
     def _inject_sbs_mono_metadata(
         self,
@@ -353,18 +311,25 @@ class SpatialConverter:
         width: int,
         height: int,
     ) -> None:
-        """
-        Inject minimal SBS mono metadata.
+        """Inject spherical metadata for the SBS mono fallback: stereo mode ``mono`` (st3d 0)."""
+        self._inject_spherical_metadata(file_path, "mono", width, height)
 
-        Appends st3d (stereo_mode=0 for mono).
-        """
-        with open(file_path, "ab") as f:
-            # st3d box: stereo_mode = 0 (mono)
-            st3d_data = struct.pack(">IB", 0, 0)
-            st3d_box = struct.pack(">I", 8 + len(st3d_data)) + b"st3d" + st3d_data
-            f.write(st3d_box)
+    def _inject_spherical_metadata(self, file_path: str, stereo_mode: str, width: int, height: int) -> None:
+        """Run :func:`pipeline.spherical_injector.inject_spherical_metadata` on *file_path* in place.
 
-        logger.info("Injected SBS mono metadata: st3d(mode=0) into %s", file_path)
+        The injector writes input -> output, so it is pointed at a sibling temp
+        file that then replaces *file_path*; on any failure the original is left
+        untouched and the temp file is removed.
+        """
+        tmp_output = f"{file_path}.vr.mp4"
+        try:
+            inject_spherical_metadata(file_path, tmp_output, width=width, height=height, stereo_mode=stereo_mode)
+            os.replace(tmp_output, file_path)
+        finally:
+            if os.path.exists(tmp_output):
+                os.remove(tmp_output)
+
+        logger.info("Injected st3d(%s) + sv3d into %s via pipeline.spherical_injector", stereo_mode, file_path)
 
     def _run_ffmpeg(self, cmd: list[str]) -> None:
         """Run an ffmpeg command and raise on failure."""
