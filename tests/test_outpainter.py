@@ -1140,6 +1140,76 @@ class TestFeatherCacheIsolation:
             t1.theta_p[0, 0] = 0.0
 
 
+# ---------------------------------------------------------------------------
+#  Issue #276 — the integer index tables are stored as int32.  The values are
+#  the pre-#276 int64 ones (git 1ed2a53 arithmetic, reproduced verbatim below);
+#  the weights stay byte-exact against the pre-#264 reference through
+#  ``TestFeatherCacheIsByteExact`` above, which runs unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _ref_int64_index_tables(h, w, n_psi):
+    """Pre-#276 ``_geometry_tables`` index arithmetic (git 1ed2a53), verbatim: ``(i0, i1, ray_flat)`` int64."""
+    _theta_p, psi_p = _ref_hemisphere_pixel_angles(h, w)
+    pos = psi_p.astype(np.float64) / (2.0 * np.pi) * n_psi
+    i0 = np.floor(pos).astype(np.int64) % n_psi
+    i1 = (i0 + 1) % n_psi
+    n_theta = max(h, w) + 1
+    theta = np.linspace(0.0, np.pi / 2.0, n_theta)[:, None]
+    psi = np.linspace(0.0, 2.0 * np.pi, n_psi, endpoint=False)[None, :]
+    sin_t = np.sin(theta)
+    x = sin_t * np.cos(psi)
+    y = sin_t * np.sin(psi)
+    z = np.broadcast_to(np.cos(theta), x.shape)
+    lon = np.arctan2(x, z)
+    colat = np.arccos(np.clip(y, -1.0, 1.0))
+    u = np.clip(np.floor((lon / np.pi + 0.5) * w).astype(np.int64), 0, w - 1)
+    v = np.clip(np.floor(colat / np.pi * h).astype(np.int64), 0, h - 1)
+    return i0, i1, v * w + u
+
+
+def _index_table_bytes(h, w, n_psi, itemsize):
+    """Bytes of ``i0 + i1 + ray_flat`` for one size at the given integer width."""
+    return (2 * h * w + (max(h, w) + 1) * n_psi) * itemsize
+
+
+class TestFeatherGeometryTablesAreInt32:
+    @pytest.mark.parametrize(("h", "w", "n_psi"), [(64, 64, 1440), (96, 128, 1440), (128, 96, 360), (90, 120, 7)])
+    def test_index_tables_are_int32_with_the_pre_276_int64_values(self, h, w, n_psi, fresh_feather_caches):
+        t = _geometry_tables(h, w, n_psi)
+        assert t.i0.dtype == t.i1.dtype == t.ray_flat.dtype == np.int32
+        assert t.theta_p.dtype == t.frac.dtype == t.omf.dtype == t.ray_theta_deg.dtype == np.float32
+        for got, ref in zip((t.i0, t.i1, t.ray_flat), _ref_int64_index_tables(h, w, n_psi), strict=True):
+            assert ref.dtype == np.int64 and np.array_equal(got, ref)
+        assert t.ray_flat.min() >= 0 and t.ray_flat.max() < h * w
+        assert t.i0.min() >= 0 and t.i0.max() < n_psi and t.i1.min() >= 0 and t.i1.max() < n_psi
+
+    def test_index_tables_take_half_the_bytes_of_int64(self, fresh_feather_caches):
+        h, w, n_psi = 96, 128, 1440
+        t = _geometry_tables(h, w, n_psi)
+        index_bytes = t.i0.nbytes + t.i1.nbytes + t.ray_flat.nbytes
+        assert index_bytes == _index_table_bytes(h, w, n_psi, 4) == _index_table_bytes(h, w, n_psi, 8) // 2
+        float_bytes = t.theta_p.nbytes + t.frac.nbytes + t.omf.nbytes + t.ray_theta_deg.nbytes
+        assert sum(a.nbytes for a in t) == index_bytes + float_bytes
+
+    def test_oversized_canvas_is_refused_before_anything_is_allocated(self, fresh_feather_caches):
+        """H*W (or n_psi) beyond int32 would wrap the indices: refuse instead of returning garbage."""
+        with pytest.raises(ValueError, match="int32"):
+            _geometry_tables(2**16, 2**15 + 1, 1440)  # H*W = 2**31 + 2**16
+        with pytest.raises(ValueError, match="int32"):
+            _geometry_tables(64, 64, 2**31 + 1)
+        assert len(_GEOMETRY_CACHE) == 0
+
+    def test_production_2880_index_tables_are_83_mb_not_166(self, fresh_feather_caches):
+        """The card's number: one 2880² size holds 82.9 MB of int32 indices (165.9 MB as int64)."""
+        t = _geometry_tables(_PROD_EYE, _PROD_EYE, 1440)
+        index_bytes = t.i0.nbytes + t.i1.nbytes + t.ray_flat.nbytes
+        assert index_bytes == _index_table_bytes(_PROD_EYE, _PROD_EYE, 1440, 4) == 82_949_760
+        assert _index_table_bytes(_PROD_EYE, _PROD_EYE, 1440, 8) == 165_899_520 == 2 * index_bytes
+        assert t.ray_flat.min() >= 0 and t.ray_flat.max() < _PROD_EYE * _PROD_EYE <= np.iinfo(np.int32).max
+        assert t.i0.max() < 1440 and t.i1.max() < 1440
+
+
 # Timing: ~0.25 s cold on a desktop CPU; a weights hit is a digest + one
 # ``np.array_equal`` + one copy (a few ms).  Card: hits < 5 % of the cold call.
 # Percentiles rather than every single sample so a GC pause / scheduler tick
