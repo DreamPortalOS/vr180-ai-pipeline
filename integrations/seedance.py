@@ -19,6 +19,7 @@ from pathlib import Path
 
 import httpx
 
+from integrations import usage_ledger
 from integrations.base import GenerationResult, VideoGenProvider
 from pipeline.image_prep import validate_image_for_i2v
 
@@ -243,9 +244,12 @@ class SeedanceProvider(VideoGenProvider):
         duration: int = 5,
         **kwargs: str | int | float | bool | None,
     ) -> GenerationResult:
-        # ``poll_timeout`` is a client-side knob (CLI --gen-timeout), never a
-        # body field — pop it before the body is assembled.
+        # ``poll_timeout`` is a client-side knob (CLI --gen-timeout) and the two
+        # budget caps are local guard rails (CLI --budget-cap) — never body
+        # fields, so pop them before the body is assembled.
         poll_timeout = kwargs.pop("poll_timeout", None)
+        budget_cap = kwargs.pop("budget_cap", None)
+        budget_cap_tokens = kwargs.pop("budget_cap_tokens", None)
         body = self._build_body(
             content=content,
             duration=duration,
@@ -256,6 +260,20 @@ class SeedanceProvider(VideoGenProvider):
             duration=body["duration"],  # type: ignore[arg-type]
             override=poll_timeout,  # type: ignore[arg-type]
         )
+
+        # W-11 (#328): the budget soft-gate. Deliberately evaluated *here* —
+        # before the httpx client is even opened — so a blocked run cannot
+        # reach the submit POST. Gating after submission would cost exactly as
+        # much as not gating at all. ``resume()`` is intentionally NOT gated:
+        # it sends no POST, so it spends nothing.
+        usage_ledger.enforce_budget(
+            cap=budget_cap,  # type: ignore[arg-type]
+            cap_tokens=budget_cap_tokens,  # type: ignore[arg-type]
+            model=str(body["model"]),
+            resolution=str(body["resolution"]),
+            duration=body["duration"],
+        )
+
         headers = self._headers()
 
         with httpx.Client(base_url=_BASE_URL, timeout=30) as client:
@@ -268,7 +286,19 @@ class SeedanceProvider(VideoGenProvider):
             resp = client.post(_SUBMIT_PATH, json=body, headers=headers)
             task_id = self._handle_submit(resp)
             log.info("Seedance: task submitted, task_id=%s", task_id)
-            return self._poll_task(client, task_id, headers, timeout_seconds)
+            result = self._poll_task(client, task_id, headers, timeout_seconds)
+
+        # W-11 (#328): book the spend. Done here rather than inside the poll
+        # loop because this is the only place that knows what was *requested*
+        # (model / resolution / duration); the poll response only carries the
+        # token counts.
+        self._record_usage(
+            result,
+            model=body["model"],
+            resolution=body["resolution"],
+            duration=body["duration"],
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Resume: poll an already-submitted task (issue #325)
@@ -310,7 +340,15 @@ class SeedanceProvider(VideoGenProvider):
                 task_id,
                 timeout_seconds,
             )
-            return self._poll_task(client, task_id, headers, timeout_seconds)
+            result = self._poll_task(client, task_id, headers, timeout_seconds)
+
+        # A resumed task was billed when it was *submitted*, so its usage still
+        # belongs in the ledger — the run that paid for it was the one that
+        # timed out before it could record anything.  The ledger de-duplicates
+        # on task id, so resuming twice never double-charges.  The request
+        # tier is unknown here: a task id alone does not say what was asked for.
+        self._record_usage(result)
+        return result
 
     # ------------------------------------------------------------------
     # Internal: the poll loop, shared by _run and resume
@@ -377,6 +415,40 @@ class SeedanceProvider(VideoGenProvider):
             time.sleep(_POLL_INTERVAL)
 
         raise RuntimeError(timeout_recovery_message(task_id, timeout_seconds))
+
+    def _record_usage(
+        self,
+        result: GenerationResult,
+        *,
+        model: object = None,
+        resolution: object = None,
+        duration: object = None,
+    ) -> None:
+        """Append this task's usage to the local ledger (issue #328, W-11).
+
+        Bookkeeping only, and it must stay that way: the generation has
+        already succeeded and the quota is already spent, so *nothing* here is
+        allowed to propagate.  :func:`usage_ledger.record_generation` already
+        swallows its own failures; the extra guard here covers a caller that
+        patches the function itself.
+
+        A task with no ``usage`` block reports no consumption, so there is
+        nothing to account for and no record is written.
+        """
+        usage = result.metadata.get("usage") or {}
+        if not usage:
+            return
+        try:
+            usage_ledger.record_generation(
+                provider=self.provider_name,
+                usage=usage,
+                task_id=result.job_id,
+                model=model,
+                resolution=resolution,
+                duration=duration,
+            )
+        except Exception as exc:  # never fail a paid generation over bookkeeping
+            log.warning("用量记账失败（已忽略，本次生成结果不受影响）：%s", exc)
 
     @staticmethod
     def _raise_for_poll_status(resp: httpx.Response, task_id: str) -> None:
