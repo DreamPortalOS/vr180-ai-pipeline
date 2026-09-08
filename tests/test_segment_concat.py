@@ -508,7 +508,7 @@ class TestConcatDemux:
         with suppress(OSError):
             rel_dir.rmdir()
 
-    def test_output_path_is_absolutized(self, tmp_path: Path):
+    def test_output_path_is_absolutized(self, tmp_path: Path, monkeypatch):
         """The ffmpeg output argument must be absolute.
 
         Same root cause as PR #75 / issue #180: a relative output would be
@@ -516,6 +516,10 @@ class TestConcatDemux:
         the fix, output_path is .resolve()-d before use.
         """
         segs = self._segs(tmp_path)
+        # The relative path under test resolves against the cwd, so the cwd
+        # must not be the repo root — otherwise .tmp_concat/ is created there
+        # and stays behind (W-5, #315).
+        monkeypatch.chdir(tmp_path)
         # Pass a caller-relative output path.
         out_rel = Path(".tmp_concat/out.mp4")
         out_rel.parent.mkdir(parents=True, exist_ok=True)

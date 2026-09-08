@@ -324,7 +324,13 @@ _HEAVY_NAMES = (
 
 
 def _main_args(**overrides):
-    """A MagicMock args wired for a minimal streaming run through main()."""
+    """A MagicMock args wired for a minimal streaming run through main().
+
+    Prefer the ``main_args`` fixture below: it pins every attribute that can
+    reach the filesystem to a real ``tmp_path``.  A bare ``MagicMock``
+    attribute that lands in ``Path()`` / ``os.path.join`` turns into a real
+    directory named after the mock's repr (issue #315, W-5).
+    """
     args = MagicMock()
     args.inputs = None
     args.input = "in.mp4"
@@ -367,6 +373,27 @@ def _main_args(**overrides):
     return args
 
 
+@pytest.fixture
+def main_args(tmp_path):
+    """Factory for :func:`_main_args` with the path attributes made real.
+
+    W-5 (#315): ``--temp-dir`` is the one MagicMock attribute main() reliably
+    feeds to ``get_temp_dir`` → ``Path(args.temp_dir) / subdir`` →
+    ``mkdir(parents=True)``.  With a mock in there the pipeline happily
+    created ``MagicMock/mock.temp_dir/<id>/concat`` *inside the repo*, and
+    since the directory is empty (or holds an ignored ``*.mp4``) ``git
+    status`` never said a word.  Handing over ``str(tmp_path)`` keeps the run
+    hermetic and keeps the repo-root guard in conftest.py green.
+    """
+
+    def _factory(**overrides):
+        defaults = {"temp_dir": str(tmp_path), "output": str(tmp_path / "out.mp4")}
+        defaults.update(overrides)
+        return _main_args(**defaults)
+
+    return _factory
+
+
 def _run_main(run_pipeline, args, report):
     """Run ``main()`` with every heavy construction site mocked.
 
@@ -406,8 +433,8 @@ class TestMainGate:
     """The gate has to fire before the expensive part, or it saves nothing."""
 
     # Acceptance (core): FAIL + strict → non-zero exit AND no heavy backend.
-    def test_strict_fail_exits_before_any_heavy_backend_streaming(self, run_pipeline):
-        args = _main_args(source_check="strict")
+    def test_strict_fail_exits_before_any_heavy_backend_streaming(self, run_pipeline, main_args):
+        args = main_args(source_check="strict")
         heavy = {}
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(run_pipeline, "run_checks", return_value=_failing_report()))
@@ -421,10 +448,10 @@ class TestMainGate:
         assert ei.value.code == 1
         _assert_no_heavy_backend(heavy)
 
-    def test_strict_fail_exits_before_any_heavy_backend_batch(self, run_pipeline):
+    def test_strict_fail_exits_before_any_heavy_backend_batch(self, run_pipeline, main_args):
         """Same gate on the batch path (--streaming off ⇒ _stage_all_body,
         which builds its backends via the very same two factories)."""
-        args = _main_args(source_check="strict", streaming=False)
+        args = main_args(source_check="strict", streaming=False)
         heavy = {}
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(run_pipeline, "run_checks", return_value=_failing_report()))
@@ -438,10 +465,10 @@ class TestMainGate:
         assert ei.value.code == 1
         _assert_no_heavy_backend(heavy)
 
-    def test_strict_fail_exits_before_any_heavy_backend_single_stage(self, run_pipeline):
+    def test_strict_fail_exits_before_any_heavy_backend_single_stage(self, run_pipeline, main_args):
         """--stage depth is a third entry into build_depth_backend; the gate
         runs before the stage dispatch, so it covers that one too."""
-        args = _main_args(source_check="strict", streaming=False, stage="depth")
+        args = main_args(source_check="strict", streaming=False, stage="depth")
         heavy = {}
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(run_pipeline, "run_checks", return_value=_failing_report()))
@@ -456,9 +483,9 @@ class TestMainGate:
         _assert_no_heavy_backend(heavy)
 
     # Acceptance: FAIL + warn → the run continues to completion.
-    def test_warn_fail_runs_to_completion_with_warning(self, run_pipeline, caplog):
+    def test_warn_fail_runs_to_completion_with_warning(self, run_pipeline, main_args, caplog):
         caplog.set_level(run_pipeline.logging.INFO)
-        args = _main_args(source_check="warn")
+        args = main_args(source_check="warn")
         heavy, checks = _run_main(run_pipeline, args, _failing_report())
         checks.assert_called_once()
         assert "Source check FAILED (warn mode)" in caplog.text
@@ -468,22 +495,22 @@ class TestMainGate:
         assert heavy["StreamingPipeline"].call_count == 1
 
     # Acceptance: off → run_checks never called from the pipeline entry point.
-    def test_off_never_calls_run_checks_from_main(self, run_pipeline):
-        args = _main_args(source_check="off")
+    def test_off_never_calls_run_checks_from_main(self, run_pipeline, main_args):
+        args = main_args(source_check="off")
         _, checks = _run_main(run_pipeline, args, _passing_report())
         assert checks.call_count == 0
 
     # Acceptance: a crashing check must not take a real run down.
-    def test_check_crash_does_not_stop_main(self, run_pipeline, caplog):
-        args = _main_args(source_check="strict")
+    def test_check_crash_does_not_stop_main(self, run_pipeline, main_args, caplog):
+        args = main_args(source_check="strict")
         heavy, _ = _run_main(run_pipeline, args, OSError("ffprobe missing"))
         assert "Source check failed to run" in caplog.text
         assert "OSError" in caplog.text
         # Even in strict mode: a broken checker is not a failing verdict.
         assert heavy["StreamingPipeline"].call_count == 1
 
-    def test_gate_checks_the_actual_input_path(self, run_pipeline):
-        args = _main_args(input="video/clip.mp4")
+    def test_gate_checks_the_actual_input_path(self, run_pipeline, main_args):
+        args = main_args(input="video/clip.mp4")
         _, checks = _run_main(run_pipeline, args, _passing_report())
         assert checks.call_args.args[0] == "video/clip.mp4"
 
@@ -520,19 +547,19 @@ class TestMainGateConcatPath:
             run_pipeline.main()
             return heavy, checks, None
 
-    def test_concat_intermediate_is_the_thing_checked(self, run_pipeline):
-        args = _main_args(inputs=["a.mp4", "b.mp4"], input=None)
+    def test_concat_intermediate_is_the_thing_checked(self, run_pipeline, main_args):
+        args = main_args(inputs=["a.mp4", "b.mp4"], input=None)
         _, checks, _ = self._run(run_pipeline, args, _passing_report(), expect_exit=False)
         checks.assert_called_once()
         assert checks.call_args.args[0] == str(Path("tmp/concat.mp4"))
 
-    def test_strict_fail_gates_the_concat_path_too(self, run_pipeline):
-        args = _main_args(inputs=["a.mp4", "b.mp4"], input=None, source_check="strict")
+    def test_strict_fail_gates_the_concat_path_too(self, run_pipeline, main_args):
+        args = main_args(inputs=["a.mp4", "b.mp4"], input=None, source_check="strict")
         heavy, _, code = self._run(run_pipeline, args, _failing_report(), expect_exit=True)
         assert code == 1
         _assert_no_heavy_backend(heavy)
 
-    def test_off_skips_the_check_on_the_concat_path(self, run_pipeline):
-        args = _main_args(inputs=["a.mp4", "b.mp4"], input=None, source_check="off")
+    def test_off_skips_the_check_on_the_concat_path(self, run_pipeline, main_args):
+        args = main_args(inputs=["a.mp4", "b.mp4"], input=None, source_check="off")
         _, checks, _ = self._run(run_pipeline, args, _passing_report(), expect_exit=False)
         assert checks.call_count == 0

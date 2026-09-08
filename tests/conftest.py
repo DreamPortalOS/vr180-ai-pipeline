@@ -23,6 +23,15 @@ fixture ``_repo_cache_pollution_guard`` is the regression net: it snapshots
 ``models/.cache`` at session start and fails the session if any new entry
 appears — catching the exact class of leakage that trips only on a dirty
 local machine, not on a clean CI runner.
+
+Issue #315 (W-5) generalises both of the above: ``_repo_root_pollution_guard``
+snapshots the *repo root itself* and fails the session if the suite created
+anything there.  ``video/`` and ``models/.cache`` were the two leaks somebody
+happened to notice; a full run was in fact also leaving ``MagicMock/``,
+``x_vr180_temp/``, ``o/``, ``.tmp_concat/`` and a real ``third_party/`` clone
+behind.  ``git status`` never complained (empty directories are invisible to
+git and ``*.mp4`` is ignored), which is exactly why the guard compares
+directory listings instead of shelling out to git.
 """
 
 from __future__ import annotations
@@ -154,6 +163,87 @@ def _repo_cache_pollution_guard() -> None:
     baseline = _repo_cache_entries()
     yield
     _finalize_repo_cache_guard(baseline)
+
+
+# ---------------------------------------------------------------------------
+# repo-root pollution guard (issue #315, W-5)
+# ---------------------------------------------------------------------------
+
+#: Entries the session is *allowed* to create at the repo root.  These are
+#: tool caches written by pytest / ruff / coverage themselves — never test
+#: artefacts.  Everything else that appears during a session is leakage.
+#:
+#: Deliberately short.  Growing this set is how a guard turns into a rubber
+#: stamp: the fix for a new name showing up is to stop the test writing it,
+#: not to append it here.
+_ROOT_GUARD_ALLOWED = frozenset(
+    {
+        "__pycache__",
+        ".hypothesis",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "coverage.xml",
+        "htmlcov",
+    }
+)
+
+
+def _repo_root_entries(root: Path) -> set[str]:
+    """Names of the entries directly under *root*, minus tool artefacts.
+
+    Only the top level is inspected: that is where the leaks land (a relative
+    path resolved against the repo-root cwd, or a mock repr used as a
+    directory name), and it keeps the snapshot cheap enough to take twice per
+    session even with a populated ``video/`` next door.
+    """
+    return {
+        entry.name
+        for entry in root.iterdir()
+        if entry.name not in _ROOT_GUARD_ALLOWED and not entry.name.startswith(".coverage")
+    }
+
+
+def _finalize_repo_root_guard(root: Path, baseline: set[str]) -> None:
+    """Session-final assertion: the suite created nothing at the repo root.
+
+    Kept as a plain function taking *root* so it can be exercised directly
+    against a throw-away directory (see ``tests/test_repo_root_guard.py``) —
+    a session-teardown assertion that is never itself tested is a guard
+    nobody can trust.
+    """
+    leaked = sorted(_repo_root_entries(root) - baseline)
+    if leaked:
+        leaked_list = "\n  ".join(leaked)
+        pytest.fail(
+            "repo-root pollution detected — the test suite created new entries "
+            "in the repository root (issue #315, W-5):\n  "
+            f"{leaked_list}\n"
+            "Tests must never write inside the repo. The three usual causes:\n"
+            "  * a MagicMock reached a path join (e.g. args.temp_dir) and its "
+            "repr became a directory name — give the mock a real str(tmp_path);\n"
+            "  * a subprocess inherited the repo-root cwd — pass cwd=tmp_path "
+            "to subprocess.run, or monkeypatch.chdir(tmp_path);\n"
+            "  * a relative --output / --outdir / --temp-dir was used — make it "
+            "absolute under tmp_path.\n"
+            "Do NOT .gitignore the offending name: that hides the leak instead "
+            "of fixing it (and empty dirs are invisible to git anyway)."
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _repo_root_pollution_guard() -> None:
+    """Autouse session guard: the repo root must look identical afterwards.
+
+    Issue #315: a full run used to leave ``MagicMock/mock.temp_dir/<id>/concat``,
+    ``x_vr180_temp/``, ``o/``, ``third_party/`` … behind.  ``git status`` stays
+    clean for most of them (empty dirs are untracked-invisible, ``*.mp4`` is
+    ignored), so nothing caught it — hence this snapshot-based guard rather
+    than a git-based one.
+    """
+    baseline = _repo_root_entries(_REPO_ROOT)
+    yield
+    _finalize_repo_root_guard(_REPO_ROOT, baseline)
 
 
 # ---------------------------------------------------------------------------

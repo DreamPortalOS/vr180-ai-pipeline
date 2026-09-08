@@ -47,6 +47,22 @@ SCRIPTS = REPO_ROOT / "scripts"
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _cli_scratch_cwd(tmp_path, monkeypatch):
+    """Run every test in this module (and every CLI subprocess it spawns) from
+    a scratch cwd.
+
+    W-5 (#315): the CLIs under test resolve their default artefacts against
+    the *cwd* — ``--input x.mp4`` derives ``x_vr180_temp/`` next to the input,
+    ``--outdir o`` is taken literally.  Inherited from pytest, that cwd is the
+    repo root, so a plain ``--help``-adjacent smoke test used to leave
+    ``x_vr180/``, ``x_vr180_temp/`` and ``o/`` in the checkout.  Every path in
+    this module is absolute (``REPO_ROOT`` / ``SCRIPTS`` / ``tmp_path``), so
+    moving the cwd changes nothing else.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
 def _cli_env() -> dict[str, str]:
     """Subprocess environment that can import the repo as a package."""
     env = os.environ.copy()
@@ -184,9 +200,18 @@ KEY_PARAMS = [
     # stereo_sweep: grid knobs
     ("stereo_sweep.py", ["--input", "x.mp4", "--outdir", "o", "--limit-seconds", "3"]),
     ("stereo_sweep.py", ["--input", "x.mp4", "--outdir", "o", "--disparities", "0.04"]),
-    # setup_seedvr2: offline/idempotence knobs
-    ("setup_seedvr2.py", ["--dry-run"]),
-    ("setup_seedvr2.py", ["--skip-model"]),
+    # setup_seedvr2: offline/idempotence knobs.
+    #
+    # W-5 (#315): every entry keeps --dry-run *and* --skip-model on the line,
+    # whatever flag it is actually pinning.  The instant argparse succeeds
+    # without them this script starts a real `git clone` into third_party/ and
+    # a pip install; --dry-run alone still mkdirs models/SEEDVR2.  Those paths
+    # are anchored to the script's own REPO_ROOT, so no cwd change can keep
+    # them out of the checkout — the flags are the only lever.  Flag presence
+    # is all this test asserts; the bootstrap itself is covered, fully mocked,
+    # by tests/test_setup_seedvr2.py.
+    ("setup_seedvr2.py", ["--dry-run", "--skip-model"]),
+    ("setup_seedvr2.py", ["--skip-model", "--dry-run", "--skip-deps"]),
 ]
 
 

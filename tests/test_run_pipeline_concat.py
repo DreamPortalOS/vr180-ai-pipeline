@@ -130,7 +130,7 @@ def fake_concat(tmp_path, monkeypatch):
 
 class TestConcatWiring:
     def test_concat_called_once_in_command_order(self, fake_concat, monkeypatch, capsys) -> None:
-        calls, _ = fake_concat
+        calls, tmp_path = fake_concat
 
         monkeypatch.setattr(
             rp,
@@ -142,6 +142,10 @@ class TestConcatWiring:
                 concat_mode="demux",
                 validate_input=False,
                 output=None,
+                # W-5 (#315): a MagicMock temp_dir reaches get_temp_dir ->
+                # Path(...).mkdir(parents=True) and its repr becomes a real
+                # directory in the repo root.  Always hand over a real path.
+                temp_dir=str(tmp_path),
             ),
         )
 
@@ -188,7 +192,7 @@ class TestConcatWiring:
         assert received_input["input"].startswith(str(tmp_path))
 
     def test_crossfade_transmitted(self, fake_concat, monkeypatch) -> None:
-        calls, _ = fake_concat
+        calls, tmp_path = fake_concat
 
         monkeypatch.setattr(
             rp,
@@ -200,6 +204,7 @@ class TestConcatWiring:
                 concat_mode="demux",
                 validate_input=False,
                 output=None,
+                temp_dir=str(tmp_path),
             ),
         )
 
@@ -209,7 +214,7 @@ class TestConcatWiring:
         assert calls["concat"][0]["crossfade"] == 0.5
 
     def test_mode_transmitted(self, fake_concat, monkeypatch) -> None:
-        calls, _ = fake_concat
+        calls, tmp_path = fake_concat
 
         monkeypatch.setattr(
             rp,
@@ -221,6 +226,7 @@ class TestConcatWiring:
                 concat_mode="filter",
                 validate_input=False,
                 output=None,
+                temp_dir=str(tmp_path),
             ),
         )
 
@@ -257,7 +263,7 @@ class TestConcatWiring:
 
 
 class TestCompatFailure:
-    def test_concat_error_prints_message_and_exits_nonzero(self, monkeypatch, capsys) -> None:
+    def test_concat_error_prints_message_and_exits_nonzero(self, monkeypatch, capsys, tmp_path) -> None:
         err = ConcatError(
             "incompatible segment resolution/fps for concat:\n"
             "  reference a.mp4: 1920x1080 @ 30fps\n"
@@ -278,6 +284,9 @@ class TestCompatFailure:
                 concat_mode="demux",
                 validate_input=False,
                 output=None,
+                # The temp dir is resolved before concat_segments raises, so a
+                # MagicMock here still leaks a directory (W-5, #315).
+                temp_dir=str(tmp_path),
             ),
         )
 
@@ -294,7 +303,7 @@ class TestCompatFailure:
 
 
 class TestNoConcatWhenInputGiven:
-    def test_single_input_bypasses_concat(self, monkeypatch, capsys) -> None:
+    def test_single_input_bypasses_concat(self, monkeypatch, capsys, tmp_path) -> None:
         """Regression: --input (single file) must keep its pre-C-1b behaviour.
 
         concat_segments must NOT be called when --input is used.
@@ -316,6 +325,7 @@ class TestNoConcatWhenInputGiven:
                 concat_mode="demux",
                 validate_input=False,
                 output=None,
+                temp_dir=str(tmp_path),
                 stage="depth",
                 streaming=False,
                 projection="vr180",
