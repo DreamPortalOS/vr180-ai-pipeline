@@ -28,7 +28,48 @@ _BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 _SUBMIT_PATH = "/contents/generations/tasks"
 _QUERY_PATH = "/contents/generations/tasks/{task_id}"
 _POLL_INTERVAL = 3.0
-_MAX_POLL_SECONDS = 300
+
+# ---------------------------------------------------------------------------
+# Poll budget (issue #325)
+# ---------------------------------------------------------------------------
+# The client used to hard-code a 300s ceiling.  That covers the 480p/5s
+# baseline but *guarantees* a false timeout for 4k/10s, which takes far longer
+# on the Ark side.  A false timeout is not free: by the time the client gives
+# up the quota has already been spent (the 4k/10s incident cost 1,952,100
+# tokens), so "just run it again" burns a second copy.  The budget therefore
+# scales with the two parameters that actually drive render time — resolution
+# tier and duration — and any leftover overrun is recoverable via
+# ``resume()`` instead of a re-submit.
+
+#: Poll budget for the 480p / 5s baseline. Unchanged from the pre-#325 value
+#: so the cheap default path behaves exactly as before.
+_BASE_POLL_SECONDS = 300
+
+#: Duration (seconds) that ``_BASE_POLL_SECONDS`` is calibrated for.
+_BASELINE_DURATION = 5
+
+#: Back-compat alias for the old module constant — still the 480p/5s budget.
+_MAX_POLL_SECONDS = _BASE_POLL_SECONDS
+
+#: Multiplier applied to the baseline budget per resolution tier. 4k is the
+#: measured pain point: 4k/10s lands at 2400s, comfortably past the 300s that
+#: aborted the live run.
+RESOLUTION_POLL_FACTORS: dict[str, float] = {
+    "480p": 1.0,
+    "720p": 1.5,
+    "1080p": 2.5,
+    "4k": 4.0,
+}
+
+#: Budget used by :meth:`SeedanceProvider.resume` when the caller cannot say
+#: what the original request looked like — the heaviest supported combination
+#: (4k / 15s). Resuming costs no quota, so waiting long is the cheap side.
+_RESUME_POLL_SECONDS = 3600
+
+#: How often (seconds) to log "still running, waited Ns" while polling. Before
+#: #325 the only sign of life was httpx's own GET logging, which says nothing
+#: about elapsed time or the remaining budget.
+_PROGRESS_LOG_INTERVAL = 30.0
 
 # Model IDs (类常量). ``MODEL_FAST`` is the default (owner note: quota-limited,
 # so we default to the lower-cost variant).
@@ -57,6 +98,57 @@ PASSTHROUGH_FIELDS = ("draft", "return_last_frame", "seed", "camera_fixed")
 # Canonical tier order, shared by both CLAs so ``choices`` never drift.
 VALID_RESOLUTIONS = ("480p", "720p", "1080p", "4k")
 VALID_RATIOS = ("adaptive", "16:9", "9:16", "1:1")
+
+
+def poll_timeout_seconds(
+    resolution: str = _DEFAULT_RESOLUTION,
+    duration: int | float | str = _DEFAULT_DURATION,
+    override: int | float | None = None,
+) -> int:
+    """Return the poll budget (seconds) for a *resolution* / *duration* pair.
+
+    The budget is ``300s × resolution_factor × duration_factor`` and never
+    drops below the 300s baseline, so the cheap 480p/5s path keeps its
+    historical behaviour while 4k/10s gets 2400s instead of a guaranteed
+    false timeout (issue #325).
+
+    *override* (the CLI's ``--gen-timeout``) wins over the computed value;
+    it must be a positive number of seconds.
+    """
+    if override is not None:
+        seconds = int(override)
+        if seconds <= 0:
+            raise ValueError(f"poll timeout must be a positive number of seconds, got {override!r}")
+        return seconds
+
+    factor = RESOLUTION_POLL_FACTORS.get(str(resolution), 1.0)
+    try:
+        duration_factor = float(duration) / _BASELINE_DURATION
+    except (TypeError, ValueError):
+        duration_factor = 1.0
+    # Shorter-than-baseline clips never shrink the budget below 300s.
+    duration_factor = max(1.0, duration_factor)
+    return max(_BASE_POLL_SECONDS, int(_BASE_POLL_SECONDS * factor * duration_factor))
+
+
+def timeout_recovery_message(task_id: str, waited_seconds: int | float) -> str:
+    """Render the operator-facing text for a poll timeout.
+
+    A timeout is **not** a failure: the Ark task usually keeps running and the
+    quota is already spent.  The one thing an operator must not do is re-run
+    the generation, so the recovery path (``--resume-task``) and the task id
+    are stated up front rather than buried behind a generic "did not complete"
+    line (issue #325).
+    """
+    return (
+        f"Seedance task {task_id} did not complete within {int(waited_seconds)}s.\n"
+        f"  ⚠️  超时 ≠ 失败：任务很可能仍在方舟服务端继续跑，额度已经消耗。\n"
+        f"  ⚠️  不要重新生成 —— 重跑会再扣一份额度。\n"
+        f"  task_id: {task_id}\n"
+        f"  取回成片: python -m scripts.generate --provider seedance "
+        f"--resume-task {task_id} -o <output.mp4>\n"
+        f"  下次想等更久: 加 --gen-timeout <秒>"
+    )
 
 
 class SeedanceProvider(VideoGenProvider):
@@ -139,59 +231,169 @@ class SeedanceProvider(VideoGenProvider):
     # Internal: submit → poll → result
     # ------------------------------------------------------------------
 
-    def _run(
-        self,
-        content: list[dict[str, object]],
-        duration: int = 5,
-        **kwargs: str | int | float | bool,
-    ) -> GenerationResult:
-        body = self._build_body(
-            content=content,
-            duration=duration,
-            **kwargs,
-        )
-        headers = {
+    def _headers(self) -> dict[str, str]:
+        return {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
 
+    def _run(
+        self,
+        content: list[dict[str, object]],
+        duration: int = 5,
+        **kwargs: str | int | float | bool | None,
+    ) -> GenerationResult:
+        # ``poll_timeout`` is a client-side knob (CLI --gen-timeout), never a
+        # body field — pop it before the body is assembled.
+        poll_timeout = kwargs.pop("poll_timeout", None)
+        body = self._build_body(
+            content=content,
+            duration=duration,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        timeout_seconds = poll_timeout_seconds(
+            resolution=str(body["resolution"]),
+            duration=body["duration"],  # type: ignore[arg-type]
+            override=poll_timeout,  # type: ignore[arg-type]
+        )
+        headers = self._headers()
+
         with httpx.Client(base_url=_BASE_URL, timeout=30) as client:
-            log.info("Seedance: submitting task")
+            log.info(
+                "Seedance: submitting task (resolution=%s duration=%ss, 轮询上限 %ds)",
+                body["resolution"],
+                body["duration"],
+                timeout_seconds,
+            )
             resp = client.post(_SUBMIT_PATH, json=body, headers=headers)
             task_id = self._handle_submit(resp)
             log.info("Seedance: task submitted, task_id=%s", task_id)
+            return self._poll_task(client, task_id, headers, timeout_seconds)
 
-            deadline = time.time() + _MAX_POLL_SECONDS
-            while time.time() < deadline:
-                time.sleep(_POLL_INTERVAL)
-                poll_resp = client.get(_QUERY_PATH.format(task_id=task_id), headers=headers)
-                poll_resp.raise_for_status()
-                poll_data = poll_resp.json()
+    # ------------------------------------------------------------------
+    # Resume: poll an already-submitted task (issue #325)
+    # ------------------------------------------------------------------
 
-                # Real Ark shape: top-level ``status`` (running/succeeded/failed).
-                # A ``usage.completion_tokens`` block may ride along — logged for observability.
-                usage = poll_data.get("usage") or {}
-                if usage:
-                    log.info("Seedance: task %s usage=%s", task_id, usage)
-                status = poll_data.get("status") or poll_data.get("task", {}).get("status") or "unknown"
+    def resume(
+        self,
+        task_id: str,
+        poll_timeout: int | float | None = None,
+    ) -> GenerationResult:
+        """Poll an **already submitted** Ark task and return its result.
 
-                if status in ("succeeded", "completed"):
-                    video_url = self._extract_video_url(poll_data)
-                    if not video_url:
-                        raise RuntimeError(f"Seedance task {task_id} completed but missing video URL: {poll_data}")
-                    log.info("Seedance: task completed, url=%s", video_url)
-                    return GenerationResult(
-                        video_url=video_url,
-                        provider=self.provider_name,
-                        job_id=task_id,
-                        metadata={"status": status, **poll_data},
-                    )
-                if status in ("failed", "expired"):
-                    error = poll_data.get("error") or poll_data.get("task", {}).get("error") or {}
-                    msg = self._error_message(error)
-                    raise RuntimeError(f"Seedance task {task_id} {status}: {msg}")
+        This is the recovery path for a client-side timeout, a dropped
+        connection or a killed session: the task lives on the Ark side and its
+        quota is already spent, so re-submitting the same generation would
+        simply pay for it twice.  ``resume`` issues **no** ``POST`` — only the
+        task-query ``GET`` — so it is always free.
 
-            raise RuntimeError(f"Seedance task {task_id} did not complete within {_MAX_POLL_SECONDS}s")
+        Parameters
+        ----------
+        task_id : str
+            The Ark task id (``cgt-…``) echoed at submit time and repeated in
+            the timeout message.
+        poll_timeout : int | float | None
+            Seconds to keep polling. Defaults to the heaviest supported
+            combination's budget, since the original request parameters are
+            not knowable from a task id alone.
+        """
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            raise ValueError("resume() requires a non-empty Seedance task id (e.g. cgt-20260908185831-69srb)")
+
+        timeout_seconds = _RESUME_POLL_SECONDS if poll_timeout is None else poll_timeout_seconds(override=poll_timeout)
+        headers = self._headers()
+
+        with httpx.Client(base_url=_BASE_URL, timeout=30) as client:
+            log.info(
+                "Seedance: resuming task %s — 跳过提交，不消耗新额度（轮询上限 %ds）",
+                task_id,
+                timeout_seconds,
+            )
+            return self._poll_task(client, task_id, headers, timeout_seconds)
+
+    # ------------------------------------------------------------------
+    # Internal: the poll loop, shared by _run and resume
+    # ------------------------------------------------------------------
+
+    def _poll_task(
+        self,
+        client: httpx.Client,
+        task_id: str,
+        headers: dict[str, str],
+        timeout_seconds: int,
+    ) -> GenerationResult:
+        """Poll *task_id* until it succeeds, fails, or the budget runs out.
+
+        The first query happens immediately (before any sleep) so a resume of
+        an already-finished task returns straight away.
+        """
+        start = time.time()
+        deadline = start + timeout_seconds
+        next_progress_log = start
+
+        while True:
+            now = time.time()
+            if now >= deadline:
+                break
+
+            poll_resp = client.get(_QUERY_PATH.format(task_id=task_id), headers=headers)
+            self._raise_for_poll_status(poll_resp, task_id)
+            poll_data = poll_resp.json()
+
+            # Real Ark shape: top-level ``status`` (running/succeeded/failed).
+            # A ``usage.completion_tokens`` block may ride along — logged for observability.
+            usage = poll_data.get("usage") or {}
+            if usage:
+                log.info("Seedance: task %s usage=%s", task_id, usage)
+            status = poll_data.get("status") or poll_data.get("task", {}).get("status") or "unknown"
+
+            if status in ("succeeded", "completed"):
+                video_url = self._extract_video_url(poll_data)
+                if not video_url:
+                    raise RuntimeError(f"Seedance task {task_id} completed but missing video URL: {poll_data}")
+                log.info("Seedance: task completed, url=%s", video_url)
+                return GenerationResult(
+                    video_url=video_url,
+                    provider=self.provider_name,
+                    job_id=task_id,
+                    metadata={"status": status, **poll_data},
+                )
+            if status in ("failed", "expired"):
+                error = poll_data.get("error") or poll_data.get("task", {}).get("error") or {}
+                msg = self._error_message(error)
+                raise RuntimeError(f"Seedance task {task_id} {status}: {msg}")
+
+            if now >= next_progress_log:
+                log.info(
+                    "Seedance: task %s status=%s, 已等待 %ds / 上限 %ds",
+                    task_id,
+                    status,
+                    int(now - start),
+                    timeout_seconds,
+                )
+                next_progress_log = now + _PROGRESS_LOG_INTERVAL
+
+            time.sleep(_POLL_INTERVAL)
+
+        raise RuntimeError(timeout_recovery_message(task_id, timeout_seconds))
+
+    @staticmethod
+    def _raise_for_poll_status(resp: httpx.Response, task_id: str) -> None:
+        """Convert a poll HTTP error into a ``RuntimeError`` naming the task.
+
+        Callers (the CLI included) catch ``RuntimeError``/``ValueError``; an
+        unwrapped ``httpx.HTTPStatusError`` would escape as a traceback. The
+        common case is a resume with a typo'd or expired task id, which Ark
+        answers with a ``ResourceNotFound`` error block.
+        """
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            error = SeedanceProvider._extract_http_error(exc)
+            if error:
+                raise RuntimeError(f"Seedance task {task_id}: {SeedanceProvider._error_message(error)}") from None
+            raise RuntimeError(f"Seedance task {task_id} poll failed: {exc.response.status_code} {exc}") from None
 
     @staticmethod
     def _build_body(

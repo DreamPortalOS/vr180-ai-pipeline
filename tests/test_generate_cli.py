@@ -102,6 +102,27 @@ def _mock_httpx_client():
     return mock_client
 
 
+class _ExpiredClock:
+    """Stand-in for ``integrations.seedance.time`` that is always out of budget.
+
+    The first reading is the poll loop's start stamp; every later reading is
+    far past any deadline, so the loop times out on its first check without a
+    real wait.  Patching the *module attribute* (rather than ``time.time``
+    itself) keeps the fake clock away from ``logging``, which also reads the
+    wall clock and would otherwise consume the fake readings.
+    """
+
+    def __init__(self) -> None:
+        self._readings = 0
+
+    def time(self) -> float:
+        self._readings += 1
+        return 1.0 if self._readings == 1 else 1e9
+
+    def sleep(self, _seconds: float) -> None:
+        return None
+
+
 class TestGenerateCliGenTierPassthrough:
     """H-2: --gen-resolution / --gen-ratio / --duration reach the seedance
     request body (CLI → provider kwargs → HTTP body). No real network: the
@@ -580,3 +601,353 @@ class TestGenerateCliSeedanceModelResolution:
         assert rc == 0
         body = mock_client.post.call_args[1]["json"]
         assert body["ratio"] == "9:16"
+
+
+class TestGenerateCliResumeTask:
+    """W-9 (#325): ``--resume-task`` retrieves a task without re-submitting it.
+
+    The production incident: a 4k/10s run timed out client-side at the
+    hard-coded 300s while the Ark task kept running.  1,952,100 tokens were
+    already spent, and the error told the operator to re-run — which would
+    have burned a second copy.  ``--resume-task`` is the way out, so the
+    load-bearing assertion here is **zero POST calls**.
+    """
+
+    def _resume_httpx(self, video_path: str, task_id: str = "cgt-20260908185831-69srb"):
+        """A mocked client whose GET reports the task as already succeeded."""
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {
+            "id": task_id,
+            "status": "succeeded",
+            "content": {"video_url": video_path},
+            "usage": {"completion_tokens": 1952100},
+        }
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.get.return_value = poll_resp
+        return mock_client
+
+    def test_resume_task_downloads_without_submitting(self, tmp_path, monkeypatch) -> None:
+        """--resume-task polls + downloads and sends NO submit request."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        src = tmp_path / "recovered.mp4"
+        src.write_bytes(b"fake-mp4")
+        out = tmp_path / "out.mp4"
+
+        mock_client = self._resume_httpx(str(src))
+        with patch("integrations.seedance.httpx.Client", return_value=mock_client):
+            import scripts.generate as gen
+
+            rc = gen.main(
+                [
+                    "--provider",
+                    "seedance",
+                    "--resume-task",
+                    "cgt-20260908185831-69srb",
+                    "--output",
+                    str(out),
+                ]
+            )
+
+        assert rc == 0
+        # The whole point of the flag: no submission, so no extra quota.
+        assert mock_client.post.call_count == 0
+        assert mock_client.get.call_count == 1
+        assert mock_client.get.call_args[0][0] == "/contents/generations/tasks/cgt-20260908185831-69srb"
+        assert out.exists()
+        assert out.read_bytes() == b"fake-mp4"
+
+    def test_resume_task_needs_no_prompt(self, tmp_path, monkeypatch) -> None:
+        """Resuming without a prompt must not trip the 'prompt required' guard."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        src = tmp_path / "recovered.mp4"
+        src.write_bytes(b"fake-mp4")
+        out = tmp_path / "out.mp4"
+
+        mock_client = self._resume_httpx(str(src))
+        with patch("integrations.seedance.httpx.Client", return_value=mock_client):
+            import scripts.generate as gen
+
+            rc = gen.main(["--provider", "seedance", "--resume-task", "cgt-x", "--output", str(out)])
+
+        assert rc == 0
+        assert mock_client.post.call_count == 0
+
+    def test_resume_task_prints_the_task_id(self, tmp_path, monkeypatch, capsys) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        src = tmp_path / "recovered.mp4"
+        src.write_bytes(b"fake-mp4")
+        out = tmp_path / "out.mp4"
+
+        mock_client = self._resume_httpx(str(src), task_id="cgt-resume-print")
+        with patch("integrations.seedance.httpx.Client", return_value=mock_client):
+            import scripts.generate as gen
+
+            rc = gen.main(["--provider", "seedance", "--resume-task", "cgt-resume-print", "--output", str(out)])
+
+        assert rc == 0
+        assert "cgt-resume-print" in capsys.readouterr().out
+
+    def test_resume_task_still_running_is_polled_then_delivered(self, tmp_path, monkeypatch) -> None:
+        """A task that is still running when resumed is waited on, not dropped."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+
+        src = tmp_path / "recovered.mp4"
+        src.write_bytes(b"fake-mp4")
+        out = tmp_path / "out.mp4"
+
+        running = MagicMock(spec=httpx.Response)
+        running.json.return_value = {"id": "cgt-x", "status": "running"}
+        running.raise_for_status.return_value = None
+        done = MagicMock(spec=httpx.Response)
+        done.json.return_value = {"id": "cgt-x", "status": "succeeded", "content": {"video_url": str(src)}}
+        done.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.get.side_effect = [running, done]
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+        ):
+            import scripts.generate as gen
+
+            rc = gen.main(["--provider", "seedance", "--resume-task", "cgt-x", "--output", str(out)])
+
+        assert rc == 0
+        assert mock_client.post.call_count == 0
+        assert mock_client.get.call_count == 2
+        assert out.exists()
+
+    def test_resume_task_failure_is_reported_not_crashed(
+        self, caplog: pytest.LogCaptureFixture, tmp_path, monkeypatch
+    ) -> None:
+        """An unknown task id exits non-zero with a message, not a traceback."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        out = tmp_path / "out.mp4"
+
+        err_resp = MagicMock(spec=httpx.Response)
+        err_resp.status_code = 404
+        err_resp.json.return_value = {"error": {"code": "ResourceNotFound", "message": "task not found"}}
+        err_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "not found", request=MagicMock(), response=err_resp
+        )
+
+        mock_client = _mock_httpx_client()
+        mock_client.get.return_value = err_resp
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            caplog.at_level(logging.ERROR),
+        ):
+            import scripts.generate as gen
+
+            rc = gen.main(["--provider", "seedance", "--resume-task", "cgt-nope", "--output", str(out)])
+
+        assert rc != 0
+        assert mock_client.post.call_count == 0
+        assert "ResourceNotFound" in "\n".join(record.getMessage() for record in caplog.records)
+        assert not out.exists()
+
+    def test_resume_task_on_unsupported_provider_is_rejected(
+        self, caplog: pytest.LogCaptureFixture, tmp_path, monkeypatch
+    ) -> None:
+        """--resume-task with a provider that has no resume() names seedance."""
+        monkeypatch.setenv("MOCK_PROVIDER_OUTPUT_DIR", str(tmp_path / "out"))
+        out = tmp_path / "out.mp4"
+
+        with caplog.at_level(logging.ERROR):
+            import scripts.generate as gen
+
+            rc = gen.main(["--provider", "mock", "--resume-task", "cgt-x", "--output", str(out)])
+
+        assert rc == 2
+        assert "seedance" in "\n".join(record.getMessage() for record in caplog.records).lower()
+        assert not out.exists()
+
+    def test_parser_defaults_have_no_resume_or_timeout(self) -> None:
+        """Both new flags are opt-in; the default behaviour is untouched."""
+        import scripts.generate as gen
+
+        args = gen.build_parser().parse_args(["p", "--provider", "seedance"])
+        assert args.resume_task is None
+        assert args.gen_timeout is None
+
+
+class TestGenerateCliGenTimeout:
+    """W-9 (#325): --gen-timeout overrides the computed poll budget."""
+
+    def _seedance_httpx(self, video_path: str):
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"id": "cgt-cli-timeout-01"}
+        submit_resp.raise_for_status.return_value = None
+
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {
+            "id": "cgt-cli-timeout-01",
+            "status": "succeeded",
+            "content": {"video_url": video_path},
+        }
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+        return mock_client
+
+    def _run_and_capture_budget(self, argv: list[str], tmp_path) -> tuple[int, int]:
+        """Run the CLI with a spied poll loop; return (exit code, poll budget)."""
+        from integrations.seedance import SeedanceProvider
+
+        src = tmp_path / "src.mp4"
+        src.write_bytes(b"fake-mp4")
+
+        captured: dict[str, int] = {}
+        original = SeedanceProvider._poll_task
+
+        def _spy(self, client, task_id, headers, timeout_seconds):
+            captured["timeout_seconds"] = timeout_seconds
+            return original(self, client, task_id, headers, timeout_seconds)
+
+        mock_client = self._seedance_httpx(str(src))
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time.sleep", return_value=None),
+            patch.object(SeedanceProvider, "_poll_task", _spy),
+        ):
+            import scripts.generate as gen
+
+            rc = gen.main(argv)
+        return rc, captured["timeout_seconds"]
+
+    def test_gen_timeout_overrides_the_computed_budget(self, tmp_path, monkeypatch) -> None:
+        from integrations.seedance import MODEL_STD
+
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        out = tmp_path / "out.mp4"
+
+        rc, budget = self._run_and_capture_budget(
+            [
+                "pan left",
+                "--provider",
+                "seedance",
+                "--model",
+                MODEL_STD,
+                "--gen-resolution",
+                "4k",
+                "--duration",
+                "10",
+                "--gen-timeout",
+                "77",
+                "--output",
+                str(out),
+            ],
+            tmp_path,
+        )
+        assert rc == 0
+        assert budget == 77
+
+    def test_4k_10s_without_the_flag_scales_past_1800s(self, tmp_path, monkeypatch) -> None:
+        """The incident combination must no longer be capped at 300s."""
+        from integrations.seedance import MODEL_STD
+
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        out = tmp_path / "out.mp4"
+
+        rc, budget = self._run_and_capture_budget(
+            [
+                "pan left",
+                "--provider",
+                "seedance",
+                "--model",
+                MODEL_STD,
+                "--gen-resolution",
+                "4k",
+                "--duration",
+                "10",
+                "--output",
+                str(out),
+            ],
+            tmp_path,
+        )
+        assert rc == 0
+        assert budget >= 1800
+
+    def test_default_run_keeps_the_300s_budget(self, tmp_path, monkeypatch) -> None:
+        """Regression: 480p/5s is still exactly 300s."""
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        out = tmp_path / "out.mp4"
+
+        rc, budget = self._run_and_capture_budget(
+            ["pan left", "--provider", "seedance", "--output", str(out)],
+            tmp_path,
+        )
+        assert rc == 0
+        assert budget == 300
+
+    def test_non_positive_gen_timeout_is_rejected(
+        self, caplog: pytest.LogCaptureFixture, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        out = tmp_path / "out.mp4"
+
+        mock_client = _mock_httpx_client()
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            caplog.at_level(logging.ERROR),
+        ):
+            import scripts.generate as gen
+
+            rc = gen.main(
+                ["p", "--provider", "seedance", "--gen-timeout", "0", "--output", str(out)],
+            )
+
+        assert rc == 2
+        assert "gen-timeout" in "\n".join(record.getMessage() for record in caplog.records)
+        assert mock_client.post.call_count == 0
+
+
+class TestGenerateCliTimeoutGuidance:
+    """W-9 (#325): what the operator reads when the client gives up.
+
+    Asserting the *wording* rather than the exception type is deliberate — the
+    text is the control that stops somebody re-running a 1.95M-token job.
+    """
+
+    def test_timeout_error_tells_the_operator_not_to_regenerate(
+        self, caplog: pytest.LogCaptureFixture, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("ARK_API_KEY", "test-key")
+        out = tmp_path / "out.mp4"
+
+        submit_resp = MagicMock(spec=httpx.Response)
+        submit_resp.json.return_value = {"id": "cgt-20260908185831-69srb"}
+        submit_resp.raise_for_status.return_value = None
+
+        poll_resp = MagicMock(spec=httpx.Response)
+        poll_resp.json.return_value = {"id": "cgt-20260908185831-69srb", "status": "running"}
+        poll_resp.raise_for_status.return_value = None
+
+        mock_client = _mock_httpx_client()
+        mock_client.post.return_value = submit_resp
+        mock_client.get.return_value = poll_resp
+
+        with (
+            patch("integrations.seedance.httpx.Client", return_value=mock_client),
+            patch("integrations.seedance.time", _ExpiredClock()),
+            caplog.at_level(logging.ERROR),
+        ):
+            import scripts.generate as gen
+
+            rc = gen.main(["p", "--provider", "seedance", "--output", str(out)])
+
+        assert rc != 0
+        msg = "\n".join(record.getMessage() for record in caplog.records)
+        assert "cgt-20260908185831-69srb" in msg
+        assert "不要重新生成" in msg
+        assert "--resume-task cgt-20260908185831-69srb" in msg
+        assert not out.exists()
