@@ -36,6 +36,13 @@ from integrations.seedance import (  # noqa: E402
     VALID_RATIOS,
     VALID_RESOLUTIONS,
 )
+from integrations.usage_ledger import (  # noqa: E402
+    ENV_BUDGET_CAP,
+    ENV_BUDGET_CAP_TOKENS,
+    ENV_LEDGER_PATH,
+    ENV_PRICE_PER_MTOKEN,
+    BudgetExceededError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +113,13 @@ def build_parser() -> argparse.ArgumentParser:
             "  ARK_API_KEY        API key for Seedance (Volcengine Ark)\n"
             "  VEO_API_KEY        API key for Veo (Vertex AI)\n"
             "  GCP_PROJECT_ID     GCP project (Veo, defaults to 'my-project')\n"
+            "\n"
+            "Usage ledger / budget guard (issue #328):\n"
+            f"  {ENV_LEDGER_PATH}            账本路径（默认 ~/.vr180/usage_ledger.jsonl）\n"
+            f"  {ENV_PRICE_PER_MTOKEN}  单价，元/百万token；未配置则只记 token、不估金额\n"
+            f"  {ENV_BUDGET_CAP}            累计预算上限（元），等价于 --budget-cap\n"
+            f"  {ENV_BUDGET_CAP_TOKENS}     累计预算上限（token），未配置单价时的闸门\n"
+            "  查看账本: python -m integrations.usage_ledger --summary\n"
         ),
     )
     parser.add_argument(
@@ -218,6 +232,15 @@ def build_parser() -> argparse.ArgumentParser:
         "cgt-20260908185831-69srb), then download its result. Use this after a client-side "
         "timeout, a dropped connection or a killed session — the quota for that task is "
         "already spent, and resuming costs nothing.",
+    )
+    parser.add_argument(
+        "--budget-cap",
+        type=float,
+        default=None,
+        metavar="AMOUNT",
+        help="累计预算软闸（元）。达到 80%% 时生成前打印醒目 WARNING，达到 100%% 时在**提交前**"
+        f"拒绝并非零退出（不消耗额度）。等价环境变量 {ENV_BUDGET_CAP}。金额模式需要配置单价 "
+        f"{ENV_PRICE_PER_MTOKEN}（元/百万token）；未配置单价时改用 {ENV_BUDGET_CAP_TOKENS} 的 token 闸门。",
     )
     parser.add_argument(
         "--output",
@@ -388,6 +411,10 @@ def main(argv: list[str] | None = None) -> int:
         log.error("--gen-timeout must be a positive number of seconds; got %d", args.gen_timeout)
         return 2
 
+    if args.budget_cap is not None and args.budget_cap <= 0:
+        log.error("--budget-cap must be a positive amount in 元; got %s", args.budget_cap)
+        return 2
+
     # Seedance (Ark) caps duration at [4, 15]. Other providers have different
     # contracts, so this check only fires for the seedance provider.  Skipped
     # when resuming: --duration describes a submission, and --resume-task does
@@ -504,6 +531,12 @@ def main(argv: list[str] | None = None) -> int:
     # resolution × duration (issue #325); other providers ignore the kwarg.
     if args.gen_timeout is not None:
         kwargs["poll_timeout"] = args.gen_timeout
+    # W-11 (#328): the budget cap is a *local* guard rail, not a body field.
+    # The provider evaluates it before its submit POST, so a run over budget
+    # never reaches the API. Absent by default; VR180_BUDGET_CAP still applies
+    # when the flag is omitted (the ledger reads it directly).
+    if args.budget_cap is not None:
+        kwargs["budget_cap"] = args.budget_cap
     if args.gen_resolution != "480p":
         log.warning("⚠️  高档位（%s）消耗更多额度，请确认后再继续。", args.gen_resolution)
 
@@ -531,6 +564,11 @@ def main(argv: list[str] | None = None) -> int:
         except NotImplementedError as exc:
             log.error("Provider %s does not support image-to-video: %s", args.provider, exc)
             return 1
+        except BudgetExceededError:
+            # Refused before the submit POST, so no quota was spent. The full
+            # operator-facing message (used / cap / how to raise it) is already
+            # logged by enforce_budget — re-printing it here would only add noise.
+            return 2
         except (RuntimeError, ValueError) as exc:
             log.error("Generation failed: %s", exc)
             return 1
@@ -553,6 +591,9 @@ def main(argv: list[str] | None = None) -> int:
                 fps=args.fps,
                 **kwargs,
             )
+        except BudgetExceededError:
+            # See the image-to-video branch: blocked pre-submit, nothing spent.
+            return 2
         except (RuntimeError, ValueError) as exc:
             log.error("Generation failed: %s", exc)
             return 1
