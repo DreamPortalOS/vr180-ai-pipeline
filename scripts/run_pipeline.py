@@ -260,12 +260,43 @@ def _source_check_reasons(report) -> list[str]:
 def _run_source_check(args) -> None:
     """Invoke the W-1 (#305) source health check for this run (W-2, #311).
 
-    Called by :func:`main` from the same place as :func:`_run_preflight` —
-    **before** any heavy backend is constructed (streaming's
+    Called by :func:`main` **before the R-1 SeedVR2 pre-stage** and therefore
+    before any heavy backend is constructed at all (streaming's
     ``build_depth_backend``/``build_stereo_backend``, the batch depth/stereo
     stages, or the single-stage ``--stage depth``/``--stage stereo`` entries).
     That placement is the whole point of the card: a source that can never
     produce parallax must not cost forty minutes of GPU time to find out.
+
+    W-4 (#314) hoisted the call site above the SeedVR2 pre-stage, for two
+    reasons that both follow from ``run_seedvr2_prestage`` rewriting
+    ``args.input`` to point at its upscaled intermediate:
+
+    1. **Cost.** Upscaling is one of the most expensive steps on a 12GB card.
+       Gating *after* it means a ``strict`` rejection has already paid for the
+       whole thing — the gate would save nothing on exactly the runs it fires.
+    2. **Correctness.** Graded after the pre-stage, the four checks measure the
+       *intermediate*, not the footage the operator handed us. Upscaling does
+       not change the camera move, so ``forward_motion`` — the check the whole
+       VR180 route rests on — is only meaningful on the original; likewise a
+       letterbox bar is a property of the source, and judging it on a
+       re-encoded derivative is one indirection too many.
+
+    What gets graded, exactly:
+
+    * ``--input``: that file, untouched, exactly as the operator typed it.
+    * ``--inputs``: the C-1b concat intermediate. The concat pre-stage has to
+      run first — the run has a single timeline and grading segment 1 alone
+      would be arbitrary — but that intermediate is a *join* of the originals,
+      not a transform of them: ``demux`` mode is a lossless ``-c copy`` and
+      even ``filter`` mode preserves the camera move, the frame size and the
+      edge bands, which is everything the four checks look at. W-1 samples
+      ``SOURCE_CHECK_PAIRS`` pairs spread over the clip and aggregates by
+      *median*, so a pair that happens to straddle a segment boundary cannot
+      decide the verdict. What it is emphatically *not* is the upscaled file.
+
+    :func:`_run_preflight` deliberately keeps its own, later call site: it
+    measures host RAM/VRAM, which has nothing to do with the footage, and its
+    semantics and tests predate this card.
 
     Behaviour is governed by ``--source-check``, mirroring ``--preflight``:
 
@@ -691,7 +722,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "a FAIL; 'strict' = exit non-zero with the reasons and the fix advice, before a "
             "single second of GPU time is spent; 'off' = skip the check entirely (no frame "
             "sampling at all). The default is 'warn' rather than 'strict' because a "
-            "non-square source is legitimate on the fisheye and 16:9 routes."
+            "non-square source is legitimate on the fisheye and 16:9 routes. "
+            "W-4 (#314): the check runs BEFORE the --video-upscale seedvr2 pre-stage, so it "
+            "grades the ORIGINAL source you passed in and a strict rejection costs zero "
+            "upscaling time — never the upscaled intermediate. With --inputs it grades the "
+            "concatenated intermediate (a lossless join of your segments, produced before "
+            "any upscaling), not the individual segments."
         ),
     )
     parser.add_argument(
@@ -3088,6 +3124,23 @@ def main():
     else:
         args.device = resolve_device(args.device)
 
+    # W-2 (#311) / W-4 (#314): source health gate.  It sits HERE — above the
+    # SeedVR2 pre-stage below — and not next to the P-4b preflight further
+    # down, because `run_seedvr2_prestage` rewrites args.input to its upscaled
+    # intermediate.  Gating after that would (a) charge every strict rejection
+    # the full price of an upscale, the single most expensive step on a 12GB
+    # card, and (b) grade the intermediate instead of the operator's footage.
+    # Everything downstream of this line is heavy: SeedVR2, then the streaming
+    # backends / _stage_all_body / the single-stage entries.
+    #
+    # --inputs: the concat pre-stage above has already folded the segments into
+    # one intermediate, and that is what gets graded — a lossless (`demux`
+    # `-c copy`) join of the originals, unchanged in camera motion, frame size
+    # and edge bands, which is all four checks look at.  See _run_source_check.
+    #
+    # Default mode is 'warn', which never exits.
+    _run_source_check(args)
+
     # R-1: SeedVR2 pre-stage — upscale the input video file before any frame loading
     if args.video_upscale == "seedvr2":
         if manifest_skip and "upscale" in manifest_skip:
@@ -3130,15 +3183,6 @@ def main():
     # the pre-P-4b pipeline unless the operator opts into 'strict' or
     # switches it 'off'.
     _run_preflight(args)
-
-    # W-2 (#311): source health gate — same moment as the preflight above, so
-    # it too runs before ANY heavy backend is constructed, on both the
-    # streaming and the batch/_stage_all_body paths, and on the --inputs path
-    # (args.input already points at the concatenated intermediate by now, which
-    # is exactly the footage the pipeline is about to process).  Runs second
-    # because it decodes frames while the preflight is a pure memory read.
-    # Default mode is 'warn', which never exits.
-    _run_source_check(args)
 
     if args.input_projection == "equirect" and args.streaming:
         log.warning("--streaming is disabled for equirect input; the batch path must skip source projection")
