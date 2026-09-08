@@ -310,6 +310,8 @@ class TestCLIBackend:
         mock_cuda: MagicMock,
         mock_height: MagicMock,
         mock_run: MagicMock,
+        tmp_path: Path,
+        monkeypatch,
     ) -> None:
         """Relative input/output must be absolutized before the subprocess call.
 
@@ -320,6 +322,10 @@ class TestCLIBackend:
         """
         mock_run.return_value.returncode = 0
         mock_run.return_value.stderr = ""
+        # ``video/tmp/`` below is created for real by the absolutizing code, so
+        # the cwd must not be the repo root — the repo's own (git-ignored)
+        # video/ dir is not a scratch space for tests (W-5, #315).
+        monkeypatch.chdir(tmp_path)
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "inference_cli.py").write_text("# fake")
             backend = CLIBackend(node_dir=tmpdir)
