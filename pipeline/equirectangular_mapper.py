@@ -446,6 +446,13 @@ class EquirectangularMapper:
         projections share that tail — the fisheye branch only swaps the
         ``v360`` head.
 
+        Neither head passes ``h_fov``/``v_fov``: ``output=hequirect`` fixes its
+        own span at ±90° and **ignores** them.  Measured on both branches — the
+        rendered frame is byte-identical with and without ``h_fov=180:v_fov=180``
+        (#294 for fisheye, K-26 #301 for rectilinear) — so writing them would
+        only advertise a control that does not exist.  ``ih_fov``/``iv_fov``
+        (the *source* span) are the real knobs and are still passed.
+
         Args:
             src_width: Source frame width (px), for the vertical-FOV solve —
                 pinhole via :meth:`_calc_vertical_fov`, equidistant via
@@ -462,7 +469,6 @@ class EquirectangularMapper:
             v360 = (
                 f"v360=input=flat:output=hequirect:"
                 f"ih_fov={self.src_hfov}:iv_fov={src_vfov:.2f}:"
-                f"h_fov=180:v_fov=180:"
                 f"w={self.output_width}:h={self.output_height}:"
                 f"alpha_mask=1"
             )

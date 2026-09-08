@@ -26,10 +26,18 @@ until #302 — describes an ellipse the moment ``width != height``, and no lens
 forms one.  ``TestNonSquareVerticalFovConvention`` measures a 16:9 source and
 holds the vertical landing to 2 px; the tables in the class docstring are, as
 above, measurements taken before the assertions were written.
+
+K-26 (#301) finished the last row of that first table.  The rectilinear branch
+still emitted ``h_fov=180:v_fov=180`` long after the fisheye branch had been
+shown they do nothing, so the code contradicted its own comment.  It now emits
+neither, and ``test_dropping_output_h_fov_and_v_fov_changes_no_pixel`` renders
+both branches with and without the pair and compares the raw output bytes, so
+the "inert" claim is checked rather than remembered.
 """
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 
@@ -154,7 +162,11 @@ class TestFisheyeFilterString:
         assert args["alpha_mask"] == "1"
 
     @pytest.mark.parametrize("fov,expected", [(180.0, "180"), (150.0, "150"), (220.5, "220.5")])
-    def test_ih_fov_and_iv_fov_carry_the_fisheye_fov(self, fov, expected):
+    def test_square_source_carries_the_fisheye_fov_on_both_axes(self, fov, expected):
+        """Only the **square** case puts ``fisheye_fov`` on both axes: since
+        #302 a non-square source derives ``iv_fov`` from the aspect, which
+        ``TestNonSquareVerticalFovConvention`` covers.
+        """
         args = _v360_args(_mapper(use_ffmpeg=True, fov=fov)._v360_filter(_S, _S))
         assert args["ih_fov"] == expected
         assert args["iv_fov"] == expected
@@ -181,12 +193,98 @@ class TestFisheyeFilterString:
         assert EquirectangularMapper._BLACK_COMPOSITE in flt
         assert flt.endswith("format=rgb24")
 
-    def test_rectilinear_filter_is_untouched(self):
-        args = _v360_args(EquirectangularMapper(64, 64, src_hfov=90.0)._v360_filter(64, 64))
+    def test_rectilinear_geometry_is_untouched(self):
+        """The fisheye branch must not have moved the pinhole one: same
+        ``input=flat``, same ``ih_fov``, same aspect-solved ``iv_fov``.
+        """
+        args = _v360_args(EquirectangularMapper(64, 64, src_hfov=90.0)._v360_filter(64, 32))
         assert args["input"] == "flat"
+        assert args["output"] == "hequirect"
         assert args["ih_fov"] == "90.0"
-        assert args["h_fov"] == "180"
-        assert args["v_fov"] == "180"
+        assert args["iv_fov"] == "53.13"  # 2*atan(tan(45°) * 32/64)
+
+
+# --------------------------------------------------------------------------- #
+# K-26 (#301): neither branch may advertise an output FOV hequirect ignores
+# --------------------------------------------------------------------------- #
+
+
+def _projection_mapper(projection: str) -> EquirectangularMapper:
+    return EquirectangularMapper(
+        output_width=_S,
+        output_height=_S,
+        src_hfov=90.0,
+        input_projection=projection,
+        fisheye_fov=180.0,
+    )
+
+
+@pytest.mark.parametrize("projection", ["rectilinear", "fisheye"])
+def test_neither_branch_passes_output_h_fov_or_v_fov(projection):
+    """``output=hequirect`` fixes its span at ±90° and ignores ``h_fov``/
+    ``v_fov``, so emitting them advertises a control that does not exist —
+    which is how the "white edge" hunt once burned time in this very chain.
+
+    The *source* spans (``ih_fov``/``iv_fov``) are the real knobs and must
+    survive; note ``_v360_args`` parses keys, so ``ih_fov`` cannot satisfy a
+    ``h_fov`` check by substring.
+    """
+    args = _v360_args(_projection_mapper(projection)._v360_filter(_S, _S))
+    assert args["output"] == "hequirect"
+    assert "h_fov" not in args
+    assert "v_fov" not in args
+    assert "ih_fov" in args and "iv_fov" in args
+
+
+def _render_rgb24(vfilter: str, src: np.ndarray) -> bytes:
+    """Run one frame through ``vfilter`` and return the raw rgb24 output bytes."""
+    h, w = src.shape[:2]
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{w}x{h}",
+        "-i",
+        "pipe:0",
+        "-vf",
+        vfilter,
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]
+    return subprocess.run(cmd, input=src.tobytes(), capture_output=True, timeout=60, check=True).stdout
+
+
+@_FFMPEG
+@pytest.mark.parametrize("projection", ["rectilinear", "fisheye"])
+def test_dropping_output_h_fov_and_v_fov_changes_no_pixel(projection):
+    """The pair was not merely unused, it was **inert** (K-26 #301).
+
+    Renders the shipped chain and a copy with ``h_fov=180:v_fov=180`` spliced
+    back in, and compares SHA-256 over the raw rgb24 output.  If ffmpeg ever
+    gives ``hequirect`` a real output-FOV control this goes red — the signal
+    to revisit the removal deliberately, not to restore it by reflex.
+    """
+    src = _smooth_fisheye()
+    shipped = _projection_mapper(projection)._v360_filter(_S, _S)
+    assert "h_fov" not in _v360_args(shipped)  # key-parsed: ``ih_fov`` must not count
+    with_inert = shipped.replace("output=hequirect:", "output=hequirect:h_fov=180:v_fov=180:", 1)
+    assert _v360_args(with_inert)["h_fov"] == "180"
+
+    a, b = _render_rgb24(shipped, src), _render_rgb24(with_inert, src)
+    assert len(a) == _S * _S * 3, f"short render: {len(a)} bytes"
+    assert hashlib.sha256(a).hexdigest() == hashlib.sha256(b).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
