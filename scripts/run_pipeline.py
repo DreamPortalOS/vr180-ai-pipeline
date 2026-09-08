@@ -627,7 +627,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--resume-from",
         default=None,
         metavar="MANIFEST",
-        help="Resume from a job manifest: completed stages are hash-validated, then skipped",
+        help="Resume from a job manifest: completed stages are hash-validated, then skipped. "
+        "A completed 'upscale' stage also hands its recorded output to the rest of the run, "
+        "so downstream stages continue from the UPSCALED clip, not the original. "
+        "If that recorded file is missing the run ABORTS (exit 1) instead of silently "
+        "continuing at the original resolution — restore it, or re-run without "
+        "--resume-from to redo the SeedVR2 upscale",
     )
     parser.add_argument(
         "--machine",
@@ -2879,6 +2884,61 @@ def _manifest_prepare(args):
     return manifest, skip_internal, stages_internal
 
 
+def _resume_upscaled_input(manifest) -> str:
+    """W-6 (#317): the clip a manifest-skipped ``upscale`` stage left behind.
+
+    The normal R-1 pre-stage rewrites ``args.input`` to its upscaled
+    intermediate, and *every* stage below it (depth / stereo / project /
+    encode) reads that rewritten path.  A resume that skips ``upscale``
+    therefore has to perform the same rewrite from the manifest — otherwise
+    the rest of the run quietly continues on the original, un-upscaled
+    footage while the manifest claims the upscale is done.  That is a silent
+    quality downgrade: no error, no traceback, just a lower-resolution master.
+
+    :func:`_stage_artifacts` records ``outputs = [args.input]`` for ``upscale``
+    *after* the rewrite, so ``outputs[0]`` is exactly the upscaled clip.
+
+    **A missing artefact is a hard stop (exit 1), never a silent fallback and
+    never an implicit re-upscale.**  Two reasons for erroring rather than
+    re-running the pre-stage: (a) SeedVR2 is the single most expensive step on
+    a 12GB card, and a resume is precisely the run the operator started in
+    order *not* to pay it again; (b) ``--resume-from`` already exits(1) on
+    every other broken-artefact condition (``validate_stage_outputs`` in
+    :func:`_manifest_prepare`), so this keeps one consistent contract.  The
+    operator who moved or cleaned the file restores it, or drops
+    ``--resume-from`` to redo the upscale deliberately.
+    """
+    from pipeline.job_manifest import get_stage
+
+    stage = get_stage(manifest, "upscale") if manifest is not None else None
+    outputs = list(stage.get("outputs") or []) if stage else []
+    recorded = outputs[0] if outputs else None
+
+    if not recorded:
+        log.error(
+            "❌ Manifest marks stage 'upscale' done but records no output path — "
+            "refusing to resume.\n"
+            "  Continuing would silently feed every downstream stage the "
+            "ORIGINAL, un-upscaled input while the manifest claims otherwise.\n"
+            "  → re-run without --resume-from to redo the SeedVR2 upscale."
+        )
+        sys.exit(1)
+
+    if not os.path.isfile(recorded):
+        log.error(
+            "❌ Manifest marks stage 'upscale' done but its recorded output is "
+            "gone: %s\n"
+            "  Continuing would silently feed every downstream stage the "
+            "ORIGINAL, un-upscaled input while the manifest claims otherwise.\n"
+            "  → restore that file, or re-run without --resume-from to redo the "
+            "SeedVR2 upscale.",
+            recorded,
+        )
+        sys.exit(1)
+
+    return recorded
+
+
 # ---------------------------------------------------------------------------
 # K-18 (#210): the stage-all body, extracted so main() can wrap it in
 # try/finally for temp-dir lifecycle (auto-derived cleanup on success,
@@ -3144,7 +3204,19 @@ def main():
     # R-1: SeedVR2 pre-stage — upscale the input video file before any frame loading
     if args.video_upscale == "seedvr2":
         if manifest_skip and "upscale" in manifest_skip:
-            log.info("⏭️  Skipping SeedVR2 pre-stage (upscale already done in manifest)")
+            # W-6 (#317): skipping the pre-stage is NOT the same as skipping
+            # its effect.  The stage's whole product is the rewritten
+            # args.input; adopt the recorded clip here so the resumed run
+            # continues from the upscaled file exactly like the fresh run
+            # below does.  Missing artefact → exit 1 (see the helper), never a
+            # silent fall-through to the original footage.
+            original_input = args.input
+            args.input = _resume_upscaled_input(manifest)
+            log.info(
+                "⏭️  Skipping SeedVR2 pre-stage (upscale already done in manifest); input replaced %s → %s",
+                original_input,
+                args.input,
+            )
         else:
             original_input = args.input
             args.input = run_seedvr2_prestage(args)
