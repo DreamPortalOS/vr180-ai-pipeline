@@ -54,6 +54,19 @@ landing to 2 px on **both** axes; ``test_calibrator_chain_and_mapper_chain_
 read_the_same_vertical_fov`` pins the two modules to one relation so they
 cannot drift apart again.
 
+…and the leftovers of the "inert h_fov" hunt (K-28, #309)
+---------------------------------------------------------
+``output=hequirect`` fixes its span at ±90° and ignores ``h_fov``/``v_fov``.
+K-26 (#307) proved that by hash and cleaned the mapper; this file's round trip
+and its ``forward_warp`` inverse still carried the pair.  Both dropped it.
+``test_roundtrip_lift_passes_no_output_h_fov_or_v_fov`` holds stage 1 to that
+while keeping stage 2's *real* ``output=flat`` window, and
+``test_the_dropped_pair_moves_neither_the_recommendation_nor_the_curve``
+re-runs the acceptance calibration with the pair spliced back and demands an
+identical score table.  Every such assertion parses the filter by key
+(:func:`v360_args`): ``"h_fov=180" in s`` is satisfied by ``ih_fov=180``, the
+trap K-26 walked into.
+
 Everything outside the ffmpeg-gated block runs without ffmpeg: the round trip
 is injected as a fake rectifier that draws deliberately bowed lines, so the
 real scoring, aggregation and confidence logic are exercised with no
@@ -79,6 +92,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
+from scripts import calibrate_hfov
 from scripts.calibrate_hfov import (
     CONSUMER_FLAGS,
     DEFAULT_FRAMES,
@@ -129,6 +143,28 @@ def _ffmpeg_v360_available() -> bool:
 
 
 _FFMPEG = pytest.mark.skipif(not _ffmpeg_v360_available(), reason="ffmpeg v360 unavailable")
+
+
+# ---------------------------------------------------------------------------
+# Filter-string parsing
+# ---------------------------------------------------------------------------
+
+
+def v360_args(stage: str) -> dict[str, str]:
+    """Parse one ``v360=k=v:k=v:…`` stage of a filter chain into a dict.
+
+    Parse, never substring-match: ``"h_fov=180" in stage`` is satisfied by
+    ``ih_fov=180``, so a naive "no h_fov" assertion can never pass and a naive
+    "has h_fov" one can never fail.  K-26 (#307) walked into exactly that.
+    """
+    assert stage.startswith("v360="), stage
+    return dict(part.split("=", 1) for part in stage[len("v360=") :].split(":"))
+
+
+def roundtrip_stages(vfilter: str) -> tuple[dict[str, str], dict[str, str]]:
+    """The two ``v360`` stages of a round-trip chain, parsed."""
+    lift, render = vfilter.split(",")
+    return v360_args(lift), v360_args(render)
 
 
 # ---------------------------------------------------------------------------
@@ -198,12 +234,17 @@ def forward_warp(frame: np.ndarray, true_hfov: float, world_hfov: float = WORLD_
     ``flat(world) -> hequirect -> fisheye(true_hfov)``.  The result is what an
     equidistant lens of ``true_hfov`` degrees would have recorded of a world
     whose lines are straight — exactly the input the calibrator claims to solve.
+
+    Like the chain it inverts, the ``output=hequirect`` head passes no
+    ``h_fov``/``v_fov`` (K-28, #309): that projection's span is fixed at ±90°
+    and the pair is inert, so carrying it here would only re-teach the fiction
+    the production chain just dropped.
     """
     height, width = frame.shape[:2]
     equirect = max(2, round(width * 2 / 2) * 2)
     vfilter = (
         f"v360=input=flat:ih_fov={world_hfov:.4f}:iv_fov={pinhole_vfov(world_hfov, width, height):.4f}:"
-        f"output=hequirect:h_fov=180:v_fov=180:w={equirect}:h={equirect},"
+        f"output=hequirect:w={equirect}:h={equirect},"
         f"v360=input=hequirect:ih_fov=180:iv_fov=180:output=fisheye:"
         f"h_fov={true_hfov:.4f}:v_fov={equidistant_vfov(true_hfov, width, height):.4f}:w={width}:h={height}"
     )
@@ -714,17 +755,39 @@ def test_render_plot_refuses_a_curve_with_nothing_on_it():
 
 
 def test_roundtrip_filter_chains_fisheye_in_and_flat_out():
-    vfilter = build_roundtrip_filter(TRUE_HFOV, SYNTH_W, SYNTH_H)
-    stage_in, stage_out = vfilter.split(",")
-    assert "input=fisheye" in stage_in and "output=hequirect" in stage_in
-    assert "input=hequirect" in stage_out and "output=flat" in stage_out
+    lift, render = roundtrip_stages(build_roundtrip_filter(TRUE_HFOV, SYNTH_W, SYNTH_H))
+    assert (lift["input"], lift["output"]) == ("fisheye", "hequirect")
+    assert (render["input"], render["output"]) == ("hequirect", "flat")
 
 
 def test_roundtrip_filter_uses_equidistant_in_and_pinhole_out():
-    """The two stages model different lenses; mixing them up is a silent error."""
-    vfilter = build_roundtrip_filter(TRUE_HFOV, SYNTH_W, SYNTH_H, out_fov=DEFAULT_OUT_FOV)
-    assert f"iv_fov={equidistant_vfov(TRUE_HFOV, SYNTH_W, SYNTH_H):.4f}" in vfilter
-    assert f"v_fov={pinhole_vfov(DEFAULT_OUT_FOV, SYNTH_W, SYNTH_H):.4f}" in vfilter
+    """The two stages model different lenses; mixing them up is a silent error.
+
+    Read by key: ``v_fov`` and ``iv_fov`` are different parameters that a
+    substring check would happily conflate.
+    """
+    lift, render = roundtrip_stages(build_roundtrip_filter(TRUE_HFOV, SYNTH_W, SYNTH_H, out_fov=DEFAULT_OUT_FOV))
+    assert lift["ih_fov"] == f"{TRUE_HFOV:.4f}"
+    assert lift["iv_fov"] == f"{equidistant_vfov(TRUE_HFOV, SYNTH_W, SYNTH_H):.4f}"
+    assert render["h_fov"] == f"{DEFAULT_OUT_FOV:.4f}"
+    assert render["v_fov"] == f"{pinhole_vfov(DEFAULT_OUT_FOV, SYNTH_W, SYNTH_H):.4f}"
+
+
+def test_roundtrip_lift_passes_no_output_h_fov_or_v_fov():
+    """K-28 (#309): ``output=hequirect`` fixes its span at ±90° and ignores
+    ``h_fov``/``v_fov``, so stage 1 must not advertise a control that does not
+    exist — the same fiction K-26 (#307) removed from the mapper.
+
+    The *source* spans stay: they are the actual candidate under test.  Stage 2
+    is ``output=flat``, where ``h_fov`` really does set the window, so it keeps
+    the pair — asserted here so "drop it everywhere" cannot be over-applied.
+    """
+    lift, render = roundtrip_stages(build_roundtrip_filter(TRUE_HFOV, SYNTH_W, SYNTH_H))
+    assert lift["output"] == "hequirect"
+    assert "h_fov" not in lift and "v_fov" not in lift
+    assert "ih_fov" in lift and "iv_fov" in lift
+    assert render["output"] == "flat"
+    assert "h_fov" in render and "v_fov" in render
 
 
 def test_roundtrip_filter_carries_no_shell_metacharacters():
@@ -1093,6 +1156,34 @@ def test_synthetic_curve_is_lowest_at_the_truth(synthetic_hfov_100):
     _, result = synthetic_hfov_100
     valid = [row for row in result.scores if row.score is not None]
     assert min(valid, key=lambda row: row.score).hfov == TRUE_HFOV
+
+
+@_FFMPEG
+def test_the_dropped_pair_moves_neither_the_recommendation_nor_the_curve(monkeypatch, synthetic_hfov_100):
+    """K-28 (#309): stage 1's ``h_fov``/``v_fov`` were not merely unused, they
+    were **inert** — dropping them changes no number the operator ever sees.
+
+    Splices ``h_fov=180:v_fov=180`` back into the shipped chain, re-runs the
+    whole acceptance calibration through it, and compares the recommendation
+    *and* every score in the table against the fixture's shipped run.  If
+    ffmpeg ever gives ``hequirect`` a real output-fov control this goes red —
+    the signal to revisit the removal deliberately, not to restore it by
+    reflex.
+    """
+    warped, shipped = synthetic_hfov_100
+
+    def with_inert_pair(*args, **kwargs):
+        chain = build_roundtrip_filter(*args, **kwargs)
+        spliced = chain.replace("output=hequirect:", "output=hequirect:h_fov=180:v_fov=180:", 1)
+        lift = v360_args(spliced.split(",")[0])
+        assert lift["h_fov"] == "180" and lift["v_fov"] == "180"  # key-parsed, not substring
+        return spliced
+
+    monkeypatch.setattr(calibrate_hfov, "build_roundtrip_filter", with_inert_pair)
+    before = calibrate([warped], parse_grid(ACCEPTANCE_GRID), rectifier=V360Rectifier())
+
+    assert before.recommended_fisheye_fov == shipped.recommended_fisheye_fov
+    assert [(row.hfov, row.score) for row in before.scores] == [(row.hfov, row.score) for row in shipped.scores]
 
 
 @_FFMPEG

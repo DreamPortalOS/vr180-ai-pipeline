@@ -100,9 +100,12 @@ _METADATA_SOURCE = b"vr180-ai-pipeline\x00"
 # equi projection bounds are 0.32 fixed-point *crop* proportions of the full
 # 360x180 sphere ("the proportion of projection cropped from each edge not
 # covered by the video frame").  Each eye of our SBS output is a 180x180
-# equirect (h_fov=180:v_fov=180 in equirectangular_mapper): the full vertical
-# range and the middle half of the horizontal range, i.e. crop 90/360 = 0.25
-# from the left and from the right, nothing from top/bottom.
+# equirect, because equirectangular_mapper renders it with v360
+# ``output=hequirect``, whose span is fixed at ±90° on both axes by the
+# projection itself (it ignores h_fov/v_fov, which is why the mapper stopped
+# emitting them — K-26 #307).  So: the full vertical range and the middle half
+# of the horizontal range, i.e. crop 90/360 = 0.25 from the left and from the
+# right, nothing from top/bottom.
 _FIXED_0_32_QUARTER = 0x40000000  # 0.25 in 0.32 fixed point
 _EQUI_BOUNDS_VR180 = (0, 0, _FIXED_0_32_QUARTER, _FIXED_0_32_QUARTER)  # top, bottom, left, right
 
