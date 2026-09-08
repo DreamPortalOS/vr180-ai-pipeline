@@ -344,11 +344,20 @@ def build_roundtrip_filter(
     Stage 1's ``iv_fov`` comes from :func:`equidistant_vfov`, i.e. the isotropic
     reading the mapper also uses for ``--fisheye-fov`` (K-27, #302) — so what is
     measured here is exactly what is consumed there, on both axes.
+
+    Stage 1 passes no ``h_fov``/``v_fov``: ``output=hequirect`` fixes its own
+    span at ±90° and **ignores** them (measured in #294 and pinned by hash in
+    K-26 #307 — the rendered frame is byte-identical either way), so emitting
+    them would only advertise a control that does not exist.  K-28 (#309)
+    removed the pair; the recommendation and the whole score table came back
+    identical, as they must for an inert argument.  Stage 2's ``h_fov``/
+    ``v_fov`` are a different matter — that head is ``output=flat``, where the
+    window width is exactly what they set, so they stay.
     """
     equi = _even(width * equirect_scale)
     return (
         f"v360=input=fisheye:ih_fov={hfov_deg:.4f}:iv_fov={equidistant_vfov(hfov_deg, width, height):.4f}:"
-        f"output=hequirect:h_fov=180:v_fov=180:w={equi}:h={equi},"
+        f"output=hequirect:w={equi}:h={equi},"
         f"v360=input=hequirect:ih_fov=180:iv_fov=180:output=flat:"
         f"h_fov={out_fov:.4f}:v_fov={pinhole_vfov(out_fov, width, height):.4f}:w={width}:h={height}"
     )
