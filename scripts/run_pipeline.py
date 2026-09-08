@@ -47,6 +47,16 @@ if str(_REPO_ROOT) not in sys.path:
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
+from scripts.check_source_quality import (  # noqa: E402
+    DEFAULT_PAIRS as SOURCE_CHECK_PAIRS,
+)
+from scripts.check_source_quality import (  # noqa: E402
+    STATUS_FAIL,
+    STATUS_PASS,
+    STATUS_SKIP,
+    STATUS_WARN,
+    run_checks,
+)
 from tqdm import tqdm  # noqa: E402
 
 from pipeline.comfort_presets import COMFORT_PRESETS, DEFAULT_COMFORT, resolve_comfort  # noqa: E402
@@ -220,6 +230,102 @@ def _run_preflight(args) -> None:
             log.error(msg)
             sys.exit(1)
         log.warning("⚠️  Preflight check FAILED (warn mode): %s", reasons_text)
+
+
+def _format_source_check(report) -> str:
+    """One-line source-check summary, shaped like :func:`format_preflight`.
+
+    The per-check prose report lives in ``check_source_quality``'s own CLI;
+    inside the pipeline log we want a single scannable line plus the failure
+    reasons, exactly like the P-4b preflight line above it.
+    """
+    counts = report.summary
+    status = {STATUS_FAIL: "FAIL", STATUS_WARN: "WARN", STATUS_PASS: "OK"}.get(counts["overall"], "OK")
+    parts = [
+        f"source-check [{status}] "
+        f"{counts[STATUS_PASS]} pass / {counts[STATUS_WARN]} warn / "
+        f"{counts[STATUS_FAIL]} fail / {counts[STATUS_SKIP]} skipped"
+    ]
+    reasons = _source_check_reasons(report)
+    if reasons:
+        parts.append("reasons: " + "; ".join(reasons))
+    return " | ".join(parts)
+
+
+def _source_check_reasons(report) -> list[str]:
+    """``["name: detail", ...]`` for every FAILing check (WARNs never gate)."""
+    return [f"{c.name}: {c.detail}" for c in report.checks if c.status == STATUS_FAIL]
+
+
+def _run_source_check(args) -> None:
+    """Invoke the W-1 (#305) source health check for this run (W-2, #311).
+
+    Called by :func:`main` from the same place as :func:`_run_preflight` —
+    **before** any heavy backend is constructed (streaming's
+    ``build_depth_backend``/``build_stereo_backend``, the batch depth/stereo
+    stages, or the single-stage ``--stage depth``/``--stage stereo`` entries).
+    That placement is the whole point of the card: a source that can never
+    produce parallax must not cost forty minutes of GPU time to find out.
+
+    Behaviour is governed by ``--source-check``, mirroring ``--preflight``:
+
+    * ``warn`` (default): log the summary line regardless of pass/fail; on a
+      FAIL also emit a WARNING with the reasons. Pipeline continues. This is
+      the default because a non-square source is legitimate (fisheye route,
+      16:9 sources) and W-1 grades plenty of real material WARN.
+    * ``strict``: on a FAIL, print the reasons + W-1's actionable advice and
+      ``sys.exit(1)``.
+    * ``off``: no-op — :func:`run_checks` is NOT called, so the optical-flow
+      frame sampling is never paid for.
+
+    A crash *inside* :func:`run_checks` (unreadable file, ffmpeg missing) is
+    caught and warned — the check must never take down the pipeline.
+    """
+    mode = getattr(args, "source_check", "warn")
+    if mode == "off":
+        return
+
+    source = getattr(args, "input", None)
+    if not source or not isinstance(source, str):
+        return
+
+    try:
+        # W-1's own default pair count: the flow sampling decodes frames, so
+        # keep it small — this runs on every pipeline invocation.
+        report = run_checks(source, pairs=SOURCE_CHECK_PAIRS)
+        summary = _format_source_check(report)
+        reasons = _source_check_reasons(report)
+        advice = [c.advice for c in report.checks if c.status == STATUS_FAIL and c.advice]
+    except Exception as exc:
+        # Unreadable source, missing ffmpeg, a bug in the checks themselves —
+        # none of that is a reason to abort a run the operator asked for.
+        log.warning(
+            "⚠️  Source check failed to run (%s: %s) — continuing without a source gate.",
+            type(exc).__name__,
+            exc,
+        )
+        return
+
+    log.info(summary)
+
+    if not reasons:
+        return
+
+    reasons_text = "; ".join(reasons)
+    if mode == "strict":
+        advice_text = "".join(f"\n    → {a}" for a in advice)
+        msg = (
+            f"❌ Source quality check FAILED (--source-check strict):\n"
+            f"    {reasons_text}{advice_text}\n"
+            f"    Source: {source}\n"
+            f"    Re-run the check alone for the full report: "
+            f"python scripts/check_source_quality.py {source}\n"
+            f"    Pass --source-check warn to continue anyway, or --source-check off to skip it."
+        )
+        print(msg, file=sys.stderr)
+        log.error(msg)
+        sys.exit(1)
+    log.warning("⚠️  Source check FAILED (warn mode): %s", reasons_text)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -572,6 +678,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "(depthcrafter RAM ≥ 12 GB, depth-anything RAM ≥ 4 GB, "
             "stereocrafter VRAM ≥ 8 GB); override per-run with env vars "
             "VR180_PREFLIGHT_MIN_RAM_GB and VR180_PREFLIGHT_MIN_VRAM_GB."
+        ),
+    )
+    parser.add_argument(
+        "--source-check",
+        choices=["warn", "strict", "off"],
+        default="warn",
+        help=(
+            "W-2 (#311): run the W-1 source health check (scripts/check_source_quality.py "
+            "— decodable / square / forward_motion / edges) on the input before any heavy "
+            "model is constructed. 'warn' (default) = log the verdict and continue even on "
+            "a FAIL; 'strict' = exit non-zero with the reasons and the fix advice, before a "
+            "single second of GPU time is spent; 'off' = skip the check entirely (no frame "
+            "sampling at all). The default is 'warn' rather than 'strict' because a "
+            "non-square source is legitimate on the fisheye and 16:9 routes."
         ),
     )
     parser.add_argument(
@@ -2360,6 +2480,10 @@ _STREAMING_SUPPORTED: dict[str, str] = {
     "force_sbs": "force SBS input",
     "validate_input": "input validation",
     "preflight": "preflight mode",
+    # W-2 (#311): like --preflight, the source-health gate is consumed in
+    # main() before the streaming branch is entered, so the stream *does*
+    # honour it and it must not be reported as a swallowed flag.
+    "source_check": "source-health gate",
     "copy_audio_from": "audio source",
 }
 
@@ -3006,6 +3130,15 @@ def main():
     # the pre-P-4b pipeline unless the operator opts into 'strict' or
     # switches it 'off'.
     _run_preflight(args)
+
+    # W-2 (#311): source health gate — same moment as the preflight above, so
+    # it too runs before ANY heavy backend is constructed, on both the
+    # streaming and the batch/_stage_all_body paths, and on the --inputs path
+    # (args.input already points at the concatenated intermediate by now, which
+    # is exactly the footage the pipeline is about to process).  Runs second
+    # because it decodes frames while the preflight is a pure memory read.
+    # Default mode is 'warn', which never exits.
+    _run_source_check(args)
 
     if args.input_projection == "equirect" and args.streaming:
         log.warning("--streaming is disabled for equirect input; the batch path must skip source projection")
