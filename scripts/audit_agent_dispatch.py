@@ -345,9 +345,9 @@ def report(snapshot: Snapshot, stream: Any = sys.stdout) -> int:
                 notes.append(f"PR #{pr_by_branch[worktree.branch].number}")
         else:
             notes.append("detached HEAD — no branch to track")
-        marker = "ALERT" if problems else "OK"
+        marker = "[ALERT]" if problems else "[OK]   "
         detail = "; ".join(problems + notes) or "clean, pushed, PR open"
-        print(f"[{marker}] {worktree.label}: {detail}", file=stream)
+        print(f"{marker} {worktree.label}: {detail}", file=stream)
         alerts += len(problems)
 
     print("", file=stream)
