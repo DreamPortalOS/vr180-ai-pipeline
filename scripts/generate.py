@@ -5,6 +5,11 @@ Usage::
     python -m scripts.generate "fly over mountains" --provider kling
     python -m scripts.generate "walkthrough of a temple" --provider seedance --target-aware --scene walkthrough
     python -m scripts.generate "dome flyover" --provider veo --duration 8 --aspect-ratio 16:9
+
+Recovering a task the client gave up on (never re-generate — the quota is
+already spent, see issue #325)::
+
+    python -m scripts.generate --provider seedance --resume-task cgt-2026… -o out.mp4
 """
 
 from __future__ import annotations
@@ -195,6 +200,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Target frame rate (default: 24).",
     )
     parser.add_argument(
+        "--gen-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Override the provider poll timeout in seconds. By default the budget "
+        "scales with --gen-resolution and --duration (480p/5s → 300s, 4k/10s → 2400s), "
+        "so you rarely need this. A timeout never means the task failed: the quota is "
+        "already spent, so recover with --resume-task instead of re-generating.",
+    )
+    parser.add_argument(
+        "--resume-task",
+        type=str,
+        default=None,
+        metavar="TASK_ID",
+        help="Skip submission and poll an already-submitted task id (Seedance/Ark, e.g. "
+        "cgt-20260908185831-69srb), then download its result. Use this after a client-side "
+        "timeout, a dropped connection or a killed session — the quota for that task is "
+        "already spent, and resuming costs nothing.",
+    )
+    parser.add_argument(
         "--output",
         "-o",
         type=str,
@@ -278,6 +303,65 @@ def _list_templates() -> int:
     return 0
 
 
+def _deliver(result, args: argparse.Namespace) -> int:
+    """Resolve the output path, download *result*, and print the summary.
+
+    Shared by the generate and ``--resume-task`` paths.  A failed download is
+    not fatal to the *task*: the URL and task id are echoed so the operator can
+    retry with ``--resume-task`` instead of paying for a new generation.
+    """
+    if args.output:
+        out_path = args.output
+    else:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(
+            _ensure_output_dir(),
+            f"{args.provider}_{timestamp}.mp4",
+        )
+
+    try:
+        _download_video(result.video_url, out_path)
+    except Exception as exc:
+        log.error("Download failed: %s", exc)
+        log.info("Video URL (download manually): %s", result.video_url)
+        if result.job_id:
+            log.info("任务已完成且额度已消耗，不要重新生成；重试下载：--resume-task %s", result.job_id)
+        return 1
+
+    print(f"\n✅ Video saved to: {out_path}")
+    print(f"   Provider: {result.provider}")
+    if result.job_id:
+        print(f"   Job ID:   {result.job_id}")
+    print(f"   URL:      {result.video_url}")
+    return 0
+
+
+def _resume_and_deliver(provider, args: argparse.Namespace) -> int:
+    """Poll an already-submitted task id and download its result (issue #325).
+
+    No submit request is sent, so this never consumes quota — it is the
+    recovery path for a client-side timeout, a dropped connection, or a
+    killed session.
+    """
+    resume = getattr(provider, "resume", None)
+    if resume is None:
+        log.error(
+            "--resume-task is not supported by provider %r; it is a Seedance (Ark) feature. "
+            "Re-run with --provider seedance.",
+            args.provider,
+        )
+        return 2
+    if args.prompt or args.image:
+        log.warning("--resume-task given: the prompt / --image are ignored, the existing task is polled as-is.")
+    log.info("Resuming task %s — 跳过提交，不消耗新额度。", args.resume_task)
+    try:
+        result = resume(args.resume_task, poll_timeout=args.gen_timeout)
+    except (RuntimeError, ValueError) as exc:
+        log.error("Resume failed: %s", exc)
+        return 1
+    return _deliver(result, args)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -300,9 +384,19 @@ def main(argv: list[str] | None = None) -> int:
         log.error("--template and a positional prompt are mutually exclusive.")
         return 2
 
+    if args.gen_timeout is not None and args.gen_timeout <= 0:
+        log.error("--gen-timeout must be a positive number of seconds; got %d", args.gen_timeout)
+        return 2
+
     # Seedance (Ark) caps duration at [4, 15]. Other providers have different
-    # contracts, so this check only fires for the seedance provider.
-    if args.provider == "seedance" and (args.duration < DURATION_MIN or args.duration > DURATION_MAX):
+    # contracts, so this check only fires for the seedance provider.  Skipped
+    # when resuming: --duration describes a submission, and --resume-task does
+    # not submit anything.
+    if (
+        args.provider == "seedance"
+        and not args.resume_task
+        and (args.duration < DURATION_MIN or args.duration > DURATION_MAX)
+    ):
         log.error(
             "--duration must be between %d and %d for seedance; got %d",
             DURATION_MIN,
@@ -375,6 +469,12 @@ def main(argv: list[str] | None = None) -> int:
         log.error("Provider error: %s", exc)
         return 1
 
+    # W-9 (#325): recover an already-submitted task without re-submitting it.
+    # Checked before any generation kwargs are assembled — nothing about this
+    # path can reach a POST.
+    if args.resume_task:
+        return _resume_and_deliver(provider, args)
+
     kwargs: dict[str, str | int | float | bool] = {}
     if negative_prompt:
         kwargs["negative_prompt"] = negative_prompt
@@ -400,6 +500,10 @@ def main(argv: list[str] | None = None) -> int:
         kwargs["seed"] = args.seed
     if args.camera_fixed:
         kwargs["camera_fixed"] = True
+    # Client-side poll budget. Absent by default so the provider scales it from
+    # resolution × duration (issue #325); other providers ignore the kwarg.
+    if args.gen_timeout is not None:
+        kwargs["poll_timeout"] = args.gen_timeout
     if args.gen_resolution != "480p":
         log.warning("⚠️  高档位（%s）消耗更多额度，请确认后再继续。", args.gen_resolution)
 
@@ -453,30 +557,7 @@ def main(argv: list[str] | None = None) -> int:
             log.error("Generation failed: %s", exc)
             return 1
 
-    # Determine output path
-    if args.output:
-        out_path = args.output
-    else:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_path = os.path.join(
-            _ensure_output_dir(),
-            f"{args.provider}_{timestamp}.mp4",
-        )
-
-    # Download
-    try:
-        _download_video(result.video_url, out_path)
-    except Exception as exc:
-        log.error("Download failed: %s", exc)
-        log.info("Video URL (download manually): %s", result.video_url)
-        return 1
-
-    print(f"\n✅ Video saved to: {out_path}")
-    print(f"   Provider: {result.provider}")
-    if result.job_id:
-        print(f"   Job ID:   {result.job_id}")
-    print(f"   URL:      {result.video_url}")
-    return 0
+    return _deliver(result, args)
 
 
 if __name__ == "__main__":
