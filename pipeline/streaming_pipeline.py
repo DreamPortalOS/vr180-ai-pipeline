@@ -712,6 +712,15 @@ class StreamingPipeline:
         # unused).  Validation lives in EquirectangularMapper.__init__.
         input_projection: str = "rectilinear",
         fisheye_fov: float = 180.0,
+        # W-8 (#323): sphere orientation, forwarded verbatim to the mapper.
+        # All three default to 0 = no rotation, so an existing caller's stream
+        # is byte-identical; ``pitch`` is the one an operator normally sets
+        # (it drops the source horizon onto eye height).  Validation — the
+        # -180..180 bound v360 itself declares — lives in
+        # EquirectangularMapper.__init__, as with the projection knobs above.
+        pitch: float = 0.0,
+        yaw: float = 0.0,
+        roll: float = 0.0,
         # K-22 / #243 (P0-2): --outpaint and its sub-params were previously
         # silently dropped on the streaming path (same anti-pattern as #120).
         # F-4 (#267): ``gradient`` is now really applied per frame (after the
@@ -759,6 +768,11 @@ class StreamingPipeline:
         self.output_width = output_width
         self.output_height = output_height
         self.src_hfov = src_hfov
+        # W-8 (#323): kept for introspection / logging parity with src_hfov;
+        # the mapper below is what actually applies them.
+        self.pitch = pitch
+        self.yaw = yaw
+        self.roll = roll
         self.codec = codec
         self.crf = crf
         self.fps = fps
@@ -893,6 +907,12 @@ class StreamingPipeline:
             # letting the stream silently fall back to rectilinear.
             input_projection=input_projection,
             fisheye_fov=fisheye_fov,
+            # W-8 (#323): same for the sphere orientation — a stream that
+            # dropped --pitch would re-create the "content is all above me"
+            # complaint this card exists to fix.
+            pitch=pitch,
+            yaw=yaw,
+            roll=roll,
         )
 
     def _build_ffmpeg_cmd(self, output_path: str, width: int, height: int) -> list[str]:

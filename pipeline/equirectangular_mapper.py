@@ -276,6 +276,15 @@ class EquirectangularMapper:
     the same relation as ``calibrate_hfov.equidistant_vfov``).  On a square
     frame the two axes coincide and ``fisheye_fov`` is exactly the inscribed
     image circle.
+
+    **Sphere orientation** (W-8, issue #323).  ``pitch``/``yaw``/``roll``
+    rotate the *output* sphere before the source is sampled, which is what
+    lets an operator drop the source's horizon onto eye height instead of
+    living "in a pit" (the owner's Quest verdict on a 180°-stretched fisheye).
+    All three default to 0 and, at 0, are emitted nowhere and computed nowhere
+    — the filter string and the OpenCV mesh are byte-for-byte the pre-#323
+    ones.  See :meth:`_orientation_matrix` for the exact convention (it is
+    ffmpeg ``v360``'s, measured, not assumed) and the sign each angle carries.
     """
 
     #: Accepted ``input_projection`` values (``equirect`` sources never reach
@@ -290,6 +299,9 @@ class EquirectangularMapper:
         use_ffmpeg: bool = True,
         input_projection: str = "rectilinear",
         fisheye_fov: float = 180.0,
+        pitch: float = 0.0,
+        yaw: float = 0.0,
+        roll: float = 0.0,
     ):
         """Configure the equirectangular mapper.
 
@@ -316,17 +328,40 @@ class EquirectangularMapper:
                 number ``scripts/calibrate_hfov.py`` reports as
                 ``recommended_fisheye_fov`` — the same quantity (#302).
                 Only used with ``input_projection="fisheye"``.
+            pitch: W-8 (#323) sphere orientation, degrees.  Positive raises the
+                line of sight, i.e. pushes the content **down** the output
+                frame by ``output_height * pitch / 180`` px on the centre
+                column.  This is the knob that lifts a source whose horizon
+                sits below eye height.  Default 0 = no rotation at all.
+            yaw: W-8 (#323) sphere orientation, degrees.  Positive turns the
+                view right, i.e. moves the content left by
+                ``output_width * yaw / 180`` px on the centre row.  Default 0.
+            roll: W-8 (#323) sphere orientation, degrees, about the forward
+                axis.  Default 0.  Typical use of this trio is ``pitch`` alone.
         """
         if input_projection not in self.INPUT_PROJECTIONS:
             raise ValueError(f"input_projection must be one of {self.INPUT_PROJECTIONS}, got {input_projection!r}")
         if not (math.isfinite(fisheye_fov) and 0.0 < fisheye_fov <= 360.0):
             raise ValueError(f"fisheye_fov must be a finite angle in (0, 360] degrees, got {fisheye_fov!r}")
+        # W-8 (#323): the bound is v360's own, so an out-of-range angle fails
+        # here (at construction) rather than as an ffmpeg option error halfway
+        # through a render — and the OpenCV path cannot silently accept an
+        # angle the ffmpeg path would refuse.
+        for _name, _angle in (("pitch", pitch), ("yaw", yaw), ("roll", roll)):
+            if not (math.isfinite(_angle) and abs(_angle) <= self.ORIENTATION_LIMIT_DEG):
+                raise ValueError(
+                    f"{_name} must be a finite angle in "
+                    f"[-{self.ORIENTATION_LIMIT_DEG:g}, {self.ORIENTATION_LIMIT_DEG:g}] degrees, got {_angle!r}"
+                )
         self.output_width = output_width
         self.output_height = output_height
         self.src_hfov = src_hfov
         self.use_ffmpeg = use_ffmpeg
         self.input_projection = input_projection
         self.fisheye_fov = float(fisheye_fov)
+        self.pitch = float(pitch)
+        self.yaw = float(yaw)
+        self.roll = float(roll)
         self._mesh: tuple[np.ndarray, np.ndarray] | None = None
         # Persistent ffmpeg workers, keyed by (src_w, src_h, with_alpha) — issue #256.
         self._pipes: dict[tuple[int, int, bool], _FfmpegV360Pipe] = {}
@@ -340,6 +375,11 @@ class EquirectangularMapper:
     #: 2880² eye-frame takes ~0.2 s on a desktop CPU; this leaves a wide margin
     #: for loaded or slow hosts while still catching a genuinely stuck worker.
     PIPE_TIMEOUT_SEC: float = 60.0
+
+    #: W-8 (#323): ffmpeg ``v360`` declares ``yaw``/``pitch``/``roll`` as
+    #: ``-180..180``; the OpenCV path adopts the same bound so the two cannot
+    #: accept different inputs.
+    ORIENTATION_LIMIT_DEG: float = 180.0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -403,6 +443,75 @@ class EquirectangularMapper:
             return "v360" in result.stdout
         except Exception:
             return False
+
+    # -- sphere orientation (W-8, issue #323) --------------------------------
+
+    def _orientation_active(self) -> bool:
+        """True when at least one of pitch/yaw/roll is non-zero.
+
+        Everything orientation-related is gated on this so a default mapper
+        emits the pre-#323 filter string and builds the pre-#323 mesh — the
+        zero-regression contract the card is built around.
+        """
+        return bool(self.yaw or self.pitch or self.roll)
+
+    def _v360_orientation_terms(self) -> str:
+        """The ``:yaw=..:pitch=..:roll=..`` tail for the v360 head, or ``""``.
+
+        Empty at the default (all three 0) on purpose: appending
+        ``yaw=0:pitch=0:roll=0`` would render identically but would still
+        change the filter *string*, and the string is what the #294/#301/#302
+        tests pin.
+        """
+        if not self._orientation_active():
+            return ""
+        return f":yaw={self.yaw:g}:pitch={self.pitch:g}:roll={self.roll:g}"
+
+    def _orientation_matrix(self) -> np.ndarray | None:
+        """The output→source rotation the OpenCV path must apply, or None.
+
+        This is **ffmpeg ``v360``'s** convention, recovered by measurement
+        rather than assumed: a 512² equidistant fisheye carrying dots at known
+        directions was rendered through the real filter, the landing of each
+        dot was converted back to a direction, and the 3×3 that maps output
+        directions to source directions was solved for.  Against that measured
+        matrix the six possible orderings of the three elementary rotations
+        separate cleanly, and only one survives every combination tried
+        (max |Δ| ≈ 0.004 vs ≥ 0.04 for the runners-up):
+
+            ``R = R_yaw @ R_pitch @ R_roll``   (v360's default ``rorder=ypr``)
+
+        with, in the frame ``x`` right / ``y`` up / ``z`` forward that
+        :meth:`_build_mesh` already uses,
+
+        =========  ==========================================================
+        R_yaw      ``[[cos y, 0, sin y], [0, 1, 0], [-sin y, 0, cos y]]``
+        R_pitch    ``[[1, 0, 0], [0, cos p, sin p], [0, -sin p, cos p]]``
+        R_roll     ``[[cos r, sin r, 0], [-sin r, cos r, 0], [0, 0, 1]]``
+        =========  ==========================================================
+
+        Read off the pitch row: an output ray at elevation ``E`` samples the
+        source at elevation ``E + pitch``, so a marker at source elevation
+        ``e`` lands at output elevation ``e - pitch`` — i.e. ``pitch`` degrees
+        further **down** the frame.  On a 180° hequirect that is exactly
+        ``output_height * pitch / 180`` px, which is the theoretical landing
+        the geometry tests assert against.  ``yaw`` is the same relation about
+        the vertical axis (content moves left); ``roll`` turns the azimuth
+        about the forward axis the other way (``ψ_src = ψ_out - roll``).
+
+        Returns None when no rotation is configured, so callers can skip the
+        multiply entirely instead of relying on an identity being exact.
+        """
+        if not self._orientation_active():
+            return None
+        yaw, pitch, roll = (math.radians(a) for a in (self.yaw, self.pitch, self.roll))
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cr, sr = math.cos(roll), math.sin(roll)
+        r_yaw = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+        r_pitch = np.array([[1.0, 0.0, 0.0], [0.0, cp, sp], [0.0, -sp, cp]])
+        r_roll = np.array([[cr, sr, 0.0], [-sr, cr, 0.0], [0.0, 0.0, 1.0]])
+        return r_yaw @ r_pitch @ r_roll
 
     def _calc_vertical_fov(self, src_width: int, src_height: float) -> float:
         """Calculate vertical FOV from horizontal FOV and aspect ratio.
@@ -470,7 +579,7 @@ class EquirectangularMapper:
                 f"v360=input=flat:output=hequirect:"
                 f"ih_fov={self.src_hfov}:iv_fov={src_vfov:.2f}:"
                 f"w={self.output_width}:h={self.output_height}:"
-                f"alpha_mask=1"
+                f"alpha_mask=1{self._v360_orientation_terms()}"
             )
         pix_fmt = "rgba" if with_alpha else "rgb24"
         return f"{v360},{self._BLACK_COMPOSITE},format={pix_fmt}"
@@ -530,7 +639,7 @@ class EquirectangularMapper:
             f"v360=input=fisheye:output=hequirect:"
             f"ih_fov={self.fisheye_fov:g}:iv_fov={self._fisheye_vertical_fov(src_width, src_height):g}:"
             f"w={self.output_width}:h={self.output_height}:"
-            f"interp=lanczos:alpha_mask=1"
+            f"interp=lanczos:alpha_mask=1{self._v360_orientation_terms()}"
         )
 
     def _map_via_ffmpeg(self, frame: np.ndarray, with_alpha: bool = False) -> np.ndarray:
@@ -696,6 +805,13 @@ class EquirectangularMapper:
         With ``input_projection="fisheye"`` step 2 is the equidistant
         fisheye model instead of the pinhole one (see
         :meth:`_fisheye_source_coords`).
+
+        W-8 (#323): a configured pitch/yaw/roll rotates the step-1 direction
+        before step 2, which is exactly where ffmpeg's ``v360`` applies its own
+        rotation (output direction → rotate → input transform), so both
+        projections inherit the orientation and both mapper paths stay in
+        register.  With no rotation configured the multiply is skipped and the
+        mesh is bit-identical to the pre-#323 one.
         """
         W_out, H_out = self.output_width, self.output_height
 
@@ -713,6 +829,16 @@ class EquirectangularMapper:
         ray_x = np.sin(theta) * np.sin(phi)
         ray_y = np.cos(phi)
         ray_z = np.cos(theta) * np.sin(phi)
+
+        # W-8 (#323): output sphere → source sphere.  Rotation preserves the
+        # norm, so both source models downstream still see unit rays.
+        rot = self._orientation_matrix()
+        if rot is not None:
+            ray_x, ray_y, ray_z = (
+                rot[0, 0] * ray_x + rot[0, 1] * ray_y + rot[0, 2] * ray_z,
+                rot[1, 0] * ray_x + rot[1, 1] * ray_y + rot[1, 2] * ray_z,
+                rot[2, 0] * ray_x + rot[2, 1] * ray_y + rot[2, 2] * ray_z,
+            )
 
         if self.input_projection == "fisheye":
             sx, sy = self._fisheye_source_coords(ray_x, ray_y, ray_z, src_width, src_height)
