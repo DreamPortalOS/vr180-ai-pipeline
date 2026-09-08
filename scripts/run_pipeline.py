@@ -104,6 +104,14 @@ logging.basicConfig(
 log = logging.getLogger("vr180-pipeline")
 
 
+# W-8 (#323): the --pitch/--yaw/--roll bound, bound at import from the mapper
+# so the CLI and the two geometry paths can never disagree about what is
+# acceptable.  Read once here (rather than through the module attribute at call
+# time) because tests legitimately monkeypatch ``EquirectangularMapper`` with a
+# recorder function to capture its kwargs.
+ORIENTATION_LIMIT_DEG: float = EquirectangularMapper.ORIENTATION_LIMIT_DEG
+
+
 # P-4b (#230): preflight thresholds per backend.  These are starting values
 # tuned to the worker's 12 GB RTX 4070 SUPER and the 09-02 MemoryError post-
 # mortem (host with 7.4 GB free + a 2.84 GB unet → diffusers OOM during
@@ -670,6 +678,38 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Full angular span of a --input-projection fisheye source, in degrees "
         "(default: 180, i.e. the inscribed image circle spans the whole hemisphere)",
     )
+    # W-8 (#323): sphere orientation.  The owner's Quest test of a fisheye
+    # source stretched to 180° was the most immersive option but "the viewing
+    # angle is too low, everything is above me, like being underground" — the
+    # pipeline had no way to tilt the sphere at all.  --pitch is that way; yaw
+    # and roll come along because they are the same rotation for free.
+    parser.add_argument(
+        "--pitch",
+        type=float,
+        default=0.0,
+        metavar="DEG",
+        help="W-8 (#323): rotate the output sphere about the horizontal axis, in degrees "
+        "(default: 0 = unchanged). Positive RAISES the line of sight, pushing content DOWN "
+        "the frame — use it when the source horizon sits below eye height and the scene "
+        "feels like it is all overhead. A marker moves output_height * pitch / 180 px down.",
+    )
+    parser.add_argument(
+        "--yaw",
+        type=float,
+        default=0.0,
+        metavar="DEG",
+        help="W-8 (#323): rotate the output sphere about the vertical axis, in degrees "
+        "(default: 0). Positive turns the view right, moving content left. Rarely needed — "
+        "--pitch is the knob this trio exists for.",
+    )
+    parser.add_argument(
+        "--roll",
+        type=float,
+        default=0.0,
+        metavar="DEG",
+        help="W-8 (#323): rotate the output sphere about the forward axis, in degrees "
+        "(default: 0), i.e. level a tilted horizon. Rarely needed.",
+    )
 
     # R-5: Fulldome projection
     parser.add_argument(
@@ -955,6 +995,16 @@ def parse_args(argv: list[str] | None = None):
             )
         if not (math.isfinite(args.fisheye_fov) and 0.0 < args.fisheye_fov <= 360.0):
             parser.error(f"--fisheye-fov must be a finite angle in (0, 360] degrees, got {args.fisheye_fov}")
+    # W-8 (#323): the -180..180 bound is ffmpeg v360's own, so rejecting it
+    # here (exit 2) is strictly earlier than the identical rejection the render
+    # would hit — and it keeps the OpenCV fallback from quietly accepting an
+    # angle the ffmpeg path refuses.
+    for _flag, _angle in (("--pitch", args.pitch), ("--yaw", args.yaw), ("--roll", args.roll)):
+        if not (math.isfinite(_angle) and abs(_angle) <= ORIENTATION_LIMIT_DEG):
+            parser.error(
+                f"{_flag} must be a finite angle in "
+                f"[-{ORIENTATION_LIMIT_DEG:g}, {ORIENTATION_LIMIT_DEG:g}] degrees, got {_angle}"
+            )
     # P0-3 (#244): reject impossible feather angles here, not after depth/stereo ran.
     try:
         resolve_edge_feather(args.edge_feather_start, args.edge_feather_end)
@@ -1708,6 +1758,10 @@ def run_equirect_stage(args, left_frames, right_frames):
         # C-2 (#294): rectilinear (pinhole/src_hfov) vs fisheye (equidistant).
         input_projection=args.input_projection,
         fisheye_fov=args.fisheye_fov,
+        # W-8 (#323): sphere orientation; all-zero default = pre-#323 pixels.
+        pitch=args.pitch,
+        yaw=args.yaw,
+        roll=args.roll,
     )
 
     out_dir = get_temp_dir(args, "equirect")
@@ -1908,6 +1962,10 @@ def run_chunked_fused_stage(args, frames, depths):
         # C-2 (#294): same source-projection contract as the per-stage path.
         input_projection=args.input_projection,
         fisheye_fov=args.fisheye_fov,
+        # W-8 (#323): ... and the same sphere orientation.
+        pitch=args.pitch,
+        yaw=args.yaw,
+        roll=args.roll,
     )
 
     output_path = get_output_path(args)
@@ -2460,6 +2518,11 @@ _STREAMING_SUPPORTED: dict[str, str] = {
     # its EquirectangularMapper.  (``equirect`` still forces the batch path.)
     "input_projection": "source projection",
     "fisheye_fov": "fisheye source span",
+    # W-8 (#323): threaded into StreamingPipeline, which hands them to its
+    # EquirectangularMapper — so they must not be reported as swallowed.
+    "pitch": "sphere pitch",
+    "yaw": "sphere yaw",
+    "roll": "sphere roll",
     "max_frames": "frame cap",
     "quality": "quality preset",
     "model_size": "depth model size",
@@ -2718,6 +2781,11 @@ def _stage_artifacts(args, manifest_name):
             # geometry knob.
             "input_projection": args.input_projection,
             "fisheye_fov": args.fisheye_fov,
+            # W-8 (#323): the sphere orientation moves every projected pixel,
+            # so it invalidates a resumed project stage exactly like src_hfov.
+            "pitch": args.pitch,
+            "yaw": args.yaw,
+            "roll": args.roll,
         }
     elif manifest_name == "encode":
         outputs = [get_output_path(args)] if args.stage == "all" else []
@@ -3311,6 +3379,12 @@ def main():
             # C-2 (#294): the stream honours the source projection too.
             input_projection=args.input_projection,
             fisheye_fov=args.fisheye_fov,
+            # W-8 (#323): ... and the sphere orientation, so --pitch is not a
+            # batch-only flag (the streaming path is the default for
+            # --quality standard/high).
+            pitch=args.pitch,
+            yaw=args.yaw,
+            roll=args.roll,
             codec=args.codec,
             crf=args.crf,
             fps=args.fps,
@@ -3632,6 +3706,16 @@ def _write_sidecar_from_args(
             generation["input_projection"] = input_projection
             if input_projection == "fisheye":
                 generation["fisheye_fov"] = float(getattr(args, "fisheye_fov", 180.0))
+        # W-8 (#323): the sphere orientation is recorded unconditionally — it
+        # is the difference between "the horizon is at eye height" and "I am in
+        # a pit", and the container cannot express it either.  Recording the
+        # zeros too means a QA reader never has to guess whether an absent key
+        # means 0 or means the run predates the flag.
+        generation["sphere_orientation"] = {
+            "pitch": float(getattr(args, "pitch", 0.0) or 0.0),
+            "yaw": float(getattr(args, "yaw", 0.0) or 0.0),
+            "roll": float(getattr(args, "roll", 0.0) or 0.0),
+        }
 
     try:
         write_sidecar(output_path, immersive=normalize_immersive(immersive), generation=generation)

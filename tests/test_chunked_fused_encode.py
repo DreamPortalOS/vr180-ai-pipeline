@@ -174,6 +174,12 @@ def _fused_args(run_pipeline, tmp_path, chunk_size, overlap=0):
     # projection name, so pin the defaults this suite actually exercises.
     args.input_projection = "rectilinear"
     args.fisheye_fov = 180.0
+    # W-8 (#323): same story for the sphere orientation — the mapper rejects a
+    # MagicMock angle outright, so pin the "no rotation" default this suite
+    # (which is about chunking, not geometry) means to exercise.
+    args.pitch = 0.0
+    args.yaw = 0.0
+    args.roll = 0.0
     args.no_ffmpeg_v360 = True  # force OpenCV equirect path (CPU, deterministic)
     args.codec = "h264"
     args.crf = 23
