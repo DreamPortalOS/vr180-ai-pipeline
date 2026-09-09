@@ -143,10 +143,35 @@ class ConfidenceGates:
     max_fb_err_px: float = 0.35
     min_inlier_ratio: float = 0.25
     max_resid_px: float = 6.0
-    #: Spatial spread of the inliers, normalised so that points spread evenly
-    #: over the whole frame score ~0.58 (see :func:`inlier_spread`).  Guards
-    #: against a solution fitted to one small clump, which is free to rotate.
+    #: Spatial spread of the inliers, 1.0 being points spread evenly over the
+    #: whole frame (see :func:`inlier_spread`).  Guards against a solution
+    #: fitted to one small clump, which is free to rotate.  Measured on the
+    #: real clips: 0.73 median / 0.40 worst (drone), 0.46 / 0.28 (crystal).
     min_spread: float = 0.30
+
+
+#: Gates for the **long-baseline** registrations, which are a different problem
+#: and must not be judged by the adjacent-frame thresholds above.
+#:
+#: Over 60-240 frames the two images share far less content: on the real clips
+#: the correspondence count drops from ~2400 to 68-449, the residual rises to
+#: 4-12 px (a global 2-D similarity cannot describe 10 seconds of parallax) and
+#: the survivors cluster in whatever part of the scene is still visible, so
+#: spread falls to 0.07-0.26.  Judged by ``ConfidenceGates()`` every one of
+#: those registrations is rejected — and a cross-check that always reports
+#: "unavailable" is a cross-check that never catches anything.
+#:
+#: These thresholds are still gates, not a rubber stamp: crystal's 0->240 pair
+#: genuinely fails to track (0 surviving points) and is correctly reported as
+#: unavailable.  They are loose because the job is coarse — the check looks for
+#: *degrees* of disagreement, not tenths.
+BASELINE_GATES = ConfidenceGates(
+    min_tracked=60,
+    max_fb_err_px=0.50,
+    min_inlier_ratio=0.15,
+    max_resid_px=15.0,
+    min_spread=0.06,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +217,10 @@ class BaselineSegment:
     direct_trusted: bool
     direct_n_tracked: int = 0
     direct_inlier_ratio: float = float("nan")
+    #: Why the direct registration was rejected, when it was.  Without this,
+    #: an "unavailable" cross-check is an unactionable shrug — the operator
+    #: cannot tell a shot change from a stride that is simply too long.
+    direct_reason: str = ""
 
     @property
     def span(self) -> int:
@@ -318,13 +347,17 @@ def roll_deg_from_affine(matrix: np.ndarray) -> float:
 
 
 def inlier_spread(points: np.ndarray, shape: tuple[int, int]) -> float:
-    """How widely the correspondences are spread over the frame.
+    """How widely the correspondences are spread over the frame, 1.0 = evenly.
 
-    ``min(std_x / width, std_y / height) * 2``: points spread evenly over the
-    whole frame score ~0.577 (a uniform distribution has std = extent/sqrt(12)),
-    a tight clump scores ~0.  A similarity fitted to a clump is under-
-    constrained in rotation, which is precisely how a confident-looking wrong
-    angle gets produced.
+    ``min(std_x / width, std_y / height) * sqrt(12)``, the ``sqrt(12)`` chosen
+    so that points scattered uniformly over the whole frame score 1.0 (a
+    uniform distribution has std = extent / sqrt(12)) and a tight clump scores
+    ~0.  A similarity fitted to a clump is under-constrained in rotation, which
+    is exactly how a confident-looking wrong angle gets produced.
+
+    Normalising to 1.0 rather than to the raw ratio matters in practice: the
+    first calibration of this gate used the raw ratio against a threshold meant
+    for the normalised one and rejected 57% of a perfectly good clip.
     """
     if points is None or len(points) < 2:
         return 0.0
@@ -332,7 +365,7 @@ def inlier_spread(points: np.ndarray, shape: tuple[int, int]) -> float:
     pts = np.asarray(points, dtype=float).reshape(-1, 2)
     sx = float(pts[:, 0].std()) / max(width, 1)
     sy = float(pts[:, 1].std()) / max(height, 1)
-    return float(min(sx, sy) * 2.0)
+    return float(min(sx, sy) * math.sqrt(12.0))
 
 
 def to_gray(frame: np.ndarray) -> np.ndarray:
@@ -641,6 +674,7 @@ def _baseline_segment(
         direct_trusted=direct.trusted,
         direct_n_tracked=direct.n_tracked,
         direct_inlier_ratio=direct.inlier_ratio,
+        direct_reason=direct.reason,
     )
 
 
@@ -655,6 +689,7 @@ def estimate_motion(
     fps: float = float("nan"),
     cfg: TrackingConfig | None = None,
     gates: ConfidenceGates | None = None,
+    baseline_gates: ConfidenceGates | None = None,
     stride: int = DEFAULT_BASELINE_STRIDE,
     drift_threshold_deg: float = DEFAULT_DRIFT_WARNING_DEG,
     incremental_estimator: PairwiseEstimator | None = None,
@@ -667,6 +702,10 @@ def estimate_motion(
     function does no I/O.  Both readings the card requires come back in one
     :class:`MotionTrack`: ``increments`` / ``cumulative_roll_deg`` for the
     integrated view and ``long_baseline`` for the integration-free one.
+
+    ``gates`` judge the adjacent-frame estimates; ``baseline_gates`` (default
+    :data:`BASELINE_GATES`) judge the long-baseline ones, which see far less
+    shared content and would all be rejected by the stricter set.
 
     ``incremental_estimator`` and ``direct_estimator`` are separate injection
     points on purpose.  The front end is the component under suspicion here,
@@ -682,8 +721,9 @@ def estimate_motion(
 
     cfg = cfg or TrackingConfig()
     gates = gates or ConfidenceGates()
+    baseline_gates = baseline_gates or BASELINE_GATES
     incremental = incremental_estimator or functools.partial(estimate_pairwise, cfg=cfg, gates=gates)
-    direct = direct_estimator or functools.partial(estimate_pairwise, cfg=cfg, gates=gates)
+    direct = direct_estimator or functools.partial(estimate_pairwise, cfg=cfg, gates=baseline_gates)
 
     grays = [to_gray(f) for f in frames]
     n = len(grays)

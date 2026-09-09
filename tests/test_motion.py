@@ -43,6 +43,7 @@ import pytest
 from scripts import analyze_motion
 
 from pipeline.motion import (
+    BASELINE_GATES,
     VERDICT_CONSISTENT,
     VERDICT_DRIFT_SUSPECTED,
     VERDICT_UNAVAILABLE,
@@ -362,12 +363,50 @@ def test_confidence_gate_names_the_failing_criterion() -> None:
 
 
 def test_inlier_spread_separates_uniform_coverage_from_a_clump() -> None:
+    """Even coverage scores 1.0; the normalisation is what the gate is read against.
+
+    An earlier cut of this returned the raw std ratio (~0.577 for even
+    coverage) while the gate threshold assumed the normalised scale, and
+    rejected 57% of a perfectly good clip.  Pinning the 1.0 here keeps the two
+    from drifting apart again.
+    """
     rng = np.random.default_rng(0)
     uniform = rng.uniform(0, 400, size=(500, 2))
     clump = rng.uniform(190, 210, size=(500, 2))
-    assert inlier_spread(uniform, (400, 400)) == pytest.approx(0.577, abs=0.08)
-    assert inlier_spread(clump, (400, 400)) < 0.05
+    assert inlier_spread(uniform, (400, 400)) == pytest.approx(1.0, abs=0.12)
+    assert inlier_spread(clump, (400, 400)) < 0.10
     assert inlier_spread(np.zeros((1, 2)), (400, 400)) == 0.0
+
+
+def test_baseline_gates_are_looser_than_the_per_frame_gates() -> None:
+    """Long-baseline pairs share far less content and need their own thresholds.
+
+    On the real clips a 60-240 frame pair keeps 68-449 correspondences (vs
+    ~2400 adjacent), residual rises to 4-12 px and spread falls to 0.07-0.26.
+    Judged by the adjacent-frame gates every one of them is rejected, and a
+    cross-check that always answers "unavailable" catches nothing.
+    """
+    strict, loose = ConfidenceGates(), BASELINE_GATES
+    assert loose.min_tracked < strict.min_tracked
+    assert loose.max_fb_err_px > strict.max_fb_err_px
+    assert loose.min_inlier_ratio < strict.min_inlier_ratio
+    assert loose.max_resid_px > strict.max_resid_px
+    assert loose.min_spread < strict.min_spread
+
+
+def test_baseline_gates_are_applied_to_the_direct_path_only(roll_ramp_frames) -> None:
+    """Tightening only ``baseline_gates`` must silence the cross-check, nothing else."""
+    impossible = ConfidenceGates(min_tracked=10**6)
+    track = estimate_motion(roll_ramp_frames, fps=FPS, stride=30, baseline_gates=impossible)
+
+    assert track.long_baseline.verdict == VERDICT_UNAVAILABLE
+    assert track.reliable_ratio == 1.0, "per-frame estimates must be unaffected"
+    assert all(not seg.direct_trusted for seg in track.long_baseline.segments)
+    # "unavailable" has to say *why*, or the operator cannot tell a shot change
+    # from a stride that is merely too long.
+    assert all("n_tracked" in seg.direct_reason for seg in track.long_baseline.segments)
+    text = analyze_motion.render_report(analyze_motion.analyse_track(track))
+    assert "n_tracked" in text
 
 
 def test_estimate_motion_rejects_degenerate_input() -> None:

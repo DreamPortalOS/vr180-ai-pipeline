@@ -231,6 +231,7 @@ def _segment_dict(segment) -> dict:
         "direct_trusted": segment.direct_trusted,
         "direct_n_tracked": segment.direct_n_tracked,
         "direct_inlier_ratio": segment.direct_inlier_ratio,
+        "direct_reason": segment.direct_reason,
     }
 
 
@@ -449,18 +450,19 @@ def render_report(report: MotionReport) -> str:
     check = report.long_baseline
     endpoint = check.get("endpoint")
     lines.append(f"Long-baseline cross-check (stride {check['stride']}, threshold {check['threshold_deg']}deg)")
-    if endpoint:
-        lines.append(
-            f"  endpoint 0->{endpoint['end']:<5} direct {_fmt(endpoint['direct_roll_deg'])}  "
-            f"integrated {_fmt(endpoint['integrated_roll_deg'])}  "
-            f"diff {_fmt(endpoint['diff_deg'])}  trusted={endpoint['direct_trusted']}"
-        )
-    for seg in check["segments"]:
-        lines.append(
-            f"  {seg['start']:>4}->{seg['end']:<5}      direct {_fmt(seg['direct_roll_deg'])}  "
+
+    def _segment_line(seg: dict, label: str) -> str:
+        tail = "" if seg["direct_trusted"] else f"  ({seg['direct_reason'] or 'rejected'})"
+        return (
+            f"  {label:<14} direct {_fmt(seg['direct_roll_deg'])}  "
             f"integrated {_fmt(seg['integrated_roll_deg'])}  "
-            f"diff {_fmt(seg['diff_deg'])}  trusted={seg['direct_trusted']}"
+            f"diff {_fmt(seg['diff_deg'])}  trusted={seg['direct_trusted']}{tail}"
         )
+
+    if endpoint:
+        lines.append(_segment_line(endpoint, f"endpoint 0->{endpoint['end']}"))
+    for seg in check["segments"]:
+        lines.append(_segment_line(seg, f"{seg['start']}->{seg['end']}"))
     icon = {"consistent": "OK", "drift_suspected": "WARN", "unavailable": "UNKNOWN"}[check["verdict"]]
     lines.append(f"  verdict: [{icon}] {check['message']}")
     lines.append("")
