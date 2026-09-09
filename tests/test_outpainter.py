@@ -872,15 +872,10 @@ class TestGradientOutpaintVectorisedIsByteExact:
         assert np.array_equal(via_class, _reference_gradient_outpaint_single(frame, mask))
 
 
-# --- 5760×2880 (2880²/eye, ``--quality standard``): byte-exact and fast ------
+# --- 5760×2880 (2880²/eye, ``--quality standard``): byte-exact and vectorised -
 
 _PROD_EYE = 2880
 _IS_CI = bool(os.environ.get("CI"))
-# Card: ≤ 0.25 s measured, asserted with head-room at 0.4 s.  GitHub-hosted
-# runners have 2 vCPUs and OpenCV's Gaussian is multi-threaded, so the absolute
-# budgets are relaxed there; the relative bound against the reference on the
-# same machine holds everywhere.
-_FULL_FRAME_BUDGET_S = 2.0 if _IS_CI else 0.4
 
 #: Issue #333 — the no-hole fast path used to be asserted with a 20 ms wall-clock
 #: budget, which measures how busy the machine is, not how fast the code is (red
@@ -908,14 +903,55 @@ def _spy_gradient_work(monkeypatch) -> dict[str, int]:
     return calls
 
 
-def _min_time(fn, repeats):
-    best = float("inf")
-    result = None
-    for _ in range(repeats):
-        t0 = time.perf_counter()
+#: Issue #337 — #333's sibling in this class.  ``test_5760x2880_…`` carried two
+#: wall-clock assertions (``t_new <= 0.4 s`` and ``t_new * 3 <= t_ref``); under a
+#: 32-process oversubscription they went red in 7 runs out of 10, because a
+#: stopwatch measures how busy the box is, not how fast the code is — the same
+#: disease #333 cured next door.  What #271 actually bought is *vectorisation*:
+#: the pre-#271 loops crossed into NumPy once per filled row and once per
+#: content-less column, the current code once per (row-chunk × column-strip)
+#: block.  ``_smear_weights`` is the kernel both implementations call at exactly
+#: those points, so *counting* its calls measures what the stopwatch was standing
+#: in for — and a count does not care how many other processes are running.
+_THIS_MODULE = sys.modules[__name__]
+
+
+def _count_smear_weights(module, name, fn):
+    """Run *fn* and return ``(number of calls made to module.name, fn's result)``.
+
+    The patch is scoped to the call, so the module is untouched afterwards even
+    if *fn* raises; ``setattr`` raises up front if the name ever disappears.
+    """
+    calls = 0
+    original = getattr(module, name)
+
+    def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(module, name, counting)
         result = fn()
-        best = min(best, time.perf_counter() - t0)
-    return best, result
+    return calls, result
+
+
+def _reference_smear_work_units(mask):
+    """``(rows, columns)`` the pre-#271 loops walked one NumPy call at a time.
+
+    *rows* — the vertical bands above the first / below the last content pixel,
+    one loop iteration each; *columns* — the columns with no content at all,
+    which :func:`_ref_smear_columns` fills one at a time.  The sum is the number
+    of ``_ref_smear_weights`` calls the reference makes, asserted below so the
+    ratio it anchors keeps a stated unit rather than being a bare magic number.
+    """
+    content = mask == 0
+    h = content.shape[0]
+    col_has = content.any(axis=0)
+    first = content.argmax(axis=0)
+    last = h - 1 - content[::-1, :].argmax(axis=0)
+    rows = int(first[col_has].max()) + (h - 1 - int(last[col_has].min()))
+    return rows, int((~col_has).sum())
 
 
 @pytest.fixture(scope="module")
@@ -925,14 +961,59 @@ def production_frame_and_mask():
 
 
 class TestGradientOutpaintProductionSize:
-    def test_5760x2880_is_byte_exact_and_at_least_3x_faster(self, production_frame_and_mask):
+    def test_5760x2880_is_byte_exact_and_does_3x_less_work_than_the_reference(self, production_frame_and_mask):
+        """#271's two promises on a production frame: the same bytes, far less work (#337).
+
+        The byte-exact half is unchanged.  The speed half used to be
+        ``t_new * 3 <= t_ref`` plus a 0.4 s absolute budget — both a stopwatch,
+        both red under load; it is now the same ``3×`` bound applied to the
+        number of NumPy round-trips each implementation makes for the identical
+        frame (see the #337 note above ``_THIS_MODULE``).
+        """
         frame, mask = production_frame_and_mask
         assert frame.shape == (2880, 5760, 3) and 0.6 < (mask > 0).mean() < 0.75, "the 126° hole covers ~68%"
-        t_ref, expected = _min_time(lambda: _reference_gradient_outpaint_single(frame, mask), repeats=1)
-        t_new, got = _min_time(lambda: _gradient_outpaint_single(frame, mask), repeats=3)
-        assert np.array_equal(got, expected)
-        assert t_new <= _FULL_FRAME_BUDGET_S, f"{t_new:.3f} s > {_FULL_FRAME_BUDGET_S} s budget"
-        assert t_new * 3 <= t_ref, f"only {t_ref / t_new:.1f}× faster than the reference ({t_ref:.2f} s)"
+        smear_rows, empty_cols = _reference_smear_work_units(mask)
+
+        n_ref, expected = _count_smear_weights(
+            _THIS_MODULE, "_ref_smear_weights", lambda: _reference_gradient_outpaint_single(frame, mask)
+        )
+        n_new, got = _count_smear_weights(
+            outpainter_mod, "_smear_weights", lambda: _gradient_outpaint_single(frame, mask)
+        )
+
+        assert np.array_equal(got, expected), "the vectorised filler is no longer byte-exact"
+        # The unit of the ratio: one call per row of the vertical bands, one per
+        # content-less column — 2028 + 1728 = 3756 for this frame.
+        assert n_ref == smear_rows + empty_cols, f"{n_ref} != {smear_rows} rows + {empty_cols} columns"
+        assert n_new > 0, "the spy never fired — it is not on the live path any more"
+        assert n_new * 2 <= smear_rows, f"{n_new} calls to fill {smear_rows} rows — that is per-row work"
+        assert n_new * 3 <= n_ref, f"only {n_ref / n_new:.1f}× fewer NumPy passes than the reference"
+
+    def test_the_call_count_separates_block_work_from_per_row_work(self):
+        """Control for the bound above — and the reason it is not a byte comparison.
+
+        Shrinking the row chunk to 1 turns the vectorised filler back into the
+        per-row shape of the pre-#271 loops.  The output stays **byte-identical**
+        (so ``np.array_equal`` cannot see the regression at all — #333's lesson),
+        while the call count crosses the ``n * 2 <= smear_rows`` line in both
+        directions.  Without this, the bound could go vacuous unnoticed.
+        """
+        mask = _pinhole_hole_mask_sbs(128, 126.0)
+        frame = _holed(_noise_frame(128, 256, 337), mask)
+        smear_rows, _ = _reference_smear_work_units(mask)
+
+        n_fast, fast = _count_smear_weights(
+            outpainter_mod, "_smear_weights", lambda: _gradient_outpaint_single(frame, mask)
+        )
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(outpainter_mod, "_GRADIENT_SMEAR_ROWS", 1)
+            n_slow, slow = _count_smear_weights(
+                outpainter_mod, "_smear_weights", lambda: _gradient_outpaint_single(frame, mask)
+            )
+
+        assert np.array_equal(slow, fast), "de-chunking must not change the bytes — that is the point"
+        assert n_fast * 2 <= smear_rows, f"{n_fast} calls for {smear_rows} rows"
+        assert n_slow * 2 > smear_rows, f"per-row work still passed the bound: {n_slow} calls, {smear_rows} rows"
 
     def test_no_hole_returns_a_copy_without_doing_any_filling_work(self, monkeypatch, production_frame_and_mask):
         """An empty mask must take the fast path: a plain copy, none of the filling work (#333).
