@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pre-pipeline source health check — four cheap tests that save a 40-minute run.
+"""Pre-pipeline source health check — six cheap tests that save a 40-minute run.
 
 Why this exists
 ---------------
@@ -17,8 +17,21 @@ is a flat picture pasted on a sphere.  Prompt text saying "camera flies forward"
 is a wish, not a guarantee — text-to-video models routinely return a static shot
 or a lateral pan instead.  This check measures it.
 
-The four checks
----------------
+Stills, and why they are the cheapest gate of all
+-------------------------------------------------
+Hand an image (``.png``/``.jpg``/…) to this tool and it switches to **still
+mode**: everything except ``forward_motion`` runs exactly as it does for a clip,
+and ``forward_motion`` is reported as ``skipped`` — one frame carries no
+evidence about camera movement, and calling that a pass or a fail would be a
+lie either way.  The exit-code contract is unchanged.
+
+This matters commercially, not just tidily.  A 4k/10s generation costs ≈¥50
+measured; the operator's ¥100 top-up buys two.  A keyframe costs a fraction of
+that, so **vetting the keyframe and refusing to animate a bad one** is the
+single biggest saving available here.
+
+The six checks
+--------------
 ``square``
     Is the frame 1:1?  The preferred generation route is a 2880×2880 native
     square (§QA).  A non-square source is **not** fatal — the fisheye route
@@ -57,7 +70,36 @@ The four checks
     ffprobe reads the file, the frame count agrees with ``duration × fps``, and
     the pixel format is printed.  ``pix_fmt`` is **reported, never judged** —
     10-bit HEVC was proven to run through the pipeline fine (#292/#298), so
-    flagging it would be a false alarm.
+    flagging it would be a false alarm.  For a still the frame-count/duration
+    agreement is meaningless (ffmpeg invents a 25 fps single-frame "clip"), so
+    that half is skipped and only the size/format is reported.
+
+``detail_ratio``
+    Laplacian edge energy of the central 1/3×1/3 rectangle divided by the same
+    energy over the rest of the frame — "is the detail where the viewer is
+    looking, or out at the rim?".  Not an aesthetic opinion: the competitor
+    teardown (``_research/redraion/ANALYSIS.md`` §3) measured **1.60** across
+    34 finished ride films and **1.58** across 613 official stills, two
+    independent samples agreeing, with 88 % of frames above 1.  Their outer 6 %
+    border carries only **0.77×** the detail of the rest of the picture.  That
+    is a deliberate content-side trick and it is worth copying: the rim is
+    exactly where VR180/fulldome geometry, outward extrapolation and feathering
+    look worst, so a source that is *empty* out there hides our ugliest ring for
+    free.  A busy rim advertises it.
+
+``anchor``
+    Is there a subject in the forward direction for the eye to hold onto?  The
+    same teardown found one in **80 %** of frames, median area **11.3 %** of the
+    picture, median eccentricity **0.236** (0 = dead centre), 62 % of them
+    inside the central third.  Frequency-tuned saliency (Achanta) → Otsu → the
+    most salient compact region, weighted toward the centre when several
+    compete, then its area and eccentricity are reported.  Measured on the
+    synthetic fixtures before any threshold was set, frames with a subject come
+    out at 11.0–39.3 % of the picture and frames without one at ≤0.35 %, so the
+    two cases are separated by a factor of ~30, not by a hair.  A missing
+    anchor is a WARN, not
+    a FAIL: not every shot needs one, but the operator should know that without
+    one the viewer will go looking at the rim.
 
 Aggregation across the sampled frames/pairs is by **median**, not mean: one
 scene cut, one fade-to-black frame or one lens flare must not decide the
@@ -68,6 +110,7 @@ Usage
 ::
 
     python scripts/check_source_quality.py video/src_720p_v2.mp4
+    python scripts/check_source_quality.py keyframe.png              # still mode
     python scripts/check_source_quality.py clip.mp4 --pairs 12
     python scripts/check_source_quality.py clip.mp4 --skip forward_motion
     python scripts/check_source_quality.py clip.mp4 --json            # stdout
@@ -102,8 +145,22 @@ import numpy as np
 # Defaults (module constants so tests reference these, not literals)
 # ---------------------------------------------------------------------------
 
-#: The four checks, in report order.  ``--skip`` takes any of these names.
-CHECK_NAMES: tuple[str, ...] = ("decodable", "square", "forward_motion", "edges")
+#: The six checks, in report order.  ``--skip`` takes any of these names.
+CHECK_NAMES: tuple[str, ...] = (
+    "decodable",
+    "square",
+    "forward_motion",
+    "edges",
+    "detail_ratio",
+    "anchor",
+)
+
+#: Extensions that put the tool into **still mode**: no adjacent frame pair
+#: exists, so ``forward_motion`` is reported ``skipped`` and every other check
+#: runs on the one frame.  Extension-driven rather than content-sniffed because
+#: the operator's keyframes are named by the generator, and a wrong guess here
+#: would silently drop the motion check on a real clip.
+STILL_SUFFIXES: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"})
 
 #: Adjacent frame pairs sampled evenly across the clip for the flow analysis.
 DEFAULT_PAIRS: int = 8
@@ -155,6 +212,75 @@ OVEREXPOSED_FRAC_MAX: float = 0.30
 #: Frame-count/duration agreement tolerance for the ``decodable`` check.
 FRAME_COUNT_TOLERANCE: float = 0.05
 
+# --- Composition thresholds ------------------------------------------------
+# Every number in this block is *measured*, not chosen: it comes from the
+# teardown of Red Raion's 34 finished ride films (frame-by-frame) and 613
+# official gallery stills in ``_research/redraion/ANALYSIS.md`` §3.  The two
+# samples were analysed independently and agree, which is why these are treated
+# as a reproducible house style rather than one studio's taste.
+
+#: Longest side the ``detail_ratio`` analysis runs at.  The research pipeline
+#: measured at this size; edge energy is a scale-dependent quantity, so
+#: reproducing its numbers means reproducing its working resolution.
+DETAIL_ANALYSIS_MAX_DIM: int = 720
+
+#: Central detail / peripheral detail, above which the composition is doing what
+#: the reference films do.  Measured there: **1.60** median across 34 trailers
+#: (33 of the 34 above 1.0; p10 1.22) and **1.58** across 613 stills.  The gate
+#: is set well below both so that only genuinely rim-heavy material trips it.
+DETAIL_RATIO_PASS: float = 1.2
+
+#: Below this the centre carries *less* detail than the rim — the opposite of
+#: the reference style, and the arrangement that puts the viewer's eye straight
+#: onto the worst ring of the projection.  Between the two constants is the
+#: WARN band.
+DETAIL_RATIO_FAIL: float = 1.0
+
+#: Longest side the saliency analysis runs at.  Fixed so that an area fraction
+#: means the same thing for a 1024² keyframe and a 2880² render, and small
+#: enough that the morphology below has a resolution-independent footprint.
+ANCHOR_ANALYSIS_MAX_DIM: int = 256
+
+#: Morphological opening then closing, in pixels at
+#: :data:`ANCHOR_ANALYSIS_MAX_DIM`.  The **opening is the load-bearing step**:
+#: without it a flat or evenly-textured frame's scattered above-threshold
+#: speckle gets welded into one frame-filling blob by the closing and reads as a
+#: giant subject.  With it, such a frame yields no component above
+#: :data:`ANCHOR_MIN_AREA` and is correctly reported as having no anchor.
+ANCHOR_MORPH_KERNEL: int = 9
+
+#: Centre prior used only to *choose* between competing salient regions (score =
+#: Σ saliency × weight), never to measure them.  A sky band along the top edge
+#: and a subject in the middle are both salient; the question this check asks is
+#: whether something holds the eye in the *forward* direction, so the middle one
+#: wins.  Area and eccentricity are then read off the unweighted mask, which is
+#: what keeps an off-centre subject detectable and reportable as off-centre.
+ANCHOR_CENTER_PRIOR_SIGMA: float = 0.5
+
+#: A component smaller than this is speckle, not an anchor.  Measured
+#: separation on the synthetic fixtures before any threshold was chosen: frames
+#: with a subject land at **11.0–39.3 %**, frames without one top out at
+#: **0.35 %**.  This sits ~4× above the loudest false positive and ~7× below the
+#: quietest true one, so neither side is anywhere near it.
+ANCHOR_MIN_AREA: float = 0.015
+
+#: The reference band for a subject's share of the picture: Red Raion's median
+#: is **11.3 %** (p10 3.3 %, p90 24.9 %), so 8–15 % brackets the median without
+#: pretending the tails are wrong — outside it is a WARN with the direction
+#: named, never a FAIL.
+ANCHOR_AREA_MIN: float = 0.08
+ANCHOR_AREA_MAX: float = 0.15
+
+#: Eccentricity of the subject's centroid, as a fraction of the half-diagonal
+#: (0 = dead centre, 1 = corner).  Red Raion's median is **0.236** and 62 % of
+#: their frames put the subject inside the central third.
+ANCHOR_OFFSET_MAX: float = 0.30
+
+#: Share of sampled frames that must contain a subject before a clip counts as
+#: "anchored".  Red Raion manage **80 %**; a simple majority is a deliberately
+#: forgiving gate for a check that only ever WARNs.
+ANCHOR_DETECTED_FRAC_MIN: float = 0.5
+
 #: Seconds allowed for one ffmpeg/ffprobe call.
 FFMPEG_TIMEOUT: float = 300.0
 
@@ -193,10 +319,47 @@ FORWARD_FAIL_ADVICE = (
     "不摇不摆不旋转，画面元素从中心持续向四周散开。"
 )
 
+#: Still mode: a single frame carries no evidence either way about camera
+#: movement, so the honest report is ``skipped`` — not a pass (which would let a
+#: locked-off clip through on a keyframe's say-so) and not a fail (which would
+#: block every keyframe there is).
+STILL_FORWARD_DETAIL = "静帧模式：只有一帧，无从判断镜头是否向前推进（既不算过也不算不过）"
+STILL_FORWARD_ADVICE = (
+    "关键帧先把其余各项过掉再花钱生成视频；视频出来之后，对视频本体再跑一次完整体检，"
+    "由 forward_motion 确认是不是真前进。"
+)
+
 #: Appended when the clip does move forward but only barely.
 FORWARD_WEAK_ADVICE = (
     "径向外流为正但偏弱：前进速度慢、或大部分画面是远景（远处视差本来就小）。"
     "可以进管线，但立体感会偏弱；想要更强的沉浸感就把运镜提速或加近景元素。"
+)
+
+#: Printed whenever the frame is flatter in the middle than at the rim.  The
+#: fix is a prompt change, not a pipeline change, which is why the wording is
+#: phrased as generation guidance.
+DETAIL_RATIO_ADVICE = (
+    "边缘太满，VR 里最烂的一圈会被看见：VR180／球幕的画面外圈正是几何最假、外扩最勉强、"
+    "羽化最明显的地方，边缘越有细节，观众越容易发现它。Red Raion 的 34 条成片与 613 张剧照"
+    "都把中央做密（中央/周边细节比 1.58–1.60）、把外 6% 边框做空（只有其余画面的 0.77 倍）、"
+    "四角压暗到全画面均值的 0.55。重生成时在提示词里写明：细节集中在画面中央 1/3，"
+    "四角自然压暗，边缘只留低对比背景。"
+)
+
+#: Printed when no subject could be found at all.  Named 「没有锚点」 verbatim
+#: because that is the phrase the operator has to act on.
+ANCHOR_MISSING_ADVICE = (
+    "正前方没有锚点，观众会盯着边缘瑕疵看。Red Raion 的成片里 80% 的帧都有一个独立主体"
+    "（面积中位 11.3%、偏心 0.236，62% 落在中央 1/3 区），三种可直接抄的形态："
+    "①载具/角色跟拍 ②轨道/通道引导 ③中央光源当消失点。"
+    "重生成时在提示词里指定一个明确的中央主体，并在故事板上把它写成可核对的产出物。"
+)
+
+#: Printed when a subject exists but sits outside the reference band.
+ANCHOR_OFF_SPEC_ADVICE = (
+    "有主体但不在竞品的构图区间内（面积 8–15%、偏心 ≤0.3，实测中位 11.3% / 0.236）。"
+    "这不致命——不是每个镜头都要标准锚点——但主体太小抓不住视线、太大会糊住整个画幅、"
+    "太偏则观众的视线被带向边缘那圈瑕疵。"
 )
 
 #: Non-square is legitimate (fisheye / 16:9 routes), so this is guidance, not
@@ -354,13 +517,22 @@ def probe_source(path: str | Path, ffprobe: str = "ffprobe") -> ProbeInfo:
     )
 
 
-def check_decodable(info: ProbeInfo, tolerance: float = FRAME_COUNT_TOLERANCE) -> CheckResult:
+def check_decodable(
+    info: ProbeInfo,
+    tolerance: float = FRAME_COUNT_TOLERANCE,
+    still: bool = False,
+) -> CheckResult:
     """ffprobe read it, and the frame count agrees with ``duration × fps``.
 
     ``pix_fmt`` is reported and never judged: 10-bit HEVC has been proven to
     run through the pipeline (#292/#298), so treating it as suspicious would be
     a false alarm.  A frame-count mismatch is a WARN, not a FAIL — the file is
     still decodable, but broken timestamps make per-frame stage accounting lie.
+
+    ``still=True`` stops after the size/format report.  ffmpeg hands a single
+    image back as a 25 fps, 0.04 s "clip" with no ``nb_frames``; running the
+    duration agreement against those invented numbers would produce a warning
+    about nothing.  The video path below is untouched by this branch.
     """
     measured: dict[str, Any] = {
         "width": info.width,
@@ -382,6 +554,15 @@ def check_decodable(info: ProbeInfo, tolerance: float = FRAME_COUNT_TOLERANCE) -
             f"ffprobe 读不到有效画面尺寸（{info.width}×{info.height}）",
             measured,
             "文件可能损坏或不是视频，换一份素材。",
+        )
+    if still:
+        measured["still"] = True
+        return CheckResult(
+            "decodable",
+            STATUS_PASS,
+            f"静帧 {info.width}×{info.height} {info.codec or '?'} {info.pix_fmt or '?'}"
+            f"（单帧素材：不做帧数/时长自洽核对，pix_fmt 仅报告不判定）",
+            measured,
         )
     if info.duration <= 0.0 or info.fps <= 0.0:
         return CheckResult(
@@ -721,6 +902,308 @@ def check_edges(
 
 
 # ---------------------------------------------------------------------------
+# 5. detail_ratio — is the detail in the middle, or out at the rim?
+# ---------------------------------------------------------------------------
+
+
+def _as_gray(frame: np.ndarray) -> np.ndarray:
+    """Luminance view of a frame that may arrive gray (video) or BGR (still)."""
+    if frame.ndim == 2:
+        return frame
+    if frame.ndim == 3 and frame.shape[2] == 3:
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    raise ValueError(f"expected a grayscale or BGR frame, got shape {frame.shape}")
+
+
+def _fit_for_analysis(frame: np.ndarray, max_dim: int) -> np.ndarray:
+    """Shrink so the longest side is ``max_dim`` (no-op if already smaller)."""
+    height, width = frame.shape[:2]
+    scale = max_dim / float(max(height, width))
+    if scale >= 1.0:
+        return frame
+    size = (max(2, round(width * scale)), max(2, round(height * scale)))
+    return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+
+
+def center_detail_stats(frame: np.ndarray, max_dim: int = DETAIL_ANALYSIS_MAX_DIM) -> dict[str, float]:
+    """Laplacian edge energy of the central 1/3×1/3 rectangle vs. the rest.
+
+    The blur before the Laplacian is what makes this a *detail* measure rather
+    than a noise measure: without it, sensor grain and compression mosquito
+    noise contribute as much energy as real structure, and a grainy rim would
+    read as a detailed one.
+
+    The analysis is done at a fixed longest side because edge energy is not
+    scale invariant — the same picture at 2880 px and at 720 px gives different
+    absolute energies, and the reference numbers (1.58/1.60) were measured at
+    720.  The *ratio* is much more stable than either term, which is why the
+    verdict is taken on it.
+    """
+    gray = _fit_for_analysis(_as_gray(frame), max_dim)
+    height, width = gray.shape
+    energy = np.abs(cv2.Laplacian(cv2.GaussianBlur(gray, (3, 3), 0), cv2.CV_32F))
+    half_h, half_w = max(1, height // 6), max(1, width // 6)
+    top, bottom = height // 2 - half_h, height // 2 + half_h
+    left, right = width // 2 - half_w, width // 2 + half_w
+    center = energy[top:bottom, left:right]
+    outside = np.ones(energy.shape, dtype=bool)
+    outside[top:bottom, left:right] = False
+    center_mean = float(center.mean())
+    periphery_mean = float(energy[outside].mean()) if outside.any() else 0.0
+    return {
+        "center": center_mean,
+        "periphery": periphery_mean,
+        "ratio": center_mean / (periphery_mean + 1e-6),
+    }
+
+
+def check_detail_ratio(
+    per_frame: Sequence[dict[str, float]],
+    pass_ratio: float = DETAIL_RATIO_PASS,
+    fail_ratio: float = DETAIL_RATIO_FAIL,
+) -> CheckResult:
+    """Verdict over the sampled frames' central-vs-peripheral detail.
+
+    Three bands, all of them taken from the measured reference rather than from
+    taste: at or above ``pass_ratio`` the frame is composed the way the films
+    that sell tickets are composed; between the two constants the rim is as busy
+    as the middle (WARN); below ``fail_ratio`` the rim is *busier*, which points
+    the viewer straight at the part of the projection we cannot make look good.
+    """
+    if not per_frame:
+        return CheckResult(
+            "detail_ratio",
+            STATUS_FAIL,
+            "没有取到任何可分析的帧",
+            {"frames": 0},
+            "先确认文件能正常解码（见 decodable）。",
+        )
+
+    ratio = float(np.median([f["ratio"] for f in per_frame]))
+    measured: dict[str, Any] = {
+        "frames": len(per_frame),
+        "ratio": round(ratio, 4),
+        "center_edge_energy": round(float(np.median([f["center"] for f in per_frame])), 3),
+        "periphery_edge_energy": round(float(np.median([f["periphery"] for f in per_frame])), 3),
+        "pass_ratio": pass_ratio,
+        "fail_ratio": fail_ratio,
+        "reference_ratio": 1.60,
+        "analysis_max_dim": DETAIL_ANALYSIS_MAX_DIM,
+    }
+    numbers = (
+        f"中央 1/3 区边缘能量 {measured['center_edge_energy']:.2f} / 周边 "
+        f"{measured['periphery_edge_energy']:.2f} = {ratio:.2f}"
+        f"（{len(per_frame)} 帧中位数；竞品实测 1.58–1.60，门槛 {pass_ratio:g}）"
+    )
+
+    if ratio >= pass_ratio:
+        return CheckResult(
+            "detail_ratio",
+            STATUS_PASS,
+            f"细节集中在中央、边缘做得空：{numbers}",
+            measured,
+        )
+    if ratio >= fail_ratio:
+        return CheckResult(
+            "detail_ratio",
+            STATUS_WARN,
+            f"中央只是勉强比周边更密：{numbers}",
+            measured,
+            DETAIL_RATIO_ADVICE,
+        )
+    return CheckResult(
+        "detail_ratio",
+        STATUS_FAIL,
+        f"周边比中央还密，与竞品的构图规律相反：{numbers}",
+        measured,
+        DETAIL_RATIO_ADVICE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. anchor — is there a subject in the forward direction?
+# ---------------------------------------------------------------------------
+
+
+def frequency_tuned_saliency(frame: np.ndarray, max_dim: int = ANCHOR_ANALYSIS_MAX_DIM) -> np.ndarray:
+    """Achanta frequency-tuned saliency, normalised to ``[0, 1]``.
+
+    Distance in CIE Lab between each (lightly blurred) pixel and the frame's
+    mean colour: "how unlike the rest of this picture is this spot?".  Cheap,
+    dependency-free and, unlike a gradient-based measure, it responds to the
+    *inside* of a large flat subject rather than only to its outline — which is
+    what lets the 40 %-of-frame case below be measured as 40 % instead of as a
+    thin ring.
+
+    A grayscale frame (what the video sampler decodes) is promoted to BGR, so
+    the measure degrades to a luminance-distinctness one rather than failing.
+    """
+    small = _fit_for_analysis(frame, max_dim)
+    if small.ndim == 2:
+        small = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+    lab = cv2.cvtColor(cv2.GaussianBlur(small, (5, 5), 0), cv2.COLOR_BGR2LAB).astype(np.float32)
+    mean_lab = lab.reshape(-1, 3).mean(axis=0)
+    saliency = np.linalg.norm(lab - mean_lab, axis=2)
+    return (saliency - saliency.min()) / (float(np.ptp(saliency)) + 1e-9)
+
+
+def anchor_stats(
+    frame: np.ndarray,
+    kernel: int = ANCHOR_MORPH_KERNEL,
+    sigma: float = ANCHOR_CENTER_PRIOR_SIGMA,
+    min_area: float = ANCHOR_MIN_AREA,
+) -> dict[str, float]:
+    """Locate the frame's anchor and report its area share and eccentricity.
+
+    The pipeline is: saliency → **Otsu** mask → open (drop speckle) → close
+    (heal a subject broken up by a highlight) → connected components → pick the
+    one with the most centre-weighted saliency mass.
+
+    Otsu rather than a fixed percentile, and the difference is not cosmetic.  A
+    percentile decides *in advance* how much of the frame is salient, so it can
+    only return the true area of a subject whose saliency is perfectly uniform:
+    measured on the fixtures, a top-decile mask reads a 40 %-of-frame subject as
+    38 % when it is flat-filled and as **0.2 %** once it carries any internal
+    texture, because the cut then falls inside the subject's own distribution
+    and the opening sweeps up the crumbs.  Otsu puts the cut *between* the two
+    modes instead and reads the same subject as 39 % either way.
+
+    The opening is what makes "no anchor" a reachable answer at all.  Otsu
+    always returns a threshold, so a frame with no subject still yields a
+    dusting of unrelated specks; closing alone would merge them into one
+    frame-filling region and report a giant, perfectly-centred subject.  Opening
+    first deletes them and leaves nothing above ``min_area``.
+
+    ``found`` is the answer to "is there an anchor"; ``area``/``offset`` are only
+    meaningful when it is true.
+    """
+    if kernel < 1:
+        raise ValueError(f"kernel must be >= 1, got {kernel}")
+    saliency = frequency_tuned_saliency(frame)
+    height, width = saliency.shape
+    _, mask = cv2.threshold(
+        np.clip(saliency * 255.0, 0, 255).astype(np.uint8),
+        0,
+        1,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+    element = np.ones((kernel, kernel), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, element)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, element)
+
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    empty = {"found": False, "area": 0.0, "offset": 0.0, "components": max(0, count - 1)}
+    if count <= 1:
+        return empty
+
+    cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+    half_diagonal = 0.5 * math.hypot(width, height)
+    ys, xs = np.mgrid[0:height, 0:width]
+    radius = np.hypot(xs - cx, ys - cy) / half_diagonal
+    weight = np.exp(-(radius**2) / (2.0 * sigma**2)).astype(np.float32)
+    weighted = saliency * weight
+
+    best_index, best_mass = 0, -1.0
+    for index in range(1, count):
+        mass = float(weighted[labels == index].sum())
+        if mass > best_mass:
+            best_index, best_mass = index, mass
+
+    pixels = int(stats[best_index, cv2.CC_STAT_AREA])
+    area = pixels / float(height * width)
+    blob_x, blob_y = centroids[best_index]
+    offset = math.hypot(blob_x - cx, blob_y - cy) / half_diagonal
+    return {
+        "found": area >= min_area,
+        "area": area,
+        "offset": offset,
+        "components": count - 1,
+    }
+
+
+def check_anchor(
+    per_frame: Sequence[dict[str, float]],
+    area_min: float = ANCHOR_AREA_MIN,
+    area_max: float = ANCHOR_AREA_MAX,
+    offset_max: float = ANCHOR_OFFSET_MAX,
+    detected_frac_min: float = ANCHOR_DETECTED_FRAC_MIN,
+) -> CheckResult:
+    """Verdict over the sampled frames: is something holding the eye up front?
+
+    Never a FAIL.  Plenty of legitimate shots — a pure landscape fly-through, an
+    abstract tunnel — have no subject, so blocking a run over it would be wrong;
+    what the operator needs is to be *told*, because the alternative to looking
+    at an anchor is looking at the rim, and the rim is where our geometry is
+    weakest.
+
+    Aggregation is the median over the frames that *had* a subject, with a
+    separate detection rate, so a clip that only shows its hero half the time
+    reports an honest 50 % rather than an area averaged with zeros.
+    """
+    if not per_frame:
+        return CheckResult(
+            "anchor",
+            STATUS_FAIL,
+            "没有取到任何可分析的帧",
+            {"frames": 0},
+            "先确认文件能正常解码（见 decodable）。",
+        )
+
+    found = [f for f in per_frame if f["found"]]
+    detected_frac = len(found) / len(per_frame)
+    measured: dict[str, Any] = {
+        "frames": len(per_frame),
+        "detected_frames": len(found),
+        "detected_frac": round(detected_frac, 4),
+        "detected_frac_min": detected_frac_min,
+        "area_min": area_min,
+        "area_max": area_max,
+        "offset_max": offset_max,
+        "reference_area": 0.113,
+        "reference_offset": 0.236,
+    }
+
+    if detected_frac < detected_frac_min:
+        measured["area"] = 0.0
+        measured["offset"] = 0.0
+        return CheckResult(
+            "anchor",
+            STATUS_WARN,
+            f"检不出锚点主体：{len(found)}/{len(per_frame)} 帧有主体（低于 {detected_frac_min * 100:g}%），"
+            f"画面里没有锚点",
+            measured,
+            ANCHOR_MISSING_ADVICE,
+        )
+
+    area = float(np.median([f["area"] for f in found]))
+    offset = float(np.median([f["offset"] for f in found]))
+    measured["area"] = round(area, 4)
+    measured["offset"] = round(offset, 4)
+    numbers = (
+        f"主体面积 {area * 100:.1f}%、偏心 {offset:.2f}"
+        f"（{len(found)}/{len(per_frame)} 帧检出；竞品实测中位 11.3% / 0.236）"
+    )
+
+    problems: list[str] = []
+    if area > area_max:
+        problems.append(f"面积偏大：{area * 100:.1f}% > {area_max * 100:g}%，主体糊住了画幅")
+    elif area < area_min:
+        problems.append(f"面积偏小：{area * 100:.1f}% < {area_min * 100:g}%，抓不住视线")
+    if offset > offset_max:
+        problems.append(f"偏离中心：偏心 {offset:.2f} > {offset_max:g}，锚点不在正前方")
+
+    if not problems:
+        return CheckResult("anchor", STATUS_PASS, f"正前方有锚点主体：{numbers}", measured)
+    return CheckResult(
+        "anchor",
+        STATUS_WARN,
+        f"{'；'.join(problems)}。{numbers}",
+        measured,
+        ANCHOR_OFF_SPEC_ADVICE,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Frame sampling — always list-form subprocess, never shell=True
 # ---------------------------------------------------------------------------
 
@@ -796,6 +1279,27 @@ def iter_frame_pairs(
             yield pair
 
 
+def is_still(path: str | Path) -> bool:
+    """Does this path name an image rather than a clip?  Extension only."""
+    return Path(path).suffix.lower() in STILL_SUFFIXES
+
+
+def read_still(path: str | Path) -> np.ndarray:
+    """Decode a still to BGR, read-only, without ffmpeg.
+
+    ``np.fromfile`` + ``cv2.imdecode`` rather than ``cv2.imread`` because
+    ``imread`` goes through a non-Unicode path API on Windows and returns
+    ``None`` for any path with a non-ASCII character in it — the operator's
+    ``video/`` names are ASCII today, but a silent "file unreadable" on a
+    perfectly good keyframe is a bad way to find that out.
+    """
+    buffer = np.fromfile(str(path), dtype=np.uint8)
+    image = cv2.imdecode(buffer, cv2.IMREAD_COLOR) if buffer.size else None
+    if image is None:
+        raise RuntimeError(f"cannot decode image: {path}")
+    return image
+
+
 def downscale_for_flow(frame: np.ndarray, target_width: int = DEFAULT_FLOW_WIDTH) -> np.ndarray:
     """Shrink to ``target_width`` for Farnebäck (no-op if already narrower)."""
     height, width = frame.shape[:2]
@@ -824,9 +1328,15 @@ def run_checks(
 ) -> SourceReport:
     """Run every non-skipped check against ``path``.  Read-only, always.
 
-    The clip is decoded **once**: each sampled pair feeds the edge bands at
-    native resolution (an 8 px bar must not be blurred away by a downscale) and
-    the flow analysis at :data:`DEFAULT_FLOW_WIDTH`.
+    The clip is decoded **once**: each sampled pair feeds the edge bands and the
+    composition checks at native resolution (an 8 px bar must not be blurred
+    away by a downscale; the composition pair do their own fixed-size
+    downscale) and the flow analysis at :data:`DEFAULT_FLOW_WIDTH`.
+
+    A still takes the same route with one frame and no pair, which is why
+    ``forward_motion`` comes back ``skipped`` rather than judged.  Everything
+    else — including both composition checks, the ones that make vetting a
+    keyframe worth doing — runs identically to the video path.
     """
     report = SourceReport(source=str(path))
     skipped = set(skip)
@@ -841,19 +1351,38 @@ def run_checks(
         )
         return report
 
+    still = is_still(src)
     try:
         info = probe_source(src, ffprobe=ffprobe)
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
         report.checks.append(CheckResult("decodable", STATUS_FAIL, str(exc), {}, "文件可能损坏或不是视频。"))
         return report
 
-    needs_frames = not {"forward_motion", "edges"} <= skipped
+    frame_checks = {"forward_motion", "edges", "detail_ratio", "anchor"}
+    needs_frames = not frame_checks <= skipped
     flow_stats: list[RadialStats] = []
     band_stats: list[dict[str, dict[str, float]]] = []
-    if needs_frames:
+    detail_stats: list[dict[str, float]] = []
+    subject_stats: list[dict[str, float]] = []
+
+    def measure(frame: np.ndarray) -> None:
+        """Every per-frame measurement, taken on the one frame we decoded."""
+        if "edges" not in skipped:
+            band_stats.append(edge_band_stats(_as_gray(frame), band=band))
+        if "detail_ratio" not in skipped:
+            detail_stats.append(center_detail_stats(frame))
+        if "anchor" not in skipped:
+            subject_stats.append(anchor_stats(frame))
+
+    if needs_frames and still:
+        try:
+            measure(read_still(src))
+        except (RuntimeError, OSError) as exc:
+            report.checks.append(CheckResult("decodable", STATUS_FAIL, str(exc), {}, "图片损坏或格式不支持。"))
+            return report
+    elif needs_frames:
         for first, second in iter_frame_pairs(src, info, pairs=pairs, ffmpeg=ffmpeg):
-            if "edges" not in skipped:
-                band_stats.append(edge_band_stats(first, band=band))
+            measure(first)
             if "forward_motion" not in skipped:
                 flow_stats.append(
                     radial_flow_stats(
@@ -862,11 +1391,24 @@ def run_checks(
                     )
                 )
 
+    def forward_motion_result() -> CheckResult:
+        if still:
+            return CheckResult(
+                "forward_motion",
+                STATUS_SKIP,
+                STILL_FORWARD_DETAIL,
+                {"still": True, "pairs": 0},
+                STILL_FORWARD_ADVICE,
+            )
+        return check_forward_motion(flow_stats, min_radial_rate=min_radial_rate)
+
     builders = {
-        "decodable": lambda: check_decodable(info),
+        "decodable": lambda: check_decodable(info, still=still),
         "square": lambda: check_square(info.width, info.height, tolerance=tolerance),
-        "forward_motion": lambda: check_forward_motion(flow_stats, min_radial_rate=min_radial_rate),
+        "forward_motion": forward_motion_result,
         "edges": lambda: check_edges(band_stats, band=band),
+        "detail_ratio": lambda: check_detail_ratio(detail_stats),
+        "anchor": lambda: check_anchor(subject_stats),
     }
     for name in CHECK_NAMES:
         if name in skipped:
@@ -899,7 +1441,7 @@ def format_report(report: SourceReport) -> str:
     elif report.warned:
         lines.append("结论: ⚠️ 可以进管线，但请先读一遍上面的 warn。")
     else:
-        lines.append("结论: ✅ 四项体检全过，可以进管线。")
+        lines.append("结论: ✅ 体检全过，可以进管线。")
     return "\n".join(lines)
 
 
@@ -912,14 +1454,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="check_source_quality",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="素材进管线前的四项体检：decodable / square / forward_motion / edges（只读，不改源文件）。",
+        description=(
+            "素材进管线前的六项体检：decodable / square / forward_motion / edges / "
+            "detail_ratio / anchor（只读，不改源文件）。传图片则自动进入静帧模式。"
+        ),
         epilog=(
             "退出码: 0 = 全过或仅 WARN；1 = 有 FAIL（可直接用于 preflight 门禁）。\n"
             "最关键的一项是 forward_motion：静态机位或横移的素材没有前后视差，\n"
             "跑完整条管线只会得到「贴在球面上的平面画」，几十分钟白费。\n"
+            "传 .png/.jpg 等图片时进入静帧模式：forward_motion 标 skipped，其余照跑——\n"
+            "先验关键帧再决定要不要花钱生成视频，是最省钱的一步。\n"
+            "detail_ratio / anchor 的阈值来自 Red Raion 34 条成片 + 613 张剧照的实测\n"
+            "（中央/周边细节比 1.58–1.60；80% 的帧有主体，面积中位 11.3%、偏心 0.236）。\n"
         ),
     )
-    parser.add_argument("source", help="要体检的视频文件（只读）")
+    parser.add_argument("source", help="要体检的视频或静帧图片（只读）")
     parser.add_argument(
         "--pairs",
         type=int,
