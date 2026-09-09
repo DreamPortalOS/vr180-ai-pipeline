@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import pytest
 
+from pipeline import outpainter as outpainter_mod
 from pipeline.equirectangular_mapper import EquirectangularMapper
 from pipeline.outpainter import (
     _FEATHER_CACHE_MAXSIZE,
@@ -880,7 +881,31 @@ _IS_CI = bool(os.environ.get("CI"))
 # budgets are relaxed there; the relative bound against the reference on the
 # same machine holds everywhere.
 _FULL_FRAME_BUDGET_S = 2.0 if _IS_CI else 0.4
-_NO_HOLE_BUDGET_S = 0.2 if _IS_CI else 0.02
+
+#: Issue #333 — the no-hole fast path used to be asserted with a 20 ms wall-clock
+#: budget, which measures how busy the machine is, not how fast the code is (red
+#: on a clean main locally, green in CI, green when the class runs alone).  What
+#: the fast path actually promises is that an empty mask returns a plain copy
+#: *without doing any of the filling work*, so these are the helpers
+#: ``_gradient_outpaint_single`` calls only after its ``mask_bool.any()`` check;
+#: the no-hole case must call none of them.  ``monkeypatch.setattr`` raises if a
+#: name disappears, and ``test_the_spied_helpers_are_the_work`` proves a real
+#: hole does call them — together that keeps the assertion from going vacuous if
+#: the implementation is refactored.
+_GRADIENT_WORK_FUNCS = ("_column_content_bounds", "_smear_band", "_smear_run", "_blur_hole")
+
+
+def _spy_gradient_work(monkeypatch) -> dict[str, int]:
+    """Count calls to the expensive helpers of the gradient filler (undone at teardown)."""
+    calls = dict.fromkeys(_GRADIENT_WORK_FUNCS, 0)
+    for name in _GRADIENT_WORK_FUNCS:
+
+        def counting(*args, _name=name, _original=getattr(outpainter_mod, name), **kwargs):
+            calls[_name] += 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(outpainter_mod, name, counting)
+    return calls
 
 
 def _min_time(fn, repeats):
@@ -909,12 +934,33 @@ class TestGradientOutpaintProductionSize:
         assert t_new <= _FULL_FRAME_BUDGET_S, f"{t_new:.3f} s > {_FULL_FRAME_BUDGET_S} s budget"
         assert t_new * 3 <= t_ref, f"only {t_ref / t_new:.1f}× faster than the reference ({t_ref:.2f} s)"
 
-    def test_no_hole_returns_fast(self, production_frame_and_mask):
+    def test_no_hole_returns_a_copy_without_doing_any_filling_work(self, monkeypatch, production_frame_and_mask):
+        """An empty mask must take the fast path: a plain copy, none of the filling work (#333).
+
+        Asserted on behaviour rather than on a wall clock — the old 20 ms budget
+        measured machine load, not the code (see ``_GRADIENT_WORK_FUNCS``).
+        """
         frame, _ = production_frame_and_mask
         no_hole = np.zeros(frame.shape[:2], np.uint8)
-        t, out = _min_time(lambda: _gradient_outpaint_single(frame, no_hole), repeats=5)
-        assert out is not frame and np.array_equal(out, frame)
-        assert t <= _NO_HOLE_BUDGET_S, f"{t * 1000:.1f} ms > {_NO_HOLE_BUDGET_S * 1000:.0f} ms budget"
+        calls = _spy_gradient_work(monkeypatch)
+        out = _gradient_outpaint_single(frame, no_hole)
+        assert out is not frame and not np.shares_memory(out, frame)
+        assert np.array_equal(out, frame)
+        assert calls == dict.fromkeys(_GRADIENT_WORK_FUNCS, 0), f"fast path still did work: {calls}"
+
+    def test_the_spied_helpers_are_the_work(self, monkeypatch):
+        """Control for the test above: with a real hole those helpers *do* run.
+
+        Without this, renaming or inlining a helper would leave the no-hole
+        assertion counting calls nobody makes any more — vacuously green.
+        """
+        mask = _pinhole_hole_mask_sbs(128, 126.0)
+        frame = _holed(_noise_frame(128, 256, 333), mask)
+        calls = _spy_gradient_work(monkeypatch)
+        _gradient_outpaint_single(frame, mask)
+        assert calls["_column_content_bounds"] == 1
+        assert calls["_smear_band"] == 2  # one vertical pass per side
+        assert calls["_blur_hole"] == 1
 
 
 # ===========================================================================
