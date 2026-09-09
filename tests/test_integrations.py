@@ -231,20 +231,25 @@ class TestSeedanceProvider:
         provider = SeedanceProvider()
         assert provider._api_key == "env-key"
 
-    def test_load_api_key_missing_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_load_api_key_missing_raises(self) -> None:
         """No ARK_API_KEY in the environment → construction must fail loudly.
 
-        The ``delenv`` below is redundant with conftest's autouse
-        ``_isolated_env`` fixture — and deliberately kept anyway (issue #330,
-        K-31).  This is the one test whose *precondition is an absent variable*,
-        and it used to state that precondition nowhere: it simply inherited
-        whatever the shell had.  On the lead's machine, which exports a real
-        ``ARK_API_KEY``, it therefore failed while CI stayed green.  Spelling
-        the precondition out here means the assertion is readable on its own
-        and survives any future refactor of the shared fixture.
+        Issue #330 (K-31): this is the one test whose *precondition is an
+        absent variable*, and it used to state that precondition nowhere — it
+        simply inherited whatever the shell happened to have.  On the lead's
+        machine, which exports a real ``ARK_API_KEY``, it therefore failed
+        while CI stayed green.
+
+        The precondition is now asserted explicitly.  Deliberately an
+        ``assert`` and not a ``monkeypatch.delenv``: a local delenv would let
+        this test silently self-heal if conftest's autouse ``_isolated_env``
+        fixture ever stopped scrubbing, hiding the regression instead of
+        reporting it.  Here the failure names the real cause on the first line.
         """
-        monkeypatch.delenv("ARK_API_KEY", raising=False)
-        assert "ARK_API_KEY" not in os.environ  # precondition, not an ambient accident
+        assert "ARK_API_KEY" not in os.environ, (
+            "ARK_API_KEY leaked in from the ambient environment — conftest's "
+            "autouse _isolated_env fixture should have scrubbed it (issue #330)."
+        )
 
         with pytest.raises(ValueError, match="ARK_API_KEY"):
             SeedanceProvider()
