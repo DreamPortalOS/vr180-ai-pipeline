@@ -32,6 +32,14 @@ happened to notice; a full run was in fact also leaving ``MagicMock/``,
 behind.  ``git status`` never complained (empty directories are invisible to
 git and ``*.mp4`` is ignored), which is exactly why the guard compares
 directory listings instead of shelling out to git.
+
+Issue #330 (K-31) closes the last "green on CI, red on the dev box" hole:
+ambient *environment variables*.  ``ARK_API_KEY`` lives in the lead's user
+environment (daily development needs it), so
+``test_load_api_key_missing_raises`` failed on the dev box and passed in CI —
+which quietly broke "a full local run is green" as the precondition every
+task card is accepted against.  The autouse ``_isolated_env`` fixture scrubs
+every project-owned variable before each test; see ``PROJECT_ENV_VARS``.
 """
 
 from __future__ import annotations
@@ -285,3 +293,125 @@ def _cache_dir_redirect(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(depth_crafter, "_DEFAULT_DEPTH_CACHE_DIR", depth_target, raising=True)
     monkeypatch.setattr(stereo_crafter, "_DEFAULT_STEREO_CACHE_DIR", stereo_target, raising=True)
+
+
+# ---------------------------------------------------------------------------
+# Ambient environment isolation (issue #330, K-31)
+# ---------------------------------------------------------------------------
+
+#: **The registry.**  Every environment variable this repository's runtime code
+#: reads, and which therefore must not leak in from the developer's shell.
+#:
+#: ⚠️  **Adding a new environment variable to the codebase?  Register it here.**
+#: That is not a style rule, it is the whole mechanism: a variable that is read
+#: by ``integrations/`` / ``pipeline/`` / ``scripts/`` but missing from this set
+#: makes the suite's behaviour depend on whoever's machine it runs on.  The
+#: matching regression test lives in ``tests/test_integrations.py``
+#: (``TestAmbientEnvIsolation``) and asserts that *every* name below is
+#: invisible inside a test.
+#:
+#: Unlike ``_ROOT_GUARD_ALLOWED`` (an allow-list, kept deliberately short) this
+#: is a *deny*-list: growing it is correct and expected.
+PROJECT_ENV_VARS = frozenset(
+    {
+        # --- Provider credentials / project config -------------------------
+        "ARK_API_KEY",  # Volcengine Ark — the one that started #330
+        "SEEDANCE_API_KEY",  # legacy alias, must stay rejected (see #330 test)
+        "KLING_API_KEY",
+        "VEO_API_KEY",
+        "GCP_PROJECT_ID",
+        # --- Usage ledger / budget gate (#328, #329) -----------------------
+        "VR180_LEDGER_PATH",
+        "VR180_BUDGET_CAP",
+        "VR180_BUDGET_CAP_TOKENS",
+        "VR180_ARK_PRICE_PER_MTOKEN",
+        # --- Pipeline preflight thresholds ---------------------------------
+        "VR180_PREFLIGHT_MIN_RAM_GB",
+        "VR180_PREFLIGHT_MIN_VRAM_GB",
+        # --- Provider output redirects / model ids -------------------------
+        "MOCK_PROVIDER_OUTPUT_DIR",
+        "SVD_PROVIDER_OUTPUT_DIR",
+        "SVD_MODEL_ID",
+        "FFMPEG_BINARY",
+        # --- DepthCrafter backend ------------------------------------------
+        "DEPTHCRAFTER_CKPT_DIR",
+        "DEPTHCRAFTER_MAX_RES",
+        "DEPTHCRAFTER_MODEL_DIR",
+        "DEPTHCRAFTER_PROCESS_LENGTH",
+        "DEPTHCRAFTER_PYTHON",
+        "DEPTHCRAFTER_REPO_DIR",
+        "DEPTHCRAFTER_TARGET_FPS",
+        "DEPTHCRAFTER_TIMEOUT_SEC",
+        # --- StereoCrafter backend -----------------------------------------
+        "STEREOCRAFTER_CKPT_DIR",
+        "STEREOCRAFTER_FRAMES_CHUNK",
+        "STEREOCRAFTER_MAX_DISP",
+        "STEREOCRAFTER_MAX_RES",
+        "STEREOCRAFTER_OVERLAP",
+        "STEREOCRAFTER_PYTHON",
+        "STEREOCRAFTER_REPO_DIR",
+        "STEREOCRAFTER_SVD_PATH",
+        "STEREOCRAFTER_TILE_NUM",
+        "STEREOCRAFTER_TIMEOUT_SEC",
+        # --- SeedVR2 upscaler backend --------------------------------------
+        "SEEDVR2_DIT_OFFLOAD",
+        "SEEDVR2_MODEL_DIR",
+        "SEEDVR2_NODE_DIR",
+        "SEEDVR2_PYTHON",
+        "SEEDVR2_RESOLUTION",
+        "SEEDVR2_VAE_OFFLOAD",
+        "SEEDVR2_VAE_TILE_SIZE",
+        # --- setup_*.py helpers --------------------------------------------
+        "SETUP_PIP_TIMEOUT",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "HUGGINGFACE_TOKEN",
+        # --- make_comparison.py device push --------------------------------
+        "QUEST_SERIAL",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_env(monkeypatch) -> None:
+    """Autouse: scrub every project-owned env var before each test.
+
+    Issue #330 (K-31).  ``tests/test_integrations.py::
+    TestSeedanceProvider::test_load_api_key_missing_raises`` asserts that
+    constructing ``SeedanceProvider`` without ``ARK_API_KEY`` raises.  The
+    lead's development machine has a real ``ARK_API_KEY`` in the *user*
+    environment, so that test failed locally and passed in CI (where no key
+    exists) — meaning the local gate and the CI gate were not running the same
+    suite.  Since "a full local run is green" is the precondition every task
+    card is accepted against, a permanently-red-locally test is not a nuisance,
+    it is a broken gate: the next executor either learns to ignore red, or
+    "fixes" the implementation to make it go away.
+
+    So the suite stops trusting the ambient environment altogether.  A test
+    that *needs* a variable sets it explicitly with ``monkeypatch.setenv`` —
+    which is also self-documenting, since the precondition is then visible in
+    the test body instead of in whoever's ``.bashrc``.
+
+    ``PYTEST_CURRENT_TEST`` is deliberately **not** scrubbed: pytest owns it,
+    and ``integrations.usage_ledger._writes_blocked`` keys off it (see below).
+
+    Relationship to the ``_writes_blocked()`` interlock (#329) — two distinct
+    defences, neither replaces the other:
+
+    * **this fixture** defends against *environment drift*: it makes a test's
+      inputs identical on every machine, so local == CI.  It is a test-side
+      guarantee and does nothing when the code runs for real.
+    * **``usage_ledger._writes_blocked()``** defends the operator's *real home
+      directory*: under pytest, with no explicit path and no
+      ``VR180_LEDGER_PATH``, ledger writes are suppressed outright, so a test
+      can never append to ``~/.vr180/usage_ledger.jsonl``.  It is a
+      production-side interlock that still holds if this fixture is removed,
+      mis-scoped, or bypassed by a test that spawns a subprocess.
+
+    Note the two actually compose here: scrubbing ``VR180_LEDGER_PATH`` is what
+    keeps ``_writes_blocked()`` *armed* by default, instead of being disarmed
+    by whatever the developer happens to have exported.  Deleting either one
+    reopens a hole the other does not cover.
+    """
+    for name in sorted(PROJECT_ENV_VARS):
+        monkeypatch.delenv(name, raising=False)

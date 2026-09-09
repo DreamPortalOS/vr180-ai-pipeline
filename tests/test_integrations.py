@@ -232,6 +232,25 @@ class TestSeedanceProvider:
         assert provider._api_key == "env-key"
 
     def test_load_api_key_missing_raises(self) -> None:
+        """No ARK_API_KEY in the environment → construction must fail loudly.
+
+        Issue #330 (K-31): this is the one test whose *precondition is an
+        absent variable*, and it used to state that precondition nowhere — it
+        simply inherited whatever the shell happened to have.  On the lead's
+        machine, which exports a real ``ARK_API_KEY``, it therefore failed
+        while CI stayed green.
+
+        The precondition is now asserted explicitly.  Deliberately an
+        ``assert`` and not a ``monkeypatch.delenv``: a local delenv would let
+        this test silently self-heal if conftest's autouse ``_isolated_env``
+        fixture ever stopped scrubbing, hiding the regression instead of
+        reporting it.  Here the failure names the real cause on the first line.
+        """
+        assert "ARK_API_KEY" not in os.environ, (
+            "ARK_API_KEY leaked in from the ambient environment — conftest's "
+            "autouse _isolated_env fixture should have scrubbed it (issue #330)."
+        )
+
         with pytest.raises(ValueError, match="ARK_API_KEY"):
             SeedanceProvider()
         # Old key name must NOT be accepted — it referred to a fake endpoint.
@@ -1903,3 +1922,99 @@ class TestLocalSVDHelperFunctions:
         from integrations.local_svd import _frames_for_duration
 
         assert _frames_for_duration(3, 7) == 21
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Ambient environment isolation (issue #330, K-31)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAmbientEnvIsolation:
+    """Pin the autouse ``_isolated_env`` fixture and its registry.
+
+    Issue #330: the suite must behave identically on a bare CI runner and on a
+    development machine that exports real credentials and backend paths.  The
+    fixture is what makes that true; these tests are what keep it true.
+    """
+
+    def test_every_registered_var_is_invisible_inside_a_test(self) -> None:
+        """Not one name from ``PROJECT_ENV_VARS`` may be readable in a test.
+
+        This is the acceptance test for the registry itself.  If somebody adds
+        a variable to the deny-list but the fixture stops scrubbing it (a typo,
+        a bad merge, a re-scoped fixture), this goes red on any machine that
+        happens to export it — and green-but-meaningless nowhere.
+        """
+        from tests.conftest import PROJECT_ENV_VARS
+
+        visible = sorted(name for name in PROJECT_ENV_VARS if name in os.environ)
+        assert visible == [], (
+            "ambient environment leaked into a test (issue #330, K-31): "
+            f"{visible}. The autouse _isolated_env fixture in tests/conftest.py "
+            "should have scrubbed these. A test that needs one of them must set "
+            "it explicitly with monkeypatch.setenv."
+        )
+
+    def test_registry_covers_every_env_var_the_runtime_reads(self) -> None:
+        """Every env var read by shipped code must be registered.
+
+        The failure mode this catches: a future card adds
+        ``os.environ.get("VR180_SOMETHING_NEW")`` to ``integrations/`` and
+        forgets ``PROJECT_ENV_VARS``.  Nothing breaks — until it breaks only on
+        the one machine that exports it, which is exactly the bug #330 exists
+        to kill.  So the registry is checked against the source, not trusted.
+
+        Deliberately a *source scan* rather than a hand-maintained mirror list:
+        a mirror would need the same discipline it is meant to enforce.
+        """
+        import re
+        from pathlib import Path
+
+        from tests.conftest import PROJECT_ENV_VARS
+
+        repo_root = Path(__file__).resolve().parent.parent
+        # Direct reads: os.environ["X"] / os.environ.get("X") / os.getenv("X").
+        direct = re.compile(r"""(?:os\.environ(?:\.get)?|os\.getenv)\s*[(\[]\s*["']([A-Z][A-Z0-9_]*)["']""")
+        # Indirect reads: module constants that *hold* a variable name and are
+        # passed to os.environ.get(...) elsewhere (usage_ledger, run_pipeline).
+        indirect = re.compile(r"""^\s*_?(?:ENV|.*_ENV)[A-Z_]*\s*=\s*["']([A-Z][A-Z0-9_]*)["']""", re.M)
+
+        found: set[str] = set()
+        for package in ("integrations", "scripts", "pipeline"):
+            for path in sorted((repo_root / package).rglob("*.py")):
+                text = path.read_text(encoding="utf-8")
+                found |= set(direct.findall(text))
+                found |= set(indirect.findall(text))
+
+        # pytest owns this one; usage_ledger._writes_blocked() keys off it, so
+        # scrubbing it would disarm the #329 home-directory interlock.
+        found.discard("PYTEST_CURRENT_TEST")
+
+        unregistered = sorted(found - PROJECT_ENV_VARS)
+        assert unregistered == [], (
+            "environment variables read by shipped code but missing from "
+            f"tests/conftest.py::PROJECT_ENV_VARS: {unregistered}. Register "
+            "them there so the suite cannot inherit them from a developer's "
+            "shell (issue #330, K-31)."
+        )
+
+    def test_a_test_that_wants_a_var_sets_it_explicitly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The fixture scrubs; it does not stop a test from opting back in."""
+        assert "ARK_API_KEY" not in os.environ
+        monkeypatch.setenv("ARK_API_KEY", "explicitly-set-by-this-test")
+        assert SeedanceProvider()._api_key == "explicitly-set-by-this-test"
+
+    def test_ledger_interlock_stays_armed_by_default(self) -> None:
+        """#329's ``_writes_blocked()`` interlock survives — and stays armed.
+
+        The two defences are complementary, not redundant (see the fixture's
+        docstring): scrubbing ``VR180_LEDGER_PATH`` is precisely what keeps the
+        interlock in its blocking state, so a stray ledger write during any
+        test can never reach ``~/.vr180/usage_ledger.jsonl``.
+        """
+        from integrations import usage_ledger
+
+        assert "VR180_LEDGER_PATH" not in os.environ
+        assert usage_ledger._writes_blocked(None) is True
+        # An explicit path (a test pointing at tmp_path) still opts in.
+        assert usage_ledger._writes_blocked("/tmp/explicit.jsonl") is False
