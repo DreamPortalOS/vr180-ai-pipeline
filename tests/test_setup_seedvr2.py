@@ -124,6 +124,93 @@ class TestDryRunSequence:
 
 
 # ---------------------------------------------------------------------------
+# Issue #320: --dry-run's --help contract is "Performs NO I/O".  It used to
+# mkdir models/SEEDVR2/ inside the repo, which both broke that contract and
+# violated the boundary lock on models/.  These tests pin "zero writes".
+# ---------------------------------------------------------------------------
+
+
+class TestDryRunPerformsNoWrites:
+    def test_download_models_dry_run_does_not_create_model_dir(self, sandbox):
+        """#320: the model dir must NOT exist after a --dry-run download step."""
+        buf = setup.DryRunBuffer()
+        setup.download_models(skip_model=False, dry_run=True, buffer=buf)
+        assert not sandbox.model_dir.exists(), (
+            f"--dry-run created {sandbox.model_dir} — it must only PRINT what it would create"
+        )
+        # And its parent models/ dir must not have been created either.
+        assert not (sandbox.repo_root / "models").exists()
+
+    def test_download_models_dry_run_announces_the_dir_instead(self, sandbox):
+        """Not creating it is not enough — the plan must say what it would create."""
+        buf = setup.DryRunBuffer()
+        setup.download_models(skip_model=False, dry_run=True, buffer=buf)
+        assert any(str(sandbox.model_dir) in s for s in buf.steps), (
+            f"planned steps never mention the model dir {sandbox.model_dir}: {buf.steps}"
+        )
+
+    def test_main_dry_run_leaves_repo_root_completely_empty(self, sandbox):
+        """A full `--dry-run` must not create a single path under the repo root."""
+        with (
+            patch("subprocess.check_call"),
+            patch("subprocess.run"),
+        ):
+            setup.main(["--dry-run"])
+        leftovers = sorted(p.name for p in sandbox.repo_root.iterdir())
+        assert leftovers == [], f"--dry-run polluted the repo root with {leftovers}"
+        assert not sandbox.model_dir.exists()
+        assert not sandbox.node_dir.exists()
+        assert not sandbox.venv_dir.exists()
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--dry-run"],
+            ["--dry-run", "--skip-model"],
+            ["--dry-run", "--skip-deps"],
+            ["--dry-run", "--skip-model", "--skip-deps"],
+            ["--dry-run", "--pip-mirror", "https://example.invalid/simple"],
+        ],
+    )
+    def test_dry_run_never_calls_any_filesystem_write_api(self, sandbox, argv):
+        """Blanket guard over *every* dry_run branch in the script.
+
+        Rather than enumerating today's write sites, this forbids the write
+        APIs outright for the whole `--dry-run` run, so a future ``mkdir`` /
+        ``touch`` / ``write_text`` slipped into any dry-run branch fails here.
+        """
+
+        def forbidden(name):
+            def _raise(*args, **kwargs):
+                raise AssertionError(f"--dry-run {argv} performed a filesystem write: Path.{name}")
+
+            return _raise
+
+        with (
+            patch("subprocess.check_call"),
+            patch("subprocess.run"),
+            patch.object(Path, "mkdir", forbidden("mkdir")),
+            patch.object(Path, "touch", forbidden("touch")),
+            patch.object(Path, "write_text", forbidden("write_text")),
+            patch.object(Path, "write_bytes", forbidden("write_bytes")),
+            patch.object(Path, "unlink", forbidden("unlink")),
+            patch.object(Path, "rmdir", forbidden("rmdir")),
+        ):
+            setup.main(argv)
+
+    def test_dry_run_exits_zero_and_prints_the_plan(self, sandbox, caplog):
+        """The contract is 'print planned steps and exit 0' — no exception, no exit."""
+        caplog.set_level("INFO", logger="setup-seedvr2")
+        with (
+            patch("subprocess.check_call"),
+            patch("subprocess.run"),
+        ):
+            setup.main(["--dry-run"])  # must not raise / SystemExit
+        msgs = "\n".join(r.message for r in caplog.records)
+        assert "planned steps" in msgs
+
+
+# ---------------------------------------------------------------------------
 # Step 1: ensure_node_repo (clone vs pull)
 # ---------------------------------------------------------------------------
 

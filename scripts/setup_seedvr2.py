@@ -335,7 +335,11 @@ def download_models(skip_model: bool, *, dry_run: bool, buffer: DryRunBuffer) ->
         return
 
     if dry_run:
-        INREPO_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        # --dry-run is "say, don't do": announce the directory the real run
+        # would create instead of creating it (issue #320).  The actual mkdir
+        # lives in _download_with_hf_hub / _download_with_curl, which is where
+        # the non-dry-run path still performs it.
+        buffer.record(f"mkdir -p {INREPO_MODEL_DIR}  (model output dir)")
 
     for filename, human_size in _MODELS:
         target = INREPO_MODEL_DIR / filename
@@ -465,7 +469,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the steps that would be executed and exit 0. Performs NO I/O.",
+        help=(
+            "Print the steps that would be executed and exit 0. Performs NO I/O "
+            "— no clone, no install, no download, and no directory is created."
+        ),
     )
     parser.add_argument(
         "--pip-mirror",
