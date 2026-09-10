@@ -80,11 +80,28 @@ A factor of ~31 between the quietest true subject and the loudest false one,
 with :data:`~scripts.check_source_quality.ANCHOR_MIN_AREA` (1.5 %) sitting
 between them — so "no anchor" is a verdict the check can actually reach, not a
 branch that never fires.  ``test_subject_and_subjectless_frames_are_separated``
-pins that margin directly.
+pins that margin directly; the texture channel added in #343 widens it to ~50×
+and ``test_the_texture_channel_widens_the_subject_separation`` pins that it may
+never narrow again.
 
-Everything here runs on synthetic arrays: no test reads ``video/``, decodes a
-real file, or shells out to ffmpeg.  The ffprobe/ffmpeg layer is covered by
-parsing captured ffprobe JSON and by an AST sweep
+And the sky is not the subject (#343)
+-------------------------------------
+The anchor detector's first field trial failed: on the owner's canyon keyframes
+it reported the *cloud band* and the *whitewater* as the subject, because a
+red-rock frame's mean colour is owned by the rock, which leaves bright sky as
+the most colour-"distinct" thing in the picture.  ``flat_sky_frame`` reproduces
+that composition synthetically, and the two checks that matter are a matched
+pair: ``test_a_flat_bright_sky_does_not_pose_as_the_subject`` says the detector
+gets it right, and ``test_removing_the_texture_channel_puts_the_sky_back``
+disables the texture channel and insists the answer goes *wrong* again — so the
+first test cannot quietly start passing for the wrong reason.
+
+Almost everything here runs on synthetic arrays: no test decodes video or shells
+out to ffmpeg.  The two exceptions are the #343 regressions against the frames
+the bug was actually reported on (``OWNER_KEYFRAME``, ``CANYON_STILL``), which
+are read **read-only** and ``skip`` when absent — neither file ships with the
+repo, so they run on the owner's machine and nowhere else.  The ffprobe/ffmpeg
+layer is covered by parsing captured ffprobe JSON and by an AST sweep
 (``test_subprocess_calls_are_list_form_without_shell``) that holds every
 ``subprocess.run`` in the module to list form with no ``shell=True``.
 """
@@ -94,6 +111,7 @@ from __future__ import annotations
 import ast
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -105,6 +123,14 @@ from scripts import check_source_quality as csq
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "check_source_quality.py"
+
+#: The two real frames issue #343 was reported against.  Neither ships with the
+#: repo — ``video/`` is git-ignored and the keyframe lives in the owner's
+#: downloads — so both regressions **skip** off his machine rather than fail.
+#: CI keeps them honest a different way: :func:`flat_sky_frame` reproduces the
+#: same failure synthetically and runs everywhere.
+OWNER_KEYFRAME = Path(os.environ.get("VR180_OWNER_KEYFRAME", r"C:\Users\musof\Downloads\Gemini_v1.jpg"))
+CANYON_STILL = Path(os.environ.get("VR180_CANYON_STILL", str(REPO_ROOT / "video" / "seed_1x1_drone.png")))
 
 FRAME_SIZE = 240
 N_FRAMES = 9  # 9 frames -> 8 adjacent pairs, the CLI default
@@ -267,6 +293,30 @@ def subject_frame(
     """A bright subject of a given size and position on a dark textured field."""
     background = np.clip(45.0 + (_fine_texture(size, size, seed) - 128.0) / 127.0 * 30.0, 0, 255)
     return _paint_subject(background.astype(np.uint8), area_frac, cx_frac=cx_frac)
+
+
+def flat_sky_frame(area_frac: float = 0.11, size: int = FRAME_SIZE, sky_frac: float = 0.22) -> np.ndarray:
+    """The #343 composition: a blown-out flat sky band over textured ground.
+
+    A deliberately unfair frame for a colour-distinctness detector, built to the
+    shape of the real failure.  The textured mid-tone ground owns most of the
+    picture and therefore owns the frame's mean colour, which leaves the
+    **sky** — flat, blown out, nothing to look at — as the most colour-distinct
+    thing in it.  The actual subject is small, dead centre and *textured*, and
+    its tone sits much closer to the mean, so on colour alone it loses.
+
+    The numbers are chosen so the sky wins on colour by a clear margin rather
+    than a hair: measured with the texture channel disabled this frame reports a
+    21.7 %-of-picture "subject" whose centroid is at y = 0.11, i.e. the sky band
+    itself.  Nothing here is flat-filled — the ground and the subject are both
+    real texture, so the only thing separating them from the sky is structure.
+    """
+    rng = np.random.default_rng(5)
+    frame = 105.0 + (_fine_texture(size, size, seed=9) - 128.0) / 127.0 * 28.0
+    band = int(size * sky_frac)
+    frame[:band, :] = 244.0 + rng.normal(0.0, 0.8, (band, size))
+    ground = np.clip(frame, 0, 255).astype(np.uint8)
+    return _paint_subject(ground, area_frac, level=70.0, amplitude=35.0, seed=13)
 
 
 def anchored_outflow_frames(
@@ -799,6 +849,163 @@ def test_saliency_is_normalised_and_peaks_on_the_subject() -> None:
     height, width = saliency.shape
     middle = saliency[height // 3 : 2 * height // 3, width // 3 : 2 * width // 3]
     assert middle.mean() > saliency.mean() * 1.5
+
+
+# ---------------------------------------------------------------------------
+# anchor — the sky is not the subject (G-4 #343)
+# ---------------------------------------------------------------------------
+
+
+def _blind_texture_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable the texture channel: every pixel claims to be equally structured.
+
+    This is the mutation the fix is measured against.  It leaves the rest of the
+    pipeline — Achanta, Otsu, the morphology, the centre prior, the density
+    scoring — completely untouched, so anything it breaks is attributable to the
+    texture channel and to nothing else.
+    """
+    monkeypatch.setattr(
+        csq,
+        "texture_gate",
+        lambda frame, *_a, **_kw: np.ones_like(
+            csq._fit_for_analysis(csq._as_gray(frame), csq.ANCHOR_ANALYSIS_MAX_DIM), dtype=np.float32
+        ),
+    )
+
+
+def test_a_flat_bright_sky_does_not_pose_as_the_subject() -> None:
+    """Acceptance (#343): the anchor of a sky-over-ground frame is the subject.
+
+    The synthetic stand-in for the owner's canyon keyframes, and the one that
+    runs in CI.  A blown-out sky band is the most colour-distinct region in the
+    picture and it is *four times the subject's size*, so both of the old
+    detector's instincts — "most distinct" and "biggest" — point at it.  The
+    detector must nonetheless come back with the small textured thing in the
+    middle.
+    """
+    stats = csq.anchor_stats(flat_sky_frame())
+
+    assert stats["found"] is True, stats
+    assert stats["centroid_x"] == pytest.approx(0.5, abs=0.06), f"not the centred subject: {stats}"
+    assert stats["centroid_y"] == pytest.approx(0.5, abs=0.06), f"looking at the sky band: {stats}"
+    assert stats["area"] == pytest.approx(0.11, abs=0.05), f"the sky leaked into the region: {stats}"
+
+
+def test_removing_the_texture_channel_puts_the_sky_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mutation check (#343): the texture channel is load-bearing, not decoration.
+
+    Without it this frame's anchor is the sky band — twice the subject's area,
+    centroid up at y≈0.11 instead of y≈0.51.  If a future change makes
+    :func:`~scripts.check_source_quality.texture_gate` a no-op, or normalises it
+    into uselessness, this test fails and the one above stops meaning anything.
+    """
+    frame = flat_sky_frame()
+    with_texture = csq.anchor_stats(frame)
+
+    _blind_texture_gate(monkeypatch)
+    without_texture = csq.anchor_stats(frame)
+
+    assert with_texture["centroid_y"] == pytest.approx(0.5, abs=0.06)
+    assert without_texture["centroid_y"] < 0.25, (
+        f"the texture channel changed nothing — the mutation must move the anchor onto the sky: {without_texture}"
+    )
+    assert without_texture["area"] > with_texture["area"] * 1.5, (
+        f"the ungated region must swell to swallow the sky: {without_texture} vs {with_texture}"
+    )
+
+
+def test_the_texture_channel_widens_the_subject_separation() -> None:
+    """The gate must not buy the sky fix by blurring the #341 margin.
+
+    #341's contract is that a frame with a subject and a frame without one are
+    separated by a wide margin rather than a hair.  Gating tightens it (≈50×
+    against ≈32×) because speckle in an evenly-textured frame is exactly what a
+    structure measure declines to promote; this pins that it does not *loosen*
+    it.
+    """
+    with_subject = min(
+        csq.anchor_stats(subject_frame(0.11))["area"],
+        csq.anchor_stats(subject_frame(0.40))["area"],
+        csq.anchor_stats(subject_frame(0.11, cx_frac=0.80))["area"],
+    )
+    without = max(
+        [csq.anchor_stats(subjectless_frame(seed=s))["area"] for s in range(1, 9)]
+        + [csq.anchor_stats(flat_frame())["area"], csq.anchor_stats(rim_damped_frame(0.18))["area"]]
+    )
+    assert with_subject / max(without, 1e-9) > 32.0, f"separation regressed: {with_subject} vs {without}"
+
+
+def test_texture_gate_reads_flat_as_flat_and_textured_as_textured() -> None:
+    """The channel itself: bright-but-flat scores low, textured saturates at 1.
+
+    Asserted on the *sky band* rather than on a synthetic constant patch because
+    "flat" in real footage still carries sensor noise, and a gate that only
+    recognises mathematically-zero variance would be useless on a photograph.
+    """
+    gate = csq.texture_gate(flat_sky_frame())
+    height = gate.shape[0]
+    sky = gate[: int(height * 0.18), :]
+    ground = gate[int(height * 0.75) :, :]
+
+    assert gate.min() >= 0.0
+    assert gate.max() <= 1.0
+    assert gate.max() == pytest.approx(1.0), "a textured frame must saturate the gate somewhere"
+    assert sky.mean() < ground.mean() * 0.75, f"flat sky {sky.mean():.3f} vs textured ground {ground.mean():.3f}"
+
+
+def test_texture_gate_rejects_a_nonsensical_window() -> None:
+    with pytest.raises(ValueError, match="window must be"):
+        csq.texture_gate(subject_frame(), window=0)
+
+
+def test_anchor_reports_where_it_found_the_subject() -> None:
+    """``centroid_*`` exists so a regression can assert *what* was found.
+
+    The #343 bug reported a perfectly plausible area and eccentricity while
+    pointing at the clouds; without a position in the payload no test could tell
+    that apart from a correct answer.
+    """
+    centred = csq.anchor_stats(subject_frame(0.11))
+    off_centre = csq.anchor_stats(subject_frame(0.11, cx_frac=0.80))
+
+    assert centred["centroid_x"] == pytest.approx(0.5, abs=0.05)
+    assert centred["centroid_y"] == pytest.approx(0.5, abs=0.05)
+    assert off_centre["centroid_x"] == pytest.approx(0.8, abs=0.05)
+    assert csq.anchor_stats(flat_frame())["centroid_x"] == pytest.approx(0.5)
+
+
+@pytest.mark.skipif(not OWNER_KEYFRAME.is_file(), reason=f"owner keyframe not present: {OWNER_KEYFRAME}")
+def test_owners_keyframe_finds_the_aircraft_not_the_cloud() -> None:
+    """Acceptance (#343): the reported regression, on the frame it was reported on.
+
+    ``Gemini_v1.jpg`` is a 1024² canyon shot with a gray quadcopter dead centre
+    at (0.50, 0.52).  The old detector answered (0.49, 0.06) — the cloud band
+    along the top edge, 11.3 % of the picture — and warned the operator that his
+    subject was off-centre.  ``found`` is deliberately *not* asserted: the
+    aircraft's coherent silhouette measures ~1.3 % of this frame, just under
+    :data:`~scripts.check_source_quality.ANCHOR_MIN_AREA`, and the card forbids
+    moving that threshold to make a number go green.  What matters, and what is
+    asserted, is that the detector is looking at the aircraft.
+    """
+    stats = csq.anchor_stats(csq.read_still(OWNER_KEYFRAME))
+
+    assert stats["centroid_x"] == pytest.approx(0.50, abs=0.12), f"not the aircraft: {stats}"
+    assert stats["centroid_y"] == pytest.approx(0.52, abs=0.12), f"still on the sky: {stats}"
+
+
+@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=f"canyon still not present: {CANYON_STILL}")
+def test_canyon_still_finds_the_aircraft_not_the_whitewater() -> None:
+    """Acceptance (#343), second frame: the bright foam must not win either.
+
+    ``seed_1x1_drone.png`` is 2048² with the aircraft at about (0.50, 0.48) and a
+    stretch of whitewater filling the bottom of the gorge.  The old detector
+    returned the foam at (0.51, 0.79); anything below y≈0.6 in this frame is
+    river, not subject.
+    """
+    stats = csq.anchor_stats(csq.read_still(CANYON_STILL))
+
+    assert stats["centroid_x"] == pytest.approx(0.50, abs=0.12), f"not the aircraft: {stats}"
+    assert stats["centroid_y"] < 0.60, f"still on the whitewater: {stats}"
 
 
 # ---------------------------------------------------------------------------
