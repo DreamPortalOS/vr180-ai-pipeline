@@ -86,6 +86,7 @@ from pipeline.stereo_renderer import StereoRenderer  # noqa: E402
 from pipeline.streaming_pipeline import (  # noqa: E402
     DEFAULT_QUALITY,
     DEFAULT_SPHERE_RADIAL_SCALE,
+    QUALITY_PRESETS,
     StreamingPipeline,
     resolve_quality,
     scaled_bitrate_mbps,
@@ -501,12 +502,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=int, default=None, help="Output frame rate (default: inherit from source video)")
     parser.add_argument(
         "--quality",
-        choices=["preview", "standard", "high"],
+        # D-3 (#346): derived from QUALITY_PRESETS, never a hand-kept literal —
+        # a new tier in the table must not need a second edit here to be usable.
+        choices=list(QUALITY_PRESETS),
         default=DEFAULT_QUALITY,
         help="Quality preset for per-eye output resolution and memory path: "
         "preview = 1920²/eye, legacy fast path (lowest RAM, for iteration); "
         "standard = 2880²/eye, streaming (O(1) RAM) — default; "
-        "high = 3840²/eye, streaming (O(1) RAM, sharpest on Quest-class HMDs). "
+        "high = 3840²/eye, streaming (O(1) RAM, sharpest on Quest-class HMDs); "
+        "dome = 4096²/eye, streaming (O(1) RAM, dome-theatre master — matches "
+        "the 4096² domemaster the venue's own library ships). "
         "Explicit --output-width/--output-height override the preset resolution. "
         "Output bitrate scales with pixel area (capped by --max-bitrate).",
     )

@@ -42,10 +42,17 @@ BASELINE_BITRATE_MBPS = 20.0
 # preview  : 1920²/eye — fast iteration, legacy resolution.
 # standard : 2880²/eye — streaming, default quality path.
 # high     : 3840²/eye — streaming, max sharpness for Quest-class HMDs.
+# dome     : 4096²/eye — streaming, dome-theatre master (D-3, #346).  A 12 m
+#            8-projector dome fuses to ~12.5 Mpx, i.e. an equivalent domemaster
+#            diameter of ~3990 px, and the venue's own library is 4096².  The
+#            3840² tier leaves ~7% of that on the table and 2880² only uses 52%,
+#            so dome delivery gets its own tier rather than being approximated.
+# Insertion order is the tier order shown in --help — keep it ascending.
 QUALITY_PRESETS: dict[str, int] = {
     "preview": 1920,
     "standard": 2880,
     "high": 3840,
+    "dome": 4096,
 }
 DEFAULT_QUALITY = "standard"
 
@@ -322,6 +329,11 @@ def select_encoder(codec: str, sbs_width: int, hw: bool = False) -> list[str]:
     Large-frame safety (issue #45 defect 3): libx264 on an 8K-class SBS frame
     (7680×3840) exhausts process RAM during encoder init, and H.264 NVENC
     hard-caps at 4096 px wide — so wide frames must use HEVC.
+
+    The cap is *inclusive*: NVENC_MAX_WIDTH itself is a legal H.264 width, so a
+    4096-wide frame (a ``--quality dome`` fulldome master, D-3/#346) still takes
+    the H.264 branch, while the same tier's SBS frame — 2×4096 = 8192 — is over
+    the cap and is routed to HEVC.  Both are covered by tests.
 
     Args:
         codec: Requested codec ('h264' or 'h265').
