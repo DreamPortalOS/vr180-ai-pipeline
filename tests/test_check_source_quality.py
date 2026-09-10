@@ -77,12 +77,30 @@ rim-damped / empty-centre       0.00 – 0.17 %
 ==============================  ====================
 
 A factor of ~31 between the quietest true subject and the loudest false one,
-with :data:`~scripts.check_source_quality.ANCHOR_MIN_AREA` (1.5 %) sitting
-between them — so "no anchor" is a verdict the check can actually reach, not a
-branch that never fires.  ``test_subject_and_subjectless_frames_are_separated``
-pins that margin directly; the texture channel added in #343 widens it to ~50×
-and ``test_the_texture_channel_widens_the_subject_separation`` pins that it may
+with :data:`~scripts.check_source_quality.ANCHOR_MIN_AREA` sitting between them
+— so "no anchor" is a verdict the check can actually reach, not a branch that
+never fires.  ``test_subject_and_subjectless_frames_are_separated`` pins that
+margin directly; the texture channel added in #343 widens it to ~50× and
+``test_the_texture_channel_widens_the_subject_separation`` pins that it may
 never narrow again.
+
+Two thresholds, two questions (#345)
+------------------------------------
+``ANCHOR_MIN_AREA`` (0.8 %) is a **detection floor** — *is anything there* — and
+``ANCHOR_AREA_MIN``/``ANCHOR_AREA_MAX`` (8–15 %) are a **quality band** — *is it
+big enough*.  Conflating them is what #345 fixed: at a 1.5 % floor the owner's
+``Gemini_v1.jpg`` keyframe, whose quadcopter measures 1.30 %, was reported as
+「画面里没有锚点」 when the true and actionable answer was 「主体面积 1.3%，远小于
+8%」.  The first sends the operator off to invent a subject; the second tells him
+to enlarge the one he has.
+
+The floor moved and the band did not, so the tests are split the same way:
+``test_a_small_real_subject_is_small_not_absent`` pins the new verdict,
+``test_the_detection_floor_sits_between_noise_and_the_smallest_real_subject``
+pins the headroom on both sides (loudest subjectless fixture 0.22 %, floor
+0.8 %, smallest real subject 1.30 %), and the subjectless fixtures above are
+deliberately **unchanged** — a lower floor that started finding anchors in an
+empty frame would be a worse bug than the one it replaced.
 
 And the sky is not the subject (#343)
 -------------------------------------
@@ -743,9 +761,15 @@ def test_subject_and_subjectless_frames_are_separated() -> None:
     """The margin is the contract — measured before the threshold was picked.
 
     Asserting only the verdicts would let a future tweak shrink the gap to a
-    hair without any test noticing.  This pins the actual daylight: every frame
-    with a subject reports at least 5× :data:`ANCHOR_MIN_AREA`, every frame
-    without one at most a fifth of it.
+    hair without any test noticing.  This pins the actual daylight between the
+    two populations — the property #341 bought — in **absolute** measured area
+    rather than as a multiple of :data:`ANCHOR_MIN_AREA`, because #345 moved that
+    threshold and a margin expressed in units of the thing being moved would have
+    silently rescaled with it instead of catching the change.
+
+    Measured today: true subjects 11.0 / 36.1 / 11.1 %, false ones at most
+    0.22 %, i.e. ~50× apart.  The bounds below are deliberately slacker than the
+    measurements so that ordinary detector noise does not flake the suite.
     """
     with_subject = [
         csq.anchor_stats(subject_frame(0.11))["area"],
@@ -755,8 +779,11 @@ def test_subject_and_subjectless_frames_are_separated() -> None:
     without = [csq.anchor_stats(subjectless_frame(seed=s))["area"] for s in range(1, 9)]
     without += [csq.anchor_stats(flat_frame())["area"], csq.anchor_stats(rim_damped_frame(0.18))["area"]]
 
-    assert min(with_subject) > csq.ANCHOR_MIN_AREA * 5.0, f"true subjects too quiet: {with_subject}"
-    assert max(without) < csq.ANCHOR_MIN_AREA / 4.0, f"false subjects too loud: {without}"
+    assert min(with_subject) > 0.05, f"true subjects too quiet: {with_subject}"
+    assert max(without) < 0.005, f"false subjects too loud: {without}"
+    assert min(with_subject) / max(max(without), 1e-9) > 15.0, (
+        f"separation collapsed: {min(with_subject)} vs {max(without)}"
+    )
 
 
 def test_oversized_subject_warns_and_says_it_is_too_big() -> None:
@@ -981,16 +1008,66 @@ def test_owners_keyframe_finds_the_aircraft_not_the_cloud() -> None:
     ``Gemini_v1.jpg`` is a 1024² canyon shot with a gray quadcopter dead centre
     at (0.50, 0.52).  The old detector answered (0.49, 0.06) — the cloud band
     along the top edge, 11.3 % of the picture — and warned the operator that his
-    subject was off-centre.  ``found`` is deliberately *not* asserted: the
-    aircraft's coherent silhouette measures ~1.3 % of this frame, just under
-    :data:`~scripts.check_source_quality.ANCHOR_MIN_AREA`, and the card forbids
-    moving that threshold to make a number go green.  What matters, and what is
-    asserted, is that the detector is looking at the aircraft.
+    subject was off-centre.  What matters here is *where* the detector is
+    looking; the area it reports is #345's subject and is asserted separately in
+    ``test_a_small_real_subject_is_small_not_absent``.
     """
     stats = csq.anchor_stats(csq.read_still(OWNER_KEYFRAME))
 
     assert stats["centroid_x"] == pytest.approx(0.50, abs=0.12), f"not the aircraft: {stats}"
     assert stats["centroid_y"] == pytest.approx(0.52, abs=0.12), f"still on the sky: {stats}"
+
+
+@pytest.mark.skipif(not OWNER_KEYFRAME.is_file(), reason=f"owner keyframe not present: {OWNER_KEYFRAME}")
+def test_a_small_real_subject_is_small_not_absent() -> None:
+    """Acceptance (#345): the drone reads as *small*, never as *absent*.
+
+    This is the whole card in one assertion pair.  The quadcopter measures
+    ~1.30 % of the frame — comfortably a subject, nowhere near the 8–15 %
+    reference band — so the only correct report is 「面积偏小」 with the number
+    in it.  Before the floor moved, the same frame produced 「画面里没有锚点」,
+    which is a different and much more expensive instruction to hand an
+    operator.
+
+    Both halves are asserted: the phrase that must appear *and* the phrase that
+    must not, because a detector that started reporting some other blob at a
+    plausible size would satisfy the first on its own.
+    """
+    result = csq.check_anchor(_anchor_for([csq.read_still(OWNER_KEYFRAME)]))
+
+    assert result.status == csq.STATUS_WARN, f"{result.status}: {result.detail}"
+    assert result.measured["detected_frames"] == 1, f"the drone must be found at all: {result.measured}"
+    assert "面积偏小" in result.detail, result.detail
+    assert "没有锚点" not in result.detail + result.advice, f"still claiming the frame is empty: {result.detail}"
+    assert csq.ANCHOR_MIN_AREA < result.measured["area"] < csq.ANCHOR_AREA_MIN, (
+        f"the drone must land between the detection floor and the quality band: {result.measured}"
+    )
+    assert result.measured["area"] == pytest.approx(0.013, abs=0.004), result.measured
+
+
+@pytest.mark.skipif(not OWNER_KEYFRAME.is_file(), reason=f"owner keyframe not present: {OWNER_KEYFRAME}")
+def test_the_detection_floor_sits_between_noise_and_the_smallest_real_subject() -> None:
+    """The floor has to clear the loudest false positive and duck the quietest true one.
+
+    #345 lowered it, so the question "did it go too far" needs an answer that is
+    measured rather than asserted.  Headroom on both sides, on the real asset the
+    card was filed about and on the subjectless fixtures #341 established:
+
+    * loudest subjectless fixture  0.22 %   → floor is ~3.6× above it
+    * floor                        0.80 %
+    * smallest real subject        1.30 %   → ~1.6× above the floor
+
+    Written as ratios so the margin, not the constant, is what is pinned.
+    """
+    noise = max(
+        [csq.anchor_stats(subjectless_frame(seed=s))["area"] for s in range(1, 9)]
+        + [csq.anchor_stats(flat_frame())["area"], csq.anchor_stats(rim_damped_frame(0.18))["area"]]
+    )
+    smallest_real = csq.anchor_stats(csq.read_still(OWNER_KEYFRAME))["area"]
+
+    assert noise * 2.5 < csq.ANCHOR_MIN_AREA, f"floor too close to the noise: {noise}"
+    assert smallest_real > csq.ANCHOR_MIN_AREA * 1.25, f"floor too close to the real subject: {smallest_real}"
+    assert csq.ANCHOR_MIN_AREA < csq.ANCHOR_AREA_MIN, "the detection floor must stay below the quality band"
 
 
 @pytest.mark.skipif(not CANYON_STILL.is_file(), reason=f"canyon still not present: {CANYON_STILL}")
@@ -1001,6 +1078,14 @@ def test_canyon_still_finds_the_aircraft_not_the_whitewater() -> None:
     stretch of whitewater filling the bottom of the gorge.  The old detector
     returned the foam at (0.51, 0.79); anything below y≈0.6 in this frame is
     river, not subject.
+
+    Note for #345: the detector picks the aircraft here (0.504, 0.359) but its
+    coherent silhouette measures only **0.53 %** of this frame — under the
+    0.8 % detection floor — so this still reports 「没有锚点」.  That is *not*
+    asserted either way: pinning it would enshrine the verdict the card calls
+    wrong, and loosening the floor to 0.53 % would leave only 2.4× to the
+    loudest subjectless fixture.  The gap is recorded in the #345 PR for the
+    lead to rule on; what this test guards is unchanged — the foam must not win.
     """
     stats = csq.anchor_stats(csq.read_still(CANYON_STILL))
 
