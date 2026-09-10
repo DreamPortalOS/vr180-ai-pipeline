@@ -12,6 +12,9 @@ Four assertion families (one per acceptance criterion):
    breakage and argparse-definition conflicts.
 2. **Key-parameter presence**  -> catches a parallel branch silently dropping
    a flag that scripts/CI depend on (argparse exits non-zero on unknown).
+   For ``setup_seedvr2.py`` — the one CLI that starts heavy I/O the instant
+   argparse succeeds — presence is asserted *in-process* against its parser
+   and its planned step list, never by running the bootstrap (section 2b).
 3. **Mock full-chain smoke**  -> the mock provider path really does emit a
    ffprobe-readable mp4; plus an orchestration-layer assertion that drives
    the real ``image_to_vr180.run_pipeline`` call graph (with the model-heavy
@@ -23,6 +26,18 @@ Four assertion families (one per acceptance criterion):
 
 Every failure message names the CLI and the contract that broke so that the
 nightly auto-reviewer can localise the break in one glance.
+
+K-29 (#319) — **a timeout is a failure, never a pass.**  Section 2 used to
+run ``setup_seedvr2.py`` with an 8-second ceiling and treat the resulting
+``TimeoutExpired`` as proof that "argparse accepted the flags and the CLI got
+on with its slow real work".  That inverts the meaning of a hang: any script
+that survived 8 seconds passed, so a missing dependency, a wedged network
+call or a crash *after* the eighth second were all indistinguishable from
+success — a permanently green test, worse than no test because it advertises
+coverage it does not have.  ``_run_cli`` now fails loudly on TimeoutExpired,
+and the setup CLI is asserted against its parser namespace, its ``--help``
+text and the argv it *plans* to execute (with a fake runner that makes any
+real subprocess an error).  No assertion in this module waits on a network.
 """
 
 from __future__ import annotations
@@ -75,17 +90,34 @@ def _run_cli(*argv: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
 
     subprocess.list form (no shell=True).  Fails the test with a message
     that names the CLI whose contract broke if the process crashes.
+
+    K-29 (#319): a ``TimeoutExpired`` is an **unconditional failure**.  It
+    used to be swallowed by the caller and re-interpreted as success, which
+    is what made this module's parameter checks unfalsifiable.  A CLI that
+    does not terminate within *timeout* has broken its contract — either it
+    hangs on something it should not touch (network, model download) or it
+    is slower than a smoke test may be — and the suite must say so.
     """
     script = Path(argv[0])
     if not script.is_absolute():
         script = SCRIPTS / (argv[0] + (".py" if not argv[0].endswith(".py") else ""))
-    proc = subprocess.run(
-        [sys.executable, str(script), *argv[1:]],
-        capture_output=True,
-        text=True,
-        env=_cli_env(),
-        timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), *argv[1:]],
+            capture_output=True,
+            text=True,
+            env=_cli_env(),
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"[{script.name}] did not terminate within {timeout}s: {' '.join(argv[1:])}\n"
+            "A hang is a FAILURE, never a pass (K-29, #319). Either the CLI "
+            "started real work a smoke test must not trigger (git clone, pip "
+            "install, model download), or it is deadlocked. Assert the parser "
+            "in-process instead of racing a wall clock.\n"
+            f"partial stderr:\n{(exc.stderr or b'')[-400:]!r}"
+        )
     return proc
 
 
@@ -200,18 +232,10 @@ KEY_PARAMS = [
     # stereo_sweep: grid knobs
     ("stereo_sweep.py", ["--input", "x.mp4", "--outdir", "o", "--limit-seconds", "3"]),
     ("stereo_sweep.py", ["--input", "x.mp4", "--outdir", "o", "--disparities", "0.04"]),
-    # setup_seedvr2: offline/idempotence knobs.
-    #
-    # W-5 (#315): every entry keeps --dry-run *and* --skip-model on the line,
-    # whatever flag it is actually pinning.  The instant argparse succeeds
-    # without them this script starts a real `git clone` into third_party/ and
-    # a pip install; --dry-run alone still mkdirs models/SEEDVR2.  Those paths
-    # are anchored to the script's own REPO_ROOT, so no cwd change can keep
-    # them out of the checkout — the flags are the only lever.  Flag presence
-    # is all this test asserts; the bootstrap itself is covered, fully mocked,
-    # by tests/test_setup_seedvr2.py.
-    ("setup_seedvr2.py", ["--dry-run", "--skip-model"]),
-    ("setup_seedvr2.py", ["--skip-model", "--dry-run", "--skip-deps"]),
+    # setup_seedvr2.py is deliberately ABSENT from this list — see section 2b.
+    # It is the one CLI that starts a real `git clone` + pip install the
+    # instant argparse succeeds, so "spawn it and see what happens" can never
+    # be a safe flag-presence probe.  Its parser is asserted in-process.
 ]
 
 
@@ -223,26 +247,17 @@ def test_key_parameter_exists(cli, extra):
     flag is caught immediately.  We deliberately pass *only* the flags under
     test plus the minimal required positional args, so the value is not
     evaluated — we only check the flag is defined.
+
+    Every CLI listed here terminates on its own (the fake ``x.mp4`` inputs do
+    not exist, so they fail fast).  ``_run_cli`` fails the test if one does
+    not: K-29 (#319) removed the branch that used to catch the timeout and
+    ``return`` early, which silently turned "this CLI hung" into a pass.
     """
-    # Some CLIs do heavy I/O (git clone, pip install) the instant argparse
-    # succeeds (e.g. setup_seedvr2.py).  For parameter-presence we only care
-    # that argparse accepted the flag, so we run with a short timeout and
-    # treat a TimeoutExpired as "flag recognised, heavy work kicked off".
-    try:
-        proc = _run_cli(str(SCRIPTS / cli), *extra, timeout=8)
-        timed_out = False
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
-        proc = type("P", (), {"returncode": -1, "stdout": "", "stderr": stderr})()
+    proc = _run_cli(str(SCRIPTS / cli), *extra, timeout=30)
     # argparse's signal for a deleted/renamed flag is the stderr message
     # "unrecognized arguments".  Some CLIs happen to use exit code 2 for
     # their own validation (e.g. generate.py "a prompt is required"), so we
     # key off the stderr signature rather than the return code.
-    if timed_out:
-        # A timeout means argparse accepted the flags and the CLI proceeded
-        # to its (slow) real work — exactly the "flag exists" signal we want.
-        return
     argparser_rejected = "unrecognized arguments" in proc.stderr
     assert not argparser_rejected, (
         f"[{cli}] parameter contract BROKEN: flag sequence {extra} "
