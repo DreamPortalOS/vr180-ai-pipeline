@@ -528,6 +528,117 @@ def test_radial_flow_stats_rejects_mismatched_frames() -> None:
         csq.radial_flow_stats(np.zeros((10, 10), np.uint8), np.zeros((12, 10), np.uint8))
 
 
+def _fisheye_outflow_frames(n: int = N_FRAMES, size: int = FRAME_SIZE, zoom: float = 1.04) -> list[np.ndarray]:
+    """Radial-outflow frames masked to an inscribed circle (outside is pure black).
+
+    A circular fisheye at rest paints its corners black, so the synthetic
+    fisheye fixture blacks out everything outside the inscribed circle.  The
+    #322 bug was that those black corners are zero-flow pixels that dragged
+    the outer-ring mean toward zero on genuinely forward clips.
+    """
+    frames = radial_outflow_frames(n, size, zoom)
+    cy = cx = (size - 1) / 2.0
+    ys, xs = np.mgrid[0:size, 0:size]
+    inside = np.hypot(xs - cx, ys - cy) <= size / 2.0
+    return [np.where(inside, f, 0).astype(np.uint8) for f in frames]
+
+
+def _fisheye_static_frames(n: int = N_FRAMES, size: int = FRAME_SIZE) -> list[np.ndarray]:
+    """Static frames masked to an inscribed circle."""
+    frames = static_frames(n, size)
+    cy = cx = (size - 1) / 2.0
+    ys, xs = np.mgrid[0:size, 0:size]
+    inside = np.hypot(xs - cx, ys - cy) <= size / 2.0
+    return [np.where(inside, f, 0).astype(np.uint8) for f in frames]
+
+
+def test_circular_fisheye_outflow_passes_forward_motion() -> None:
+    """Acceptance (#322): a circular-fisheye forward clip must PASS.
+
+    Without the imaging-circle detection and threshold adaptation the black
+    corners made the outer-ring mean collapse, and the clip failed despite
+    being obviously forward-moving.
+    """
+    frames = _fisheye_outflow_frames()
+    circle = csq.estimate_imaging_circle(frames[0])
+    assert circle is not None, "the fisheye fixture must trigger circle detection"
+    stats = [csq.radial_flow_stats(frames[i], frames[i + 1], circle_frac=circle) for i in range(len(frames) - 1)]
+    rate = csq.DEFAULT_MIN_RADIAL_RATE * csq.FISHEYE_MIN_RADIAL_FACTOR
+    result = csq.check_forward_motion(stats, min_radial_rate=rate, circle_frac=circle)
+    assert result.status == csq.STATUS_PASS, f"fisheye outflow must PASS: {result.detail}"
+    assert result.measured["imaging_circle_frac"] is not None
+
+
+def test_circular_fisheye_static_still_fails() -> None:
+    """Acceptance (#322): a circular-fisheye locked-off clip must still FAIL.
+
+    The gate narrows for fisheye; it does not open.  The static fisheye
+    fixture must not be waved through by the adapted threshold.
+    """
+    frames = _fisheye_static_frames()
+    circle = csq.estimate_imaging_circle(frames[0])
+    assert circle is not None
+    stats = [csq.radial_flow_stats(frames[i], frames[i + 1], circle_frac=circle) for i in range(len(frames) - 1)]
+    rate = csq.DEFAULT_MIN_RADIAL_RATE * csq.FISHEYE_MIN_RADIAL_FACTOR
+    result = csq.check_forward_motion(stats, min_radial_rate=rate, circle_frac=circle)
+    assert result.status == csq.STATUS_FAIL, f"fisheye static must FAIL: {result.detail}"
+    assert "静态" in result.detail + result.advice
+
+
+def test_rectangular_source_has_no_imaging_circle() -> None:
+    """Acceptance (#322): a rectangular source must not be masked.
+
+    Patchy darkness or vignetting must not produce a false circle — the
+    detection requires a genuine step, so a rectilinear source returns None
+    and the existing behaviour is preserved exactly.
+    """
+    assert csq.estimate_imaging_circle(radial_outflow_frames()[0]) is None
+    assert csq.estimate_imaging_circle(static_frames()[0]) is None
+    assert csq.estimate_imaging_circle(panning_frames()[0]) is None
+
+
+def test_rectangular_verdicts_are_unchanged_by_fisheye_logic() -> None:
+    """Acceptance (#322): the three rectilinear verdicts are byte-identical."""
+    # Outflow still PASS, static still FAIL, pan still FAIL — and no imaging
+    # circle key appears in measured, confirming the fisheye path was not taken.
+    good = csq.check_forward_motion(_stats_for(radial_outflow_frames()))
+    assert good.status == csq.STATUS_PASS
+    assert "imaging_circle_frac" not in good.measured
+
+    still = csq.check_forward_motion(_stats_for(static_frames()))
+    assert still.status == csq.STATUS_FAIL
+    assert "imaging_circle_frac" not in still.measured
+
+    pan = csq.check_forward_motion(_stats_for(panning_frames()))
+    assert pan.status == csq.STATUS_FAIL
+    assert "imaging_circle_frac" not in pan.measured
+
+
+def test_slow_forward_does_not_say_not_positive() -> None:
+    """Acceptance (#322): a positive-but-slow radial rate must not say 「不为正」.
+
+    The old text said "径向分量不为正" while printing a positive number beside
+    it — the failure must name the real cause (too slow), and the advice must
+    differ from a lateral pan's.
+    """
+    radius = 100.0
+    rate = csq.DEFAULT_MIN_RADIAL_RATE * 0.7  # positive but below threshold
+    stats = [
+        csq.RadialStats(
+            radial_mean=rate * radius,
+            inner_mean=0.3 * rate * radius,
+            outer_mean=1.5 * rate * radius,
+            flow_mean=rate * radius * 1.5,  # above static gate; radial dominates → slow, not pan
+            radius=radius,
+        )
+    ] * 3
+    result = csq.check_forward_motion(stats)
+    assert result.status == csq.STATUS_FAIL
+    assert "不为正" not in result.detail
+    assert result.advice == csq.FORWARD_SLOW_ADVICE
+    assert result.advice != csq.FORWARD_FAIL_ADVICE
+
+
 # ---------------------------------------------------------------------------
 # edges — letterbox bars and blown highlights
 # ---------------------------------------------------------------------------
