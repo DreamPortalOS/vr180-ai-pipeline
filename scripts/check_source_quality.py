@@ -92,17 +92,22 @@ The six checks
     same teardown found one in **80 %** of frames, median area **11.3 %** of the
     picture, median eccentricity **0.236** (0 = dead centre), 62 % of them
     inside the central third.  Frequency-tuned saliency (Achanta) **gated by
-    local texture** → Otsu → the densest salient region, weighted toward the
+    local texture** → Otsu → the **densest** salient region, weighted toward the
     centre when several compete, then its area and eccentricity are reported.
-    The texture gate is what stops a bright flat sky — the most colour-distinct
-    thing in a red-rock canyon frame, and therefore the old detector's favourite
-    "subject" — from posing as the anchor.  Measured on the
-    synthetic fixtures before any threshold was set, frames with a subject come
-    out at 11.0–39.3 % of the picture and frames without one at ≤0.35 %, so the
-    two cases are separated by a factor of ~30, not by a hair.  A missing
-    anchor is a WARN, not
-    a FAIL: not every shot needs one, but the operator should know that without
-    one the viewer will go looking at the rim.
+
+    Both of those emphasised words are there because plain Achanta picked the
+    sky.  Colour distinctness alone is measured against the frame *mean*, which
+    red-brown rock owns, so a bright sky is the most "distinct" thing in a canyon
+    frame and a gray aircraft in the middle is one of the least; and scoring
+    candidates by total saliency *mass* then hands the verdict to whichever
+    region is merely biggest.  The texture gate removes the **flat** impostors
+    (blown highlights, sheet water, clear sky); density removes the **big** ones
+    (cloud and whitewater, which are textured and survive the gate).  Measured on
+    the synthetic fixtures, frames with a subject come out at 11.0–36.1 % of the
+    picture and frames without one at ≤0.22 %, a separation of ~50× (it was ~30×
+    before the gate).  A missing anchor is a WARN, not a FAIL: not every shot
+    needs one, but the operator should know that without one the viewer will go
+    looking at the rim.
 
 Aggregation across the sampled frames/pairs is by **median**, not mean: one
 scene cut, one fade-to-black frame or one lens flare must not decide the
@@ -263,9 +268,13 @@ ANCHOR_MORPH_KERNEL: int = 9
 ANCHOR_CENTER_PRIOR_SIGMA: float = 0.5
 
 #: Side, in pixels at :data:`ANCHOR_ANALYSIS_MAX_DIM`, of the box the texture
-#: channel measures local contrast over.  ~8 % of the frame: small enough to
+#: channel averages Laplacian energy over.  ~8 % of the frame: small enough to
 #: read a hand-sized subject as textured, large enough that a single hard edge
 #: (a cloud rim, a horizon) does not paint a whole flat region as structured.
+#: Measured across 15/21/31 on both of the owner's keyframes and the synthetic
+#: fixtures, 21 gives the widest subject-vs-subjectless separation (50×, against
+#: 42× at 15 and 46× at 31); the real-asset centroids move by <0.01 across the
+#: three, so this is a tuning choice, not a knife edge.
 ANCHOR_TEXTURE_WINDOW: int = 21
 
 #: A component smaller than this is speckle, not an anchor.  Measured
@@ -1065,15 +1074,22 @@ def texture_gate(
 ) -> np.ndarray:
     """How *structured* each spot is, as a ``[0, 1]`` gate on saliency.
 
-    Local standard deviation of luminance over a ``window`` box, divided by the
-    frame's **median** local standard deviation and clipped at 1.  Read it as a
-    yes/no question with a soft edge: "does this spot carry at least as much
-    detail as a typical spot in this frame?".  Flat sky, blown highlights and
-    open water answer no; rock, foliage, foam and any manufactured object answer
-    yes and saturate.
+    Local mean of the **Laplacian magnitude** over a ``window`` box, divided by
+    the frame's median and clipped at 1.  Read it as a yes/no question with a
+    soft edge: "does this spot carry at least as much fine detail as a typical
+    spot in this frame?".  Flat sky, blown highlights and open water answer no;
+    rock, foliage, foam and any manufactured object answer yes and saturate.
 
-    Two properties matter and neither is negotiable:
+    Three properties matter and none is negotiable:
 
+    * **High-frequency only.**  The obvious alternative, local *standard
+      deviation*, counts a soft gradient as structure — and a cloud is exactly
+      that: a large, smooth light-to-dark swing.  Measured on the owner's
+      keyframe, stddev leaves the cloud band at 0.53–0.66 of the reference while
+      the Laplacian puts it at 0.33, against 1.0 for the aircraft.  That is the
+      difference between a gate that trims the sky and one that removes it, and
+      "bright but *soft*" is what a sky, a water sheet and a blown highlight all
+      have in common.
     * **Self-scaling.** The reference is the frame's own median, so a hazy
       low-contrast frame and a punchy one are judged on the same terms and no
       absolute contrast constant has to be invented.
@@ -1082,8 +1098,8 @@ def texture_gate(
       bright subject on a dark field is the strongest edge in the picture, so the
       subject's own interior scores low and Otsu then cuts the subject in half.
       Clipping at the median makes the whole interior of anything textured read
-      as 1.0, which leaves the mask, and therefore the reported area, exactly
-      where the ungated saliency put it.
+      as 1.0, which leaves the mask, and therefore the reported area, where the
+      ungated saliency put it.
 
     Grayscale in, grayscale out — the video sampler decodes ``-pix_fmt gray`` and
     this costs nothing extra there.
@@ -1091,12 +1107,9 @@ def texture_gate(
     if window < 1:
         raise ValueError(f"window must be >= 1, got {window}")
     gray = _fit_for_analysis(_as_gray(frame), max_dim).astype(np.float32)
-    box = (window, window)
-    mean = cv2.blur(gray, box)
-    mean_square = cv2.blur(gray * gray, box)
-    deviation = np.sqrt(np.maximum(mean_square - mean * mean, 0.0))
-    reference = float(np.median(deviation)) + 1e-6
-    return np.clip(deviation / reference, 0.0, 1.0)
+    energy = cv2.blur(np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3)), (window, window))
+    reference = float(np.median(energy)) + 1e-6
+    return np.clip(energy / reference, 0.0, 1.0)
 
 
 def structured_saliency(frame: np.ndarray, window: int = ANCHOR_TEXTURE_WINDOW) -> np.ndarray:
@@ -1107,11 +1120,24 @@ def structured_saliency(frame: np.ndarray, window: int = ANCHOR_TEXTURE_WINDOW) 
     systematically wrong answer.  In a canyon frame the red-brown rock owns the
     mean, so the *sky* is the most distinct thing in the picture and a gray
     aircraft in the middle — whose colour happens to sit near that mean — is the
-    least.  Measured on the owner's keyframe, the ungated detector put the
-    subject's centroid at (0.49, 0.06): the clouds along the top edge.
+    least.  Multiplying by :func:`texture_gate` asks for both at once — distinct
+    **and** structured — which is what an object is and what a flat sky is not.
 
-    Multiplying by :func:`texture_gate` asks for both at once — distinct **and**
-    structured — which is what an object is and what a sky is not.
+    What this fixes, precisely, is worth stating because it is *not* the whole
+    of issue #343.  Ablated on the owner's two keyframes and the synthetic
+    fixtures, the gate is what saves the **flat** bright region: on a fixture
+    with a blown-out sky band over textured ground, the ungated detector returns
+    the sky (21.7 % of the frame, centroid y = 0.11) and the gated one returns
+    the subject (10.7 %, centroid y = 0.51).  It also tightens the
+    subject-vs-subjectless separation the anchor check rests on, from 32× to
+    50×.
+
+    It is **not** what unseats the sky in the owner's own frames, and pretending
+    otherwise would leave the next reader mis-tuning this function.  Real cloud
+    and real whitewater are *textured*, so they survive the gate; what demotes
+    them there is scoring candidate regions by saliency **density** rather than
+    total mass (see :func:`anchor_stats`).  The two changes fix two different
+    halves of the same bug and neither is redundant.
     """
     combined = frequency_tuned_saliency(frame) * texture_gate(frame, window)
     return (combined - combined.min()) / (float(np.ptp(combined)) + 1e-9)
@@ -1129,14 +1155,20 @@ def anchor_stats(
     speckle) → close (heal a subject broken up by a highlight) → connected
     components → pick the one with the **densest** centre-weighted saliency.
 
-    Density (mean per pixel), not total mass, and the difference is the whole
-    point of this function.  Mass is area × density, so it is won by whatever is
-    *biggest*: a sky band or a stretch of whitewater beats a subject that is
-    more distinct per pixel but a fifth of the size, every time, and no amount of
-    gating fixes an ordering that is dominated by the area term.  Asking which
-    region is most strongly "subject" per pixel is the question the check
-    actually poses, and it is scale-free — the same object read at 1024² and at
-    2880² scores the same.
+    Density (mean per pixel), not total mass, and this is the half of issue #343
+    that actually moved the owner's frames.  Mass is area × density, so it is won
+    by whatever is *biggest*: a sky band or a stretch of whitewater beats a
+    subject that is more distinct per pixel but a fifth of the size, every time,
+    and **no amount of texture gating fixes an ordering dominated by the area
+    term** — real cloud and real foam are textured, so they pass the gate and
+    then win on sheer size.  Measured on the owner's keyframes, with mass the
+    detector returns the cloud band (centroid y = 0.06) or the whitewater
+    (y = 0.79) whether or not the texture gate is applied; with density it
+    returns the aircraft (y = 0.47 / 0.36).
+
+    Asking which region is most strongly "subject" per pixel is the question the
+    check actually poses, and it is scale-free — the same object read at 1024²
+    and at 2880² scores the same.
 
     Otsu rather than a fixed percentile, and the difference is not cosmetic.  A
     percentile decides *in advance* how much of the frame is salient, so it can
