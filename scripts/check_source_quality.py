@@ -206,6 +206,29 @@ WEAK_RADIAL_FACTOR: float = 2.0
 INNER_RADIUS_FRAC: float = 0.3
 OUTER_RADIUS_FRAC: float = 0.6
 
+#: Threshold multiplier for a detected circular (fisheye) source.  The
+#: rectilinear rate in :data:`DEFAULT_MIN_RADIAL_RATE` is calibrated on
+#: ``flow ≈ (s-1)·r`` — displacement grows linearly with radius.  Under the
+#: **equidistant** projection a circular fisheye uses (``r_px ∝ θ``), the same
+#: forward translation moves a point at polar angle θ at ``∝ sinθ·cosθ`` per
+#: pixel — the ``cosθ`` term compresses the rim exactly where the outer ring
+#: samples, and integrating over the imaging disc puts the mean radial rate at
+#: ≈0.55–0.65× the rectilinear equivalent.  Two empirical anchors fixed the
+#: exact value (#322): the lead-verified forward fisheye clip
+#: ``gen_1x1_fisheye.mp4`` measures a **0.00185** rate (0.46× of the rectilinear
+#: threshold — it must clear the gate, ideally clear the weak band too), while
+#: the static noise floor stays at ``|rate| ≲ 4e-5`` (#310), so 0.4 keeps a
+#: **20×** margin above noise.  The gate narrows for fisheye, it does not open.
+FISHEYE_MIN_RADIAL_FACTOR: float = 0.4
+
+#: A sub-threshold radial rate is called "slow forward" — not a lateral pan —
+#: only when the radial component dominates the total flow, carrying at least
+#: this share of it.  Measured separation (#322): the slow fisheye clip puts
+#: **0.69** of its flow radially while the pan fixture manages **~0.07** — the
+#: gate sits between them with headroom both ways, and it is what keeps the
+#: 「推进太慢」advice from replacing the 「横移」diagnosis on sideways motion.
+RADIAL_SHARE_FOR_SLOW: float = 0.4
+
 #: A band this dark *and* this flat is a letterbox bar, not dark content.
 #: Both conditions are needed: a night sky is dark but textured (variance in
 #: the hundreds), while a bar is a constant.
@@ -375,6 +398,17 @@ STILL_FORWARD_ADVICE = (
 FORWARD_WEAK_ADVICE = (
     "径向外流为正但偏弱：前进速度慢、或大部分画面是远景（远处视差本来就小）。"
     "可以进管线，但立体感会偏弱；想要更强的沉浸感就把运镜提速或加近景元素。"
+)
+
+#: Printed when the radial component IS positive but cannot clear even the
+#: (projection-adapted) threshold — a FAIL, not the WARN above.  #322: the old
+#: text claimed 「径向分量不为正」 while the same line reported a positive
+#: number, sending the operator hunting for a pan that was not there.  This is
+#: a different failure from a lateral move and gets different advice.
+FORWARD_SLOW_ADVICE = (
+    "径向确实外流，只是强度低于可转立体感的下限：推进太慢，或画面以远景为主"
+    "（远景视差天然小）。这与横移不同——方向对了、量不够。"
+    "请把运镜提速（每帧推进更大）或加入近景元素后重新生成。"
 )
 
 #: Printed whenever the frame is flatter in the middle than at the rim.  The
@@ -737,11 +771,73 @@ class RadialStats:
         return self._rate(self.flow_mean)
 
 
+def estimate_imaging_circle(frame: np.ndarray) -> float | None:
+    """Radius of the imaging circle (fraction of the half-diagonal), or None.
+
+    A circular fisheye source paints pure black outside its inscribed imaging
+    circle — the four frame corners are black *and flat* (compression noise
+    aside), while real dark content (night sky, shadow) is dark *and textured*.
+    #322: those black corners are zero-flow pixels that dragged the outer-ring
+    statistics toward zero and failed genuinely-forward fisheye clips.
+
+    The estimate is a radial profile of the dark-pixel fraction: inside the
+    circle it is whatever the content is (≈0 after binning), outside it is ≈1.
+    The circle radius is where the profile crosses ½, validated by requiring a
+    genuine step (dark inside the transition band ≲25 %, dark outside ≳75 %) —
+    patchy darkness does not produce a step and returns ``None``, so a
+    rectilinear source is never masked.  The accepted range ``[0.45, 0.85]``
+    brackets the inscribed circle of a square frame (``1/√2 ≈ 0.707``) with
+    room for slight over/underscan.
+    """
+    gray = _as_gray(frame)
+    small = _fit_for_analysis(gray, 256)
+    height, width = small.shape
+    _, _, r, radius = _radial_basis(height, width)
+    r_norm = (r / radius).ravel()
+    dark = (small < 16).ravel()
+
+    corner = max(4, int(0.05 * min(height, width)))
+    patches = [
+        small[:corner, :corner],
+        small[:corner, -corner:],
+        small[-corner:, :corner],
+        small[-corner:, -corner:],
+    ]
+    corners_black = all(p.mean() < 16.0 and float(p.std()) < 6.0 for p in patches)
+    centre = small[
+        height // 2 - corner : height // 2 + corner,
+        width // 2 - corner : width // 2 + corner,
+    ]
+    if not corners_black or centre.mean() < 24.0:
+        return None
+
+    n_bins = 32
+    bin_idx = np.clip((r_norm * n_bins).astype(int), 0, n_bins - 1)
+    frac = np.bincount(bin_idx, weights=dark, minlength=n_bins) / np.maximum(np.bincount(bin_idx, minlength=n_bins), 1)
+    crossing = np.argmax(frac >= 0.5) if (frac >= 0.5).any() else -1
+    if crossing <= 0:
+        return None
+    # The crossing bin *and* its inner neighbour straddle the circle edge
+    # (part content, part black), so both are excluded from the validation
+    # bands — only bins fully inside / fully outside speak to the step.
+    inside_band = frac[max(0, crossing - 4) : max(0, crossing - 1)]
+    outside_band = frac[crossing + 1 : min(n_bins, crossing + 4)]
+    circle = (crossing + 0.5) / n_bins
+    if inside_band.size == 0 or outside_band.size == 0:
+        return None
+    if inside_band.max() > 0.25 or outside_band.min() < 0.75:
+        return None
+    if not 0.45 <= circle <= 0.85:
+        return None
+    return float(circle)
+
+
 def radial_flow_stats(
     prev: np.ndarray,
     nxt: np.ndarray,
     inner_frac: float = INNER_RADIUS_FRAC,
     outer_frac: float = OUTER_RADIUS_FRAC,
+    circle_frac: float | None = None,
 ) -> RadialStats:
     """Dense flow ``prev → nxt``, projected onto the radial direction.
 
@@ -750,6 +846,12 @@ def radial_flow_stats(
     looks like.  A pan projects to ``+|v|`` ahead of the centre and ``-|v|``
     behind it, so it cancels to ~0 here while ``flow_mean`` stays large — that
     asymmetry between the two numbers is what separates the two failure modes.
+
+    ``circle_frac`` masks the statistics to inside a detected imaging circle
+    (:func:`estimate_imaging_circle`); ``None`` (the default, and every
+    rectilinear source) samples the whole frame unchanged (#322: the black
+    corners of a circular fisheye are zero-flow pixels that poisoned the
+    outer-ring mean).
     """
     if prev.shape != nxt.shape or prev.ndim != 2:
         raise ValueError(f"expected two same-sized grayscale frames, got {prev.shape} and {nxt.shape}")
@@ -759,13 +861,14 @@ def radial_flow_stats(
     height, width = a.shape
     ux, uy, r, radius = _radial_basis(height, width)
     radial = flow[..., 0] * ux + flow[..., 1] * uy
-    inner = r < inner_frac * radius
-    outer = r > outer_frac * radius
+    valid = r <= circle_frac * radius if circle_frac is not None else np.ones(r.shape, dtype=bool)
+    inner = valid & (r < inner_frac * radius)
+    outer = valid & (r > outer_frac * radius)
     return RadialStats(
-        radial_mean=float(radial.mean()),
+        radial_mean=float(radial[valid].mean()),
         inner_mean=float(radial[inner].mean()) if inner.any() else 0.0,
         outer_mean=float(radial[outer].mean()) if outer.any() else 0.0,
-        flow_mean=float(np.hypot(flow[..., 0], flow[..., 1]).mean()),
+        flow_mean=float(np.hypot(flow[..., 0], flow[..., 1])[valid].mean()),
         radius=radius,
     )
 
@@ -773,6 +876,7 @@ def radial_flow_stats(
 def check_forward_motion(
     stats: Sequence[RadialStats],
     min_radial_rate: float = DEFAULT_MIN_RADIAL_RATE,
+    circle_frac: float | None = None,
 ) -> CheckResult:
     """Verdict over the sampled pairs: does this clip really move forward?
 
@@ -783,8 +887,14 @@ def check_forward_motion(
     Both of §QA's conditions must hold: the radial component is positive
     (beyond ``min_radial_rate``) *and* it grows with radius (outer ring above
     inner disc).  When it fails, the detail names which failure mode it looks
-    like — locked-off, lateral, or "outward but not radius-scaled" — while the
-    advice is the same for all three, because so is the fix.
+    like — locked-off, inward, too-slow, lateral, or "outward but not
+    radius-scaled" — with distinct advice where the operator's next step
+    differs.  #322: "positive" here means *clears the threshold*; the failure
+    text must never claim the sign is wrong when the numbers printed beside it
+    are positive.
+
+    ``circle_frac`` records a detected imaging circle in ``measured`` and adds
+    it to the detail line so the projection adaptation is visible, not silent.
     """
     if not stats:
         return CheckResult(
@@ -819,11 +929,15 @@ def check_forward_motion(
         "radial_positive": positive,
         "outer_exceeds_inner": grows,
     }
+    if circle_frac is not None:
+        measured["imaging_circle_frac"] = round(circle_frac, 3)
     numbers = (
         f"径向 {measured['radial_mean_px']:+.3f}px（内圈 {measured['inner_mean_px']:+.3f} → "
         f"外圈 {measured['outer_mean_px']:+.3f}），总光流 {measured['flow_mean_px']:.3f}px，"
         f"{len(stats)} 对相邻帧中位数"
     )
+    if circle_frac is not None:
+        numbers += f"（圆形鱼眼：成像圆 {circle_frac:.2f}R，已排除圆外黑区，阈值×{FISHEYE_MIN_RADIAL_FACTOR:g}）"
 
     if positive and grows:
         weak = radial_rate < min_radial_rate * WEAK_RADIAL_FACTOR
@@ -835,13 +949,30 @@ def check_forward_motion(
             FORWARD_WEAK_ADVICE if weak else "",
         )
 
+    # Classify by whether the radial component *dominates* the flow field
+    # first, then by its sign (#322): a pan's radial projection cancels to a
+    # whisper that can land on either side of zero, and only a radial-
+    # dominated field says anything about forward vs backward.
+    radial_dominant = abs(radial_rate) >= RADIAL_SHARE_FOR_SLOW * flow_rate
     if flow_rate < min_radial_rate:
         reason = "疑似静态机位：整帧光流几乎为零，画面基本不动"
+        advice = FORWARD_FAIL_ADVICE
+    elif not radial_dominant:
+        reason = "径向分量不显著：运动几乎不向外，疑似横移／摇镜（pan），不是向前推进"
+        advice = FORWARD_FAIL_ADVICE
+    elif radial_rate < 0.0:
+        reason = "径向分量为负：画面向中心收缩，这是后撤／拉远，不是前进"
+        advice = FORWARD_FAIL_ADVICE
     elif not positive:
-        reason = "有明显运动但径向分量不为正：疑似横移／摇镜（pan），不是向前推进"
+        reason = (
+            "径向分量为正但强度低于阈值：确有外流，只是推进太慢"
+            "（或画面以远景为主），未达到可转立体感的下限——这与横移不同，方向是对的、量不够"
+        )
+        advice = FORWARD_SLOW_ADVICE
     else:
         reason = "径向分量为正但不随半径递增：外圈没有比内圈流得更快，不符合前进的几何"
-    return CheckResult("forward_motion", STATUS_FAIL, f"{reason}。{numbers}", measured, FORWARD_FAIL_ADVICE)
+        advice = FORWARD_FAIL_ADVICE
+    return CheckResult("forward_motion", STATUS_FAIL, f"{reason}。{numbers}", measured, advice)
 
 
 # ---------------------------------------------------------------------------
@@ -1514,6 +1645,7 @@ def run_checks(
     band_stats: list[dict[str, dict[str, float]]] = []
     detail_stats: list[dict[str, float]] = []
     subject_stats: list[dict[str, float]] = []
+    circle_frac: float | None = None
 
     def measure(frame: np.ndarray) -> None:
         """Every per-frame measurement, taken on the one frame we decoded."""
@@ -1534,10 +1666,16 @@ def run_checks(
         for first, second in iter_frame_pairs(src, info, pairs=pairs, ffmpeg=ffmpeg):
             measure(first)
             if "forward_motion" not in skipped:
+                small_first = downscale_for_flow(first, flow_width)
+                if circle_frac is None:
+                    # Detect once from the first sampled frame; the imaging
+                    # circle does not move between frames of one clip (#322).
+                    circle_frac = estimate_imaging_circle(small_first)
                 flow_stats.append(
                     radial_flow_stats(
-                        downscale_for_flow(first, flow_width),
+                        small_first,
                         downscale_for_flow(second, flow_width),
+                        circle_frac=circle_frac,
                     )
                 )
 
@@ -1550,7 +1688,10 @@ def run_checks(
                 {"still": True, "pairs": 0},
                 STILL_FORWARD_ADVICE,
             )
-        return check_forward_motion(flow_stats, min_radial_rate=min_radial_rate)
+        rate = min_radial_rate
+        if circle_frac is not None:
+            rate *= FISHEYE_MIN_RADIAL_FACTOR
+        return check_forward_motion(flow_stats, min_radial_rate=rate, circle_frac=circle_frac)
 
     builders = {
         "decodable": lambda: check_decodable(info, still=still),
