@@ -91,9 +91,12 @@ The six checks
     Is there a subject in the forward direction for the eye to hold onto?  The
     same teardown found one in **80 %** of frames, median area **11.3 %** of the
     picture, median eccentricity **0.236** (0 = dead centre), 62 % of them
-    inside the central third.  Frequency-tuned saliency (Achanta) → Otsu → the
-    most salient compact region, weighted toward the centre when several
-    compete, then its area and eccentricity are reported.  Measured on the
+    inside the central third.  Frequency-tuned saliency (Achanta) **gated by
+    local texture** → Otsu → the densest salient region, weighted toward the
+    centre when several compete, then its area and eccentricity are reported.
+    The texture gate is what stops a bright flat sky — the most colour-distinct
+    thing in a red-rock canyon frame, and therefore the old detector's favourite
+    "subject" — from posing as the anchor.  Measured on the
     synthetic fixtures before any threshold was set, frames with a subject come
     out at 11.0–39.3 % of the picture and frames without one at ≤0.35 %, so the
     two cases are separated by a factor of ~30, not by a hair.  A missing
@@ -250,12 +253,20 @@ ANCHOR_ANALYSIS_MAX_DIM: int = 256
 ANCHOR_MORPH_KERNEL: int = 9
 
 #: Centre prior used only to *choose* between competing salient regions (score =
-#: Σ saliency × weight), never to measure them.  A sky band along the top edge
-#: and a subject in the middle are both salient; the question this check asks is
-#: whether something holds the eye in the *forward* direction, so the middle one
-#: wins.  Area and eccentricity are then read off the unweighted mask, which is
-#: what keeps an off-centre subject detectable and reportable as off-centre.
+#: mean of saliency × weight), never to measure them.  A sky band along the top
+#: edge and a subject in the middle are both salient; the question this check
+#: asks is whether something holds the eye in the *forward* direction, so the
+#: middle one wins.  Area and eccentricity are then read off the unweighted
+#: mask, which is what keeps an off-centre subject detectable and reportable as
+#: off-centre.  Deliberately wide: at σ=0.5 a region on the frame diagonal still
+#: keeps ~14 % of its weight, so this breaks ties, it does not veto.
 ANCHOR_CENTER_PRIOR_SIGMA: float = 0.5
+
+#: Side, in pixels at :data:`ANCHOR_ANALYSIS_MAX_DIM`, of the box the texture
+#: channel measures local contrast over.  ~8 % of the frame: small enough to
+#: read a hand-sized subject as textured, large enough that a single hard edge
+#: (a cloud rim, a horizon) does not paint a whole flat region as structured.
+ANCHOR_TEXTURE_WINDOW: int = 21
 
 #: A component smaller than this is speckle, not an anchor.  Measured
 #: separation on the synthetic fixtures before any threshold was chosen: frames
@@ -1047,6 +1058,65 @@ def frequency_tuned_saliency(frame: np.ndarray, max_dim: int = ANCHOR_ANALYSIS_M
     return (saliency - saliency.min()) / (float(np.ptp(saliency)) + 1e-9)
 
 
+def texture_gate(
+    frame: np.ndarray,
+    window: int = ANCHOR_TEXTURE_WINDOW,
+    max_dim: int = ANCHOR_ANALYSIS_MAX_DIM,
+) -> np.ndarray:
+    """How *structured* each spot is, as a ``[0, 1]`` gate on saliency.
+
+    Local standard deviation of luminance over a ``window`` box, divided by the
+    frame's **median** local standard deviation and clipped at 1.  Read it as a
+    yes/no question with a soft edge: "does this spot carry at least as much
+    detail as a typical spot in this frame?".  Flat sky, blown highlights and
+    open water answer no; rock, foliage, foam and any manufactured object answer
+    yes and saturate.
+
+    Two properties matter and neither is negotiable:
+
+    * **Self-scaling.** The reference is the frame's own median, so a hazy
+      low-contrast frame and a punchy one are judged on the same terms and no
+      absolute contrast constant has to be invented.
+    * **Saturating.** A ranking measure (divide by the 99th percentile, or take
+      the percentile rank) is dominated by object *outlines* — the boundary of a
+      bright subject on a dark field is the strongest edge in the picture, so the
+      subject's own interior scores low and Otsu then cuts the subject in half.
+      Clipping at the median makes the whole interior of anything textured read
+      as 1.0, which leaves the mask, and therefore the reported area, exactly
+      where the ungated saliency put it.
+
+    Grayscale in, grayscale out — the video sampler decodes ``-pix_fmt gray`` and
+    this costs nothing extra there.
+    """
+    if window < 1:
+        raise ValueError(f"window must be >= 1, got {window}")
+    gray = _fit_for_analysis(_as_gray(frame), max_dim).astype(np.float32)
+    box = (window, window)
+    mean = cv2.blur(gray, box)
+    mean_square = cv2.blur(gray * gray, box)
+    deviation = np.sqrt(np.maximum(mean_square - mean * mean, 0.0))
+    reference = float(np.median(deviation)) + 1e-6
+    return np.clip(deviation / reference, 0.0, 1.0)
+
+
+def structured_saliency(frame: np.ndarray, window: int = ANCHOR_TEXTURE_WINDOW) -> np.ndarray:
+    """Colour distinctness × structure, normalised to ``[0, 1]``.
+
+    Achanta on its own answers "how unlike the frame's average colour is this
+    spot?", and on the footage this pipeline exists for that question has a
+    systematically wrong answer.  In a canyon frame the red-brown rock owns the
+    mean, so the *sky* is the most distinct thing in the picture and a gray
+    aircraft in the middle — whose colour happens to sit near that mean — is the
+    least.  Measured on the owner's keyframe, the ungated detector put the
+    subject's centroid at (0.49, 0.06): the clouds along the top edge.
+
+    Multiplying by :func:`texture_gate` asks for both at once — distinct **and**
+    structured — which is what an object is and what a sky is not.
+    """
+    combined = frequency_tuned_saliency(frame) * texture_gate(frame, window)
+    return (combined - combined.min()) / (float(np.ptp(combined)) + 1e-9)
+
+
 def anchor_stats(
     frame: np.ndarray,
     kernel: int = ANCHOR_MORPH_KERNEL,
@@ -1055,9 +1125,18 @@ def anchor_stats(
 ) -> dict[str, float]:
     """Locate the frame's anchor and report its area share and eccentricity.
 
-    The pipeline is: saliency → **Otsu** mask → open (drop speckle) → close
-    (heal a subject broken up by a highlight) → connected components → pick the
-    one with the most centre-weighted saliency mass.
+    The pipeline is: :func:`structured_saliency` → **Otsu** mask → open (drop
+    speckle) → close (heal a subject broken up by a highlight) → connected
+    components → pick the one with the **densest** centre-weighted saliency.
+
+    Density (mean per pixel), not total mass, and the difference is the whole
+    point of this function.  Mass is area × density, so it is won by whatever is
+    *biggest*: a sky band or a stretch of whitewater beats a subject that is
+    more distinct per pixel but a fifth of the size, every time, and no amount of
+    gating fixes an ordering that is dominated by the area term.  Asking which
+    region is most strongly "subject" per pixel is the question the check
+    actually poses, and it is scale-free — the same object read at 1024² and at
+    2880² scores the same.
 
     Otsu rather than a fixed percentile, and the difference is not cosmetic.  A
     percentile decides *in advance* how much of the frame is salient, so it can
@@ -1075,11 +1154,15 @@ def anchor_stats(
     first deletes them and leaves nothing above ``min_area``.
 
     ``found`` is the answer to "is there an anchor"; ``area``/``offset`` are only
-    meaningful when it is true.
+    meaningful when it is true.  ``centroid_x``/``centroid_y`` are the picked
+    region's centre in ``[0, 1]`` frame coordinates and exist so that a
+    regression can assert *which* thing was found, not merely that something
+    was: the bug this replaced reported a perfectly plausible area while
+    pointing at the sky.
     """
     if kernel < 1:
         raise ValueError(f"kernel must be >= 1, got {kernel}")
-    saliency = frequency_tuned_saliency(frame)
+    saliency = structured_saliency(frame)
     height, width = saliency.shape
     _, mask = cv2.threshold(
         np.clip(saliency * 255.0, 0, 255).astype(np.uint8),
@@ -1092,7 +1175,14 @@ def anchor_stats(
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, element)
 
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
-    empty = {"found": False, "area": 0.0, "offset": 0.0, "components": max(0, count - 1)}
+    empty = {
+        "found": False,
+        "area": 0.0,
+        "offset": 0.0,
+        "components": max(0, count - 1),
+        "centroid_x": 0.5,
+        "centroid_y": 0.5,
+    }
     if count <= 1:
         return empty
 
@@ -1103,11 +1193,12 @@ def anchor_stats(
     weight = np.exp(-(radius**2) / (2.0 * sigma**2)).astype(np.float32)
     weighted = saliency * weight
 
-    best_index, best_mass = 0, -1.0
+    best_index, best_density = 0, -1.0
     for index in range(1, count):
-        mass = float(weighted[labels == index].sum())
-        if mass > best_mass:
-            best_index, best_mass = index, mass
+        region = labels == index
+        density = float(weighted[region].mean())
+        if density > best_density:
+            best_index, best_density = index, density
 
     pixels = int(stats[best_index, cv2.CC_STAT_AREA])
     area = pixels / float(height * width)
@@ -1118,6 +1209,8 @@ def anchor_stats(
         "area": area,
         "offset": offset,
         "components": count - 1,
+        "centroid_x": blob_x / max(1.0, width - 1.0),
+        "centroid_y": blob_y / max(1.0, height - 1.0),
     }
 
 
