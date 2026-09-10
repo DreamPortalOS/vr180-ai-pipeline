@@ -277,17 +277,39 @@ ANCHOR_CENTER_PRIOR_SIGMA: float = 0.5
 #: three, so this is a tuning choice, not a knife edge.
 ANCHOR_TEXTURE_WINDOW: int = 21
 
-#: A component smaller than this is speckle, not an anchor.  Measured
-#: separation on the synthetic fixtures before any threshold was chosen: frames
-#: with a subject land at **11.0–39.3 %**, frames without one top out at
-#: **0.35 %**.  This sits ~4× above the loudest false positive and ~7× below the
-#: quietest true one, so neither side is anywhere near it.
-ANCHOR_MIN_AREA: float = 0.015
+#: **Detection floor — "is there anything there", not "is it big enough".**
+#: The two questions are separate and this constant only answers the first one.
+#: A component below it is speckle and the frame honestly has no anchor; a
+#: component above it *exists*, and how well-sized it is then gets judged by
+#: :data:`ANCHOR_AREA_MIN`/:data:`ANCHOR_AREA_MAX` (the 8–15 % quality band),
+#: which this constant must never be confused with or tuned against.
+#:
+#: Set from the measured gap between "no subject" and "a real but small
+#: subject".  Subjectless fixtures — uniform texture across 8 seeds, flat gray
+#: plus sensor noise, rim-damped/empty-centre — top out at **0.22 %** (#341's
+#: table quotes 0.35 % as the pre-#343 worst case, and the texture channel only
+#: pushed it down).  The smallest *real* subject on record is the quadcopter in
+#: the owner's ``Gemini_v1.jpg`` keyframe at **1.30 %**.  0.8 % sits 3.6× above
+#: the loudest false positive and 1.6× below that true one, so both sides keep
+#: room.
+#:
+#: It was 1.5 % until #345, which is what made the check answer 「画面里没有
+#: 锚点」 for a frame with a visible drone in it.  That verdict was not merely
+#: unhelpful but wrong, and wrong in an expensive direction: it tells the
+#: operator to invent a subject from scratch when the actionable truth is that
+#: the subject is there and needs to be **bigger** (1.3 % against a target of
+#: 8–15 %).  #344 established that no saliency tuning reaches 1.5 % from below
+#: without flooding the mask to 65–72 % of the frame, so the floor, not the
+#: detector, was the thing that was wrong.
+ANCHOR_MIN_AREA: float = 0.008
 
-#: The reference band for a subject's share of the picture: Red Raion's median
-#: is **11.3 %** (p10 3.3 %, p90 24.9 %), so 8–15 % brackets the median without
-#: pretending the tails are wrong — outside it is a WARN with the direction
-#: named, never a FAIL.
+#: **Quality band — "is it big enough", asked only of a subject that already
+#: cleared :data:`ANCHOR_MIN_AREA`.**  The reference band for a subject's share
+#: of the picture: Red Raion's median is **11.3 %** (p10 3.3 %, p90 24.9 %), so
+#: 8–15 % brackets the median without pretending the tails are wrong — outside
+#: it is a WARN with the direction named, never a FAIL.  Untouched by #345:
+#: lowering the detection floor changes *which frames get judged*, never the
+#: standard they are judged against.
 ANCHOR_AREA_MIN: float = 0.08
 ANCHOR_AREA_MAX: float = 0.15
 
@@ -380,6 +402,9 @@ ANCHOR_OFF_SPEC_ADVICE = (
     "有主体但不在竞品的构图区间内（面积 8–15%、偏心 ≤0.3，实测中位 11.3% / 0.236）。"
     "这不致命——不是每个镜头都要标准锚点——但主体太小抓不住视线、太大会糊住整个画幅、"
     "太偏则观众的视线被带向边缘那圈瑕疵。"
+    "注意：主体是找到了的，要改的是它的大小/位置，不是从头加一个主体——"
+    "偏小就把它拉近或放大（提示词写明主体占画面 1/3 左右、镜头更贴近），"
+    "偏大就退远一点，偏心就把它挪回中央 1/3 区，然后重生成再体检一次。"
 )
 
 #: Non-square is legitimate (fisheye / 16:9 routes), so this is guidance, not
