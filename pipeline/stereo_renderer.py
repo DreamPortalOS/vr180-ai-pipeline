@@ -31,12 +31,14 @@ class StereoRenderer:
         max_disparity: float = 0.02,  # Max shift as fraction of image width (~0.02 for comfortable VR180)
         temporal_smooth: bool = True,
         convergence: float = 0.3,  # Convergence plane depth (fraction of max depth)
+        src_hfov: float | None = None,  # Source horizontal FOV in degrees (None = auto from projection)
     ):
         self.ipd = ipd
         self.focal_length_px = focal_length_px
         self.max_disparity = max_disparity
         self.temporal_smooth = temporal_smooth
         self.convergence = convergence
+        self.src_hfov = src_hfov
         self._prev_disparity: np.ndarray | None = None
 
     def render(self, frame: np.ndarray, depth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -53,11 +55,11 @@ class StereoRenderer:
 
         H, W = frame.shape[:2]
 
-        # Auto-compute focal length in pixels (use local variable to avoid side effects)
+        # Auto-compute focal length in pixels from source hfov (or legacy 70° default)
         focal_length_px = self.focal_length_px
         if focal_length_px is None:
-            # Assume ~70° horizontal FOV
-            focal_length_px = W / (2 * np.tan(np.radians(35)))
+            hfov_deg = self.src_hfov if self.src_hfov is not None else 70.0
+            focal_length_px = W / (2 * np.tan(np.radians(hfov_deg / 2)))
 
         # Compute per-pixel disparity shift
         disparity = self._compute_disparity(depth, focal_length_px)
@@ -81,9 +83,10 @@ class StereoRenderer:
         right_x = grid_x - disparity
         right_view = cv2.remap(frame, right_x, grid_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-        # Inpaint disocclusion holes
-        left_view = self._inpaint_holes(left_view)
-        right_view = self._inpaint_holes(right_view)
+        # Inpaint disocclusion holes — pass remap coords so holes along object
+        # edges (not just image borders) are detected and repaired.
+        left_view = self._inpaint_holes(left_view, map_x=left_x, map_y=grid_y)
+        right_view = self._inpaint_holes(right_view, map_x=right_x, map_y=grid_y)
 
         return left_view, right_view
 
@@ -109,33 +112,47 @@ class StereoRenderer:
 
         return np.clip(disp, -max_px, max_px).astype(np.float32)
 
-    def _inpaint_holes(self, image: np.ndarray) -> np.ndarray:
-        """Find and inpaint disocclusion holes (black/zero strips at edges).
+    def _inpaint_holes(
+        self, image: np.ndarray, map_x: np.ndarray | None = None, map_y: np.ndarray | None = None
+    ) -> np.ndarray:
+        """Find and inpaint disocclusion holes.
 
-        Uses edge-aware detection: only detects holes near image borders
-        to avoid false positives on legitimately dark regions in the scene.
+        Two detection paths:
+
+        1. ``map_x``/``map_y`` given (from ``render``): any pixel whose source
+           coordinate falls **outside** the image is a disocclusion hole — mask
+           it.  This catches holes **anywhere** in the frame, including along
+           object edges (the bug that produced "transparent" spots on the drone
+           body and crystal).
+        2. No maps given (legacy callers): fall back to black-pixel detection
+           with a border-restricted mask (original behaviour).
+
+        The border-only mask was the historical bug: it left disocclusion
+        along object contours untouched, which the stereo warp then filled
+        with ``BORDER_REPLICATE`` smearing — the "transparent" artefact the
+        owner reported.
         """
         import cv2
 
-        # Detect black regions (holes from shifting)
-        gray = image.mean(axis=2)
-        raw_mask = (gray < 1).astype(np.uint8)
+        H, W = image.shape[:2]
 
-        # Only consider holes within a border region (where disocclusion occurs)
-        # This prevents false positives on legitimately dark scene content
-        _H, W = raw_mask.shape
-        border_width = max(int(W * 0.05), 5)  # 5% of width or at least 5px
-        border_mask = np.zeros_like(raw_mask)
-        border_mask[:border_width, :] = 1  # top
-        border_mask[-border_width:, :] = 1  # bottom
-        border_mask[:, :border_width] = 1  # left
-        border_mask[:, -border_width:] = 1  # right
-
-        # Combine: only inpaint dark pixels near borders
-        mask = (raw_mask & border_mask).astype(np.uint8) * 255
+        if map_x is not None and map_y is not None:
+            # Path 1: precise — pixels that map outside the source image.
+            outside = (map_x < 0) | (map_x >= W) | (map_y < 0) | (map_y >= H)
+            mask = outside.astype(np.uint8) * 255
+        else:
+            # Path 2: legacy — only border dark pixels.
+            gray = image.mean(axis=2)
+            raw_mask = (gray < 1).astype(np.uint8)
+            border_width = max(int(W * 0.05), 5)
+            border_mask = np.zeros_like(raw_mask)
+            border_mask[:border_width, :] = 1
+            border_mask[-border_width:, :] = 1
+            border_mask[:, :border_width] = 1
+            border_mask[:, -border_width:] = 1
+            mask = (raw_mask & border_mask).astype(np.uint8) * 255
 
         if mask.sum() > 0:
-            # Dilate mask slightly to catch edge pixels
             kernel = np.ones((3, 3), np.uint8)
             mask = cv2.dilate(mask, kernel, iterations=1)
             image = cv2.inpaint(image, mask, 5, cv2.INPAINT_TELEA)
