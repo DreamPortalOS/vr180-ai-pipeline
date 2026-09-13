@@ -1080,17 +1080,86 @@ def test_canyon_still_finds_the_aircraft_not_the_whitewater() -> None:
     river, not subject.
 
     Note for #345: the detector picks the aircraft here (0.504, 0.359) but its
-    coherent silhouette measures only **0.53 %** of this frame — under the
-    0.8 % detection floor — so this still reports 「没有锚点」.  That is *not*
-    asserted either way: pinning it would enshrine the verdict the card calls
-    wrong, and loosening the floor to 0.53 % would leave only 2.4× to the
-    loudest subjectless fixture.  The gap is recorded in the #345 PR for the
-    lead to rule on; what this test guards is unchanged — the foam must not win.
+    opened core measures only **0.53 %** of this frame — under the 0.8 %
+    detection floor.  #348 resolved that gap with the rescue
+    (:func:`check_source_quality.anchor_stats` re-grows a credible-but-
+    sub-floor core to its full pre-morphology extent), so this still now reads
+    ~1.38 % and reports 「面积偏小」; what this test guards is unchanged — the
+    foam must not win.
     """
     stats = csq.anchor_stats(csq.read_still(CANYON_STILL))
 
     assert stats["centroid_x"] == pytest.approx(0.50, abs=0.12), f"not the aircraft: {stats}"
     assert stats["centroid_y"] < 0.60, f"still on the whitewater: {stats}"
+
+
+@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=f"canyon still not present: {CANYON_STILL}")
+def test_a_sub_floor_core_is_rescued_to_its_full_extent() -> None:
+    """Acceptance (#348): the 2048² drone measures its subject, not its skeleton.
+
+    The opening eats the quadcopter's thin arms exactly as it eats specks, so
+    the opened core reads 0.53 % — under the detection floor — for a subject
+    whose true extent is 1.38 %.  The rescue re-grows the winning core to its
+    pre-morphology extent; these assertions pin the rescued verdict (found,
+    area above the floor but below the quality band, centroid still on the
+    airframe within ±0.12 per axis of the measured (0.504, 0.359)) and, via
+    the ``rescue=False`` pair, that the rescue is load-bearing rather than
+    decorative: switch it off and this frame is back to 「没有锚点」.
+    """
+    frame = csq.read_still(CANYON_STILL)
+    rescued = csq.anchor_stats(frame)
+    bare = csq.anchor_stats(frame, rescue=False)
+
+    assert rescued["found"], f"the drone must be found at all: {rescued}"
+    assert csq.ANCHOR_MIN_AREA < rescued["area"] < csq.ANCHOR_AREA_MIN, (
+        f"the drone must land between the detection floor and the quality band: {rescued}"
+    )
+    assert rescued["area"] >= 2.0 * bare["area"], (
+        f"the rescue must more than double the eroded skeleton's area: {rescued} vs {bare}"
+    )
+    assert abs(rescued["centroid_x"] - 0.504) <= 0.12, f"off the airframe: {rescued}"
+    assert abs(rescued["centroid_y"] - 0.359) <= 0.12, f"off the airframe: {rescued}"
+    assert not bare["found"], f"disabling the rescue must restore the #348 bug: {bare}"
+
+
+@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=f"canyon still not present: {CANYON_STILL}")
+def test_the_rescue_is_size_invariant() -> None:
+    """Acceptance (#348): the same still at 1024²/2048²/2880² measures the same.
+
+    All anchor analysis runs at :data:`check_source_quality.ANCHOR_ANALYSIS_MAX_DIM`,
+    so the rescued area must be essentially identical regardless of source
+    resolution — the card's bound is a 30 % relative spread, measured <1 %.
+    """
+    frame = csq.read_still(CANYON_STILL)
+    areas = []
+    for size in (1024, 2048, 2880):
+        img = frame if size == frame.shape[0] else cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
+        stats = csq.anchor_stats(img)
+        assert stats["found"], f"{size}² lost the subject: {stats}"
+        areas.append(stats["area"])
+
+    spread = (max(areas) - min(areas)) / min(areas)
+    assert spread <= 0.30, f"size-dependent measurement: {areas} (spread {spread:.1%})"
+
+
+@pytest.mark.skipif(not OWNER_KEYFRAME.is_file(), reason=f"owner keyframe not present: {OWNER_KEYFRAME}")
+def test_the_rescue_leaves_established_and_noise_cores_alone() -> None:
+    """The rescue is gated on both sides and must stay that way.
+
+    A core that already clears the floor (the owner's keyframe at 1.30 %) must
+    measure *identically* with and without the rescue — the #345 pins depend on
+    it.  And the rescue must not fabricate anchors out of specks: every
+    subjectless fixture's sub-floor core stays sub-floor, because cores under
+    ``ANCHOR_RESCUE_CORE_FLOOR`` × the detection floor are not re-grown.
+    """
+    frame = csq.read_still(OWNER_KEYFRAME)
+    assert csq.anchor_stats(frame) == csq.anchor_stats(frame, rescue=False), (
+        "the rescue must not touch a core that already clears the floor"
+    )
+
+    for seed in range(1, 9):
+        stats = csq.anchor_stats(subjectless_frame(seed=seed))
+        assert not stats["found"], f"seed {seed} grew an anchor out of specks: {stats}"
 
 
 # ---------------------------------------------------------------------------

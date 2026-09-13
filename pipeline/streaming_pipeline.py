@@ -905,6 +905,7 @@ class StreamingPipeline:
         self.stereo_renderer = stereo_renderer or StereoRenderer(
             ipd=ipd,
             max_disparity=max_disparity,
+            src_hfov=src_hfov,
         )
         self.depth_backend_name = depth_backend_name or "depth-anything"
         self.stereo_backend_name = stereo_backend_name or "default"

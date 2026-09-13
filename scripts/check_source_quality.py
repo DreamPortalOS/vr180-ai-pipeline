@@ -323,6 +323,18 @@ ANCHOR_OFFSET_MAX: float = 0.30
 #: forgiving gate for a check that only ever WARNs.
 ANCHOR_DETECTED_FRAC_MIN: float = 0.5
 
+#: Smallest winning core — as a fraction of the detection floor — that still
+#: earns the #348 rescue.  The opening that deletes noise specks also erodes a
+#: real subject's thin extremities (#348: on the 2048² drone keyframe, a
+#: 1.38 %-of-frame subject is eaten down to a 0.53 % core, under the floor).
+#: The rescue re-grows such a core to its full pre-morphology extent — but the
+#: amplification is largest exactly where the evidence is weakest: on the
+#: subjectless fixtures, cores of 0.06–0.22 % restore to 0.3–1.0 %, so
+#: rescuing every sub-floor core would fabricate anchors out of specks.
+#: Measured separation: real-subject cores ≥ 0.53 %, noise cores ≤ 0.22 % —
+#: 0.4× the floor (0.32 %) sits between them with headroom on both sides.
+ANCHOR_RESCUE_CORE_FLOOR: float = 0.4
+
 #: Seconds allowed for one ffmpeg/ffprobe call.
 FFMPEG_TIMEOUT: float = 300.0
 
@@ -1173,6 +1185,7 @@ def anchor_stats(
     kernel: int = ANCHOR_MORPH_KERNEL,
     sigma: float = ANCHOR_CENTER_PRIOR_SIGMA,
     min_area: float = ANCHOR_MIN_AREA,
+    rescue: bool = True,
 ) -> dict[str, float]:
     """Locate the frame's anchor and report its area share and eccentricity.
 
@@ -1210,6 +1223,23 @@ def anchor_stats(
     frame-filling region and report a giant, perfectly-centred subject.  Opening
     first deletes them and leaves nothing above ``min_area``.
 
+    But opening is also a measurement error on real subjects (#348): it erodes
+    thin extremities — a drone's arms — as effectively as it erodes specks, and
+    on the 2048² keyframe that alone pushed a 1.38 %-of-frame subject under the
+    detection floor (its opened core measures 0.53 %).  The fix is a **rescue**,
+    applied only when it is needed and only where it is safe.  If the winning
+    core already clears the detection floor, the subject is established and the
+    conservative core measurement stands — every fixture's numbers are
+    unchanged.  If the core is too small to be credible evidence of a subject —
+    under :data:`ANCHOR_RESCUE_CORE_FLOOR` × ``min_area`` — restoration would
+    amplify speck noise four- to five-fold, so it is withheld.  Only a core in
+    between (credible, yet sub-floor) is re-grown to its full pre-morphology
+    extent: the union of the core and every raw-mask component continuous with
+    it — open-by-reconstruction for exactly one region.  Pass ``rescue=False``
+    to measure the bare core — the pre-#348 behaviour — which exists so the
+    regression proving the rescue is load-bearing can disable exactly this
+    step.
+
     ``found`` is the answer to "is there an anchor"; ``area``/``offset`` are only
     meaningful when it is true.  ``centroid_x``/``centroid_y`` are the picked
     region's centre in ``[0, 1]`` frame coordinates and exist so that a
@@ -1221,14 +1251,14 @@ def anchor_stats(
         raise ValueError(f"kernel must be >= 1, got {kernel}")
     saliency = structured_saliency(frame)
     height, width = saliency.shape
-    _, mask = cv2.threshold(
+    _, raw_mask = cv2.threshold(
         np.clip(saliency * 255.0, 0, 255).astype(np.uint8),
         0,
         1,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU,
     )
     element = np.ones((kernel, kernel), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, element)
+    mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, element)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, element)
 
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
@@ -1260,6 +1290,26 @@ def anchor_stats(
     pixels = int(stats[best_index, cv2.CC_STAT_AREA])
     area = pixels / float(height * width)
     blob_x, blob_y = centroids[best_index]
+
+    # #348: rescue a credible-but-sub-floor core by re-growing it to its full
+    # pre-morphology extent.  The opening that deletes noise specks also eats
+    # a real subject's thin extremities — on the 2048² drone keyframe it alone
+    # pushed a 1.38 %-of-frame subject under the 0.8 % detection floor, leaving
+    # a 0.53 % core.  Every raw-mask component continuous with the core is part
+    # of the same subject; unioning them measures the subject, not its eroded
+    # skeleton.  Gated on ANCHOR_RESCUE_CORE_FLOOR so specks are not amplified.
+    if rescue and ANCHOR_RESCUE_CORE_FLOOR * min_area <= area < min_area:
+        _count_raw, labels_raw, _stats_raw, _cents_raw = cv2.connectedComponentsWithStats(raw_mask, 8)
+        under_core = labels_raw[labels == best_index]
+        frag_ids = np.unique(under_core[under_core > 0])
+        if frag_ids.size:
+            region = labels == best_index
+            for r in frag_ids:
+                region |= labels_raw == r
+            area = float(region.sum()) / float(height * width)
+            ys_r, xs_r = np.nonzero(region)
+            blob_x, blob_y = float(xs_r.mean()), float(ys_r.mean())
+
     offset = math.hypot(blob_x - cx, blob_y - cy) / half_diagonal
     return {
         "found": area >= min_area,

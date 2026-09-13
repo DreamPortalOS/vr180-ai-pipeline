@@ -523,7 +523,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-width", type=int, default=None, help="Equirectangular output width per eye")
     parser.add_argument("--output-height", type=int, default=None, help="Equirectangular output height per eye")
-    parser.add_argument("--src-hfov", type=float, default=None, help="Source camera horizontal FOV (degrees)")
+    parser.add_argument(
+        "--src-hfov",
+        type=float,
+        default=None,
+        help=(
+            "Source horizontal FOV in degrees (e.g. 180 for 1:1 equirectangular, "
+            "150 for wide rectilinear). Used to compute the correct stereo focal length. "
+            "When omitted the stereo renderer falls back to 70° (legacy behaviour)."
+        ),
+    )
     parser.add_argument("--max-frames", type=int, default=None, help="Limit number of frames (for testing)")
     parser.add_argument(
         "--chunk-size",
@@ -1644,6 +1653,7 @@ def run_stereo_stage(args, frames, depths):
         max_disparity=args.max_disparity,
         convergence=getattr(args, "convergence", 0.3),
         temporal_smooth=getattr(args, "temporal_smooth", not args.no_temporal),
+        src_hfov=getattr(args, "src_hfov", None),
     )
 
     left_dir = get_temp_dir(args, "left")
