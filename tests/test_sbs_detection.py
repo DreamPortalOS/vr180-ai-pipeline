@@ -87,6 +87,9 @@ def _encode_solid_clip(dest: Path, size: str, color: str, timeout: float = ENCOD
 
     cmd = [
         FFMPEG,
+        # Keep the build banner out of stderr so the tail quoted on failure is
+        # the diagnostic rather than 2 KB of ./configure flags.
+        "-hide_banner",
         "-y",
         "-f",
         "lavfi",
