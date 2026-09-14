@@ -73,6 +73,7 @@ class StereoRenderer:
         src_hfov: float | None = None,  # Source horizontal FOV in degrees (None = auto from projection)
         occlusion_aware: bool = True,  # G-8 (#355): z-buffered forward warp + background-side fill
         edge_align: bool = True,  # G-8 (#355): snap disparity edges to image edges (guided filter)
+        edge_align_radius: float = 0.005,  # G-8 (#355): guided-filter radius as a fraction of the short side
         gradient_limit: float | None = 0.9,  # G-8 (#355): max |d disparity / dx| per eye (None = off)
     ):
         self.ipd = ipd
@@ -83,6 +84,7 @@ class StereoRenderer:
         self.src_hfov = src_hfov
         self.occlusion_aware = occlusion_aware
         self.edge_align = edge_align
+        self.edge_align_radius = edge_align_radius
         self.gradient_limit = gradient_limit
         self._prev_disparity: np.ndarray | None = None
         #: Fraction of pixels filled as disocclusion in the last :meth:`render`,
@@ -207,13 +209,7 @@ class StereoRenderer:
         import cv2
 
         H, W = disparity.shape[:2]
-        # 2% of the short side (58px at 2880).  The radius bounds how far a
-        # depth edge can be dragged back onto its image edge, so it has to
-        # cover the depth map's misalignment; measured on the drone clip it is
-        # also where the halo stops improving and the disparity field starts
-        # being flattened (a 4% radius already costs 21% of the disparity
-        # range — real 3D traded for a better-looking ratio).
-        radius = max(2, round(min(H, W) * 0.02))
+        radius = max(2, round(min(H, W) * self.edge_align_radius))
         ksize = radius * 2 + 1
         if ksize >= min(H, W):  # image too small to filter meaningfully
             return disparity.astype(np.float32)
