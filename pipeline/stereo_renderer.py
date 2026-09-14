@@ -159,6 +159,121 @@ class StereoRenderer:
 
         return np.clip(disp, -max_px, max_px).astype(np.float32)
 
+    def _align_disparity_edges(self, disparity: np.ndarray, frame: np.ndarray) -> np.ndarray:
+        """Snap disparity edges onto image edges (G-8, #355).
+
+        He et al.'s guided filter with the source frame's luma as the guide.
+        Where the guide is flat the result is a local mean (harmless
+        smoothing); where the guide has an edge the result keeps that edge.
+        A depth map whose silhouette is *fatter* than the object therefore
+        stops dragging a ring of background along with the foreground — that
+        ring is one of the two things the owner saw as an "extra edge".
+
+        Built from ``cv2.boxFilter`` alone: ``cv2.ximgproc.guidedFilter``
+        lives in opencv-contrib, which this project does not depend on.
+        """
+        import cv2
+
+        H, W = disparity.shape[:2]
+        radius = max(2, round(min(H, W) * 0.01))
+        ksize = radius * 2 + 1
+        if ksize >= min(H, W):  # image too small to filter meaningfully
+            return disparity.astype(np.float32)
+
+        if frame.ndim == 3 and frame.shape[2] == 3:
+            guide = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        else:
+            guide = frame.reshape(H, W, -1).mean(axis=2).astype(np.float32)
+        guide /= 255.0
+        src = disparity.astype(np.float32)
+
+        def box(x: np.ndarray) -> np.ndarray:
+            return cv2.boxFilter(x, -1, (ksize, ksize), normalize=True, borderType=cv2.BORDER_REFLECT)
+
+        mean_g, mean_d = box(guide), box(src)
+        var_g = box(guide * guide) - mean_g * mean_g
+        cov_gd = box(guide * src) - mean_g * mean_d
+
+        # Guide is in [0, 1]; eps sets the luma contrast below which the
+        # filter smooths rather than preserves (~1% of full range).
+        a = cov_gd / (var_g + 1e-4)
+        b = mean_d - a * mean_g
+        return (box(a) * guide + box(b)).astype(np.float32)
+
+    def _warp_eye(self, frame: np.ndarray, disparity: np.ndarray, sign: int) -> tuple[np.ndarray, float]:
+        """Forward-warp (splat) one eye with a z-buffer, then fill from the background.
+
+        ``sign=+1`` renders the left eye, ``sign=-1`` the right, matching the
+        legacy backward-remap convention (``left_x = x + disparity``): a source
+        pixel at ``x`` lands at ``x - sign * disparity``.
+
+        Unlike a backward remap, a forward splat actually *moves* the
+        silhouette, so the band around a depth discontinuity becomes an
+        explicit hole instead of silently carrying foreground colour into the
+        other eye.  Each hole is then filled from the **background side** —
+        the horizontal neighbour with the *smaller* disparity — so the
+        revealed area gets background, never a smear of the foreground.
+
+        Returns:
+            ``(view, fill_ratio)`` where ``fill_ratio`` is the fraction of
+            output pixels that were holes.
+        """
+        H, W = frame.shape[:2]
+        src3 = frame.reshape(H, W, -1)
+        C = src3.shape[2]
+
+        cols = np.arange(W, dtype=np.float32)[None, :]
+        dest = np.rint(cols - sign * disparity).astype(np.int64)
+        inside = (dest >= 0) & (dest < W)
+
+        row_base = (np.arange(H, dtype=np.int64) * W)[:, None]
+        flat_dest = row_base + np.clip(dest, 0, W - 1)
+
+        # z-buffer — larger disparity means nearer, so the nearest source wins.
+        zbuf = np.full(H * W, -np.inf, dtype=np.float32)
+        np.maximum.at(zbuf, flat_dest[inside], disparity[inside])
+
+        # A source pixel draws iff it owns its destination's z-buffer value.
+        wins = inside & (disparity >= zbuf[flat_dest])
+        src_idx = np.flatnonzero(wins)
+        dst_idx = flat_dest.reshape(-1)[src_idx]
+
+        out = np.zeros((H * W, C), dtype=frame.dtype)
+        out[dst_idx] = src3.reshape(H * W, C)[src_idx]
+        drawn = np.zeros(H * W, dtype=bool)
+        drawn[dst_idx] = True
+
+        drawn2 = drawn.reshape(H, W)
+        holes = ~drawn2
+        fill_ratio = float(holes.sum()) / float(H * W)
+        if not fill_ratio:
+            return out.reshape(frame.shape), 0.0
+
+        out3 = out.reshape(H, W, C)
+        zb = zbuf.reshape(H, W)
+        idx = np.broadcast_to(np.arange(W, dtype=np.int64), (H, W))
+
+        # Nearest drawn column at or to the left / right of every pixel.
+        left_i = np.maximum.accumulate(np.where(drawn2, idx, -1), axis=1)
+        right_i = np.minimum.accumulate(np.where(drawn2, idx, W)[:, ::-1], axis=1)[:, ::-1]
+        has_left, has_right = left_i >= 0, right_i < W
+        lc, rc = np.clip(left_i, 0, W - 1), np.clip(right_i, 0, W - 1)
+
+        rows = np.broadcast_to(np.arange(H, dtype=np.int64)[:, None], (H, W))
+        # The background side is the neighbour with the smaller disparity.
+        take_left = has_left & (~has_right | (zb[rows, lc] <= zb[rows, rc]))
+        pick = np.where(take_left, lc, rc)
+
+        usable = holes & (has_left | has_right)
+        out3[usable] = out3[rows[usable], pick[usable]]
+
+        # A row nothing was drawn into keeps its un-warped source pixels.
+        dead = holes & ~(has_left | has_right)
+        if dead.any():
+            out3[dead] = src3[dead]
+
+        return out3.reshape(frame.shape), fill_ratio
+
     def _inpaint_holes(
         self, image: np.ndarray, map_x: np.ndarray | None = None, map_y: np.ndarray | None = None
     ) -> np.ndarray:
