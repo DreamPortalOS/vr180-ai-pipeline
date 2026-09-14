@@ -27,7 +27,26 @@ full-frame inpainting fix.
 The renderer therefore *forward*-warps (splats) each eye with a z-buffer so the
 silhouette actually moves.  The pixels left empty behind a near object are the
 true disocclusions; they are filled from the **background side** of the
-contour (the neighbour with the smaller disparity), never from the foreground.
+contour, never from the foreground.
+
+.. _disparity-sign:
+
+Which way is "near"?
+--------------------
+Both depth backends in this repo (Depth-Anything V2 through
+:class:`~pipeline.depth_estimator.DepthEstimator`, DepthCrafter through
+:mod:`pipeline.depth_crafter`) emit *inverse* depth normalised to ``[0, 1]``:
+**larger value = nearer**.  :meth:`StereoRenderer._compute_disparity` then
+computes ``(convergence - depth) * …``, so in the field it returns
+
+    **smaller (more negative) disparity = nearer.**
+
+That is the geometrically correct signed disparity: a near surface comes out
+*crossed* (it sits further right in the left eye than in the right), which is
+what puts it in front of the screen plane.  ``nearness = -disparity`` is
+therefore the depth order used by the z-buffer, by the background-side fill,
+and by the gradient limiter — pinned by
+``test_near_object_renders_with_crossed_disparity``.
 """
 
 import logging
@@ -54,6 +73,7 @@ class StereoRenderer:
         src_hfov: float | None = None,  # Source horizontal FOV in degrees (None = auto from projection)
         occlusion_aware: bool = True,  # G-8 (#355): z-buffered forward warp + background-side fill
         edge_align: bool = True,  # G-8 (#355): snap disparity edges to image edges (guided filter)
+        gradient_limit: float | None = 0.9,  # G-8 (#355): max |d disparity / dx| per eye (None = off)
     ):
         self.ipd = ipd
         self.focal_length_px = focal_length_px
@@ -63,6 +83,7 @@ class StereoRenderer:
         self.src_hfov = src_hfov
         self.occlusion_aware = occlusion_aware
         self.edge_align = edge_align
+        self.gradient_limit = gradient_limit
         self._prev_disparity: np.ndarray | None = None
         #: Fraction of pixels filled as disocclusion in the last :meth:`render`,
         #: as ``{"left": float, "right": float}`` (G-8 #355 — also logged).
@@ -97,6 +118,15 @@ class StereoRenderer:
         # along with the foreground — visible as the same halo.
         if self.edge_align:
             disparity = self._align_disparity_edges(disparity, frame)
+
+        # G-8 (#355): bound the horizontal disparity gradient.  A depth cliff
+        # of Δ px is Δ px of content that exists in neither eye; bounding the
+        # gradient turns that tear into a Δ/g-wide ramp of *real, stretched*
+        # pixels, which both eyes still share.  Applied before the temporal EMA
+        # so the smoothed field stays gradient-limited too (a convex
+        # combination of g-Lipschitz fields is g-Lipschitz).
+        if self.gradient_limit is not None:
+            disparity = self._limit_disparity_gradient(disparity, self.gradient_limit)
 
         # Temporal smoothing
         if self.temporal_smooth and self._prev_disparity is not None:
@@ -138,10 +168,12 @@ class StereoRenderer:
         return left_view, right_view
 
     def _compute_disparity(self, depth: np.ndarray, focal_length_px: float) -> np.ndarray:
-        """Convert depth to pixel disparity.
+        """Convert depth to signed pixel disparity.
 
-        Formula: disparity = (ipd * focal_length_px) / depth
-        Closer objects get larger disparity (more 3D pop-out).
+        *depth* is the backends' normalised **inverse** depth (larger = nearer),
+        so the returned field is *smaller = nearer* — see :ref:`disparity-sign`.
+        Objects nearer than the convergence plane come out negative (crossed,
+        in front of the screen), objects beyond it positive.
         """
         # Normalize depth to a meaningful range
         d_min, d_max = depth.min(), depth.max()
@@ -151,7 +183,7 @@ class StereoRenderer:
         # Objects closer than convergence pop out (positive disparity)
         # Objects farther recede (negative disparity)
         d_conv = self.convergence
-        depth_rel = d_conv - depth_norm  # positive = closer than convergence
+        depth_rel = d_conv - depth_norm  # negative = nearer than convergence
 
         # Compute disparity
         max_px = self.max_disparity * depth.shape[1]
@@ -206,6 +238,74 @@ class StereoRenderer:
         b = mean_d - a * mean_g
         return (box(a) * guide + box(b)).astype(np.float32)
 
+    @staticmethod
+    def _limit_disparity_gradient(disparity: np.ndarray, limit: float) -> np.ndarray:
+        """Bound ``|∂disparity/∂x|`` by *limit* (G-8, #355).
+
+        Returns the **largest** *limit*-Lipschitz field that is everywhere ≤
+        the input: the min-plus erosion by the cone ``k ↦ limit·|k|``.
+        Equivalently, it dilates ``nearness = -disparity`` (see
+        :ref:`disparity-sign`).  Three properties make this the right tool:
+
+        * Where the field already satisfies the bound the output is bit-exact
+          with the input.  This is not a blur — undisturbed geometry, and in
+          particular the entire far field, is untouched.
+        * It only ever pulls *towards* the viewer, so a foreground object keeps
+          its full pop-out.  What changes is a ``Δ/limit``-wide band of
+          background beside each contour, ramped in instead of stepped.
+        * The result is still bounded by the input's own range, so it can never
+          push disparity past the ``max_disparity`` comfort clip.
+
+        Why bound the gradient at all: the per-eye mapping is
+        ``x ↦ x ∓ disparity(x)``, whose local scale factor is ``1 ∓ d'(x)`` —
+        *with opposite signs in the two eyes*.  Where ``|d'| > 1`` the mapping
+        stops being monotone and a band of width ``≈Δ`` exists in neither eye;
+        no amount of inpainting makes the eyes agree about invented pixels.
+        That band is what an opaque body being locally see-through looks like.
+
+        The default ``limit`` (0.9) is therefore chosen just under 1: every
+        destination column stays within one pixel of some source pixel, so the
+        sub-pixel splat in :meth:`_warp_eye` covers the frame with real,
+        stretched content and there is nothing left to invent.  Pushing it
+        lower also shrinks the inter-eye width ratio ``(1+d')/(1-d')``, but at
+        the cost of a proportionally wider ramp, so it is left as a knob rather
+        than made the default.
+
+        The cost is honest and local: background within ``Δ/limit`` px of a
+        contour sits at an intermediate depth rather than its true one.
+
+        Args:
+            disparity: Per-eye disparity field, ``(H, W)`` float.
+            limit: Max change in disparity per pixel of x.  ``≤ 0`` is a no-op
+                (an unbounded-gradient request).
+
+        Returns:
+            The gradient-limited field, float32.
+        """
+        out = -disparity.astype(np.float32)  # work on nearness; negated back below
+        if limit <= 0:
+            return disparity.astype(np.float32, copy=True)
+
+        W = out.shape[1]
+        # A cone of radius R is reachable by composing cones of radius
+        # 1, 2, 4, …  (max-plus: cone_a ∘ cone_b = cone_{a+b}), so the whole
+        # envelope costs O(log W) full-array passes instead of O(W) column
+        # steps.  R only has to span the largest cliff the field can hold.
+        span = float(out.max() - out.min())
+        reach = min(W - 1, int(np.ceil(span / limit)) if span > 0 else 0)
+        step = 1
+        while step <= reach:
+            drop = limit * step
+            shifted_left = np.empty_like(out)  # neighbour `step` px to the right
+            shifted_left[:, : W - step] = out[:, step:] - drop
+            shifted_left[:, W - step :] = -np.inf
+            shifted_right = np.empty_like(out)  # neighbour `step` px to the left
+            shifted_right[:, step:] = out[:, : W - step] - drop
+            shifted_right[:, :step] = -np.inf
+            out = np.maximum(out, np.maximum(shifted_left, shifted_right))
+            step *= 2
+        return -out
+
     def _warp_eye(self, frame: np.ndarray, disparity: np.ndarray, sign: int) -> tuple[np.ndarray, float]:
         """Forward-warp (splat) one eye with a z-buffer, then fill from the background.
 
@@ -217,8 +317,14 @@ class StereoRenderer:
         silhouette, so the band around a depth discontinuity becomes an
         explicit hole instead of silently carrying foreground colour into the
         other eye.  Each hole is then filled from the **background side** —
-        the horizontal neighbour with the *smaller* disparity — so the
-        revealed area gets background, never a smear of the foreground.
+        the horizontal neighbour that is *farther*, i.e. the one with the
+        *larger* disparity (see :ref:`disparity-sign`) — so the revealed area
+        gets background, never a smear of the foreground.
+
+        The sign matters twice, and both ways round it is exactly the artefact
+        this card exists to remove: an inverted z-buffer lets the background
+        paint over the object (holes *in* an opaque body), and an inverted fill
+        paints the foreground colour into the revealed band (the halo).
 
         Returns:
             ``(view, fill_ratio)`` where ``fill_ratio`` is the fraction of
@@ -227,31 +333,64 @@ class StereoRenderer:
         H, W = frame.shape[:2]
         src3 = frame.reshape(H, W, -1)
         C = src3.shape[2]
+        n = H * W
 
         cols = np.arange(W, dtype=np.float32)[None, :]
-        dest = np.rint(cols - sign * disparity).astype(np.int64)
-        inside = (dest >= 0) & (dest < W)
-
+        xs = np.broadcast_to(np.arange(W, dtype=np.int64), (H, W))
         row_base = (np.arange(H, dtype=np.int64) * W)[:, None]
-        flat_dest = row_base + np.clip(dest, 0, W - 1)
 
-        # z-buffer — larger disparity means nearer, so the nearest source wins.
-        zbuf = np.full(H * W, -np.inf, dtype=np.float32)
-        np.maximum.at(zbuf, flat_dest[inside], disparity[inside])
+        # Sub-pixel splat: a source pixel lands at a fractional destination and
+        # is shared between the two columns straddling it (a tent kernel).
+        # Rounding to the nearest column instead — the obvious implementation —
+        # costs up to half a pixel of shift *per eye*, in opposite directions,
+        # which is a stereo error the viewer sees on fine texture.
+        dest_f = cols - sign * disparity
+        base = np.floor(dest_f).astype(np.int64)
+        frac = (dest_f - base).astype(np.float32)
 
-        # A source pixel draws iff it owns its destination's z-buffer value.
-        wins = inside & (disparity >= zbuf[flat_dest])
-        src_idx = np.flatnonzero(wins)
-        dst_idx = flat_dest.reshape(-1)[src_idx]
+        taps = []
+        for k, weight in ((0, 1.0 - frac), (1, frac)):
+            col = base + k
+            live = (col >= 0) & (col < W) & (weight > 0)
+            taps.append((row_base + np.clip(col, 0, W - 1), live, weight))
 
-        out = np.zeros((H * W, C), dtype=frame.dtype)
-        out[dst_idx] = src3.reshape(H * W, C)[src_idx]
-        drawn = np.zeros(H * W, dtype=bool)
-        drawn[dst_idx] = True
+        # z-buffer on nearness = -disparity: the *smallest* disparity is the
+        # nearest surface, so it is the one that survives a collision.
+        zbuf = np.full(n, np.inf, dtype=np.float32)
+        for flat, live, _ in taps:
+            np.minimum.at(zbuf, flat[live], disparity[live])
+
+        # Which source column owns each destination.  Ties are pixels of the
+        # same surface, so either answer is right.
+        winner = np.full(n, -(W + 2), dtype=np.int64)
+        for flat, live, _ in taps:
+            owns = live & (disparity <= zbuf[flat])
+            winner[flat[owns]] = xs[owns]
+
+        # Accumulate the tent, but only from the surface that won: neighbours
+        # within one column of the winner are the same surface, anything
+        # further away is the occluded one and must not bleed through.
+        acc = np.zeros((n, C), dtype=np.float32)
+        wsum = np.zeros(n, dtype=np.float32)
+        for flat, live, weight in taps:
+            sel = live & (np.abs(xs - winner[flat]) <= 1)
+            f, w = flat[sel], weight[sel]
+            wsum += np.bincount(f, w, minlength=n)
+            for c in range(C):
+                acc[:, c] += np.bincount(f, w * src3[:, :, c][sel], minlength=n)
+
+        drawn = wsum > 0
+        out = np.zeros((n, C), dtype=frame.dtype)
+        np.divide(acc, wsum[:, None], out=acc, where=drawn[:, None])
+        values = acc[drawn]
+        if np.issubdtype(frame.dtype, np.integer):
+            lo, hi = np.iinfo(frame.dtype).min, np.iinfo(frame.dtype).max
+            values = np.rint(values).clip(lo, hi)
+        out[drawn] = values.astype(frame.dtype)
 
         drawn2 = drawn.reshape(H, W)
         holes = ~drawn2
-        fill_ratio = float(holes.sum()) / float(H * W)
+        fill_ratio = float(holes.sum()) / float(n)
         if not fill_ratio:
             return out.reshape(frame.shape), 0.0
 
@@ -266,8 +405,8 @@ class StereoRenderer:
         lc, rc = np.clip(left_i, 0, W - 1), np.clip(right_i, 0, W - 1)
 
         rows = np.broadcast_to(np.arange(H, dtype=np.int64)[:, None], (H, W))
-        # The background side is the neighbour with the smaller disparity.
-        take_left = has_left & (~has_right | (zb[rows, lc] <= zb[rows, rc]))
+        # The background side is the *farther* neighbour — the larger disparity.
+        take_left = has_left & (~has_right | (zb[rows, lc] >= zb[rows, rc]))
         pick = np.where(take_left, lc, rc)
 
         usable = holes & (has_left | has_right)
