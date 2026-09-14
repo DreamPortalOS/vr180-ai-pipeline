@@ -73,7 +73,7 @@ class StereoRenderer:
         src_hfov: float | None = None,  # Source horizontal FOV in degrees (None = auto from projection)
         occlusion_aware: bool = True,  # G-8 (#355): z-buffered forward warp + background-side fill
         edge_align: bool = True,  # G-8 (#355): snap disparity edges to image edges (guided filter)
-        edge_align_radius: float = 0.005,  # G-8 (#355): guided-filter radius as a fraction of the short side
+        edge_align_radius: float = 0.005,  # G-8 (#355): guided-filter radius / short side — see _align_disparity_edges
         gradient_limit: float | None = 0.9,  # G-8 (#355): max |d disparity / dx| per eye (None = off)
     ):
         self.ipd = ipd
@@ -205,6 +205,24 @@ class StereoRenderer:
 
         Built from ``cv2.boxFilter`` alone: ``cv2.ximgproc.guidedFilter``
         lives in opencv-contrib, which this project does not depend on.
+
+        **Radius.**  ``edge_align_radius`` is a fraction of the short side, and
+        it is a two-sided cost, so the default is measured rather than guessed:
+
+        * A radius of ``r`` can only drag a depth edge that is misaligned by up
+          to roughly ``r / 2`` px (pinned by
+          ``test_edge_align_radius_bounds_how_far_an_edge_can_be_dragged``), so
+          too small a radius simply does nothing.
+        * Everywhere the guide is *flat* the filter is a plain local mean, so
+          too large a radius flattens the far field's real structure.  Measured
+          on the drone clip's frame 120 (``gen_1x1_4k_drone.mp4``, DepthCrafter
+          depth, 2880² equirect per eye), raising this from 0.005 to 0.02 costs
+          **+143%** inter-eye block-match error in the far field (2.6 → 7.8 px
+          MAE) — it trades away real background 3D to make the contour ratio
+          look better, which is exactly what #355 rules out.
+
+        0.005 (14 px at 2880) is the largest radius that left the far field
+        within the card's 10% budget.
         """
         import cv2
 

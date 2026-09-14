@@ -182,27 +182,55 @@ def test_uniform_depth_translates_exactly_with_only_border_holes():
     assert renderer.last_fill_ratio == {"left": shift / W, "right": shift / W}
 
 
-def test_edge_align_snaps_disparity_onto_the_image_edge():
-    """A depth silhouette fatter than the object is pulled back to the edge.
-
-    The image edge sits at column 120; the depth edge is deliberately 2px "fat"
-    at column 122.  Guided filtering with the image as guide snaps the
-    disparity transition back onto the image edge.  The correction is bounded
-    by the filter radius (2% of the short side), which is the point: it fixes
-    the depth-map misalignment that fringes a contour, and leaves genuinely
-    distant structure alone.
-    """
-    size, img_edge, depth_edge = 500, 120, 122
+def _snapped_crossing(size, img_edge, depth_edge, radius):
+    """Where the aligned disparity crosses, for a depth edge `depth_edge - img_edge` px fat."""
     frame = np.zeros((size, size, 3), np.uint8)
     frame[:, :] = BG
     frame[:, img_edge:] = FG
     disparity = np.zeros((size, size), np.float32)
     disparity[:, depth_edge:] = 10.0
 
-    aligned = StereoRenderer(temporal_smooth=False)._align_disparity_edges(disparity, frame)
+    renderer = StereoRenderer(temporal_smooth=False, edge_align_radius=radius)
+    aligned = renderer._align_disparity_edges(disparity, frame)
+    return int(np.argmax(aligned[size // 2] > 5.0))
 
-    crossing = int(np.argmax(aligned[size // 2] > 5.0))
-    assert crossing == img_edge, f"edge not snapped onto the image edge (at {crossing})"
+
+def test_edge_align_snaps_disparity_onto_the_image_edge():
+    """A depth silhouette fatter than the object is pulled back to the edge.
+
+    The image edge sits at column 120; the depth edge is deliberately 2px "fat"
+    at column 122.  Guided filtering with the image as guide snaps the
+    disparity transition back onto the image edge — that is the depth-map
+    misalignment that fringes a contour.
+    """
+    crossing = _snapped_crossing(500, 120, 122, radius=0.01)
+
+    assert crossing == 120, f"edge not snapped onto the image edge (at {crossing})"
+
+
+def test_edge_align_radius_bounds_how_far_an_edge_can_be_dragged():
+    """The radius is the budget: it corrects roughly ``radius / 2`` px of fat.
+
+    This is why :meth:`_align_disparity_edges` cannot simply be given a tiny
+    radius "to be safe" — below the depth map's own misalignment it is a no-op.
+    A radius of 5px leaves an 8px-fat edge exactly where it was; 20px snaps it.
+    """
+    assert _snapped_crossing(500, 120, 128, radius=0.01) == 128  # radius 5 — no reach
+    assert _snapped_crossing(500, 120, 128, radius=0.04) < 124  # radius 20 — dragged back
+
+
+def test_edge_align_radius_default_is_the_measured_one():
+    """0.005 of the short side, and it is on by default.
+
+    Pinned because it is a *measured* setting, not a guess: on the drone clip
+    (#355) a 0.02 radius costs +143% far-field inter-eye error — the filter is
+    a local mean wherever the guide is flat, so a large radius buys a better
+    contour ratio by flattening real background 3D.  See
+    :meth:`StereoRenderer._align_disparity_edges`.
+    """
+    renderer = StereoRenderer()
+    assert renderer.edge_align is True
+    assert renderer.edge_align_radius == 0.005
 
 
 # ---------------------------------------------------------------------------
