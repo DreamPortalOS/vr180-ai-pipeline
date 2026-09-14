@@ -165,24 +165,41 @@ class TestFixtureEncodeGuard:
         message = str(excinfo.value)
         assert "SBS fixture encode failed" in message
         assert "exited with code" in message
-        assert "ffmpeg stderr" in message
-        # The real diagnostic, not an empty placeholder.
-        assert "<no stderr captured>" not in message
-        assert "Error opening input" in message
         # The command line is present so the failure is reproducible by hand.
         assert "color=c=red:s=0x0" in message
 
-    def test_encode_timeout_fails_loudly(self, tmp_path):
-        """A timed-out encode must fail, not fall through with no file."""
-        if shutil.which(FFMPEG) is None:
-            pytest.skip(f"{FFMPEG!r} is not on PATH")
+        # Everything after the header is ffmpeg's own words.  Assert on the
+        # rejected geometry rather than on a particular phrasing: ffmpeg has
+        # reworded "Error opening input" between releases, and CI runs whatever
+        # the runner's apt ships.
+        _, marker, ffmpeg_said = message.partition("ffmpeg stderr")
+        assert marker, message
+        assert "<no stderr captured>" not in ffmpeg_said
+        assert "0x0" in ffmpeg_said
+
+    def test_encode_timeout_fails_loudly(self, tmp_path, monkeypatch):
+        """A timed-out encode must fail, not fall through with no file.
+
+        The timeout is injected rather than provoked with a real (immediately
+        killed) ffmpeg: the branch under test is this module's handler, and
+        spawning a process only to kill it costs ~0.5s on Windows for no extra
+        coverage.
+        """
+
+        def _timeout(cmd, **_kwargs):
+            raise subprocess.TimeoutExpired(cmd, 7.0, stderr=b"frame=    0 fps=0.0")
+
+        monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/ffmpeg")
+        monkeypatch.setattr(subprocess, "run", _timeout)
 
         with pytest.raises(pytest.fail.Exception) as excinfo:
-            _encode_solid_clip(tmp_path / "slow.mp4", "192x108", "blue", timeout=0.0)
+            _encode_solid_clip(tmp_path / "slow.mp4", "192x108", "blue", timeout=7.0)
 
         message = str(excinfo.value)
         assert "SBS fixture encode failed" in message
-        assert "timed out after 0.0s" in message
+        assert "timed out after 7.0s" in message
+        # stderr captured before the kill is decoded and shown, not dropped.
+        assert "frame=    0 fps=0.0" in message
 
     def test_missing_ffmpeg_skips_with_a_readable_reason(self, tmp_path, monkeypatch):
         """No encoder on the box is a visible skip, never a silent pass.
