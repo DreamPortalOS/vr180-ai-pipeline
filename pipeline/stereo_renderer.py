@@ -12,9 +12,29 @@ For each pixel at position (x, y) with depth d:
     shift = (ipd * focal_length_px) / d
     x_L = x + shift / 2   (left eye — shift right)
     x_R = x - shift / 2   (right eye — shift left)
+
+Occlusion handling (G-8, #355)
+------------------------------
+A *backward* remap indexed by the destination pixel's own depth (the pre-#355
+behaviour) never produces a hole away from the image border: every output pixel
+samples somewhere inside the source.  What it produces instead is a silhouette
+that does not move while its content does — so a band of width ``≈ disparity``
+around every depth discontinuity carries foreground colour in one eye and
+background colour in the other.  That band is the "extra edge" the owner saw,
+and its width grows with disparity, which is why it survived the #354
+full-frame inpainting fix.
+
+The renderer therefore *forward*-warps (splats) each eye with a z-buffer so the
+silhouette actually moves.  The pixels left empty behind a near object are the
+true disocclusions; they are filled from the **background side** of the
+contour (the neighbour with the smaller disparity), never from the foreground.
 """
 
+import logging
+
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 class StereoRenderer:
@@ -32,6 +52,8 @@ class StereoRenderer:
         temporal_smooth: bool = True,
         convergence: float = 0.3,  # Convergence plane depth (fraction of max depth)
         src_hfov: float | None = None,  # Source horizontal FOV in degrees (None = auto from projection)
+        occlusion_aware: bool = True,  # G-8 (#355): z-buffered forward warp + background-side fill
+        edge_align: bool = True,  # G-8 (#355): snap disparity edges to image edges (guided filter)
     ):
         self.ipd = ipd
         self.focal_length_px = focal_length_px
@@ -39,7 +61,12 @@ class StereoRenderer:
         self.temporal_smooth = temporal_smooth
         self.convergence = convergence
         self.src_hfov = src_hfov
+        self.occlusion_aware = occlusion_aware
+        self.edge_align = edge_align
         self._prev_disparity: np.ndarray | None = None
+        #: Fraction of pixels filled as disocclusion in the last :meth:`render`,
+        #: as ``{"left": float, "right": float}`` (G-8 #355 — also logged).
+        self.last_fill_ratio: dict[str, float] = {"left": 0.0, "right": 0.0}
 
     def render(self, frame: np.ndarray, depth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Generate left and right views.
@@ -64,12 +91,32 @@ class StereoRenderer:
         # Compute per-pixel disparity shift
         disparity = self._compute_disparity(depth, focal_length_px)
 
+        # G-8 (#355): snap disparity edges onto image edges before warping, so
+        # the silhouette we move matches the silhouette the viewer sees.  A
+        # depth map that is "fatter" than the object drags a ring of background
+        # along with the foreground — visible as the same halo.
+        if self.edge_align:
+            disparity = self._align_disparity_edges(disparity, frame)
+
         # Temporal smoothing
         if self.temporal_smooth and self._prev_disparity is not None:
             alpha = 0.3
             disparity = alpha * disparity + (1 - alpha) * self._prev_disparity
         self._prev_disparity = disparity.copy()
 
+        if self.occlusion_aware:
+            left_view, left_fill = self._warp_eye(frame, disparity, sign=+1)
+            right_view, right_fill = self._warp_eye(frame, disparity, sign=-1)
+            self.last_fill_ratio = {"left": left_fill, "right": right_fill}
+            if left_fill or right_fill:
+                log.debug(
+                    "disocclusion fill: left %.3f%% / right %.3f%% of pixels",
+                    left_fill * 100.0,
+                    right_fill * 100.0,
+                )
+            return left_view, right_view
+
+        # Legacy backward-remap path (pre-#355), kept for A/B comparison.
         # Build remap grids
         grid_x, grid_y = np.meshgrid(np.arange(W), np.arange(H))
         grid_x = grid_x.astype(np.float32)
