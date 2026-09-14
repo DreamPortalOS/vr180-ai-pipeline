@@ -175,7 +175,13 @@ class StereoRenderer:
         import cv2
 
         H, W = disparity.shape[:2]
-        radius = max(2, round(min(H, W) * 0.01))
+        # 2% of the short side (58px at 2880).  The radius bounds how far a
+        # depth edge can be dragged back onto its image edge, so it has to
+        # cover the depth map's misalignment; measured on the drone clip it is
+        # also where the halo stops improving and the disparity field starts
+        # being flattened (a 4% radius already costs 21% of the disparity
+        # range — real 3D traded for a better-looking ratio).
+        radius = max(2, round(min(H, W) * 0.02))
         ksize = radius * 2 + 1
         if ksize >= min(H, W):  # image too small to filter meaningfully
             return disparity.astype(np.float32)

@@ -133,9 +133,9 @@ def test_edge_align_snaps_disparity_onto_the_image_edge():
     The image edge sits at column 120; the depth edge is deliberately 2px "fat"
     at column 122.  Guided filtering with the image as guide snaps the
     disparity transition back onto the image edge.  The correction is bounded
-    by the filter radius (1% of the short side), which is the point: it fixes
-    the few-pixel depth-map misalignment that fringes a contour, and leaves
-    genuinely distant structure alone.
+    by the filter radius (2% of the short side), which is the point: it fixes
+    the depth-map misalignment that fringes a contour, and leaves genuinely
+    distant structure alone.
     """
     size, img_edge, depth_edge = 500, 120, 122
     frame = np.zeros((size, size, 3), np.uint8)
