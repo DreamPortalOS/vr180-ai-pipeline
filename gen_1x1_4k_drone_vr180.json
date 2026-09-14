@@ -1,0 +1,73 @@
+{
+  "name": "gen_1x1_4k_drone_vr180.mp4",
+  "bytes": 67163842,
+  "sha256": "2475592883e7468757aab2bcfde10d1e1bf42428745db4b5f9623fe477826f87",
+  "duration_sec": 10.041667,
+  "video": {
+    "codec": "hevc",
+    "width": 7680,
+    "height": 3840,
+    "fps": 24.0,
+    "bitrate_bps": 53368362,
+    "pix_fmt": "yuv420p"
+  },
+  "audio": {
+    "codec": "aac",
+    "channels": 2,
+    "sample_rate": 32000
+  },
+  "immersive": {
+    "projection": "equirect",
+    "fov_deg": 180,
+    "stereo_layout": "side_by_side",
+    "spatial_metadata": [
+      "sv3d",
+      "st3d"
+    ],
+    "eye_resolution": [
+      3840,
+      3840
+    ]
+  },
+  "generation": {
+    "route": "vr180",
+    "preset": "source",
+    "input_projection": "rectilinear",
+    "sphere_orientation": {
+      "pitch": 0.0,
+      "yaw": 0.0,
+      "roll": 0.0
+    },
+    "pipeline_version": "0.2.0"
+  },
+  "qa": {
+    "passed": true,
+    "verdict": "VR180 (180° 3D SBS)",
+    "checks": {
+      "stream info": {
+        "status": "pass",
+        "detail": "7680×3840 hevc 24 fps, 53368 kbps, 10.0s"
+      },
+      "audio stream": {
+        "status": "pass",
+        "detail": "aac @ 130 kbps"
+      },
+      "sv3d/st3d boxes": {
+        "status": "pass",
+        "detail": "sv3d + st3d present"
+      },
+      "stereo mode": {
+        "status": "pass",
+        "detail": "left-right SBS"
+      },
+      "SBS square-eye layout": {
+        "status": "pass",
+        "detail": "7680×3840 = 2×(3840×3840)"
+      },
+      "per-eye resolution": {
+        "status": "pass",
+        "detail": "per-eye width 3840px"
+      }
+    }
+  }
+}
