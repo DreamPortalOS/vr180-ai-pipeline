@@ -330,6 +330,62 @@ def test_the_default_gradient_limit_leaves_nothing_to_invent():
     assert all(v > border for v in unlimited.last_fill_ratio.values()), unlimited.last_fill_ratio
 
 
+# ---------------------------------------------------------------------------
+# Area resampling in the compressed band (G-8, #355)
+# ---------------------------------------------------------------------------
+
+
+def _striped_row(slope: float, **kw) -> tuple[np.ndarray, np.ndarray]:
+    """Warp a 1px-striped field through a constant-slope disparity ramp.
+
+    ``slope`` is ``d'(x)``, so the left eye's map ``x ↦ x - d(x)`` has local
+    scale ``1 - slope``: at 0.9 ten source columns land on one destination.
+    Returns ``(covered_destination_row, source_row)``.
+    """
+    h, w = 4, 400
+    frame = np.full((h, w, 3), 220, np.uint8)
+    frame[:, ::8] = 20
+    disparity = np.tile((slope * np.arange(w)).astype(np.float32), (h, 1))
+
+    out, _ = StereoRenderer(temporal_smooth=False, **kw)._warp_eye(frame, disparity, sign=+1)
+    covered = int(w * (1 - slope))
+    return out[0, :covered, 0].astype(float), frame[0, :, 0].astype(float)
+
+
+def test_collision_reach_follows_the_gradient_limit():
+    """``1/(1-g)`` source columns can share a destination — so that many are averaged."""
+    assert StereoRenderer(gradient_limit=0.9)._collision_reach() == 11
+    assert StereoRenderer(gradient_limit=0.5)._collision_reach() == 2
+    # Unlimited: the map may fold, a real occlusion can collide, stay at ±1.
+    assert StereoRenderer(gradient_limit=None)._collision_reach() == 1
+
+
+def test_compressed_band_is_area_averaged_not_point_sampled():
+    """A 10x-compressed stripe field must average to flat, not alias into moire.
+
+    Keeping only the winner ± 1 source column point-samples the compressed
+    signal: nine columns in ten are dropped, the surviving stripes stay fully
+    saturated and the band breaks into dashes — which is what the drone clip's
+    panel lines and contours did beside every silhouette.  Averaging the whole
+    contiguous run (the map is monotone below a gradient limit of 1, so the run
+    *is* one surface) is area resampling: the mean is preserved and the
+    aliased contrast collapses.
+    """
+    dest, source = _striped_row(0.9, gradient_limit=0.9)
+
+    assert dest.mean() == pytest.approx(source.mean(), abs=2.0), "compression lost energy"
+    assert dest.std() < 0.25 * source.std(), f"stripes aliased through: {dest.std()=:.1f}"
+
+
+def test_uncompressed_content_is_untouched_by_the_widened_reach():
+    """Reach only matters where columns collide; a pure translate is bit-exact."""
+    wide, _ = _striped_row(0.0, gradient_limit=0.9)
+    tight, source = _striped_row(0.0, gradient_limit=None)
+
+    assert np.array_equal(wide, tight)
+    assert np.array_equal(wide, source[: wide.size])
+
+
 def test_legacy_backward_remap_path_still_available():
     """``occlusion_aware=False`` keeps the pre-#355 behaviour for A/B work."""
     frame, depth = _scene()

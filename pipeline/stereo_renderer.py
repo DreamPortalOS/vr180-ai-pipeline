@@ -320,6 +320,33 @@ class StereoRenderer:
             step *= 2
         return -out
 
+    def _collision_reach(self) -> int:
+        """How many source columns may share one destination column (G-8, #355).
+
+        The per-eye map is ``x ↦ x ∓ disparity(x)``, whose derivative is
+        ``1 ∓ d'(x)``.  With the gradient limited to ``g < 1`` that derivative
+        is bounded **below** by ``1 - g > 0``, so the map is strictly monotone:
+        it never folds, nothing is ever occluded, and every destination column's
+        contributors are one *contiguous* run of at most ``1 / (1 - g)`` source
+        columns — all of them the same surface.  Averaging that whole run is
+        then exactly area resampling.
+
+        Keeping only the winner ± 1 instead (the obvious occlusion rule) throws
+        the rest of the run away, which is point sampling of a ``(1-g)``-times
+        compressed signal: at ``g = 0.9`` nine source columns in ten are
+        dropped.  On the drone clip that showed up as *dashed* panel lines and
+        stair-stepped contours in the compressed band beside every silhouette —
+        a new artefact in the same place as the one #355 is about, and one the
+        two eyes disagree on because each eye compresses a different side.
+
+        Without a limit the map *can* fold, a real occlusion can land on the
+        destination, and only the winner's immediate neighbours are safe.
+        """
+        g = self.gradient_limit
+        if g is None or not (0.0 < g < 1.0):
+            return 1
+        return max(1, int(np.ceil(1.0 / (1.0 - g))))
+
     def _warp_eye(self, frame: np.ndarray, disparity: np.ndarray, sign: int) -> tuple[np.ndarray, float]:
         """Forward-warp (splat) one eye with a z-buffer, then fill from the background.
 
@@ -381,13 +408,14 @@ class StereoRenderer:
             owns = live & (disparity <= zbuf[flat])
             winner[flat[owns]] = xs[owns]
 
-        # Accumulate the tent, but only from the surface that won: neighbours
-        # within one column of the winner are the same surface, anything
+        # Accumulate the tent, but only from the surface that won: source
+        # columns within ``reach`` of the winner are the same surface, anything
         # further away is the occluded one and must not bleed through.
+        reach = self._collision_reach()
         acc = np.zeros((n, C), dtype=np.float32)
         wsum = np.zeros(n, dtype=np.float32)
         for flat, live, weight in taps:
-            sel = live & (np.abs(xs - winner[flat]) <= 1)
+            sel = live & (np.abs(xs - winner[flat]) <= reach)
             f, w = flat[sel], weight[sel]
             wsum += np.bincount(f, w, minlength=n)
             for c in range(C):
