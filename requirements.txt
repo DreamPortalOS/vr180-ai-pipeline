@@ -3,6 +3,19 @@
 # branch `archive/platform-layer` and intentionally NOT installed here.
 
 # Core
+#
+# ⚠️ GPU 用户请注意：下面两行装的是 **CPU 版** torch（PyPI 默认轮子）。
+# 直接 `pip install -r requirements.txt` 之后跑 `--device cuda` 会报
+# `ValueError: CUDA requested but not available`。NVIDIA 卡请在本文件装完后**另外执行一条命令**：
+#
+#   pip install --index-url https://download.pytorch.org/whl/cu124 \
+#       torch==2.6.0 torchvision==0.21.0
+#
+# 这条命令装出的是 `2.6.0+cu124`，与 `third_party/StereoCrafter/.venv` 一致（本仓参考环境）。
+# 为什么不写进本文件：cu124 源只有 linux_x86_64 / win_amd64 轮子，没有 macOS arm64——
+# 写成硬钉会让 Mac(MPS) 开发机整条 `pip install -r requirements.txt` 直接失败；
+# 而只加 `--extra-index-url` 不钉版本是无效的（PyPI 的 2.14.0 > cu124 源的 2.6.0，pip 仍选 CPU 轮子）。
+# 详见 README「安装」与 docs/DEV_GUIDE.md §5.3。
 torch>=2.0.0,<3.0.0
 torchvision>=0.15.0,<1.0.0
 opencv-python>=4.8.0,<5.0.0
