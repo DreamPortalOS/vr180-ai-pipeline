@@ -460,6 +460,34 @@ celery -A workers.celery_app worker --loglevel=info
 open http://localhost:8000
 ```
 
+#### 5.3.1 CUDA：GPU 用户必须额外执行的一条命令
+
+`requirements.txt` 的第 3 步装到的是 **CPU 版** torch（PyPI 默认轮子）。
+NVIDIA 卡上直接跑 `--device cuda` 会报 `ValueError: CUDA requested but not available`。
+**装完 `requirements.txt` 后再执行**：
+
+```bash
+pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0 torchvision==0.21.0
+
+# 自检：应输出 `2.6.0+cu124 True`
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+`2.6.0+cu124` 是本仓参考版本（与 `third_party/StereoCrafter/.venv` 一致）。
+
+**为什么不把这条写进 `requirements.txt`**（三条都是可复现的事实）：
+
+1. cu124 源（`https://download.pytorch.org/whl/cu124/torch/`）只有 `linux_x86_64` 与
+   `win_amd64` 轮子，**没有 macOS arm64**。硬钉 `torch==2.6.0+cu124` 会让 Mac(MPS) 开发机
+   整条 `pip install -r requirements.txt` 直接失败。
+2. 只加 `--extra-index-url` 而不钉版本是**无效**的：cu124 源最高只到 `2.6.0`，
+   PyPI 有 `2.14.0`，pip 取版本号更高的那个，结果仍是 CPU 轮子。
+3. CI 是 **CPU-only ubuntu**，两个 job 都跑 `pip install -r requirements.txt`。
+   钉 cu124 会让 CI 每次多下载 ~768 MB 的 torch 轮子外加 nvidia-\* CUDA 运行时包，
+   纯属浪费且有耗尽 runner 磁盘的风险。
+
+Mac(MPS) / CPU-only 环境**不要**执行本节命令，直接用 `requirements.txt` 即可。
+
 ---
 
 ## 6. 代码审查与测试流程

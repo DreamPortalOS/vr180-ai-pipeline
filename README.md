@@ -77,6 +77,19 @@ pip install -r requirements.txt
 pip install "git+https://github.com/google/spatial-media.git#egg=spatialmedia"  # 路线2 VR 元数据需要
 ```
 
+> ⚠️ **NVIDIA 显卡用户必须额外执行下面这一条**，否则 `requirements.txt` 装到的是 **CPU 版** torch，
+> 跑 `--device cuda` 会直接报 `ValueError: CUDA requested but not available`：
+>
+> ```bash
+> pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0 torchvision==0.21.0
+> ```
+>
+> 装完自检应输出 `2.6.0+cu124` 与 `True`：
+> `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`
+> 这条命令为什么不能写进 `requirements.txt`：cu124 源没有 macOS arm64 轮子，硬钉会让 Mac(MPS)
+> 开发机装不上（详见 `requirements.txt` 顶部注释与 [docs/DEV_GUIDE.md](docs/DEV_GUIDE.md) §5.3）。
+> Mac(MPS) 与 CPU-only 环境**不要**执行这条，直接用 `requirements.txt` 即可。
+
 ### 路线 1 · 球幕 domemaster（最快、单目、无需眼镜）
 ```bash
 ffmpeg -i video/输入.mp4 \
@@ -150,4 +163,4 @@ pytest -q
 | [docs/archive/](docs/archive/) | 历史过程文件（cline 看板/协议等） |
 
 ## License
-MIT — 见 [LICENSE](LICENSE)。
+MIT — 见 [LICENSE](LICENSE)。第三方代码与模型权重的许可证差异（含**不得商用**的项）见 [LICENSES.md](LICENSES.md)。
