@@ -346,17 +346,40 @@ ANCHOR_OFFSET_MAX: float = 0.30
 #: forgiving gate for a check that only ever WARNs.
 ANCHOR_DETECTED_FRAC_MIN: float = 0.5
 
-#: Smallest winning core — as a fraction of the detection floor — that still
-#: earns the #348 rescue.  The opening that deletes noise specks also erodes a
-#: real subject's thin extremities (#348: on the 2048² drone keyframe, a
-#: 1.38 %-of-frame subject is eaten down to a 0.53 % core, under the floor).
-#: The rescue re-grows such a core to its full pre-morphology extent — but the
-#: amplification is largest exactly where the evidence is weakest: on the
-#: subjectless fixtures, cores of 0.06–0.22 % restore to 0.3–1.0 %, so
-#: rescuing every sub-floor core would fabricate anchors out of specks.
-#: Measured separation: real-subject cores ≥ 0.53 %, noise cores ≤ 0.22 % —
-#: 0.4× the floor (0.32 %) sits between them with headroom on both sides.
-ANCHOR_RESCUE_CORE_FLOOR: float = 0.4
+#: Smallest region — as a fraction of the detection floor — that counts as
+#: **credible evidence of a subject at all**.  One constant, two uses, and they
+#: are the same question asked twice.
+#:
+#: *Rescue gate (#348).*  The opening that deletes noise specks also erodes a
+#: real subject's thin extremities (on the 2048² drone keyframe a 1.38 %-of-frame
+#: subject is eaten down to a 0.53 % core, under the floor).  The rescue re-grows
+#: such a core to its full pre-morphology extent — but the amplification is
+#: largest exactly where the evidence is weakest: on the subjectless fixtures,
+#: cores of 0.06–0.22 % restore to 0.3–1.0 %, so rescuing every sub-floor core
+#: would fabricate anchors out of specks.
+#:
+#: *Candidacy gate (#356).*  The same threshold decides who may **enter** the
+#: density election in :func:`anchor_stats`.  A region below it can never be
+#: reported as an anchor — it is under the detection floor and too small to be
+#: rescued — so letting it win the election has exactly one possible effect:
+#: vetoing a real subject that was standing right next to it.
+#:
+#: Re-measured for #356, and the re-measurement is a consequence of the
+#: candidacy gate rather than a re-tuning.  #348 set this at 0.4× from a table
+#: of noise cores topping out at 0.22 % — but that table could only contain
+#: cores that had actually *won* an election, and under the old speck-biased
+#: scoring the loudest ones never did.  With the gate in place the empty-centre
+#: fixture's 0.358 % rim blob wins its frame, and at 0.4× it was rescued to
+#: 0.97 % — a subject conjured out of a textured rim.  The population that
+#: matters is "cores that can win", so the floor is set from that one:
+#:
+#: * loudest subjectless core   0.358 %  (empty centre, busy rim)
+#: * floor                      0.44 %   → 1.23× above it
+#: * smallest real core         0.531 %  (2048² drone) → 1.21× above the floor
+#:
+#: Deliberately symmetric: there is no evidence justifying a floor nearer one
+#: side than the other, and both neighbours are measured, not assumed.
+ANCHOR_RESCUE_CORE_FLOOR: float = 0.55
 
 #: Seconds allowed for one ffmpeg/ffprobe call.
 FFMPEG_TIMEOUT: float = 300.0
@@ -1339,6 +1362,31 @@ def anchor_stats(
     check actually poses, and it is scale-free — the same object read at 1024²
     and at 2880² scores the same.
 
+    Density has one failure the #343 work did not close, and #356 is it: the
+    measure is *biased towards small regions*.  A region's mean converges on its
+    own peak as it shrinks, so an eight-pixel specular glint scores higher than
+    any real object can, wins the election outright, and — being far below the
+    detection floor itself — makes the frame answer 「没有锚点」 while an 11 %
+    subject sits untouched beside it.  Worse, it does so *intermittently*: a
+    speck that big is at the mercy of resampling and compression, so it survives
+    the opening as its own component in some renderings of a frame and not
+    others.  Measured on ``video/seed_v6.png``, the same picture answered
+    **10.7 %** at 2048², 1024² and 256² and **0.12 %** at 960² and 512², and
+    ``video/gen_1x1_720p_v6.mp4`` produced 0.12 / 0.27 / 1.45 / 1.11 / 1.48 /
+    0.82 / 0.15 / 0.63 % across eight frames of one continuous shot — a
+    bimodal reading, not a resolution effect.
+
+    The fix is candidacy, not scoring: a component under
+    :data:`ANCHOR_RESCUE_CORE_FLOOR` × ``min_area`` cannot be reported as an
+    anchor under any circumstance — it is below the detection floor and too
+    small to be rescued — so it has no business deciding which region is.  Only
+    components at or above that floor stand in the election; if a frame has
+    none (a genuinely subjectless one), every component stands and the answer is
+    "no anchor" exactly as before.  Note what this does **not** claim to fix: a
+    *credible-sized* small region that is more distinct per pixel than a larger
+    one still wins, which is the intended behaviour — at that size it is a
+    subject, and the quality band is what judges it.
+
     Otsu rather than a fixed percentile, and the difference is not cosmetic.  A
     percentile decides *in advance* how much of the frame is salient, so it can
     only return the true area of a subject whose saliency is perfectly uniform:
@@ -1411,8 +1459,21 @@ def anchor_stats(
     weight = np.exp(-(radius**2) / (2.0 * sigma**2)).astype(np.float32)
     weighted = saliency * weight
 
-    best_index, best_density = 0, -1.0
-    for index in range(1, count):
+    # #356: only regions that could actually *be* an anchor may stand in the
+    # election.  Mean density is a biased score — as a region shrinks its mean
+    # converges on its own peak — so an 8-pixel specular glint outscores any
+    # real subject, and the winner-takes-all pick then hands the frame's verdict
+    # to a speck that is itself far too small to be reported.  Whether such a
+    # speck survives the opening as a separate component turns on resampling
+    # noise, which is what made the same frame answer 10.7 % at 2048²/1024²/256²
+    # and 0.12 % at 960²/512², and made 4 of 8 frames of one clip "anchorless".
+    credible = ANCHOR_RESCUE_CORE_FLOOR * min_area * height * width
+    candidates = [i for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] >= credible]
+    if not candidates:  # nothing credible in frame — judge the specks as before
+        candidates = list(range(1, count))
+
+    best_index, best_density = candidates[0], -1.0
+    for index in candidates:
         region = labels == index
         density = float(weighted[region].mean())
         if density > best_density:
