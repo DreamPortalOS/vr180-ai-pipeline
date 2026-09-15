@@ -745,6 +745,45 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dome-size", type=int, default=4096, help="Fulldome output square size in pixels (default 4096)"
     )
+    # D-2 (#371): the two knobs the dome route was missing — how to read the
+    # source frame, and how the dome is oriented relative to it.  Both are
+    # ``--dome-``-prefixed and reach FulldomeMapper only; the VR180
+    # --input-projection / --pitch / --yaw / --roll are untouched (#294/#323).
+    parser.add_argument(
+        "--dome-input-projection",
+        choices=list(FulldomeMapper.INPUT_PROJECTIONS),
+        default="rectilinear",
+        help="D-2 (#371): how to read the fulldome source frame. rectilinear (default) "
+        "= pinhole patch of --dome-coverage-h degrees; fisheye = equidistant circular "
+        "fisheye spanning --dome-coverage-h degrees across the frame width; equirect = "
+        "a full 360°×180° sphere (--dome-coverage-h/-v are not consulted). "
+        "Independent of the VR180 --input-projection.",
+    )
+    parser.add_argument(
+        "--dome-pitch",
+        type=float,
+        default=0.0,
+        metavar="DEG",
+        help="D-2 (#371): tilt the dome relative to the source, in degrees (default: 0). "
+        "pitch = 90° − the elevation the source's optical axis takes on the dome, i.e. "
+        "0 puts the source centre at the zenith and 20 drops it to 70° of elevation.",
+    )
+    parser.add_argument(
+        "--dome-yaw",
+        type=float,
+        default=0.0,
+        metavar="DEG",
+        help="D-2 (#371): swing the dome about its vertical axis, in degrees (default: 0) "
+        "— which way the source faces once --dome-pitch has tipped it off the zenith.",
+    )
+    parser.add_argument(
+        "--dome-roll",
+        type=float,
+        default=0.0,
+        metavar="DEG",
+        help="D-2 (#371): spin the domemaster about its own centre, in degrees (default: 0) "
+        "— the knob that aligns the source's horizon with the venue's seating.",
+    )
 
     # Depth model selection
     parser.add_argument(
@@ -3498,6 +3537,14 @@ def main():
             output_size=args.dome_size,
             codec=args.codec,
             crf=args.crf,
+            # D-2 (#371).  --dome-size is passed straight through, so the
+            # 4096² master is one v360 pass at 4096² — never a 2880² render
+            # scaled up afterwards, which would cost half the venue's pixels
+            # without adding a single one back.
+            input_projection=args.dome_input_projection,
+            pitch=args.dome_pitch,
+            yaw=args.dome_yaw,
+            roll=args.dome_roll,
         )
         output = get_output_path(args, suffix="_dome.mp4")
         result = mapper.convert(args.input, output)
@@ -3716,20 +3763,26 @@ def _write_sidecar_from_args(
         # C-2 (#294): record how the source was interpreted.  The container
         # cannot express it, and it is the one knob that decides whether the
         # artefact's geometry is reproducible from the source file alone.
-        input_projection = getattr(args, "input_projection", None)
+        #
+        # D-2 (#371): the dome route reads its *own* flags here.  Recording
+        # args.input_projection / args.pitch on a dome master would describe
+        # the VR180 run that never happened — the two sets are independent and
+        # a reader cannot tell them apart after the fact.
+        prefix = "" if vr180 else "dome_"
+        input_projection = getattr(args, f"{prefix}input_projection", None)
         if input_projection:
             generation["input_projection"] = input_projection
             if input_projection == "fisheye":
-                generation["fisheye_fov"] = float(getattr(args, "fisheye_fov", 180.0))
+                # The dome route's equidistant span is --dome-coverage-h — the
+                # same quantity --fisheye-fov names on the VR180 side (#302).
+                generation["fisheye_fov"] = float(getattr(args, "fisheye_fov" if vr180 else "dome_coverage_h", 180.0))
         # W-8 (#323): the sphere orientation is recorded unconditionally — it
         # is the difference between "the horizon is at eye height" and "I am in
         # a pit", and the container cannot express it either.  Recording the
         # zeros too means a QA reader never has to guess whether an absent key
         # means 0 or means the run predates the flag.
         generation["sphere_orientation"] = {
-            "pitch": float(getattr(args, "pitch", 0.0) or 0.0),
-            "yaw": float(getattr(args, "yaw", 0.0) or 0.0),
-            "roll": float(getattr(args, "roll", 0.0) or 0.0),
+            angle: float(getattr(args, f"{prefix}{angle}", 0.0) or 0.0) for angle in ("pitch", "yaw", "roll")
         }
 
     try:
