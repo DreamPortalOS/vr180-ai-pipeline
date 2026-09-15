@@ -444,6 +444,11 @@ ANCHOR_DISTINCTNESS_EXPONENT: float = 0.7
 #: speckle that the enclosure gate then has to judge, so the reference's
 #: operating point moves with it.
 #:
+#: The pairing is not a caution, it is measured: move this constant to 12 and
+#: leave the reference at 80 and **ten** tests in
+#: ``tests/test_check_source_quality.py`` fail, including every real-asset
+#: acceptance.  Move the window back to 21 and the two separation floors fail.
+#:
 #: G-11 (#364) scanned window × passes on the three owner assets, with the
 #: reference re-derived per pass count from the airframe ratio above
 #: (80 → 56 → 53).  Separation is the #341 subject-vs-subjectless margin;
