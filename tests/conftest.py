@@ -318,8 +318,6 @@ PROJECT_ENV_VARS = frozenset(
         "ARK_API_KEY",  # Volcengine Ark — the one that started #330
         "SEEDANCE_API_KEY",  # legacy alias, must stay rejected (see #330 test)
         "KLING_API_KEY",
-        "MINIMAX_API_KEY",  # MiniMax H3 (#353)
-        "MINIMAX_API_BASE",  # MiniMax host override: global vs mainland (#353)
         "VEO_API_KEY",
         "GCP_PROJECT_ID",
         # --- Usage ledger / budget gate (#328, #329) -----------------------
