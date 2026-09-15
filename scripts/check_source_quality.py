@@ -325,13 +325,14 @@ ANCHOR_TEXTURE_WINDOW: int = 31
 #:
 #: Set from the measured gap between "no subject" and "a real but small
 #: subject".  Subjectless fixtures — uniform texture across 8 seeds, flat gray
-#: plus sensor noise, rim-damped/empty-centre — top out at **0.27 %** (#341's
+#: plus sensor noise, rim-damped/empty-centre — top out at **0.17 %** (#341's
 #: table quotes 0.35 % as the pre-#343 worst case; the texture channel pushed it
-#: to 0.22 % and the #361 enclosure channel put it back to 0.27 %, which is the
-#: price of a gate that does not care how bright a region is).  The smallest
-#: *real* subject on record is the quadcopter in the owner's ``Gemini_v1.jpg``
-#: keyframe at **1.30 %**.  0.8 % sits 2.9× above the loudest false positive and
-#: 1.6× below that true one, so both sides keep room.
+#: to 0.22 %, the #361 enclosure channel put it back to 0.27 % — the price of a
+#: gate that does not care how bright a region is — and G-11's wider
+#: :data:`ANCHOR_TEXTURE_WINDOW` took it to 0.17 %, below every earlier figure).
+#: The smallest *real* subject on record is the quadcopter in the owner's
+#: ``Gemini_v1.jpg`` keyframe at **1.30 %**.  0.8 % sits 4.7× above the loudest
+#: false positive and 1.6× below that true one, so both sides keep room.
 #:
 #: It was 1.5 % until #345, which is what made the check answer 「画面里没有
 #: 锚点」 for a frame with a visible drone in it.  That verdict was not merely
@@ -1594,7 +1595,7 @@ def structured_saliency(frame: np.ndarray, window: int = ANCHOR_TEXTURE_WINDOW) 
     against 2.2 %), so the same still measured two legal ways disagreed by 75 %
     and #360's ≤30 % contract failed.  Feeding this channel luminance makes the
     still path and the video sampler's gray path agree by construction; the
-    spread is 12 %.
+    spread is 4.9 % (12.2 % until G-11 widened :data:`ANCHOR_TEXTURE_WINDOW`).
     """
     combined = (
         frequency_tuned_saliency(_as_gray(frame)) ** ANCHOR_DISTINCTNESS_EXPONENT
