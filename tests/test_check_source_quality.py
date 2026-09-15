@@ -81,10 +81,13 @@ with :data:`~scripts.check_source_quality.ANCHOR_MIN_AREA` sitting between them
 — so "no anchor" is a verdict the check can actually reach, not a branch that
 never fires.  ``test_subject_and_subjectless_frames_are_separated`` pins that
 margin directly; the texture channel added in #343 widened it to ~50×, the
-enclosure channel added in #361 gives back some of that (~41×, because a gate
+enclosure channel added in #361 gave back some of that (~41×, because a gate
 that refuses to look at brightness also refuses to punish bright speckle), and
-``test_the_texture_channel_widens_the_subject_separation`` pins the 32× floor
-that neither may cross.
+G-11 (#364) recovered it and more by widening
+:data:`~scripts.check_source_quality.ANCHOR_TEXTURE_WINDOW` from 21 to 31 —
+**64.1×**, with the loudest subjectless fixture down to 0.17 % of the frame.
+``test_the_texture_channel_widens_the_subject_separation`` pins the 55× floor
+that none of them may cross.
 
 Two thresholds, two questions (#345)
 ------------------------------------
@@ -132,7 +135,15 @@ composition                   acceptance                      mutation
 The #343 mutation needs *both* channels blinded because a sky band that runs off
 the top edge is unenclosed as well as flat, so either channel alone now disposes
 of it; the texture channel's own necessity is pinned instead on the #341 margin,
-which collapses from 40.6× to 7.6× without it.
+which collapses from 64.1× to 7.6× without it.
+
+G-11 (#364) extended that pattern one step further, and the table above records
+the current state rather than the historical one.  With the texture window at 31
+the foam on ``seed_v6.png`` is held off by the texture gate alone, so blinding
+*only* the enclosure channel no longer lands the anchor in the water there —
+it lands on the canyon wall at x = 0.11 instead.  The real-still mutation
+therefore asserts "off the airframe", and the enclosure channel's own necessity
+is pinned where it is still unshadowed: :func:`gorge_frame`, in CI.
 
 Almost everything here runs on synthetic arrays: no test decodes video or shells
 out to ffmpeg.  The exceptions are the regressions against the frames the bugs
@@ -994,7 +1005,7 @@ def test_subject_and_subjectless_frames_are_separated() -> None:
     silently rescaled with it instead of catching the change.
 
     Measured today: true subjects 11.1 / 40.2 / 11.3 %, false ones at most
-    0.27 %, i.e. ~41× apart.  The bounds below are deliberately slacker than the
+    0.17 %, i.e. ~64× apart.  The bounds below are deliberately slacker than the
     measurements so that ordinary detector noise does not flake the suite.
     """
     with_subject = [
@@ -1207,7 +1218,7 @@ def test_removing_the_texture_channel_collapses_the_separation(monkeypatch: pyte
     frame is full of speckle that is both distinct and — being blob texture —
     thoroughly enclosed; structure is the only one of the three questions that
     answers "no" to it.  Measured, blinding this channel takes the loudest
-    subjectless fixture from 0.27 % to 1.46 % and the margin from 40.6× to 7.6×,
+    subjectless fixture from 0.17 % to 1.46 % and the margin from 64.1× to 7.6×,
     i.e. straight through :data:`~scripts.check_source_quality.ANCHOR_MIN_AREA`.
     """
     quietest_true = min(
@@ -1236,8 +1247,17 @@ def test_the_texture_channel_widens_the_subject_separation() -> None:
     separated by a wide margin rather than a hair.  Gating widened it (≈50×
     against the ungated ≈32×) because speckle in an evenly-textured frame is
     exactly what a structure measure declines to promote; #361's enclosure gate
-    gives part of that back (≈41×) because it judges scenery by where it leaks
-    to and not by how bright it is.  32× is the floor neither may cross.
+    gave part of that back (≈41×) because it judges scenery by where it leaks to
+    and not by how bright it is; G-11's wider window took it to **64.1×**, which
+    is the whole reason that card moved the constant.
+
+    **55× is the floor, and it is the mutation check for G-11's retune.**  The
+    number is chosen to sit above the 40.6× the detector measured at the old
+    window of 21 and below today's 64.1×, so reverting
+    :data:`~scripts.check_source_quality.ANCHOR_TEXTURE_WINDOW` turns this test
+    red rather than leaving it quietly passing on a worse constant.  Every
+    window in G-11's scan that clears it does so by a margin (21 → 40.6×,
+    25 → 38.0×, 31 → 64.1×, 35 → 44.8×): 31 is the only one that passes.
     """
     with_subject = min(
         csq.anchor_stats(subject_frame(0.11))["area"],
@@ -1245,7 +1265,7 @@ def test_the_texture_channel_widens_the_subject_separation() -> None:
         csq.anchor_stats(subject_frame(0.11, cx_frac=0.80))["area"],
     )
     without = _loudest_subjectless()
-    assert with_subject / max(without, 1e-9) > 32.0, f"separation regressed: {with_subject} vs {without}"
+    assert with_subject / max(without, 1e-9) > 55.0, f"separation regressed: {with_subject} vs {without}"
 
 
 def test_texture_gate_reads_flat_as_flat_and_textured_as_textured() -> None:
@@ -1339,13 +1359,16 @@ def test_the_detection_floor_sits_between_noise_and_the_smallest_real_subject() 
     measured rather than asserted.  Headroom on both sides, on the real asset the
     card was filed about and on the subjectless fixtures #341 established:
 
-    * loudest subjectless fixture  0.27 %   → floor is ~2.9× above it
+    * loudest subjectless fixture  0.17 %   → floor is ~4.7× above it
     * floor                        0.80 %
     * smallest real subject        1.30 %   → ~1.6× above the floor
 
     Written as ratios so the margin, not the constant, is what is pinned.  The
-    lower figure was 0.22 % before #361; the enclosure channel costs a little
-    headroom on that side because it does not care how bright a speck is.
+    lower figure has moved twice: 0.22 % before #361, 0.27 % after it (the
+    enclosure channel costs headroom on that side because it does not care how
+    bright a speck is), and 0.17 % since G-11 widened
+    :data:`~scripts.check_source_quality.ANCHOR_TEXTURE_WINDOW`, which is the
+    quietest it has ever been.
     """
     noise = _loudest_subjectless()
     smallest_real = csq.anchor_stats(csq.read_still(OWNER_KEYFRAME))["area"]
@@ -1362,7 +1385,7 @@ def test_canyon_still_finds_the_aircraft_not_the_whitewater() -> None:
     ``seed_1x1_drone.png`` is 2048² with the aircraft at about (0.50, 0.48) and a
     stretch of whitewater filling the bottom of the gorge.  The old detector
     returned the foam at (0.51, 0.79); anything below y≈0.6 in this frame is
-    river, not subject.  It now reads 1.65 % at (0.506, 0.439).
+    river, not subject.  It now reads 1.93 % at (0.506, 0.441).
 
     **This test is weak on its own and #361 is why**: the detector's answer
     before that card was (0.510, 0.371) — the bright bend of the river directly
@@ -1396,7 +1419,7 @@ def test_a_sub_floor_core_is_rescued_to_its_full_extent() -> None:
     property of the *morphology*, not of that photograph, and #361 stopped that
     photograph from demonstrating it: with the enclosure channel the detector
     resolves the airframe well enough that its opened core clears the floor on
-    its own (1.65 %), so the real still can no longer show the rescue doing
+    its own (1.93 %), so the real still can no longer show the rescue doing
     anything.  A synthetic composition can, always, and in CI.
     """
     frame = thin_limbed_frame()
@@ -1614,9 +1637,12 @@ def test_the_seed_still_measures_the_same_at_every_resolution() -> None:
     The card's evidence, reproduced without needing the clip: the same 2048²
     still resampled to 1024²/960²/512² and read both in colour (the still path)
     and in luminance (what the video sampler hands over, ``-pix_fmt gray``).
-    Before the candidacy gate those ten readings were 0.12 % or ~11 % with
-    nothing in between — an 88× spread.  They are now 10.65–11.72 %, a 10 %
-    spread, against the card's 30 % bound.
+    Before the candidacy gate those readings were 0.12 % or ~11 % with nothing
+    in between — an 88× spread.  They are now 2.35–2.46 %, a **4.9 %** spread,
+    against the card's 30 % bound.  (The absolute share fell from ~11 % to ~2 %
+    when #361 moved the anchor off the rapids and onto the airframe, which is a
+    much smaller thing; G-11's wider texture window then took the spread itself
+    from 12.2 % to 4.9 %.)
     """
     still = csq.read_still(SEED_STILL)
     areas = {}
@@ -1645,8 +1671,8 @@ def test_the_clip_agrees_with_its_own_seed_frame() -> None:
     same picture as the seed still and never was.  Its *first* sampled frame is.
 
     Before: still 10.7 %, first frame 0.12 % (86× apart) and four of the eight
-    frames reporting no anchor at all.  After: 10.65 % against 9.86 %, 8 %
-    apart, with seven of eight frames anchored.
+    frames reporting no anchor at all.  After: 2.41 % against 2.60 %, 8 %
+    apart, with all eight frames anchored.
     """
     info = csq.probe_source(SEED_CLIP)
     frames = [first for first, _second in csq.iter_frame_pairs(SEED_CLIP, info, pairs=8)]
@@ -1727,14 +1753,14 @@ def test_the_enclosure_channel_does_not_narrow_the_subject_separation() -> None:
     could have quietly promoted speckle in an evenly-textured frame, since blob
     texture is — by the barrier measure — thoroughly enclosing.  It does not,
     because the reference is set above where those frames saturate; measured
-    40.6× against #341's floor of 32×.
+    64.1× against G-11's floor of 55×.
     """
     quietest_true = min(
         csq.anchor_stats(subject_frame(0.11))["area"],
         csq.anchor_stats(subject_frame(0.40))["area"],
         csq.anchor_stats(subject_frame(0.11, cx_frac=0.80))["area"],
     )
-    assert quietest_true / max(_loudest_subjectless(), 1e-9) > 32.0, "separation regressed"
+    assert quietest_true / max(_loudest_subjectless(), 1e-9) > 55.0, "separation regressed"
 
 
 def test_enclosure_gate_reads_the_border_as_open_and_the_subject_as_closed() -> None:
@@ -1793,7 +1819,7 @@ def test_the_seed_still_anchors_on_the_aircraft_not_the_rapids() -> None:
     frame and a stretch of whitewater filling the bottom of the gorge.  The
     detector answered **10.65 % at (0.396, 0.787)** — the rapids — and the card's
     own bound is that the reported centroid has to land in the airframe band,
-    y ∈ [0.28, 0.55].  It now answers **2.22 % at (0.539, 0.506)**.
+    y ∈ [0.28, 0.55].  It now answers **2.41 % at (0.535, 0.501)**.
 
     Asserted as a band rather than a point because the reported region is the
     fuselage and gimbal rather than the full rotor span, and where its centre of
@@ -1807,14 +1833,34 @@ def test_the_seed_still_anchors_on_the_aircraft_not_the_rapids() -> None:
 
 
 @pytest.mark.skipif(not SEED_STILL.is_file(), reason=f"seed still not present: {SEED_STILL}")
-def test_removing_the_enclosure_channel_puts_the_seed_still_back_on_the_rapids(
+def test_removing_the_enclosure_channel_takes_the_seed_still_off_the_airframe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mutation check (#361) on the real frame, not only the synthetic one.
+    """Mutation check (#361) on the real frame, re-derived by G-11 (#364).
 
-    Blind the channel and ``seed_v6.png`` reports 13.27 % at y = 0.792 — the
-    reported bug, reproduced to within a centroid's width of the number in the
-    card (10.65 % at y = 0.787).
+    **What this asserted until #364, and why it had to change.**  At a texture
+    window of 21, blinding this channel put ``seed_v6.png`` back at 13.27 % and
+    y = 0.792 — the reported bug reproduced to within a centroid's width of the
+    card's own number (10.65 % at y = 0.787) — so the test asserted "back on the
+    whitewater".  G-11 widened the window to 31 and that stopped being true: a
+    31-pixel box averages the foam's fine structure down far enough that the
+    *texture* gate alone now keeps the rapids out of the running on this
+    photograph.  Blinding the enclosure channel moves the anchor to the left
+    canyon wall instead, at (0.113, 0.489), and blinding **both** structure
+    channels does not reach the water either (it gives (0.115, 0.435)).  There
+    is no longer any mutation that reproduces the rapids on this asset.
+
+    That is the same shadowing #361 itself created for #343's sky mutation, one
+    step further along, and it is handled the same way: assert what the mutation
+    still demonstrably does — takes the anchor **off the airframe** — and leave
+    the enclosure channel's own necessity pinned where nothing shadows it, on
+    :func:`gorge_frame` in ``test_removing_the_enclosure_channel_puts_the_anchor_in_the_water``,
+    which runs in CI and still moves y from 0.26 to 0.76.
+
+    Asserted on ``centroid_x`` because that is where the daylight is: 0.535
+    gated against 0.113 ungated, a gap of 0.42, and the ungated answer is
+    identical to three decimals at 2048²/1024²/960²/512² down both the colour
+    and the luminance path.  This is a stable relocation, not a wobble.
     """
     frame = csq.read_still(SEED_STILL)
     gated = csq.anchor_stats(frame)
@@ -1823,7 +1869,8 @@ def test_removing_the_enclosure_channel_puts_the_seed_still_back_on_the_rapids(
     ungated = csq.anchor_stats(frame)
 
     assert 0.28 <= gated["centroid_y"] <= 0.55, gated
-    assert ungated["centroid_y"] > 0.70, f"the mutation must put the anchor back on the whitewater: {ungated}"
+    assert gated["centroid_x"] == pytest.approx(0.50, abs=0.12), gated
+    assert ungated["centroid_x"] < 0.30, f"the mutation must take the anchor off the airframe: {ungated}"
 
 
 @pytest.mark.skipif(not SEED_CLIP.is_file(), reason=f"seed clip not present: {SEED_CLIP}")
@@ -1835,7 +1882,7 @@ def test_the_clip_anchors_on_the_aircraft_frame_by_frame() -> None:
     have behaved differently down the two — see
     ``test_enclosure_barrier_reads_a_colour_frame_and_a_gray_one_alike``.  What
     this pins is the end-to-end consequence: over eight sampled frames of the
-    gorge flight the median winning centroid is y = 0.402, inside the airframe
+    gorge flight the median winning centroid is y = 0.468, inside the airframe
     band, with every frame anchored.
     """
     info = csq.probe_source(SEED_CLIP)
