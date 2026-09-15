@@ -1,4 +1,4 @@
-"""Tests for the pre-pipeline source health check (scripts/check_source_quality.py, W-1 #305).
+r"""Tests for the pre-pipeline source health check (scripts/check_source_quality.py, W-1 #305).
 
 The tool answers one question before a 40-minute conversion starts: *is this
 clip worth converting?*  Six checks — ``decodable`` / ``square`` /
@@ -94,16 +94,25 @@ Two thresholds, two questions (#345)
 ``ANCHOR_MIN_AREA`` (0.8 %) is a **detection floor** — *is anything there* — and
 ``ANCHOR_AREA_MIN``/``ANCHOR_AREA_MAX`` (8–15 %) are a **quality band** — *is it
 big enough*.  Conflating them is what #345 fixed: at a 1.5 % floor the owner's
-``Gemini_v1.jpg`` keyframe, whose quadcopter measures 1.30 %, was reported as
+``Gemini_v1.jpg`` keyframe, whose quadcopter measured 1.30 %, was reported as
 「画面里没有锚点」 when the true and actionable answer was 「主体面积 1.3%，远小于
 8%」.  The first sends the operator off to invent a subject; the second tells him
 to enlarge the one he has.
 
+That keyframe no longer exists (#366).  The owner deleted it, and re-running the
+prompt cannot reproduce a 1.30 % reading pixel for pixel, so the numbers it
+carried had to be **re-measured** rather than carried over.  The two canyon
+stills under ``video/`` hold exactly the property the card was about — a small,
+roughly centred aircraft over water — and the #345 pins now run on them:
+``seed_v6.png`` at **2.41 %** and ``seed_1x1_drone.png`` at **1.93 %**, both far
+under the 8 % band and comfortably over the 0.8 % floor.
+
 The floor moved and the band did not, so the tests are split the same way:
-``test_a_small_real_subject_is_small_not_absent`` pins the new verdict,
+``test_a_small_real_subject_is_small_not_absent`` pins the new verdict on
+``seed_v6.png``,
 ``test_the_detection_floor_sits_between_noise_and_the_smallest_real_subject``
-pins the headroom on both sides (loudest subjectless fixture 0.22 %, floor
-0.8 %, smallest real subject 1.30 %), and the subjectless fixtures above are
+pins the headroom on both sides (loudest subjectless fixture 0.17 %, floor
+0.8 %, smallest real subject 1.93 %), and the subjectless fixtures above are
 deliberately **unchanged** — a lower floor that started finding anchors in an
 empty frame would be a worse bug than the one it replaced.
 
@@ -146,13 +155,16 @@ therefore asserts "off the airframe", and the enclosure channel's own necessity
 is pinned where it is still unshadowed: :func:`gorge_frame`, in CI.
 
 Almost everything here runs on synthetic arrays: no test decodes video or shells
-out to ffmpeg.  The exceptions are the regressions against the frames the bugs
-were actually reported on (``OWNER_KEYFRAME``, ``CANYON_STILL``, ``SEED_STILL``,
-``SEED_CLIP``), which are read **read-only** and ``skip`` when absent — none of
-them ships with the repo, so they run on the owner's machine and nowhere else.
-Note that they also skip in a **git worktree**, whose ``video/`` directory does
-not exist; point ``VR180_SEED_STILL`` and friends at the main checkout to run
-them there.  The ffprobe/ffmpeg layer is covered by parsing captured ffprobe
+out to ffmpeg.  The exceptions are the regressions against the footage the bugs
+were actually reported on (``CANYON_STILL``, ``SEED_STILL``, ``SEED_CLIP``),
+which is read **read-only** and ``skip``\ ped when absent — ``video/`` is
+git-ignored, so none of it ships with the repo and none of it exists in CI or in
+a **git worktree**.  Every one of those skips names the missing file, the
+environment variable that re-points it and where the main checkout keeps it
+(:func:`_missing_assets`), because a skip nobody can act on is how the fourth
+constant that used to live here spent four cards pointing at a file the owner
+had deleted without anyone noticing (#366).
+The ffprobe/ffmpeg layer is covered by parsing captured ffprobe
 JSON and by an AST sweep (``test_subprocess_calls_are_list_form_without_shell``)
 that holds every ``subprocess.run`` in the module to list form with no
 ``shell=True``.
@@ -176,20 +188,56 @@ from scripts import check_source_quality as csq
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "check_source_quality.py"
 
-#: The two real frames issue #343 was reported against.  Neither ships with the
-#: repo — ``video/`` is git-ignored and the keyframe lives in the owner's
-#: downloads — so both regressions **skip** off his machine rather than fail.
-#: CI keeps them honest a different way: :func:`flat_sky_frame` reproduces the
-#: same failure synthetically and runs everywhere.
-OWNER_KEYFRAME = Path(os.environ.get("VR180_OWNER_KEYFRAME", r"C:\Users\musof\Downloads\Gemini_v1.jpg"))
+#: The canyon still issue #343 was reported against, and the one #361 reproduced
+#: the whitewater failure on.  It does not ship with the repo — ``video/`` is
+#: git-ignored — so its regressions **skip** wherever the footage is absent
+#: rather than fail.  CI keeps them honest a different way: :func:`flat_sky_frame`
+#: and :func:`gorge_frame` reproduce the same failures synthetically and run
+#: everywhere.
+#:
+#: #343's *first* frame, ``C:\Users\musof\Downloads\Gemini_v1.jpg``, used to be
+#: wired up beside it as ``OWNER_KEYFRAME``.  The owner deleted that file, which
+#: left four tests skipping on every machine on earth — a test that can never
+#: run is worse than no test, because it still counts (#366).  Its readings
+#: (1.30 % at (0.50, 0.52)) cannot be reproduced by re-generating the prompt, so
+#: the pins it carried were re-measured on the two stills below instead.
 CANYON_STILL = Path(os.environ.get("VR180_CANYON_STILL", str(REPO_ROOT / "video" / "seed_1x1_drone.png")))
 
 #: The #356 pair: a 2048² keyframe and the 960² clip generated from it.  Same
 #: gorge, same aircraft, two orders of magnitude apart in the old reading — the
-#: evidence the card was filed on.  Git-ignored like the two above, so these
-#: regressions skip everywhere except the owner's machine.
+#: evidence the card was filed on.  Git-ignored like the one above, so these
+#: regressions skip wherever ``video/`` is not present.
 SEED_STILL = Path(os.environ.get("VR180_SEED_STILL", str(REPO_ROOT / "video" / "seed_v6.png")))
 SEED_CLIP = Path(os.environ.get("VR180_SEED_CLIP", str(REPO_ROOT / "video" / "gen_1x1_720p_v6.mp4")))
+
+#: Which environment variable re-points which asset, for the skip messages.
+_ASSET_ENV = {
+    CANYON_STILL: "VR180_CANYON_STILL",
+    SEED_STILL: "VR180_SEED_STILL",
+    SEED_CLIP: "VR180_SEED_CLIP",
+}
+
+
+def _missing_assets(*assets: Path) -> str:
+    """Why a real-asset test did not run, in enough detail to act on.
+
+    ``skip`` is how this file survives not shipping its footage, and a skip whose
+    reason is a bare path is indistinguishable from a test that has quietly
+    stopped testing anything.  That is precisely what happened to
+    ``OWNER_KEYFRAME``: it named a deleted file, every run said so, and four
+    cards went by before anyone read it as 「这条从来没跑过」 (#366).  So each
+    reason names the file, the variable that re-points it, and where a checkout
+    that has the footage keeps it — enough for a reader to tell 「本来就不该跑」
+    from 「该跑却没跑」 without opening this file.
+    """
+    return "; ".join(
+        f"{path.name} not found at {path} — set {_ASSET_ENV[path]} to it "
+        f"(a checkout with footage keeps it at <repo>/video/{path.name}; "
+        f"video/ is git-ignored, so it is absent in CI and in every git worktree)"
+        for path in assets
+        if not path.is_file()
+    )
+
 
 FRAME_SIZE = 240
 N_FRAMES = 9  # 9 frames -> 8 adjacent pairs, the CLI default
@@ -1307,39 +1355,75 @@ def test_anchor_reports_where_it_found_the_subject() -> None:
     assert csq.anchor_stats(flat_frame())["centroid_x"] == pytest.approx(0.5)
 
 
-@pytest.mark.skipif(not OWNER_KEYFRAME.is_file(), reason=f"owner keyframe not present: {OWNER_KEYFRAME}")
-def test_owners_keyframe_finds_the_aircraft_not_the_cloud() -> None:
-    """Acceptance (#343): the reported regression, on the frame it was reported on.
+@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=_missing_assets(CANYON_STILL))
+def test_the_canyon_still_anchors_on_the_aircraft_not_the_backdrop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Acceptance (#343/#361) on a real photograph — re-pointed by #366.
 
-    ``Gemini_v1.jpg`` is a 1024² canyon shot with a gray quadcopter dead centre
-    at (0.50, 0.52).  The old detector answered (0.49, 0.06) — the cloud band
-    along the top edge, 11.3 % of the picture — and warned the operator that his
-    subject was off-centre.  What matters here is *where* the detector is
-    looking; the area it reports is #345's subject and is asserted separately in
-    ``test_a_small_real_subject_is_small_not_absent``.
+    This slot held ``Gemini_v1.jpg``, the 1024² frame #343 was filed on, whose
+    cloud band along the top edge the old detector reported as the subject at
+    (0.49, 0.06).  The owner deleted that file, so the pin was re-measured on
+    ``video/seed_1x1_drone.png``: the same composition at 2048² — overcast sky
+    along the top edge, red-rock walls, whitewater down the middle, a gray
+    quadcopter at **(0.506, 0.441)** measuring 1.93 %.
+
+    Two things are asserted and the second is why this is not decoration.
+
+    The centroid has to clear the sky *and* the river.  Only the lower bound is
+    new: ``test_canyon_still_finds_the_aircraft_not_the_whitewater`` bounds this
+    same frame from above (y < 0.60) and nothing bounds it from below, so a
+    detector that went back to answering the cloud band at y = 0.06 would pass
+    every other assertion in this file that touches a real photograph.
+
+    Then the frame is held to a mutation, because a surviving margin is worth
+    more than a number: blind the enclosure channel and the anchor drops into the
+    rapids at (0.527, 0.758), 10.80 % of the picture — the #361 bug reproduced on
+    the asset rather than on a fixture.  That is coverage ``seed_v6.png`` can no
+    longer give, since G-11 (#364) widened the texture window far enough that
+    blinding a channel there relocates the anchor to the canyon wall instead (see
+    ``test_removing_the_enclosure_channel_takes_the_seed_still_off_the_airframe``).
+
+    Neither surviving still can reproduce the *cloud* half of #343 under any
+    mutation — blinding both structure channels gives (0.510, 0.373) here and
+    (0.115, 0.435) on ``seed_v6.png``, both well clear of the sky — so that half
+    stays pinned where it is demonstrable, on :func:`flat_sky_frame`, in CI.
     """
-    stats = csq.anchor_stats(csq.read_still(OWNER_KEYFRAME))
+    frame = csq.read_still(CANYON_STILL)
+    gated = csq.anchor_stats(frame)
 
-    assert stats["centroid_x"] == pytest.approx(0.50, abs=0.12), f"not the aircraft: {stats}"
-    assert stats["centroid_y"] == pytest.approx(0.52, abs=0.12), f"still on the sky: {stats}"
+    assert gated["found"], f"the aircraft must be found at all: {gated}"
+    assert gated["centroid_x"] == pytest.approx(0.51, abs=0.12), f"not the aircraft: {gated}"
+    assert 0.20 <= gated["centroid_y"] <= 0.60, f"on the sky band or in the river: {gated}"
+
+    _blind_enclosure_gate(monkeypatch)
+    ungated = csq.anchor_stats(frame)
+
+    assert ungated["centroid_y"] > 0.60, (
+        f"the enclosure channel changed nothing — the mutation must land in the rapids: {ungated}"
+    )
 
 
-@pytest.mark.skipif(not OWNER_KEYFRAME.is_file(), reason=f"owner keyframe not present: {OWNER_KEYFRAME}")
+@pytest.mark.skipif(not SEED_STILL.is_file(), reason=_missing_assets(SEED_STILL))
 def test_a_small_real_subject_is_small_not_absent() -> None:
     """Acceptance (#345): the drone reads as *small*, never as *absent*.
 
     This is the whole card in one assertion pair.  The quadcopter measures
-    ~1.30 % of the frame — comfortably a subject, nowhere near the 8–15 %
-    reference band — so the only correct report is 「面积偏小」 with the number
-    in it.  Before the floor moved, the same frame produced 「画面里没有锚点」,
-    which is a different and much more expensive instruction to hand an
-    operator.
+    **2.41 %** of ``video/seed_v6.png`` — comfortably a subject, nowhere near the
+    8–15 % reference band — so the only correct report is 「面积偏小」 with the
+    number in it.  Before the floor moved, a frame like this produced 「画面里
+    没有锚点」, which is a different and much more expensive instruction to hand
+    an operator.
+
+    Re-pointed by #366: the card was measured on ``Gemini_v1.jpg`` at 1.30 % and
+    that file is gone.  ``seed_v6.png`` was chosen over ``seed_1x1_drone.png``
+    because it is the better-centred of the two (offset 0.049 against 0.083),
+    which keeps the verdict a pure statement about *size* — 「面积偏小」 and
+    nothing else — exactly as it was on the frame the card was filed on.
 
     Both halves are asserted: the phrase that must appear *and* the phrase that
     must not, because a detector that started reporting some other blob at a
     plausible size would satisfy the first on its own.
     """
-    result = csq.check_anchor(_anchor_for([csq.read_still(OWNER_KEYFRAME)]))
+    result = csq.check_anchor(_anchor_for([csq.read_still(SEED_STILL)]))
 
     assert result.status == csq.STATUS_WARN, f"{result.status}: {result.detail}"
     assert result.measured["detected_frames"] == 1, f"the drone must be found at all: {result.measured}"
@@ -1348,20 +1432,23 @@ def test_a_small_real_subject_is_small_not_absent() -> None:
     assert csq.ANCHOR_MIN_AREA < result.measured["area"] < csq.ANCHOR_AREA_MIN, (
         f"the drone must land between the detection floor and the quality band: {result.measured}"
     )
-    assert result.measured["area"] == pytest.approx(0.013, abs=0.004), result.measured
+    assert result.measured["area"] == pytest.approx(0.024, abs=0.004), result.measured
 
 
-@pytest.mark.skipif(not OWNER_KEYFRAME.is_file(), reason=f"owner keyframe not present: {OWNER_KEYFRAME}")
+@pytest.mark.skipif(
+    not (SEED_STILL.is_file() and CANYON_STILL.is_file()),
+    reason=_missing_assets(SEED_STILL, CANYON_STILL),
+)
 def test_the_detection_floor_sits_between_noise_and_the_smallest_real_subject() -> None:
     """The floor has to clear the loudest false positive and duck the quietest true one.
 
     #345 lowered it, so the question "did it go too far" needs an answer that is
-    measured rather than asserted.  Headroom on both sides, on the real asset the
-    card was filed about and on the subjectless fixtures #341 established:
+    measured rather than asserted.  Headroom on both sides, across every real
+    still this repo can reach and the subjectless fixtures #341 established:
 
     * loudest subjectless fixture  0.17 %   → floor is ~4.7× above it
     * floor                        0.80 %
-    * smallest real subject        1.30 %   → ~1.6× above the floor
+    * smallest real subject        1.93 %   → ~2.4× above the floor
 
     Written as ratios so the margin, not the constant, is what is pinned.  The
     lower figure has moved twice: 0.22 % before #361, 0.27 % after it (the
@@ -1369,16 +1456,26 @@ def test_the_detection_floor_sits_between_noise_and_the_smallest_real_subject() 
     bright a speck is), and 0.17 % since G-11 widened
     :data:`~scripts.check_source_quality.ANCHOR_TEXTURE_WINDOW`, which is the
     quietest it has ever been.
+
+    The upper figure moved for a different reason.  #345 measured it on
+    ``Gemini_v1.jpg`` at 1.30 % and that file is gone (#366), so "smallest real
+    subject" is now taken as the **minimum over both surviving stills** —
+    ``seed_1x1_drone.png`` at 1.93 % against ``seed_v6.png`` at 2.41 % — rather
+    than over one frame.  Adding a third still can only tighten this, never
+    loosen it, which is the direction a headroom claim should be able to move.
     """
     noise = _loudest_subjectless()
-    smallest_real = csq.anchor_stats(csq.read_still(OWNER_KEYFRAME))["area"]
+    smallest_real = min(
+        csq.anchor_stats(csq.read_still(SEED_STILL))["area"],
+        csq.anchor_stats(csq.read_still(CANYON_STILL))["area"],
+    )
 
     assert noise * 2.5 < csq.ANCHOR_MIN_AREA, f"floor too close to the noise: {noise}"
     assert smallest_real > csq.ANCHOR_MIN_AREA * 1.25, f"floor too close to the real subject: {smallest_real}"
     assert csq.ANCHOR_MIN_AREA < csq.ANCHOR_AREA_MIN, "the detection floor must stay below the quality band"
 
 
-@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=f"canyon still not present: {CANYON_STILL}")
+@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=_missing_assets(CANYON_STILL))
 def test_canyon_still_finds_the_aircraft_not_the_whitewater() -> None:
     """Acceptance (#343), second frame: the bright foam must not win either.
 
@@ -1394,8 +1491,11 @@ def test_canyon_still_finds_the_aircraft_not_the_whitewater() -> None:
     airframe that must win.  A regression that can be satisfied by either
     candidate is a smoke test, not an acceptance test.  The discriminating
     version is ``test_the_gorge_fixture_finds_the_subject_not_the_water``, whose
-    two candidates are 0.49 apart; this one is kept because it is the only place
-    the real photograph is exercised at all.
+    two candidates are 0.49 apart.  Since #366 this frame also carries
+    ``test_the_canyon_still_anchors_on_the_aircraft_not_the_backdrop``, which
+    bounds the centroid from *below* (the sky band this test would happily
+    accept) and blinds the enclosure channel to prove the water is still
+    reachable on the photograph itself.
     """
     stats = csq.anchor_stats(csq.read_still(CANYON_STILL))
 
@@ -1441,7 +1541,7 @@ def test_a_sub_floor_core_is_rescued_to_its_full_extent() -> None:
     assert not bare["found"], f"disabling the rescue must restore the #348 bug: {bare}"
 
 
-@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=f"canyon still not present: {CANYON_STILL}")
+@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=_missing_assets(CANYON_STILL))
 def test_the_canyon_still_no_longer_needs_the_rescue() -> None:
     """The #348 gap, re-measured on the frame it was found on, after #361.
 
@@ -1458,7 +1558,7 @@ def test_the_canyon_still_no_longer_needs_the_rescue() -> None:
     )
 
 
-@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=f"canyon still not present: {CANYON_STILL}")
+@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=_missing_assets(CANYON_STILL))
 def test_the_rescue_is_size_invariant() -> None:
     """Acceptance (#348): the same still at 1024²/2048²/2880² measures the same.
 
@@ -1478,17 +1578,24 @@ def test_the_rescue_is_size_invariant() -> None:
     assert spread <= 0.30, f"size-dependent measurement: {areas} (spread {spread:.1%})"
 
 
-@pytest.mark.skipif(not OWNER_KEYFRAME.is_file(), reason=f"owner keyframe not present: {OWNER_KEYFRAME}")
+@pytest.mark.skipif(not SEED_STILL.is_file(), reason=_missing_assets(SEED_STILL))
 def test_the_rescue_leaves_established_and_noise_cores_alone() -> None:
     """The rescue is gated on both sides and must stay that way.
 
-    A core that already clears the floor (the owner's keyframe at 1.30 %) must
+    A core that already clears the floor (``video/seed_v6.png`` at 2.41 %) must
     measure *identically* with and without the rescue — the #345 pins depend on
     it.  And the rescue must not fabricate anchors out of specks: every
     subjectless fixture's sub-floor core stays sub-floor, because cores under
     ``ANCHOR_RESCUE_CORE_FLOOR`` × the detection floor are not re-grown.
+
+    Re-pointed by #366, which read the owner's deleted keyframe at 1.30 %.
+    Deliberately a *different* still from
+    ``test_the_canyon_still_no_longer_needs_the_rescue``, which makes the same
+    no-op claim on ``seed_1x1_drone.png`` at 1.93 %: the gate is an inequality
+    against the floor, so pinning it at one measured area proves less than
+    pinning it at two.
     """
-    frame = csq.read_still(OWNER_KEYFRAME)
+    frame = csq.read_still(SEED_STILL)
     assert csq.anchor_stats(frame) == csq.anchor_stats(frame, rescue=False), (
         "the rescue must not touch a core that already clears the floor"
     )
@@ -1630,7 +1737,7 @@ def test_the_candidacy_gate_does_not_manufacture_an_anchor() -> None:
         assert biggest < floor, f"{name} now has a credible candidate ({biggest:.4%} >= {floor:.4%})"
 
 
-@pytest.mark.skipif(not SEED_STILL.is_file(), reason=f"seed still not present: {SEED_STILL}")
+@pytest.mark.skipif(not SEED_STILL.is_file(), reason=_missing_assets(SEED_STILL))
 def test_the_seed_still_measures_the_same_at_every_resolution() -> None:
     """Acceptance (#356): ``video/seed_v6.png`` reads one number, not two.
 
@@ -1659,7 +1766,7 @@ def test_the_seed_still_measures_the_same_at_every_resolution() -> None:
 
 @pytest.mark.skipif(
     not (SEED_STILL.is_file() and SEED_CLIP.is_file()),
-    reason=f"seed pair not present: {SEED_STILL} / {SEED_CLIP}",
+    reason=_missing_assets(SEED_STILL, SEED_CLIP),
 )
 def test_the_clip_agrees_with_its_own_seed_frame() -> None:
     """Acceptance (#356): the 2048² still and the 960² clip stop disagreeing.
@@ -1811,7 +1918,7 @@ def test_enclosure_barrier_reads_a_colour_frame_and_a_gray_one_alike() -> None:
     assert float(np.abs(colour - gray).max()) == pytest.approx(0.0, abs=1e-3)
 
 
-@pytest.mark.skipif(not SEED_STILL.is_file(), reason=f"seed still not present: {SEED_STILL}")
+@pytest.mark.skipif(not SEED_STILL.is_file(), reason=_missing_assets(SEED_STILL))
 def test_the_seed_still_anchors_on_the_aircraft_not_the_rapids() -> None:
     """Acceptance (#361), on the still the card was filed against.
 
@@ -1832,7 +1939,7 @@ def test_the_seed_still_anchors_on_the_aircraft_not_the_rapids() -> None:
     assert stats["centroid_x"] == pytest.approx(0.50, abs=0.12), f"not the aircraft: {stats}"
 
 
-@pytest.mark.skipif(not SEED_STILL.is_file(), reason=f"seed still not present: {SEED_STILL}")
+@pytest.mark.skipif(not SEED_STILL.is_file(), reason=_missing_assets(SEED_STILL))
 def test_removing_the_enclosure_channel_takes_the_seed_still_off_the_airframe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1873,7 +1980,7 @@ def test_removing_the_enclosure_channel_takes_the_seed_still_off_the_airframe(
     assert ungated["centroid_x"] < 0.30, f"the mutation must take the anchor off the airframe: {ungated}"
 
 
-@pytest.mark.skipif(not SEED_CLIP.is_file(), reason=f"seed clip not present: {SEED_CLIP}")
+@pytest.mark.skipif(not SEED_CLIP.is_file(), reason=_missing_assets(SEED_CLIP))
 def test_the_clip_anchors_on_the_aircraft_frame_by_frame() -> None:
     """Acceptance (#361), video path: the sampler's gray frames agree with the still.
 
