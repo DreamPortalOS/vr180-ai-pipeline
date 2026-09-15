@@ -6,7 +6,11 @@ bills **$0.13 per second at 2K** (≈9.5 元 for a 10s clip at 7.3 元/$), i.e. 
 a fifth of the Seedance 4k cost, and it is the only MiniMax tier that reaches
 2K at all.
 
-Verified contract (2026-09-15, platform.minimax.io — see the PR for links):
+Verified contract, re-checked 2026-09-16 against the primary sources:
+
+* API reference — https://platform.minimax.io/docs/guides/video-generation
+* Pay-as-you-go price list — https://platform.minimax.io/docs/guides/pricing-paygo
+
 
 * submit  ``POST https://api.minimax.io/v2/video_generation``
 * query   ``GET  https://api.minimax.io/v2/query/video_generation/{task_id}``
@@ -25,10 +29,19 @@ Answers to the three questions the card asked us to verify:
   1440 short-edge figure is the published definition, so 1:1 lands at roughly
   1440×1440.  MiniMax does **not** publish per-ratio pixel dimensions, so treat
   1440×1440 as expected-but-unconfirmed until the first real clip is probed.
-* **1:1 is supported.**  ``ratio`` accepts
-  ``adaptive / 21:9 / 16:9 / 4:3 / 1:1 / 3:4 / 9:16``.  Our square requirement
-  is met — with one operational caveat, see :data:`RATIO_IGNORED_NOTE`.
+  Note this is **half** our 2880 target, and upscaling adds no information.
+* **1:1 is supported at 2K** — the card's hard requirement.  ``ratio`` accepts
+  ``adaptive / 21:9 / 16:9 / 4:3 / 1:1 / 3:4 / 9:16``, constrained only by a
+  documented ``2:5 … 5:2`` width/height envelope that 1:1 sits in the middle
+  of; the tier and the ratio are independent fields with no documented
+  incompatibility.  One operational caveat, see :data:`RATIO_IGNORED_NOTE`.
 * **10s is supported.**  ``duration`` is an integer in [4, 15].
+
+Not wired up, but worth knowing when the bill matters: MiniMax also sells a
+768P→2K *regeneration* at **$0.05/s**, and 0.08 + 0.05 == 0.13, so drafting at
+768P first and upgrading only the keeper costs the same as going straight to 2K
+— while every rejected draft costs $0.08/s instead of $0.13/s.  That is the
+same "only pay for the last leg" layering the repo already applies to Gemini.
 
 Credentials: ``MINIMAX_API_KEY`` (MiniMax 开放平台 console).  ``MINIMAX_API_BASE``
 switches to the mainland China host (``https://api.minimaxi.com``), which serves
