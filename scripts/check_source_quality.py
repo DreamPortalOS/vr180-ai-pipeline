@@ -292,21 +292,29 @@ ANCHOR_MORPH_KERNEL: int = 9
 ANCHOR_CENTER_PRIOR_SIGMA: float = 0.5
 
 #: Side, in pixels at :data:`ANCHOR_ANALYSIS_MAX_DIM`, of the box the texture
-#: channel averages Laplacian energy over.  ~8 % of the frame: small enough to
+#: channel averages Laplacian energy over.  ~12 % of the frame: small enough to
 #: read a hand-sized subject as textured, large enough that a single hard edge
 #: (a cloud rim, a horizon) does not paint a whole flat region as structured.
-#: Measured across 15/21/31 on both of the owner's keyframes and the synthetic
-#: fixtures, 21 gave the widest subject-vs-subjectless separation (50×, against
-#: 42× at 15 and 46× at 31); the real-asset centroids moved by <0.01 across the
-#: three, so this is a tuning choice, not a knife edge.
 #:
-#: Re-measured after #361 added the enclosure channel: 40.6× at both 15 and 21,
-#: and **64.1×** at 31.  The centroids still barely move between 21 and 31
-#: ((0.539, 0.506) against (0.535, 0.501) on ``seed_v6.png``), so 31 is now the
-#: better-separating choice and is left alone deliberately — re-tuning a #343
-#: constant was not in #361's scope and a window change moves every anchor
-#: number in the suite.  Worth a card of its own.
-ANCHOR_TEXTURE_WINDOW: int = 21
+#: **One of three constants that are a set** — with
+#: :data:`ANCHOR_ENCLOSURE_PASSES` and :data:`ANCHOR_ENCLOSURE_REFERENCE`.  Move
+#: one and the other two have to be re-measured; see the G-11 table under
+#: :data:`ANCHOR_ENCLOSURE_PASSES` for why, and for the scan this value came
+#: from.
+#:
+#: It was 21 from #343 (chosen over 15/31 on the pre-enclosure detector) until
+#: G-11 re-scanned 21/25/31/35 against the #361 detector.  31 wins on every axis
+#: that was measured and loses on none: the subject-vs-subjectless separation
+#: goes from **40.6× to 64.1×** (the loudest subjectless fixture drops from
+#: 0.27 % of the frame to 0.17 %), #360's cross-read spread on ``seed_v6.png``
+#: falls from **12.2 % to 4.9 %**, and the real-asset centroids do not move —
+#: ``seed_v6`` reads (0.535, 0.501) against 21's (0.539, 0.506), ``seed_1x1_drone``
+#: (0.506, 0.441) against (0.506, 0.439).  A bigger window finds the *same*
+#: subject and is simply quieter about everything that is not one.
+#:
+#: 35 was scanned too and is worse (44.8×), so this is a peak rather than a
+#: "larger is better" gradient.
+ANCHOR_TEXTURE_WINDOW: int = 31
 
 #: **Detection floor — "is there anything there", not "is it big enough".**
 #: The two questions are separate and this constant only answers the first one.
@@ -381,8 +389,20 @@ ANCHOR_DETECTED_FRAC_MIN: float = 0.5
 #: * ``seed_1x1_drone`` airframe   73.0   ← must win (0.91 of reference)
 #: * ``seed_v6`` airframe          84.1   ← must win (saturated)
 #:
-#: The plateau is wide: 78–82 with :data:`ANCHOR_ENCLOSURE_EXPONENT` 1.9–2.1
-#: gives the same verdict on every asset and fixture in the suite.
+#: **One of three constants that are a set** — with
+#: :data:`ANCHOR_ENCLOSURE_PASSES` and :data:`ANCHOR_TEXTURE_WINDOW`.  Move one
+#: and the other two have to be re-measured; the pass count in particular is
+#: what the barrier numbers above are denominated in, so a reference quoted
+#: without one is meaningless.  See :data:`ANCHOR_ENCLOSURE_PASSES`.
+#:
+#: The plateau is wide and G-11 re-measured it at the new texture window: over
+#: 70–90 every real-asset verdict holds still (``seed_v6`` y within
+#: 0.498–0.508, ``seed_1x1_drone`` y within 0.434–0.453, the clip anchored in
+#: every frame from 70 to 82).  The #341 separation is the one number that is
+#: not flat across it — 64.1× at 78 and 80, 45.5× at 82 — because it is decided
+#: by whichever synthetic fixture happens to be loudest, so 80 is kept at the
+#: centre of the quiet stretch rather than pushed to an edge.
+#: :data:`ANCHOR_ENCLOSURE_EXPONENT` 1.9–2.1 is likewise unmoved.
 ANCHOR_ENCLOSURE_REFERENCE: float = 80.0
 
 #: Exponent applied to the enclosure ratio, i.e. how sharply a half-enclosed
@@ -412,8 +432,53 @@ ANCHOR_DISTINCTNESS_EXPONENT: float = 0.7
 #: Lab units at 3 / 6 / 12 / 25).  What matters is that the ordering it produces
 #: is already stable — foam below wall below airframe at every pass count — and
 #: that three sweeps cost ~0.1 s a frame instead of ~1 s.
-#: :data:`ANCHOR_ENCLOSURE_REFERENCE` is calibrated against this pass count and
-#: the two must move together.
+#:
+#: **These three constants are a set** — this one,
+#: :data:`ANCHOR_ENCLOSURE_REFERENCE` and :data:`ANCHOR_TEXTURE_WINDOW` — and
+#: changing any one of them obliges you to re-measure the other two.  The
+#: pass count and the reference are paired because the reference is an
+#: *absolute* Lab distance and the pass count is what the barrier map's absolute
+#: scale depends on (halving as above).  The texture window joins the set because
+#: the two gates multiply: a wider window removes exactly the finely-textured
+#: speckle that the enclosure gate then has to judge, so the reference's
+#: operating point moves with it.
+#:
+#: G-11 (#364) scanned window × passes on the three owner assets, with the
+#: reference re-derived per pass count from the airframe ratio above
+#: (80 → 56 → 53).  Separation is the #341 subject-vs-subjectless margin;
+#: cross-read is #360's spread over ``seed_v6.png`` read at 2048/1024/960/512²
+#: in both colour and luminance; the contract is ≤30 %:
+#:
+#: ====== ====== ========== ============== ================ ==========
+#: window passes separation ``seed_v6`` xy ``…_drone`` xy   cross-read
+#: ====== ====== ========== ============== ================ ==========
+#: 21     3       40.6×     (0.539, 0.506) (0.506, 0.439)      12.2 %
+#: 25     3       38.0×     (0.536, 0.503) (0.505, 0.439)       6.0 %
+#: **31** **3**  **64.1×**  (0.535, 0.501) (0.506, 0.441)     **4.9 %**
+#: 35     3       44.8×     (0.535, 0.501) (0.506, 0.441)       4.3 %
+#: 21     6       58.9×     (0.574, 0.574) (0.509, 0.448)      15.6 %
+#: 25     6       64.8×     (0.572, 0.569) (0.531, 0.547)      20.9 %
+#: 31     6       64.1×     (0.563, 0.547) (0.532, 0.549)      44.2 %
+#: 35     6       48.6×     (0.561, 0.542) (0.532, 0.550)      53.9 %
+#: 21     12      58.9×     (0.575, 0.573) (0.662, 0.225)      22.7 %
+#: 25     12      58.9×     (0.568, 0.557) (0.662, 0.225)      43.4 %
+#: 31     12      58.8×     (0.561, 0.543) (0.662, 0.225)      30.3 %
+#: 35     12      58.8×     (0.559, 0.540) (0.662, 0.225)      28.3 %
+#: ====== ====== ========== ============== ================ ==========
+#:
+#: The result is the opposite of what the card expected: **more relaxation makes
+#: the detector worse**, and three passes survive on merit rather than on cost.
+#: Above three, #360's cross-read contract starts failing outright (44 % and
+#: 54 % at six passes), and at twelve the ``seed_1x1_drone`` centroid leaves the
+#: airframe for the canyon rim at (0.662, 0.225) at *every* window.  A further
+#: reference sweep (41–70 in steps of 4, at windows 21/25/31) confirms this is
+#: not a mis-chosen reference: at six and twelve passes the canyon centroid flips
+#: between the airframe and the rim on a 4-unit reference step and the cross-read
+#: spread swings from 1.3 % to 864 %.  A converged barrier map is a *flatter*
+#: one — the relaxation only ever lowers distances — so it compresses the very
+#: gap between airframe and foam the gate is reading, and the verdict starts
+#: turning on noise.  At three passes the same sweep (70–90) leaves every real
+#: centroid put.
 ANCHOR_ENCLOSURE_PASSES: int = 3
 
 #: Smallest region — as a fraction of the detection floor — that counts as
