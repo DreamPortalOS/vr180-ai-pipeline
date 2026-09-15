@@ -80,9 +80,11 @@ A factor of ~31 between the quietest true subject and the loudest false one,
 with :data:`~scripts.check_source_quality.ANCHOR_MIN_AREA` sitting between them
 — so "no anchor" is a verdict the check can actually reach, not a branch that
 never fires.  ``test_subject_and_subjectless_frames_are_separated`` pins that
-margin directly; the texture channel added in #343 widens it to ~50× and
-``test_the_texture_channel_widens_the_subject_separation`` pins that it may
-never narrow again.
+margin directly; the texture channel added in #343 widened it to ~50×, the
+enclosure channel added in #361 gives back some of that (~41×, because a gate
+that refuses to look at brightness also refuses to punish bright speckle), and
+``test_the_texture_channel_widens_the_subject_separation`` pins the 32× floor
+that neither may cross.
 
 Two thresholds, two questions (#345)
 ------------------------------------
@@ -102,26 +104,47 @@ pins the headroom on both sides (loudest subjectless fixture 0.22 %, floor
 deliberately **unchanged** — a lower floor that started finding anchors in an
 empty frame would be a worse bug than the one it replaced.
 
-And the sky is not the subject (#343)
--------------------------------------
+And the sky is not the subject (#343), nor the river (#361)
+-----------------------------------------------------------
 The anchor detector's first field trial failed: on the owner's canyon keyframes
 it reported the *cloud band* and the *whitewater* as the subject, because a
 red-rock frame's mean colour is owned by the rock, which leaves bright sky as
-the most colour-"distinct" thing in the picture.  ``flat_sky_frame`` reproduces
-that composition synthetically, and the two checks that matter are a matched
-pair: ``test_a_flat_bright_sky_does_not_pose_as_the_subject`` says the detector
-gets it right, and ``test_removing_the_texture_channel_puts_the_sky_back``
-disables the texture channel and insists the answer goes *wrong* again — so the
-first test cannot quietly start passing for the wrong reason.
+the most colour-"distinct" thing in the picture.  #343 answered the *flat* half
+of that with a texture channel; #361 answered the rest, because real whitewater
+is bright **and** finely textured and passes a structure test honestly.  What
+separates foam from airframe is neither tone nor position but **enclosure**: the
+river runs off the edge of the picture and the aircraft does not.
+
+Each fix owns a fixture and a matched mutation, so no acceptance test can
+quietly start passing for the wrong reason:
+
+============================  ==============================  ====================
+composition                   acceptance                      mutation
+============================  ==============================  ====================
+``flat_sky_frame`` (#343)     subject, not the sky band       blind both structure
+                                                              channels → y = 0.11
+``gorge_frame`` (#361)        subject at y = 0.26, not the    blind enclosure
+                              river at y = 0.75               → y = 0.75
+``thin_limbed_frame`` (#348)  3.97 %, not a 0.73 % skeleton   ``rescue=False``
+                                                              → 「没有锚点」
+============================  ==============================  ====================
+
+The #343 mutation needs *both* channels blinded because a sky band that runs off
+the top edge is unenclosed as well as flat, so either channel alone now disposes
+of it; the texture channel's own necessity is pinned instead on the #341 margin,
+which collapses from 40.6× to 7.6× without it.
 
 Almost everything here runs on synthetic arrays: no test decodes video or shells
-out to ffmpeg.  The two exceptions are the #343 regressions against the frames
-the bug was actually reported on (``OWNER_KEYFRAME``, ``CANYON_STILL``), which
-are read **read-only** and ``skip`` when absent — neither file ships with the
-repo, so they run on the owner's machine and nowhere else.  The ffprobe/ffmpeg
-layer is covered by parsing captured ffprobe JSON and by an AST sweep
-(``test_subprocess_calls_are_list_form_without_shell``) that holds every
-``subprocess.run`` in the module to list form with no ``shell=True``.
+out to ffmpeg.  The exceptions are the regressions against the frames the bugs
+were actually reported on (``OWNER_KEYFRAME``, ``CANYON_STILL``, ``SEED_STILL``,
+``SEED_CLIP``), which are read **read-only** and ``skip`` when absent — none of
+them ships with the repo, so they run on the owner's machine and nowhere else.
+Note that they also skip in a **git worktree**, whose ``video/`` directory does
+not exist; point ``VR180_SEED_STILL`` and friends at the main checkout to run
+them there.  The ffprobe/ffmpeg layer is covered by parsing captured ffprobe
+JSON and by an AST sweep (``test_subprocess_calls_are_list_form_without_shell``)
+that holds every ``subprocess.run`` in the module to list form with no
+``shell=True``.
 """
 
 from __future__ import annotations
@@ -344,6 +367,78 @@ def flat_sky_frame(area_frac: float = 0.11, size: int = FRAME_SIZE, sky_frac: fl
     return _paint_subject(ground, area_frac, level=70.0, amplitude=35.0, seed=13)
 
 
+def gorge_frame(
+    size: int = FRAME_SIZE,
+    rock: float = 110.0,
+    water: float = 250.0,
+    subject: float = 60.0,
+    area_frac: float = 0.10,
+    cy_frac: float = 0.26,
+) -> np.ndarray:
+    """The #361 composition: a dark subject *high* in the frame, water *low*.
+
+    :func:`flat_sky_frame` cannot catch G-10, because the region that must lose
+    there is **flat** and the texture channel alone disposes of it.  The region
+    that must lose here is bright, finely textured, four times more
+    colour-distinct than the subject and — the only thing that separates them —
+    it *runs off the bottom edge of the picture*, the way a river does and the
+    way an aircraft does not.
+
+    The geometry is the point.  ``video/seed_1x1_drone.png``, the still the
+    previous regression used, puts its whitewater within ±0.12 of the airframe's
+    own centroid, so ``centroid_y < 0.60`` passed whichever of the two the
+    detector had picked and the test proved nothing.  Here the subject sits at
+    y = 0.26 and the water's centre of mass at y = 0.75 — **0.49 apart**, four
+    times the tolerance — so the assertion can only pass by naming the right one.
+
+    Measured: the detector answers 9.26 % at (0.498, 0.260); with the enclosure
+    channel disabled it answers 5.10 % at (0.502, 0.751).
+    """
+    frame = rock + (_fine_texture(size, size, seed=11) - 128.0) / 127.0 * 15.0
+    foam = water + (_fine_texture(size, size, seed=23) - 128.0) / 127.0 * 6.0
+    band = np.zeros((size, size), np.uint8)
+    cv2.rectangle(band, (int(0.30 * size), int(0.60 * size)), (int(0.70 * size), size), 1, -1)
+    frame[band == 1] = foam[band == 1]
+    body = subject + (_fine_texture(size, size, seed=29) - 128.0) / 127.0 * 20.0
+    disc = np.zeros((size, size), np.uint8)
+    radius = round(math.sqrt(area_frac * size * size / math.pi))
+    cv2.circle(disc, (size // 2, int(cy_frac * size)), radius, 1, -1)
+    frame[disc == 1] = body[disc == 1]
+    return np.clip(frame, 0, 255).astype(np.uint8)
+
+
+def thin_limbed_frame(
+    size: int = FRAME_SIZE,
+    hub: float = 0.09,
+    limb: float = 0.021,
+    reach: float = 0.30,
+    level: float = 215.0,
+) -> np.ndarray:
+    """A textured hub with four arms thinner than the morphological kernel.
+
+    The #348 composition in synthetic form: the opening that deletes speckle
+    deletes a quadcopter's arms just as efficiently, leaving a core far too small
+    to clear the detection floor for a subject that is plainly there.  ``limb``
+    is 5 px at the 256² analysis size against a 9 px kernel, so the arms cannot
+    survive the erosion and the hub can.
+
+    Measured: the opened core reads 0.73 % — inside the rescue window
+    ``[0.44 %, 0.80 %)`` — and the rescued extent 3.97 %, a 5.5× difference.
+    """
+    field = np.clip(45.0 + (_fine_texture(size, size, seed=3) - 128.0) / 127.0 * 30.0, 0, 255)
+    body = level + (_fine_texture(size, size, seed=17) - 128.0) / 127.0 * 26.0
+    mask = np.zeros((size, size), np.uint8)
+    centre = size // 2
+    cv2.circle(mask, (centre, centre), round(hub * size / 2), 1, -1)
+    half = max(1, round(limb * size / 2))
+    span = round(reach * size)
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        cv2.line(mask, (centre, centre), (centre + dx * span, centre + dy * span), 1, 2 * half)
+    out = field.copy()
+    out[mask == 1] = body[mask == 1]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def anchored_outflow_frames(
     n: int = N_FRAMES,
     size: int = FRAME_SIZE,
@@ -376,6 +471,19 @@ def _detail_for(frames: list[np.ndarray]) -> list[dict[str, float]]:
 
 def _anchor_for(frames: list[np.ndarray]) -> list[dict[str, float]]:
     return [csq.anchor_stats(f) for f in frames]
+
+
+def _loudest_subjectless() -> float:
+    """Largest "subject" the detector can be provoked into finding in an empty frame.
+
+    The false-positive half of the #341 margin, in one number: eight seeds of
+    uniform texture plus the flat and rim-damped compositions, which is the same
+    population ``test_subject_and_subjectless_frames_are_separated`` measures.
+    """
+    return max(
+        [csq.anchor_stats(subjectless_frame(seed=s))["area"] for s in range(1, 9)]
+        + [csq.anchor_stats(flat_frame())["area"], csq.anchor_stats(rim_damped_frame(0.18))["area"]]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -885,8 +993,8 @@ def test_subject_and_subjectless_frames_are_separated() -> None:
     threshold and a margin expressed in units of the thing being moved would have
     silently rescaled with it instead of catching the change.
 
-    Measured today: true subjects 11.0 / 36.1 / 11.1 %, false ones at most
-    0.22 %, i.e. ~50× apart.  The bounds below are deliberately slacker than the
+    Measured today: true subjects 11.1 / 40.2 / 11.3 %, false ones at most
+    0.27 %, i.e. ~41× apart.  The bounds below are deliberately slacker than the
     measurements so that ordinary detector noise does not flake the suite.
     """
     with_subject = [
@@ -1018,6 +1126,23 @@ def _blind_texture_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _blind_enclosure_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable the enclosure channel: every pixel claims to be equally enclosed.
+
+    The #361 mutation, built to the same rule as :func:`_blind_texture_gate` —
+    Achanta, Otsu, the morphology, the centre prior, the density scoring and the
+    texture channel are all left exactly as they are, so whatever this breaks is
+    attributable to the enclosure channel and to nothing else.
+    """
+    monkeypatch.setattr(
+        csq,
+        "enclosure_gate",
+        lambda frame, *_a, **_kw: np.ones_like(
+            csq._fit_for_analysis(csq._as_gray(frame), csq.ANCHOR_ANALYSIS_MAX_DIM), dtype=np.float32
+        ),
+    )
+
+
 def test_a_flat_bright_sky_does_not_pose_as_the_subject() -> None:
     """Acceptance (#343): the anchor of a sky-over-ground frame is the subject.
 
@@ -1036,26 +1161,71 @@ def test_a_flat_bright_sky_does_not_pose_as_the_subject() -> None:
     assert stats["area"] == pytest.approx(0.11, abs=0.05), f"the sky leaked into the region: {stats}"
 
 
-def test_removing_the_texture_channel_puts_the_sky_back(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mutation check (#343): the texture channel is load-bearing, not decoration.
+def test_removing_both_structure_channels_puts_the_sky_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mutation check (#343, restated for #361): the sky fix is load-bearing.
 
-    Without it this frame's anchor is the sky band — twice the subject's area,
-    centroid up at y≈0.11 instead of y≈0.51.  If a future change makes
-    :func:`~scripts.check_source_quality.texture_gate` a no-op, or normalises it
-    into uselessness, this test fails and the one above stops meaning anything.
+    It used to be enough to blind :func:`~scripts.check_source_quality.texture_gate`
+    on its own, and #361 is why that stopped being true: a blown-out sky band
+    that runs off the top edge is not merely structureless, it is also
+    **unenclosed**, so the channel added in #361 declines to promote it for a
+    second and independent reason.  Measured on this fixture, blinding either
+    channel alone still returns the subject (y = 0.526 with texture blind,
+    y = 0.498 with enclosure blind).
+
+    Asserting "blind one channel and it breaks" would therefore now fail for a
+    *good* reason, and weakening it to "blind one channel and something changes"
+    would assert nothing.  Blinding both restores the original bug exactly — the
+    21.7 %-of-frame sky band at y = 0.11 that :func:`flat_sky_frame`'s docstring
+    was written around — which keeps
+    ``test_a_flat_bright_sky_does_not_pose_as_the_subject`` from quietly passing
+    for the wrong reason.  Each channel's *own* necessity is pinned separately:
+    texture by ``test_removing_the_texture_channel_collapses_the_separation``,
+    enclosure by ``test_removing_the_enclosure_channel_puts_the_anchor_in_the_water``.
     """
     frame = flat_sky_frame()
-    with_texture = csq.anchor_stats(frame)
+    gated = csq.anchor_stats(frame)
 
     _blind_texture_gate(monkeypatch)
-    without_texture = csq.anchor_stats(frame)
+    _blind_enclosure_gate(monkeypatch)
+    ungated = csq.anchor_stats(frame)
 
-    assert with_texture["centroid_y"] == pytest.approx(0.5, abs=0.06)
-    assert without_texture["centroid_y"] < 0.25, (
-        f"the texture channel changed nothing — the mutation must move the anchor onto the sky: {without_texture}"
+    assert gated["centroid_y"] == pytest.approx(0.5, abs=0.06)
+    assert ungated["centroid_y"] < 0.25, (
+        f"the structure channels changed nothing — the mutation must move the anchor onto the sky: {ungated}"
     )
-    assert without_texture["area"] > with_texture["area"] * 1.5, (
-        f"the ungated region must swell to swallow the sky: {without_texture} vs {with_texture}"
+    assert ungated["area"] > gated["area"] * 1.5, (
+        f"the ungated region must swell to swallow the sky: {ungated} vs {gated}"
+    )
+
+
+def test_removing_the_texture_channel_collapses_the_separation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mutation check (#343): what the texture channel is still uniquely for.
+
+    Since #361 the sky band is held off by two channels, so the texture gate's
+    necessity has to be demonstrated where it is *not* shadowed: the #341 margin
+    between a frame with a subject and a frame without one.  An evenly-textured
+    frame is full of speckle that is both distinct and — being blob texture —
+    thoroughly enclosed; structure is the only one of the three questions that
+    answers "no" to it.  Measured, blinding this channel takes the loudest
+    subjectless fixture from 0.27 % to 1.46 % and the margin from 40.6× to 7.6×,
+    i.e. straight through :data:`~scripts.check_source_quality.ANCHOR_MIN_AREA`.
+    """
+    quietest_true = min(
+        csq.anchor_stats(subject_frame(0.11))["area"],
+        csq.anchor_stats(subject_frame(0.40))["area"],
+        csq.anchor_stats(subject_frame(0.11, cx_frac=0.80))["area"],
+    )
+    gated = _loudest_subjectless()
+
+    _blind_texture_gate(monkeypatch)
+    ungated = _loudest_subjectless()
+
+    assert gated < csq.ANCHOR_MIN_AREA, f"the gated detector must find nothing in an empty frame: {gated}"
+    assert ungated > csq.ANCHOR_MIN_AREA, (
+        f"the texture channel changed nothing — without it an empty frame must grow an anchor: {ungated}"
+    )
+    assert quietest_true / ungated < 15.0, (
+        f"the #341 margin must collapse without the texture channel: {quietest_true} vs {ungated}"
     )
 
 
@@ -1063,20 +1233,18 @@ def test_the_texture_channel_widens_the_subject_separation() -> None:
     """The gate must not buy the sky fix by blurring the #341 margin.
 
     #341's contract is that a frame with a subject and a frame without one are
-    separated by a wide margin rather than a hair.  Gating tightens it (≈50×
-    against ≈32×) because speckle in an evenly-textured frame is exactly what a
-    structure measure declines to promote; this pins that it does not *loosen*
-    it.
+    separated by a wide margin rather than a hair.  Gating widened it (≈50×
+    against the ungated ≈32×) because speckle in an evenly-textured frame is
+    exactly what a structure measure declines to promote; #361's enclosure gate
+    gives part of that back (≈41×) because it judges scenery by where it leaks
+    to and not by how bright it is.  32× is the floor neither may cross.
     """
     with_subject = min(
         csq.anchor_stats(subject_frame(0.11))["area"],
         csq.anchor_stats(subject_frame(0.40))["area"],
         csq.anchor_stats(subject_frame(0.11, cx_frac=0.80))["area"],
     )
-    without = max(
-        [csq.anchor_stats(subjectless_frame(seed=s))["area"] for s in range(1, 9)]
-        + [csq.anchor_stats(flat_frame())["area"], csq.anchor_stats(rim_damped_frame(0.18))["area"]]
-    )
+    without = _loudest_subjectless()
     assert with_subject / max(without, 1e-9) > 32.0, f"separation regressed: {with_subject} vs {without}"
 
 
@@ -1171,16 +1339,15 @@ def test_the_detection_floor_sits_between_noise_and_the_smallest_real_subject() 
     measured rather than asserted.  Headroom on both sides, on the real asset the
     card was filed about and on the subjectless fixtures #341 established:
 
-    * loudest subjectless fixture  0.22 %   → floor is ~3.6× above it
+    * loudest subjectless fixture  0.27 %   → floor is ~2.9× above it
     * floor                        0.80 %
     * smallest real subject        1.30 %   → ~1.6× above the floor
 
-    Written as ratios so the margin, not the constant, is what is pinned.
+    Written as ratios so the margin, not the constant, is what is pinned.  The
+    lower figure was 0.22 % before #361; the enclosure channel costs a little
+    headroom on that side because it does not care how bright a speck is.
     """
-    noise = max(
-        [csq.anchor_stats(subjectless_frame(seed=s))["area"] for s in range(1, 9)]
-        + [csq.anchor_stats(flat_frame())["area"], csq.anchor_stats(rim_damped_frame(0.18))["area"]]
-    )
+    noise = _loudest_subjectless()
     smallest_real = csq.anchor_stats(csq.read_still(OWNER_KEYFRAME))["area"]
 
     assert noise * 2.5 < csq.ANCHOR_MIN_AREA, f"floor too close to the noise: {noise}"
@@ -1195,15 +1362,17 @@ def test_canyon_still_finds_the_aircraft_not_the_whitewater() -> None:
     ``seed_1x1_drone.png`` is 2048² with the aircraft at about (0.50, 0.48) and a
     stretch of whitewater filling the bottom of the gorge.  The old detector
     returned the foam at (0.51, 0.79); anything below y≈0.6 in this frame is
-    river, not subject.
+    river, not subject.  It now reads 1.65 % at (0.506, 0.439).
 
-    Note for #345: the detector picks the aircraft here (0.504, 0.359) but its
-    opened core measures only **0.53 %** of this frame — under the 0.8 %
-    detection floor.  #348 resolved that gap with the rescue
-    (:func:`check_source_quality.anchor_stats` re-grows a credible-but-
-    sub-floor core to its full pre-morphology extent), so this still now reads
-    ~1.38 % and reports 「面积偏小」; what this test guards is unchanged — the
-    foam must not win.
+    **This test is weak on its own and #361 is why**: the detector's answer
+    before that card was (0.510, 0.371) — the bright bend of the river directly
+    above the fuselage — and both assertions below passed on it, because in
+    *this* composition the water that must lose sits within ±0.12 of the
+    airframe that must win.  A regression that can be satisfied by either
+    candidate is a smoke test, not an acceptance test.  The discriminating
+    version is ``test_the_gorge_fixture_finds_the_subject_not_the_water``, whose
+    two candidates are 0.49 apart; this one is kept because it is the only place
+    the real photograph is exercised at all.
     """
     stats = csq.anchor_stats(csq.read_still(CANYON_STILL))
 
@@ -1211,33 +1380,59 @@ def test_canyon_still_finds_the_aircraft_not_the_whitewater() -> None:
     assert stats["centroid_y"] < 0.60, f"still on the whitewater: {stats}"
 
 
-@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=f"canyon still not present: {CANYON_STILL}")
 def test_a_sub_floor_core_is_rescued_to_its_full_extent() -> None:
-    """Acceptance (#348): the 2048² drone measures its subject, not its skeleton.
+    """Acceptance (#348): a thin-limbed subject measures itself, not its skeleton.
 
-    The opening eats the quadcopter's thin arms exactly as it eats specks, so
-    the opened core reads 0.53 % — under the detection floor — for a subject
-    whose true extent is 1.38 %.  The rescue re-grows the winning core to its
-    pre-morphology extent; these assertions pin the rescued verdict (found,
-    area above the floor but below the quality band, centroid still on the
-    airframe within ±0.12 per axis of the measured (0.504, 0.359)) and, via
-    the ``rescue=False`` pair, that the rescue is load-bearing rather than
-    decorative: switch it off and this frame is back to 「没有锚点」.
+    The opening eats a quadcopter's arms exactly as it eats specks, leaving a
+    core under the detection floor for a subject that is plainly there.  The
+    rescue re-grows the winning core to its pre-morphology extent; these
+    assertions pin the rescued verdict (found, area above the floor but below
+    the quality band, centroid unmoved) and, via the ``rescue=False`` pair, that
+    the rescue is load-bearing rather than decorative: switch it off and the
+    frame is back to 「没有锚点」.
+
+    Asserted on :func:`thin_limbed_frame` rather than on ``CANYON_STILL``, which
+    is where #348 measured it.  The gap the rescue was built to close is a
+    property of the *morphology*, not of that photograph, and #361 stopped that
+    photograph from demonstrating it: with the enclosure channel the detector
+    resolves the airframe well enough that its opened core clears the floor on
+    its own (1.65 %), so the real still can no longer show the rescue doing
+    anything.  A synthetic composition can, always, and in CI.
     """
-    frame = csq.read_still(CANYON_STILL)
+    frame = thin_limbed_frame()
     rescued = csq.anchor_stats(frame)
     bare = csq.anchor_stats(frame, rescue=False)
 
-    assert rescued["found"], f"the drone must be found at all: {rescued}"
+    assert rescued["found"], f"the subject must be found at all: {rescued}"
     assert csq.ANCHOR_MIN_AREA < rescued["area"] < csq.ANCHOR_AREA_MIN, (
-        f"the drone must land between the detection floor and the quality band: {rescued}"
+        f"the subject must land between the detection floor and the quality band: {rescued}"
     )
     assert rescued["area"] >= 2.0 * bare["area"], (
         f"the rescue must more than double the eroded skeleton's area: {rescued} vs {bare}"
     )
-    assert abs(rescued["centroid_x"] - 0.504) <= 0.12, f"off the airframe: {rescued}"
-    assert abs(rescued["centroid_y"] - 0.359) <= 0.12, f"off the airframe: {rescued}"
+    assert csq.ANCHOR_RESCUE_CORE_FLOOR * csq.ANCHOR_MIN_AREA <= bare["area"] < csq.ANCHOR_MIN_AREA, (
+        f"the fixture must place its core inside the rescue window or it proves nothing: {bare}"
+    )
+    assert rescued["centroid_x"] == pytest.approx(0.5, abs=0.06), f"off the subject: {rescued}"
+    assert rescued["centroid_y"] == pytest.approx(0.5, abs=0.06), f"off the subject: {rescued}"
     assert not bare["found"], f"disabling the rescue must restore the #348 bug: {bare}"
+
+
+@pytest.mark.skipif(not CANYON_STILL.is_file(), reason=f"canyon still not present: {CANYON_STILL}")
+def test_the_canyon_still_no_longer_needs_the_rescue() -> None:
+    """The #348 gap, re-measured on the frame it was found on, after #361.
+
+    Kept as a *record* rather than deleted: #348's numbers (a 0.53 % core for a
+    1.38 % subject) are quoted throughout this file and the next reader needs to
+    know why they no longer reproduce.  The enclosure channel resolves the
+    airframe directly, so the core and the rescued extent are now the same
+    region and the rescue is a no-op here.
+    """
+    frame = csq.read_still(CANYON_STILL)
+
+    assert csq.anchor_stats(frame) == csq.anchor_stats(frame, rescue=False), (
+        "the canyon still is expected to clear the floor without the rescue since #361"
+    )
 
 
 @pytest.mark.skipif(not CANYON_STILL.is_file(), reason=f"canyon still not present: {CANYON_STILL}")
@@ -1467,6 +1662,191 @@ def test_the_clip_agrees_with_its_own_seed_frame() -> None:
 
     detected = sum(1 for stats in per_frame if stats["found"])
     assert detected >= 6, f"the clip is still losing its subject: {[s['area'] for s in per_frame]}"
+
+
+# ---------------------------------------------------------------------------
+# anchor — the water is not the subject either (G-10 #361)
+# ---------------------------------------------------------------------------
+#
+# #343 taught the detector that a *flat* bright region is not a subject.  G-10 is
+# the same sentence with the adjective removed: real whitewater is bright,
+# finely textured and four times more colour-distinct than a gray airframe, so
+# it passes both of the older channels and wins on density.  On
+# ``video/seed_v6.png`` the aircraft scored 0.26 against the foam's 0.56 with
+# Otsu cutting at 0.38 — the subject was not losing the election, it was not on
+# the ballot, and no candidate-level veto could have reached it.
+#
+# What separates them is neither brightness (white fuselages, snow and lit rock
+# would all be casualties) nor position (a centre prior would make 「主体偏离
+# 中心」 unreachable) but **enclosure**: the water runs off the edge of the
+# picture and the aircraft does not.
+
+
+def test_the_gorge_fixture_finds_the_subject_not_the_water() -> None:
+    """Acceptance (#361): the bright textured backdrop must not win.
+
+    The synthetic half of the card, and the one that runs in CI.  Subject at
+    y = 0.26, water's centre of mass at y = 0.75; see :func:`gorge_frame` for why
+    the gap has to be that wide before the assertion means anything.
+    """
+    stats = csq.anchor_stats(gorge_frame())
+
+    assert stats["found"] is True, stats
+    assert stats["centroid_x"] == pytest.approx(0.5, abs=0.08), f"not the centred subject: {stats}"
+    assert stats["centroid_y"] == pytest.approx(0.26, abs=0.12), f"looking at the river: {stats}"
+    assert stats["area"] == pytest.approx(0.10, abs=0.05), f"the water leaked into the region: {stats}"
+
+
+def test_removing_the_enclosure_channel_puts_the_anchor_in_the_water(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation check (#361): the enclosure channel is load-bearing, not decoration.
+
+    Blind it and this frame's anchor drops to the river — y = 0.751 instead of
+    0.260, on the far side of a 0.49 gap.  If a future change makes
+    :func:`~scripts.check_source_quality.enclosure_gate` a no-op, or normalises
+    it into uselessness, this fails and the test above stops meaning anything.
+    """
+    frame = gorge_frame()
+    gated = csq.anchor_stats(frame)
+
+    _blind_enclosure_gate(monkeypatch)
+    ungated = csq.anchor_stats(frame)
+
+    assert gated["centroid_y"] == pytest.approx(0.26, abs=0.12)
+    assert ungated["centroid_y"] > 0.60, (
+        f"the enclosure channel changed nothing — the mutation must move the anchor into the river: {ungated}"
+    )
+
+
+def test_the_enclosure_channel_does_not_narrow_the_subject_separation() -> None:
+    """The new gate must not buy the water fix by blurring the #341 margin.
+
+    Same contract as ``test_the_texture_channel_widens_the_subject_separation``
+    and the same reason it is asserted separately: an absolute-referenced gate
+    could have quietly promoted speckle in an evenly-textured frame, since blob
+    texture is — by the barrier measure — thoroughly enclosing.  It does not,
+    because the reference is set above where those frames saturate; measured
+    40.6× against #341's floor of 32×.
+    """
+    quietest_true = min(
+        csq.anchor_stats(subject_frame(0.11))["area"],
+        csq.anchor_stats(subject_frame(0.40))["area"],
+        csq.anchor_stats(subject_frame(0.11, cx_frac=0.80))["area"],
+    )
+    assert quietest_true / max(_loudest_subjectless(), 1e-9) > 32.0, "separation regressed"
+
+
+def test_enclosure_gate_reads_the_border_as_open_and_the_subject_as_closed() -> None:
+    """The channel itself: zero where the picture leaks, high where it encloses.
+
+    Asserted on the three regions of :func:`gorge_frame` because that is what the
+    gate claims to distinguish — and note the water, which is *not* on the border
+    and is the brightest thing in the frame, reads 0.002: what demotes it is that
+    it is continuous with the bottom edge, not that it is bright.
+    """
+    frame = gorge_frame()
+    gate = csq.enclosure_gate(frame)
+    height, width = gate.shape
+    border = np.concatenate([gate[0], gate[-1], gate[:, 0], gate[:, -1]])
+    subject = gate[int(0.20 * height) : int(0.33 * height), int(0.43 * width) : int(0.57 * width)]
+    water = gate[int(0.70 * height) :, int(0.35 * width) : int(0.65 * width)]
+
+    assert gate.min() >= 0.0
+    assert gate.max() <= 1.0
+    assert border.max() == pytest.approx(0.0, abs=1e-6), "the frame's own edge is by definition not enclosed"
+    assert water.mean() < 0.05, f"water continuous with the bottom edge must read as open: {water.mean():.4f}"
+    assert subject.mean() > water.mean() * 10.0, (
+        f"the enclosed subject must outscore the open water: {subject.mean():.4f} vs {water.mean():.4f}"
+    )
+
+
+def test_enclosure_gate_rejects_nonsensical_settings() -> None:
+    with pytest.raises(ValueError, match="reference must be"):
+        csq.enclosure_gate(gorge_frame(), reference=0.0)
+    with pytest.raises(ValueError, match="passes must be"):
+        csq.enclosure_barrier(gorge_frame(), passes=0)
+
+
+def test_enclosure_barrier_reads_a_colour_frame_and_a_gray_one_alike() -> None:
+    """#360's contract, at the level of the channel that could most easily break it.
+
+    The still path hands this function BGR and the video sampler hands it
+    ``-pix_fmt gray``; reducing the per-channel barrier by *mean* would divide
+    the grayscale answer by three for no physical reason.  The maximum keeps the
+    two within a few percent, which is what lets the same picture measure the
+    same area down both paths.
+    """
+    frame = cv2.cvtColor(gorge_frame(), cv2.COLOR_GRAY2BGR)
+    colour = csq.enclosure_barrier(frame)
+    gray = csq.enclosure_barrier(csq._as_gray(frame))
+
+    assert colour.shape == gray.shape
+    assert float(np.abs(colour - gray).max()) == pytest.approx(0.0, abs=1e-3)
+
+
+@pytest.mark.skipif(not SEED_STILL.is_file(), reason=f"seed still not present: {SEED_STILL}")
+def test_the_seed_still_anchors_on_the_aircraft_not_the_rapids() -> None:
+    """Acceptance (#361), on the still the card was filed against.
+
+    ``video/seed_v6.png`` is 2048² with the quadcopter across the middle of the
+    frame and a stretch of whitewater filling the bottom of the gorge.  The
+    detector answered **10.65 % at (0.396, 0.787)** — the rapids — and the card's
+    own bound is that the reported centroid has to land in the airframe band,
+    y ∈ [0.28, 0.55].  It now answers **2.22 % at (0.539, 0.506)**.
+
+    Asserted as a band rather than a point because the reported region is the
+    fuselage and gimbal rather than the full rotor span, and where its centre of
+    mass falls inside the airframe is not something this card fixed.
+    """
+    stats = csq.anchor_stats(csq.read_still(SEED_STILL))
+
+    assert stats["found"], f"the aircraft must be found at all: {stats}"
+    assert 0.28 <= stats["centroid_y"] <= 0.55, f"still on the rapids: {stats}"
+    assert stats["centroid_x"] == pytest.approx(0.50, abs=0.12), f"not the aircraft: {stats}"
+
+
+@pytest.mark.skipif(not SEED_STILL.is_file(), reason=f"seed still not present: {SEED_STILL}")
+def test_removing_the_enclosure_channel_puts_the_seed_still_back_on_the_rapids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation check (#361) on the real frame, not only the synthetic one.
+
+    Blind the channel and ``seed_v6.png`` reports 13.27 % at y = 0.792 — the
+    reported bug, reproduced to within a centroid's width of the number in the
+    card (10.65 % at y = 0.787).
+    """
+    frame = csq.read_still(SEED_STILL)
+    gated = csq.anchor_stats(frame)
+
+    _blind_enclosure_gate(monkeypatch)
+    ungated = csq.anchor_stats(frame)
+
+    assert 0.28 <= gated["centroid_y"] <= 0.55, gated
+    assert ungated["centroid_y"] > 0.70, f"the mutation must put the anchor back on the whitewater: {ungated}"
+
+
+@pytest.mark.skipif(not SEED_CLIP.is_file(), reason=f"seed clip not present: {SEED_CLIP}")
+def test_the_clip_anchors_on_the_aircraft_frame_by_frame() -> None:
+    """Acceptance (#361), video path: the sampler's gray frames agree with the still.
+
+    The still path reads colour and the clip path reads ``-pix_fmt gray``, and
+    the enclosure channel is the one part of the detector that could plausibly
+    have behaved differently down the two — see
+    ``test_enclosure_barrier_reads_a_colour_frame_and_a_gray_one_alike``.  What
+    this pins is the end-to-end consequence: over eight sampled frames of the
+    gorge flight the median winning centroid is y = 0.402, inside the airframe
+    band, with every frame anchored.
+    """
+    info = csq.probe_source(SEED_CLIP)
+    frames = [first for first, _second in csq.iter_frame_pairs(SEED_CLIP, info, pairs=8)]
+    per_frame = [csq.anchor_stats(frame) for frame in frames]
+    ys = [stats["centroid_y"] for stats in per_frame]
+
+    assert 0.28 <= float(np.median(ys)) <= 0.55, f"the clip is anchored on the water: {[round(y, 3) for y in ys]}"
+    assert sum(1 for stats in per_frame if stats["found"]) >= 6, (
+        f"the clip is losing its subject: {[round(s['area'], 4) for s in per_frame]}"
+    )
 
 
 # ---------------------------------------------------------------------------
