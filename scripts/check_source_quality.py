@@ -346,6 +346,52 @@ ANCHOR_OFFSET_MAX: float = 0.30
 #: forgiving gate for a check that only ever WARNs.
 ANCHOR_DETECTED_FRAC_MIN: float = 0.5
 
+#: Percentile of a candidate region's **barrier distance from the frame border**
+#: (:func:`background_barrier`) that decides whether the region is scenery.
+#:
+#: The low tail, not the mean, and that is the whole point.  A background region
+#: is one that *leaks* — somewhere along its extent it joins the picture's edge
+#: without crossing a colour boundary — and a leak is a property of its weakest
+#: link, not of its average.  The whitewater in ``video/seed_v6.png`` averages
+#: 13.0 Lab units of barrier because most of the foam sits deep in the gorge;
+#: its 10th percentile is **3.7**, because it runs off the bottom of the frame.
+#: Measured across the real stills and the synthetic fixtures, the mean
+#: separates background from subject by 1.17× and the 10th percentile by 1.75×.
+ANCHOR_BACKGROUND_PERCENTILE: float = 10.0
+
+#: Barrier distance, in CIE-Lab units at :data:`ANCHOR_ANALYSIS_MAX_DIM`, below
+#: which a candidate region is **scenery rather than subject** and may not win
+#: the density election.
+#:
+#: This is a *background* prior, not a centre prior, and the difference is the
+#: reason it is allowed to exist here at all: it asks whether a region reaches
+#: the frame's edge without crossing a colour boundary, not where in the frame
+#: it sits.  A subject parked in the corner still wins — 「主体偏离中心」 stays a
+#: reachable verdict, which a centre prior would quietly make impossible.
+#:
+#: Set from the measured gap between regions that must lose and regions that
+#: must win (10th percentile of the barrier inside each, in Lab units):
+#:
+#: * ``seed_v6`` whitewater      3.7   ← must lose
+#: * ``seed_1x1_drone`` rock     7.7   ← must lose
+#: * ``seed_1x1_drone`` river    8.0   ← must lose
+#: * **floor                    10.0**
+#: * ``flat_sky_frame`` subject 14.0   ← must win (1.4× above)
+#: * ``seed_v6`` aircraft core  18.0   ← must win (1.8× above)
+#: * ``subject_frame`` subject  56.7   ← must win
+#:
+#: The floor only ever *removes* candidates, and if it removes all of them the
+#: election runs unfiltered — a frame whose every region leaks to the edge is
+#: judged exactly as it was before, which is what keeps this from inventing new
+#: 「没有锚点」 verdicts on material it was not tuned against.
+ANCHOR_BACKGROUND_FLOOR: float = 10.0
+
+#: Raster sweeps used to approximate the barrier distance.  Each sweep relaxes
+#: the whole frame in four directions; three of them is where the map stops
+#: changing on the fixtures (the 2048² stills move by <0.5 Lab units between
+#: three and six).
+ANCHOR_BACKGROUND_PASSES: int = 3
+
 #: Smallest region — as a fraction of the detection floor — that counts as
 #: **credible evidence of a subject at all**.  One constant, two uses, and they
 #: are the same question asked twice.
@@ -1334,12 +1380,98 @@ def structured_saliency(frame: np.ndarray, window: int = ANCHOR_TEXTURE_WINDOW) 
     return (combined - combined.min()) / (float(np.ptp(combined)) + 1e-9)
 
 
+def _barrier_sweep(channel: np.ndarray, passes: int) -> np.ndarray:
+    """Minimum-barrier distance from the frame border for one image channel.
+
+    The barrier of a path is ``max(path) - min(path)``; the distance of a pixel
+    is the smallest barrier over all paths reaching it from any border pixel.
+    Read it as "how big a colour step do you have to climb over to get here from
+    outside the picture?" — zero along the edge, zero throughout any region that
+    joins the edge smoothly, and large inside anything the edge cannot reach
+    without crossing a boundary.
+
+    Computed by the standard raster relaxation: each pass sweeps the frame
+    top-down, left-right, bottom-up and right-left, propagating the running
+    ``(max, min)`` of the best path found so far.  Each sweep is vectorised
+    across the axis it is *not* walking, so the Python loop runs once per row or
+    column rather than once per pixel — 256 iterations a sweep at
+    :data:`ANCHOR_ANALYSIS_MAX_DIM`, ~0.1 s for a whole frame.
+    """
+    height, width = channel.shape
+    distance = np.full((height, width), np.inf, np.float32)
+    high = channel.copy()
+    low = channel.copy()
+    distance[0, :] = distance[-1, :] = distance[:, 0] = distance[:, -1] = 0.0
+
+    def relax(target: Any, source: Any) -> None:
+        candidate_high = np.maximum(high[source], channel[target])
+        candidate_low = np.minimum(low[source], channel[target])
+        candidate = candidate_high - candidate_low
+        better = candidate < distance[target]
+        high[target][better] = candidate_high[better]
+        low[target][better] = candidate_low[better]
+        distance[target][better] = candidate[better]
+
+    every = slice(None)
+    for _ in range(passes):
+        for row in range(1, height):
+            relax((row, every), (row - 1, every))
+        for column in range(1, width):
+            relax((every, column), (every, column - 1))
+        for row in range(height - 2, -1, -1):
+            relax((row, every), (row + 1, every))
+        for column in range(width - 2, -1, -1):
+            relax((every, column), (every, column + 1))
+    return distance
+
+
+def background_barrier(
+    frame: np.ndarray,
+    max_dim: int = ANCHOR_ANALYSIS_MAX_DIM,
+    passes: int = ANCHOR_BACKGROUND_PASSES,
+) -> np.ndarray:
+    """How far each spot is from the frame's border, measured in colour barriers.
+
+    The **background prior**: whatever the picture is of, the strip around its
+    edge is mostly *not* it.  Sky runs off the top, a canyon wall runs off the
+    side, a river runs off the bottom — each of them reachable from the border
+    without ever crossing a colour boundary, so each of them scores ~0 here.  A
+    subject is by construction the thing the frame is wrapped around, so getting
+    to it from outside means climbing over its outline, and it scores high.
+
+    Returned in **CIE-Lab units** (the mean of the per-channel barrier over L, a
+    and b), not normalised to ``[0, 1]``, and that is deliberate: a barrier of 10
+    Lab units is the same visible colour step in a hazy frame and a punchy one,
+    whereas a min-max normalisation would stretch a frame containing nothing but
+    noise until its noise looked like a subject.  :data:`ANCHOR_BACKGROUND_FLOOR`
+    is expressed in the same units.
+
+    What this is *not* is a centre prior — see
+    :data:`ANCHOR_BACKGROUND_FLOOR`.  A subject pushed into the corner is still
+    enclosed and still scores high; only a region that actually *leaks* off the
+    edge is demoted.  Grayscale in is handled by promoting to BGR first, so the
+    video sampler's ``-pix_fmt gray`` frames degrade to a luminance-only barrier
+    rather than failing.
+    """
+    if passes < 1:
+        raise ValueError(f"passes must be >= 1, got {passes}")
+    small = _fit_for_analysis(frame, max_dim)
+    if small.ndim == 2:
+        small = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+    lab = cv2.cvtColor(cv2.GaussianBlur(small, (5, 5), 0), cv2.COLOR_BGR2LAB).astype(np.float32)
+    total = np.zeros(lab.shape[:2], np.float32)
+    for index in range(3):
+        total += _barrier_sweep(np.ascontiguousarray(lab[..., index]), passes)
+    return total / 3.0
+
+
 def anchor_stats(
     frame: np.ndarray,
     kernel: int = ANCHOR_MORPH_KERNEL,
     sigma: float = ANCHOR_CENTER_PRIOR_SIGMA,
     min_area: float = ANCHOR_MIN_AREA,
     rescue: bool = True,
+    background_prior: bool = True,
 ) -> dict[str, float]:
     """Locate the frame's anchor and report its area share and eccentricity.
 
@@ -1471,6 +1603,26 @@ def anchor_stats(
     candidates = [i for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] >= credible]
     if not candidates:  # nothing credible in frame — judge the specks as before
         candidates = list(range(1, count))
+
+    # #361: scenery may not stand in the election.  The candidacy gate above
+    # asks "is this region big enough to be a subject"; this one asks "is it a
+    # subject at all, or is it the picture's backdrop".  Distinctness and
+    # texture cannot tell those apart — whitewater and cloud are both, which is
+    # why #343's two fixes left the detector pointing at the river — but the
+    # background prior can: a backdrop reaches the frame's edge without crossing
+    # a colour boundary and a subject does not.  Measured on the owner's
+    # ``seed_v6.png``, the 10.65 % region the detector reported sits at
+    # y = 0.787 (the rapids) and its 10th-percentile barrier is 3.7 Lab units;
+    # the aircraft's core at y = 0.43 scores 18.0.
+    if background_prior:
+        barrier = background_barrier(frame)
+        if barrier.shape == saliency.shape:
+            foreground = [
+                i
+                for i in candidates
+                if float(np.percentile(barrier[labels == i], ANCHOR_BACKGROUND_PERCENTILE)) >= ANCHOR_BACKGROUND_FLOOR
+            ]
+            candidates = foreground or candidates
 
     best_index, best_density = candidates[0], -1.0
     for index in candidates:
