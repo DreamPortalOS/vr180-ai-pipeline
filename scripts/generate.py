@@ -1,15 +1,10 @@
-"""CLI for generating videos via external providers (Kling / Seedance / MiniMax / Veo).
+"""CLI for generating videos via external providers (Kling / Seedance / Veo).
 
 Usage::
 
     python -m scripts.generate "fly over mountains" --provider kling
     python -m scripts.generate "walkthrough of a temple" --provider seedance --target-aware --scene walkthrough
     python -m scripts.generate "dome flyover" --provider veo --duration 8 --aspect-ratio 16:9
-
-The MiniMax 2K lane (#353) — square, 10s, from a square seed frame::
-
-    python -m scripts.generate --provider minimax --image video/seed_1x1_drone.png \\
-        --gen-resolution 2k --gen-ratio 1:1 --duration 10 -o video/minimax_2k_10s.mp4
 
 Recovering a task the client gave up on (never re-generate — the quota is
 already spent, see issue #325)::
@@ -35,7 +30,6 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import httpx  # noqa: E402
-from integrations import minimax  # noqa: E402
 from integrations.factory import get_provider, list_providers  # noqa: E402
 from integrations.seedance import (  # noqa: E402
     MODEL_FAST,
@@ -54,26 +48,16 @@ log = logging.getLogger(__name__)
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "video")
 
-# Seedance duration contract (Ark): 4-15 seconds inclusive. MiniMax (#353)
-# happens to publish the same 4-15s range, so both providers are validated
-# here — other providers (mock, kling, veo) have different duration contracts
-# and existing CLI flows that use shorter durations should keep working.
+# Seedance duration contract (Ark): 4-15 seconds inclusive. Only enforced
+# for the seedance provider — other providers (mock, kling, veo) have
+# different duration contracts and existing CLI flows that use shorter
+# durations should keep working.
 DURATION_MIN = 4
 DURATION_MAX = 15
 
-#: Providers whose duration contract is the 4-15s range validated above.
-_DURATION_RANGE_PROVIDERS = ("seedance", "minimax")
-
-# Model choices for the --model flag. Both Seedance constants are wired so
-# callers can pick the standard model (needed for 4k / 1080p) without
-# hardcoding an id; MiniMax-H3 is the only MiniMax model with a 2K tier.
-_MODEL_CHOICES = [MODEL_FAST, "doubao-seedance-2-0-260128", minimax.MODEL_H3]
-
-# Generation tier names accepted by --gen-resolution. The first four are Ark's
-# (Seedance); MiniMax has its own two-tier vocabulary (#353) and the provider
-# translates between them — an Ark tier MiniMax cannot serve is rejected
-# locally rather than silently promoted to a more expensive one.
-_GEN_RESOLUTION_CHOICES = [*VALID_RESOLUTIONS, "768p", "2k"]
+# Model choices for the --model flag. Both constants are wired so callers can
+# pick the standard model (needed for 4k / 1080p) without hardcoding an id.
+_MODEL_CHOICES = [MODEL_FAST, "doubao-seedance-2-0-260128"]
 
 
 def _model_sort_key(model: str) -> int:
@@ -127,9 +111,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Environment variables:\n"
             "  KLING_API_KEY      API key for Kling\n"
             "  ARK_API_KEY        API key for Seedance (Volcengine Ark)\n"
-            f"  {minimax.ENV_API_KEY}     API key for MiniMax (platform.minimax.io)\n"
-            f"  {minimax.ENV_API_BASE}    MiniMax host override "
-            f"(default {minimax.BASE_URL_GLOBAL}; mainland: {minimax.BASE_URL_CN})\n"
             "  VEO_API_KEY        API key for Veo (Vertex AI)\n"
             "  GCP_PROJECT_ID     GCP project (Veo, defaults to 'my-project')\n"
             "\n"
@@ -178,20 +159,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MODEL_ID",
         help=f"Seedance model id (default: {MODEL_FAST} — quota discipline). "
         "4k and 1080p require the standard model; the fast variant tops out at 720p. "
-        f"With --provider minimax the only supported id is {minimax.MODEL_H3}, which is "
-        "substituted automatically when this flag is left at its Seedance default. "
         "Ignored by providers that do not use Seedance.",
     )
     parser.add_argument(
         "--gen-resolution",
         default="480p",
-        choices=_GEN_RESOLUTION_CHOICES,
+        choices=list(VALID_RESOLUTIONS),
         help="Generation resolution tier (default: 480p — quota discipline). "
         "Higher tiers consume more quota; a reminder is logged when >480p is selected. "
-        "4k (2880x2880 at 1:1) needs --model <standard>. "
-        "MiniMax only has 768p and 2k (2k = 1440 short edge, $0.13/s): the default 480p "
-        "and 720p map onto its cheap 768p tier, while 1080p/4k are rejected so a habit-typed "
-        "Ark tier never silently buys the expensive one.",
+        "4k (2880x2880 at 1:1) needs --model <standard>.",
     )
     parser.add_argument(
         "--gen-ratio",
@@ -393,8 +369,8 @@ def _resume_and_deliver(provider, args: argparse.Namespace) -> int:
     resume = getattr(provider, "resume", None)
     if resume is None:
         log.error(
-            "--resume-task is not supported by provider %r; it is a Seedance (Ark) / MiniMax feature. "
-            "Re-run with --provider seedance or --provider minimax.",
+            "--resume-task is not supported by provider %r; it is a Seedance (Ark) feature. "
+            "Re-run with --provider seedance.",
             args.provider,
         )
         return 2
@@ -439,20 +415,19 @@ def main(argv: list[str] | None = None) -> int:
         log.error("--budget-cap must be a positive amount in 元; got %s", args.budget_cap)
         return 2
 
-    # Seedance (Ark) and MiniMax both cap duration at [4, 15]. Other providers
-    # have different contracts, so this check only fires for those two.
-    # Skipped when resuming: --duration describes a submission, and
-    # --resume-task does not submit anything.
+    # Seedance (Ark) caps duration at [4, 15]. Other providers have different
+    # contracts, so this check only fires for the seedance provider.  Skipped
+    # when resuming: --duration describes a submission, and --resume-task does
+    # not submit anything.
     if (
-        args.provider in _DURATION_RANGE_PROVIDERS
+        args.provider == "seedance"
         and not args.resume_task
         and (args.duration < DURATION_MIN or args.duration > DURATION_MAX)
     ):
         log.error(
-            "--duration must be between %d and %d for %s; got %d",
+            "--duration must be between %d and %d for seedance; got %d",
             DURATION_MIN,
             DURATION_MAX,
-            args.provider,
             args.duration,
         )
         return 2
@@ -534,20 +509,8 @@ def main(argv: list[str] | None = None) -> int:
     # resolution/ratio/model from the request body; other providers ignore
     # unknown kwargs. Default stays 480p/adaptive/fast so the quota
     # discipline is unchanged.
-    # #353: both tier flags speak Ark's vocabulary because Seedance was wired
-    # up first. MiniMax has its own two tiers and its own model id, so the
-    # values are translated here. A tier MiniMax cannot serve raises locally —
-    # before the provider is even asked to build a request — so nothing is spent.
-    if args.provider == "minimax":
-        try:
-            kwargs["resolution"] = minimax.resolve_cli_resolution(args.gen_resolution)
-        except ValueError as exc:
-            log.error("%s", exc)
-            return 2
-        kwargs["model"] = minimax.resolve_cli_model(args.model)
-    else:
-        kwargs["resolution"] = args.gen_resolution
-        kwargs["model"] = args.model
+    kwargs["resolution"] = args.gen_resolution
+    kwargs["model"] = args.model
     # --aspect-ratio (-a) is passed explicitly below to the provider surface
     # (aspect_ratio=...) and SeedanceProvider._build_body maps it onto the
     # Ark body field "ratio". So we only send "ratio" here when --aspect-ratio
@@ -574,18 +537,7 @@ def main(argv: list[str] | None = None) -> int:
     # when the flag is omitted (the ledger reads it directly).
     if args.budget_cap is not None:
         kwargs["budget_cap"] = args.budget_cap
-    if args.provider == "minimax":
-        # MiniMax quotes a firm per-second price, so the pre-flight warning can
-        # state the actual bill instead of a vague "this tier costs more".
-        cost = minimax.estimate_cost_usd(str(kwargs["resolution"]), args.duration)
-        if cost is not None:
-            log.warning(
-                "⚠️  MiniMax 按秒计费：%s × %ds ≈ $%.2f，请确认后再继续。",
-                kwargs["resolution"],
-                args.duration,
-                cost,
-            )
-    elif args.gen_resolution != "480p":
+    if args.gen_resolution != "480p":
         log.warning("⚠️  高档位（%s）消耗更多额度，请确认后再继续。", args.gen_resolution)
 
     # Generate — text-to-video or image-to-video
