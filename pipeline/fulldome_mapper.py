@@ -27,8 +27,12 @@ the whole deliverable.  Before #334 the renderer emitted neither:
      bilinear (``line``)                       VR180 side.
 ===  =======================================  =====================================
 
-CLI wiring for the input projection / dome orientation is deliberately *not*
-here — that is D-2 (``--dome-input-projection`` / ``--dome-pitch``).
+D-2 (#371) adds the two knobs the dome route was missing: which projection the
+source frame is in (:attr:`~FulldomeMapper.INPUT_PROJECTIONS`) and how the
+dome is oriented relative to it (``pitch``/``yaw``/``roll``).  Both reuse the
+VR180 side's implementations rather than restating them — see
+:meth:`FulldomeMapper._vr180_geometry`.  At the defaults (``rectilinear``, all
+three angles 0) the emitted filtergraph is byte-for-byte the pre-#371 one.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from __future__ import annotations
 import logging
 import subprocess
 from pathlib import Path
+from typing import ClassVar
 
 from pipeline.equirectangular_mapper import EquirectangularMapper
 
@@ -57,14 +62,33 @@ class FulldomeMapper:
         up to 220 for some dome systems). This is the angle spanned by the
         **inscribed circle**, which is also where the circle mask cuts.
     coverage_h_fov : float
-        How many degrees of horizontal FOV the source flat video covers on the
+        How many degrees of horizontal FOV the source video covers on the
         input sphere (default 120). Lower values = screen-like patch; higher
         values = fuller dome but more geometric stretch. The sphere outside that
-        patch is genuinely black (not smeared) since #334.
+        patch is genuinely black (not smeared) since #334.  For
+        ``input_projection="fisheye"`` this is the equidistant span across the
+        frame **width** — the same quantity ``EquirectangularMapper.fisheye_fov``
+        names (#302) and ``scripts/calibrate_hfov.py`` reports.  Not consulted
+        for ``"equirect"``, whose source *is* the whole sphere (measured: v360
+        renders ``input=equirect`` byte-identically with and without
+        ``ih_fov=360:iv_fov=180``, its defaults).
     coverage_v_fov : float | None
         Vertical coverage FOV. If None, auto-computed from the source aspect
-        ratio with the **pinhole** relation (``2*atan(tan(hfov/2)*h/w)``, #334),
-        not the linear ratio this used before.
+        ratio — the **pinhole** relation (``2*atan(tan(hfov/2)*h/w)``, #334) for
+        a rectilinear source, the **equidistant** one (``h_fov*h/w``, #303) for
+        a fisheye source.
+    input_projection : str
+        How to read the source frame, one of :attr:`INPUT_PROJECTIONS`
+        (D-2, #371).  ``"rectilinear"`` (default) is a pinhole patch — the
+        pre-#371 behaviour; ``"fisheye"`` an equidistant circular fisheye;
+        ``"equirect"`` a full 360°×180° sphere.
+    pitch, yaw, roll : float
+        Dome orientation in degrees (D-2, #371), all 0 by default.  The
+        convention is v360's, measured (#324): ``pitch`` is
+        ``90° − (the elevation the source's optical axis takes on the dome)``,
+        i.e. ``--dome-pitch 20`` drops the source centre from the zenith to 70°
+        of elevation.  ``yaw`` swings it round the dome's vertical axis and
+        ``roll`` spins the domemaster about its own centre.
     output_size : int
         Width and height of the square output domemaster in pixels (default 4096).
         Must be even.
@@ -74,6 +98,20 @@ class FulldomeMapper:
         Constant rate factor for encoding quality (default 18).
     """
 
+    #: Accepted ``input_projection`` values (D-2, #371).  ``rectilinear`` and
+    #: ``fisheye`` mean exactly what they mean on the VR180 side
+    #: (:attr:`EquirectangularMapper.INPUT_PROJECTIONS`); ``equirect`` is extra
+    #: here because a dome master *can* take a full sphere as its source, while
+    #: the VR180 path joins equirect eyes without ever projecting them (#286).
+    INPUT_PROJECTIONS: tuple[str, ...] = ("rectilinear", "fisheye", "equirect")
+
+    #: ``input_projection`` → the ``v360`` ``input=`` token it maps to.
+    _V360_INPUT: ClassVar[dict[str, str]] = {
+        "rectilinear": "flat",
+        "fisheye": "fisheye",
+        "equirect": "equirect",
+    }
+
     def __init__(
         self,
         dome_fov: float = 180.0,
@@ -82,7 +120,13 @@ class FulldomeMapper:
         output_size: int = 4096,
         codec: str = "h264",
         crf: int = 18,
+        input_projection: str = "rectilinear",
+        pitch: float = 0.0,
+        yaw: float = 0.0,
+        roll: float = 0.0,
     ) -> None:
+        if input_projection not in self.INPUT_PROJECTIONS:
+            raise ValueError(f"input_projection must be one of {self.INPUT_PROJECTIONS}, got {input_projection!r}")
         if output_size % 2 != 0:
             output_size += 1  # ffmpeg requires even dimensions
         self.dome_fov = dome_fov
@@ -91,6 +135,15 @@ class FulldomeMapper:
         self.output_size = output_size
         self.codec = codec
         self.crf = crf
+        self.input_projection = input_projection
+        self.pitch = float(pitch)
+        self.yaw = float(yaw)
+        self.roll = float(roll)
+        # Build the delegate once, here, so an out-of-range angle fails at
+        # construction (EquirectangularMapper owns v360's own ±180° bound,
+        # #323) instead of surfacing as an ffmpeg option error halfway through
+        # a 4096² render.
+        self._vr180_geometry()
 
     def convert(self, input_path: str, output_path: str) -> str:
         """Run single ffmpeg v360 pass over the whole video.
@@ -111,10 +164,14 @@ class FulldomeMapper:
         if not input_path_obj.exists():
             raise FileNotFoundError(f"Input video not found: {input_path}")
 
-        # Auto-compute coverage_v_fov from source aspect ratio if not given
+        # Auto-compute coverage_v_fov from source aspect ratio if not given.
+        # An ``equirect`` source spans the whole sphere and emits no
+        # ``ih_fov``/``iv_fov`` at all (#371), so there is nothing to probe for
+        # — skipping the ffprobe keeps the log honest rather than announcing a
+        # coverage angle the filtergraph never uses.
         coverage_v_fov = self.coverage_v_fov
         if coverage_v_fov is None:
-            coverage_v_fov = self._probe_coverage_v_fov(input_path)
+            coverage_v_fov = 0.0 if self.input_projection == "equirect" else self._probe_coverage_v_fov(input_path)
 
         codec_map = {"h264": "libx264", "h265": "libx265"}
         encoder = codec_map.get(self.codec, f"libx{self.codec}")
@@ -145,10 +202,17 @@ class FulldomeMapper:
             output_path,
         ]
 
+        coverage = (
+            "coverage=whole-sphere "
+            if self.input_projection == "equirect"
+            else f"coverage=({self.coverage_h_fov:g}×{coverage_v_fov:g})° "
+        )
         log.info(
             "Running fulldome conversion: "
             f"dome_fov={self.dome_fov}° "
-            f"coverage=({self.coverage_h_fov:g}×{coverage_v_fov:g})° "
+            f"input={self.input_projection} "
+            f"{coverage}"
+            f"orientation=(yaw {self.yaw:g}°, pitch {self.pitch:g}°, roll {self.roll:g}°) "
             f"output={self.output_size}×{self.output_size} "
             f"codec={self.codec} crf={self.crf} "
             f"circle_mask=on audio=copy"
@@ -190,18 +254,52 @@ class FulldomeMapper:
         For ``output=fisheye`` the inscribed circle spans ``dome_fov``, so with
         the default 120° flat coverage the honest content stops at 0.75 R and
         the annulus out to the rim is exactly what used to be brown smear.
+
+        D-2 (#371) made the ``input=`` token and the orientation tail
+        configurable.  Both additions are inert at the defaults: ``rectilinear``
+        maps back to ``input=flat`` and
+        :meth:`_orientation_terms` is empty at 0/0/0, so the emitted string is
+        character-for-character the pre-#371 one.
         """
         return (
-            f"v360=input=flat:output=fisheye"
-            f":ih_fov={self.coverage_h_fov:g}"
-            f":iv_fov={coverage_v_fov:g}"
+            f"v360=input={self._V360_INPUT[self.input_projection]}:output=fisheye"
+            f"{self._input_fov_terms(coverage_v_fov)}"
             f":h_fov={self.dome_fov:g}"
             f":v_fov={self.dome_fov:g}"
             f":w={self.output_size}"
             f":h={self.output_size}"
             f":interp=lanczos"
             f":alpha_mask=1"
+            f"{self._orientation_terms()}"
         )
+
+    def _input_fov_terms(self, coverage_v_fov: float) -> str:
+        """The ``:ih_fov=..:iv_fov=..`` pair describing the *source* span.
+
+        Empty for ``equirect``: v360's equirect input is the full sphere and
+        those two options are its 360/180 defaults.  Measured — the rendered
+        frame is byte-identical with and without ``ih_fov=360:iv_fov=180``, and
+        passing anything *else* (say 120×60) does not crop the source, it
+        rescales the sphere and wraps the content round the dome several times
+        over.  Writing them would therefore only advertise a control the dome
+        route does not offer, the same reasoning that keeps ``h_fov``/``v_fov``
+        off the VR180 ``hequirect`` heads (#294/#301).
+        """
+        if self.input_projection == "equirect":
+            return ""
+        return f":ih_fov={self.coverage_h_fov:g}:iv_fov={coverage_v_fov:g}"
+
+    def _orientation_terms(self) -> str:
+        """The ``:yaw=..:pitch=..:roll=..`` tail, or ``""`` at 0/0/0 (D-2, #371).
+
+        Delegated to :meth:`EquirectangularMapper._v360_orientation_terms` — the
+        same reuse-don't-restate rule :meth:`_pinhole_vertical_fov` follows.
+        That matters twice over: the rotation convention is ``rorder=ypr``
+        recovered by measurement (#324, six orderings fitted, only this one to
+        0.003), and the "emit nothing at all when every angle is 0" rule is the
+        zero-regression contract both routes are pinned to.
+        """
+        return self._vr180_geometry()._v360_orientation_terms()
 
     def _circle_mask_filter(self) -> str:
         """A one-frame black/white **inscribed-circle** mask, built inside ffmpeg.
@@ -298,10 +396,13 @@ class FulldomeMapper:
         if h <= 0 or w <= 0:
             return 90.0
 
-        computed = self._pinhole_vertical_fov(w, h)
-        log.info(
-            f"Source {w}×{h} → auto iv_fov = {computed:.2f}° (pinhole: 2·atan(tan({self.coverage_h_fov:g}°/2)·{h}/{w}))"
-        )
+        if self.input_projection == "fisheye":
+            computed = self._fisheye_vertical_fov(w, h)
+            rule = f"equidistant: {self.coverage_h_fov:g}°·{h}/{w}"
+        else:
+            computed = self._pinhole_vertical_fov(w, h)
+            rule = f"pinhole: 2·atan(tan({self.coverage_h_fov:g}°/2)·{h}/{w})"
+        log.info(f"Source {w}×{h} → auto iv_fov = {computed:.2f}° ({rule})")
         return computed
 
     def _pinhole_vertical_fov(self, src_width: int, src_height: int) -> float:
@@ -310,10 +411,44 @@ class FulldomeMapper:
         Deliberately a one-line delegation rather than a copy of the ``atan``:
         a second copy of the formula is a second thing to keep in sync, and the
         drift is silent (a square source makes both formulas agree).
-        ``EquirectangularMapper`` reads only ``src_hfov`` here, and its
-        constructor allocates nothing but a handful of attributes.
+        """
+        return self._vr180_geometry()._calc_vertical_fov(src_width, src_height)
+
+    def _fisheye_vertical_fov(self, src_width: int, src_height: int) -> float:
+        """Equidistant vertical FOV for *coverage_h_fov* (D-2, #371).
+
+        The other half of the same delegation: an equidistant fisheye puts the
+        same degrees per pixel on both axes, so the vertical span is the
+        aspect-scaled horizontal one with no ``tan`` anywhere — the #303
+        convention, owned by
+        :meth:`EquirectangularMapper._fisheye_vertical_fov`.  Feeding a fisheye
+        source through :meth:`_pinhole_vertical_fov` instead is exactly the
+        silent-on-square-sources failure #334 found on the other branch.
+        """
+        return self._vr180_geometry()._fisheye_vertical_fov(src_width, src_height)
+
+    def _vr180_geometry(self) -> EquirectangularMapper:
+        """A VR180 mapper configured like this dome, for geometry delegation.
+
+        The dome route owns no geometry formulas of its own: the pinhole solve
+        (#334), the equidistant solve (#303) and the ``rorder=ypr`` orientation
+        tail (#323/#324) all live on :class:`EquirectangularMapper` and are
+        reached through here.  ``use_ffmpeg=False`` keeps the delegate inert —
+        its constructor allocates nothing but a handful of attributes and never
+        spawns a worker — and it doubles as the validator for the angles and
+        for ``coverage_h_fov``, which it bounds to v360's own legal ranges.
+
+        ``coverage_h_fov`` feeds *both* ``src_hfov`` (pinhole) and
+        ``fisheye_fov`` (equidistant) because on the dome route it is the one
+        "how much of the sphere does the source cover" knob
+        (``--dome-coverage-h``); which of the two the delegate actually reads
+        is decided by the caller, not by a second flag.
         """
         return EquirectangularMapper(
             src_hfov=self.coverage_h_fov,
+            fisheye_fov=self.coverage_h_fov,
             use_ffmpeg=False,
-        )._calc_vertical_fov(src_width, src_height)
+            pitch=self.pitch,
+            yaw=self.yaw,
+            roll=self.roll,
+        )
