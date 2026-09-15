@@ -83,12 +83,17 @@ class TestVideoGenProviderABC:
 class TestFactory:
     def test_list_providers(self) -> None:
         providers = list_providers()
-        assert "kling" in providers
-        assert "local-svd" in providers
-        assert "seedance" in providers
-        assert "veo" in providers
-        assert "mock" in providers
-        assert len(providers) == 5
+        # Exact set rather than a magic count: a stale ``len(...) == N`` breaks on
+        # every new provider without saying which one moved the number.
+        assert set(providers) == {
+            "kling",
+            "local-svd",
+            "minimax",
+            "seedance",
+            "veo",
+            "mock",
+        }
+        assert len(providers) == len(set(providers))
 
     def test_get_provider_kling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("KLING_API_KEY", "key")
