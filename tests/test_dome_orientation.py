@@ -444,3 +444,92 @@ class TestZeroRegressionAtZero:
         assert hashlib.sha256(_render_graph(src, shipped, tmp_path / "ship.rgb")).hexdigest() == (
             hashlib.sha256(reference).hexdigest()
         )
+
+
+# --------------------------------------------------------------------------- #
+# 3. --dome-size is the *mapping* size — one v360 pass, never a rescale
+# --------------------------------------------------------------------------- #
+
+
+def _captured_ffmpeg_cmd(mapper: FulldomeMapper, tmp_path: Path) -> list[str]:
+    """Run :meth:`FulldomeMapper.convert` with ffmpeg mocked; return its argv.
+
+    The size claim cannot be checked by rendering — a 4096² master produced by
+    upscaling a 2880² one is the same 4096² file, just softer.  What separates
+    the two is the *command*, so the command is what is captured.
+    """
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"")
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, *_a, **_kw):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with unittest.mock.patch.object(subprocess, "run", _fake_run):
+        mapper.convert(str(src), str(tmp_path / "out.mp4"))
+    ffmpeg_calls = [c for c in calls if c and c[0] == "ffmpeg"]
+    assert len(ffmpeg_calls) == 1, f"expected exactly one ffmpeg pass, got {len(ffmpeg_calls)}"
+    return ffmpeg_calls[0]
+
+
+def _v360_terms(graph: str) -> dict[str, str]:
+    """The ``key=value`` pairs of the single ``v360`` term in *graph*."""
+    assert graph.count("v360=") == 1, f"expected exactly one v360 pass, found {graph.count('v360=')}"
+    term = graph[graph.index("v360=") + len("v360=") :].split(",")[0]
+    return dict(part.split("=", 1) for part in term.split(":"))
+
+
+class TestTheMasterIsMappedStraightToSize:
+    """``--dome-size 4096`` must be one v360 pass *at* 4096, not a rescale.
+
+    The venue's library ships 4096² domemasters, and the dome route's whole
+    reason to exist is matching them.  Rendering the sphere at 2880² and
+    scaling up would produce a file with the right header and half the
+    resolution the operator asked for — invisible to every geometry assertion
+    in this file, and to the operator until it is on the dome.
+    """
+
+    @pytest.mark.parametrize("size", [1024, 2880, 4096, 8192])
+    def test_the_v360_maps_directly_at_the_requested_size(self, size, tmp_path: Path):
+        cmd = _captured_ffmpeg_cmd(FulldomeMapper(output_size=size, coverage_v_fov=90.0), tmp_path)
+        terms = _v360_terms(cmd[cmd.index("-filter_complex") + 1])
+        assert (terms["w"], terms["h"]) == (str(size), str(size))
+
+    @pytest.mark.parametrize("size", [2880, 4096])
+    def test_nothing_in_the_chain_rescales(self, size, tmp_path: Path):
+        """No ``scale``/``zscale`` filter and no ``-s`` — so the sampled grid
+        the v360 built *is* the delivered grid.
+        """
+        cmd = _captured_ffmpeg_cmd(FulldomeMapper(output_size=size, coverage_v_fov=90.0), tmp_path)
+        graph = cmd[cmd.index("-filter_complex") + 1]
+        assert "scale=" not in graph and "zscale=" not in graph
+        assert "-s" not in cmd and "-vf" not in cmd
+
+    @pytest.mark.parametrize("size", [2880, 4096])
+    def test_the_circle_mask_is_built_at_the_same_size(self, size, tmp_path: Path):
+        """A mask generated at any other size would have to be scaled to fit —
+        the rescale the test above forbids, arriving by the back door.
+        """
+        cmd = _captured_ffmpeg_cmd(FulldomeMapper(output_size=size, coverage_v_fov=90.0), tmp_path)
+        graph = cmd[cmd.index("-filter_complex") + 1]
+        assert f"color=c=black:s={size}x{size}:" in graph
+        assert f"hypot(X-{(size - 1) / 2:g},Y-{(size - 1) / 2:g}),{size / 2:g}" in graph
+
+    def test_the_default_dome_size_is_the_4096_master(self):
+        """The default is the deliverable, so it is pinned in both places."""
+        from scripts import run_pipeline as rp
+
+        assert FulldomeMapper().output_size == 4096
+        assert rp.parse_args(["--input", "s.mp4"]).dome_size == 4096
+
+    def test_the_cli_size_is_the_mapping_size(self, tmp_path: Path):
+        """End of the chain: ``--dome-size 4096`` on the command line reaches
+        the v360's ``w``/``h`` with nothing in between.
+        """
+        from scripts import run_pipeline as rp
+
+        args = rp.parse_args(["--input", "s.mp4", "--projection", "fulldome", "--dome-size", "4096"])
+        mapper = FulldomeMapper(output_size=args.dome_size, coverage_v_fov=90.0)
+        cmd = _captured_ffmpeg_cmd(mapper, tmp_path)
+        assert _v360_terms(cmd[cmd.index("-filter_complex") + 1])["w"] == "4096"
