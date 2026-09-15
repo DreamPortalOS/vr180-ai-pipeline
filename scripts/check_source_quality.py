@@ -346,51 +346,66 @@ ANCHOR_OFFSET_MAX: float = 0.30
 #: forgiving gate for a check that only ever WARNs.
 ANCHOR_DETECTED_FRAC_MIN: float = 0.5
 
-#: Percentile of a candidate region's **barrier distance from the frame border**
-#: (:func:`background_barrier`) that decides whether the region is scenery.
+#: Barrier distance, in CIE-Lab units at :data:`ANCHOR_ANALYSIS_MAX_DIM`, at
+#: which :func:`enclosure_gate` saturates — the step you have to climb to get
+#: *inside* something that counts as fully enclosed.
 #:
-#: The low tail, not the mean, and that is the whole point.  A background region
-#: is one that *leaks* — somewhere along its extent it joins the picture's edge
-#: without crossing a colour boundary — and a leak is a property of its weakest
-#: link, not of its average.  The whitewater in ``video/seed_v6.png`` averages
-#: 13.0 Lab units of barrier because most of the foam sits deep in the gorge;
-#: its 10th percentile is **3.7**, because it runs off the bottom of the frame.
-#: Measured across the real stills and the synthetic fixtures, the mean
-#: separates background from subject by 1.17× and the 10th percentile by 1.75×.
-ANCHOR_BACKGROUND_PERCENTILE: float = 10.0
+#: Absolute rather than self-scaling, and that is the opposite of the choice
+#: :func:`texture_gate` makes, for a reason.  A frame's own barrier distribution
+#: is not a usable yardstick here: measured at 256², the evenly-textured
+#: subjectless fixtures run a *higher* barrier (median 66–72 Lab units) than the
+#: owner's canyon stills (29–32), because full-range blob texture is, pixel for
+#: pixel, extremely enclosing.  Referencing a percentile of the frame's own
+#: distribution therefore promotes exactly the frames that must stay
+#: subjectless.  An absolute reference leaves them alone — everything in them
+#: sits near the saturation point, the gate reads ≈1 throughout, and the
+#: #341 separation is decided by distinctness and texture exactly as before.
+#:
+#: Set from the measured gap on the real material (mean barrier inside each
+#: region, in Lab units, 3 raster passes):
+#:
+#: * ``seed_v6`` sky                0.7   ← must lose
+#: * ``seed_v6`` right wall        10.3   ← must lose
+#: * ``seed_v6`` whitewater        41.3   ← must lose
+#: * ``seed_1x1_drone`` whitewater 43.6   ← must lose
+#: * **reference                   80.0**
+#: * ``seed_1x1_drone`` airframe   73.0   ← must win (0.91 of reference)
+#: * ``seed_v6`` airframe          84.1   ← must win (saturated)
+#:
+#: The plateau is wide: 78–82 with :data:`ANCHOR_ENCLOSURE_EXPONENT` 1.9–2.1
+#: gives the same verdict on every asset and fixture in the suite.
+ANCHOR_ENCLOSURE_REFERENCE: float = 80.0
 
-#: Barrier distance, in CIE-Lab units at :data:`ANCHOR_ANALYSIS_MAX_DIM`, below
-#: which a candidate region is **scenery rather than subject** and may not win
-#: the density election.
+#: Exponent applied to the enclosure ratio, i.e. how sharply a half-enclosed
+#: region is discounted against a fully enclosed one.
 #:
-#: This is a *background* prior, not a centre prior, and the difference is the
-#: reason it is allowed to exist here at all: it asks whether a region reaches
-#: the frame's edge without crossing a colour boundary, not where in the frame
-#: it sits.  A subject parked in the corner still wins — 「主体偏离中心」 stays a
-#: reachable verdict, which a centre prior would quietly make impossible.
+#: At 1.0 the whitewater keeps half the aircraft's weight and the two merge into
+#: one component; at 2.0 it keeps a quarter and they separate.  Above ~2.5 the
+#: airframe itself starts to fragment.  Measured across 78–82 × 1.9–2.1 the
+#: answer does not move.
+ANCHOR_ENCLOSURE_EXPONENT: float = 2.0
+
+#: Exponent applied to :func:`frequency_tuned_saliency` before the gates.
 #:
-#: Set from the measured gap between regions that must lose and regions that
-#: must win (10th percentile of the barrier inside each, in Lab units):
-#:
-#: * ``seed_v6`` whitewater      3.7   ← must lose
-#: * ``seed_1x1_drone`` rock     7.7   ← must lose
-#: * ``seed_1x1_drone`` river    8.0   ← must lose
-#: * **floor                    10.0**
-#: * ``flat_sky_frame`` subject 14.0   ← must win (1.4× above)
-#: * ``seed_v6`` aircraft core  18.0   ← must win (1.8× above)
-#: * ``subject_frame`` subject  56.7   ← must win
-#:
-#: The floor only ever *removes* candidates, and if it removes all of them the
-#: election runs unfiltered — a frame whose every region leaks to the edge is
-#: judged exactly as it was before, which is what keeps this from inventing new
-#: 「没有锚点」 verdicts on material it was not tuned against.
-ANCHOR_BACKGROUND_FLOOR: float = 10.0
+#: Sub-linear on purpose.  Colour distinctness is evidence of a subject but a
+#: badly *scaled* one: measured on ``video/seed_v6.png``, whitewater scores 0.68
+#: against the aircraft's 0.30, so at exponent 1.0 the foam still carries 2.3×
+#: the aircraft's weight and no achievable enclosure gate closes that.  At 0.7
+#: the ratio falls to 1.7× and the enclosure gate's 4× turns the order over.
+#: Read it as "twice as distinct is not twice as much of a subject".
+ANCHOR_DISTINCTNESS_EXPONENT: float = 0.7
 
 #: Raster sweeps used to approximate the barrier distance.  Each sweep relaxes
-#: the whole frame in four directions; three of them is where the map stops
-#: changing on the fixtures (the 2048² stills move by <0.5 Lab units between
-#: three and six).
-ANCHOR_BACKGROUND_PASSES: int = 3
+#: the whole frame in four directions.
+#:
+#: Three is a deliberate *under*-relaxation, not convergence: the map is still
+#: falling at 25 passes (``seed_v6``'s airframe reads 84.1 / 58.7 / 55.4 / 52.8
+#: Lab units at 3 / 6 / 12 / 25).  What matters is that the ordering it produces
+#: is already stable — foam below wall below airframe at every pass count — and
+#: that three sweeps cost ~0.1 s a frame instead of ~1 s.
+#: :data:`ANCHOR_ENCLOSURE_REFERENCE` is calibrated against this pass count and
+#: the two must move together.
+ANCHOR_ENCLOSURE_PASSES: int = 3
 
 #: Smallest region — as a fraction of the detection floor — that counts as
 #: **credible evidence of a subject at all**.  One constant, two uses, and they
@@ -1349,37 +1364,6 @@ def texture_gate(
     return np.clip(energy / reference, 0.0, 1.0)
 
 
-def structured_saliency(frame: np.ndarray, window: int = ANCHOR_TEXTURE_WINDOW) -> np.ndarray:
-    """Colour distinctness × structure, normalised to ``[0, 1]``.
-
-    Achanta on its own answers "how unlike the frame's average colour is this
-    spot?", and on the footage this pipeline exists for that question has a
-    systematically wrong answer.  In a canyon frame the red-brown rock owns the
-    mean, so the *sky* is the most distinct thing in the picture and a gray
-    aircraft in the middle — whose colour happens to sit near that mean — is the
-    least.  Multiplying by :func:`texture_gate` asks for both at once — distinct
-    **and** structured — which is what an object is and what a flat sky is not.
-
-    What this fixes, precisely, is worth stating because it is *not* the whole
-    of issue #343.  Ablated on the owner's two keyframes and the synthetic
-    fixtures, the gate is what saves the **flat** bright region: on a fixture
-    with a blown-out sky band over textured ground, the ungated detector returns
-    the sky (21.7 % of the frame, centroid y = 0.11) and the gated one returns
-    the subject (10.7 %, centroid y = 0.51).  It also tightens the
-    subject-vs-subjectless separation the anchor check rests on, from 32× to
-    50×.
-
-    It is **not** what unseats the sky in the owner's own frames, and pretending
-    otherwise would leave the next reader mis-tuning this function.  Real cloud
-    and real whitewater are *textured*, so they survive the gate; what demotes
-    them there is scoring candidate regions by saliency **density** rather than
-    total mass (see :func:`anchor_stats`).  The two changes fix two different
-    halves of the same bug and neither is redundant.
-    """
-    combined = frequency_tuned_saliency(frame) * texture_gate(frame, window)
-    return (combined - combined.min()) / (float(np.ptp(combined)) + 1e-9)
-
-
 def _barrier_sweep(channel: np.ndarray, passes: int) -> np.ndarray:
     """Minimum-barrier distance from the frame border for one image channel.
 
@@ -1396,6 +1380,10 @@ def _barrier_sweep(channel: np.ndarray, passes: int) -> np.ndarray:
     across the axis it is *not* walking, so the Python loop runs once per row or
     column rather than once per pixel — 256 iterations a sweep at
     :data:`ANCHOR_ANALYSIS_MAX_DIM`, ~0.1 s for a whole frame.
+
+    The relaxation only ever *lowers* the distance, so a small ``passes`` yields
+    an over-estimate rather than a wrong ordering; see
+    :data:`ANCHOR_ENCLOSURE_PASSES` for why three is the operating point.
     """
     height, width = channel.shape
     distance = np.full((height, width), np.inf, np.float32)
@@ -1425,33 +1413,41 @@ def _barrier_sweep(channel: np.ndarray, passes: int) -> np.ndarray:
     return distance
 
 
-def background_barrier(
+def enclosure_barrier(
     frame: np.ndarray,
     max_dim: int = ANCHOR_ANALYSIS_MAX_DIM,
-    passes: int = ANCHOR_BACKGROUND_PASSES,
+    passes: int = ANCHOR_ENCLOSURE_PASSES,
 ) -> np.ndarray:
-    """How far each spot is from the frame's border, measured in colour barriers.
+    """How enclosed each spot is, in CIE-Lab units: the colour step from outside.
 
-    The **background prior**: whatever the picture is of, the strip around its
-    edge is mostly *not* it.  Sky runs off the top, a canyon wall runs off the
-    side, a river runs off the bottom — each of them reachable from the border
-    without ever crossing a colour boundary, so each of them scores ~0 here.  A
-    subject is by construction the thing the frame is wrapped around, so getting
-    to it from outside means climbing over its outline, and it scores high.
+    Whatever a picture is *of*, the strip around its edge is mostly not it.  Sky
+    runs off the top, a canyon wall runs off the side, a river runs off the
+    bottom — each reachable from the border without ever crossing a colour
+    boundary, so each scores low here.  A subject is by construction the thing
+    the frame is wrapped around, so getting to it from outside means climbing
+    over its outline, and it scores high.
 
-    Returned in **CIE-Lab units** (the mean of the per-channel barrier over L, a
-    and b), not normalised to ``[0, 1]``, and that is deliberate: a barrier of 10
-    Lab units is the same visible colour step in a hazy frame and a punchy one,
-    whereas a min-max normalisation would stretch a frame containing nothing but
-    noise until its noise looked like a subject.  :data:`ANCHOR_BACKGROUND_FLOOR`
-    is expressed in the same units.
+    This is **not** a centre prior, and the distinction is what makes it
+    admissible in this check at all: it asks whether a region reaches the frame's
+    edge without crossing a boundary, never where in the frame it sits.  A
+    subject parked in a corner is still enclosed and still scores high, so
+    「主体偏离中心」 stays a reachable verdict — which a centre prior would
+    quietly make impossible.
 
-    What this is *not* is a centre prior — see
-    :data:`ANCHOR_BACKGROUND_FLOOR`.  A subject pushed into the corner is still
-    enclosed and still scores high; only a region that actually *leaks* off the
-    edge is demoted.  Grayscale in is handled by promoting to BGR first, so the
-    video sampler's ``-pix_fmt gray`` frames degrade to a luminance-only barrier
-    rather than failing.
+    Reduced over L, a and b by **maximum**, not mean: "the largest step in any
+    one channel".  The mean makes the measure depend on how the frame arrived —
+    a grayscale frame has no a/b barrier at all, so its mean is divided by three
+    for no physical reason, and ``seed_v6``'s airframe then reads 31.9 in colour
+    against 27.3 in luminance (17 % apart).  Under the maximum the same airframe
+    reads 84.1 and 81.9 (2.7 % apart), because the luminance channel carries the
+    step in both cases.  #360's contract is that the still path and the video
+    sampler's ``-pix_fmt gray`` path measure the same picture; this reduction is
+    what makes that true of this channel rather than lucky.
+
+    Returned in raw Lab units, never min-max normalised: a barrier of 40 units is
+    the same visible step in a hazy frame and a punchy one, whereas normalising
+    would stretch a frame containing nothing but noise until its noise looked
+    like a subject.
     """
     if passes < 1:
         raise ValueError(f"passes must be >= 1, got {passes}")
@@ -1459,10 +1455,79 @@ def background_barrier(
     if small.ndim == 2:
         small = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
     lab = cv2.cvtColor(cv2.GaussianBlur(small, (5, 5), 0), cv2.COLOR_BGR2LAB).astype(np.float32)
-    total = np.zeros(lab.shape[:2], np.float32)
+    barrier = np.zeros(lab.shape[:2], np.float32)
     for index in range(3):
-        total += _barrier_sweep(np.ascontiguousarray(lab[..., index]), passes)
-    return total / 3.0
+        np.maximum(barrier, _barrier_sweep(np.ascontiguousarray(lab[..., index]), passes), out=barrier)
+    return barrier
+
+
+def enclosure_gate(
+    frame: np.ndarray,
+    reference: float = ANCHOR_ENCLOSURE_REFERENCE,
+    exponent: float = ANCHOR_ENCLOSURE_EXPONENT,
+) -> np.ndarray:
+    """How *enclosed* each spot is, as a ``[0, 1]`` gate on saliency.
+
+    :func:`enclosure_barrier` divided by :data:`ANCHOR_ENCLOSURE_REFERENCE`,
+    clipped at 1 and raised to :data:`ANCHOR_ENCLOSURE_EXPONENT`.  Read it, like
+    :func:`texture_gate`, as a yes/no question with a soft edge: "is this spot
+    something the picture is wrapped around, or is it the backdrop?".
+
+    Unlike :func:`texture_gate` the reference is **absolute**, not the frame's
+    own median — see :data:`ANCHOR_ENCLOSURE_REFERENCE` for the measurement that
+    forces that choice.  The short version: an evenly-textured frame is, by this
+    measure, enclosing everywhere, so a self-scaling reference would manufacture
+    subjects out of exactly the fixtures that must have none.
+    """
+    if reference <= 0:
+        raise ValueError(f"reference must be > 0, got {reference}")
+    return np.clip(enclosure_barrier(frame) / reference, 0.0, 1.0) ** exponent
+
+
+def structured_saliency(frame: np.ndarray, window: int = ANCHOR_TEXTURE_WINDOW) -> np.ndarray:
+    """Distinctness × structure × enclosure, normalised to ``[0, 1]``.
+
+    Three questions, each a gate, and an object is the only thing that answers
+    all three: is this spot *unlike* the rest of the picture
+    (:func:`frequency_tuned_saliency`), does it carry *structure*
+    (:func:`texture_gate`), and is it something the frame is *wrapped around*
+    (:func:`enclosure_gate`)?
+
+    **Distinctness** alone has a systematically wrong answer on the footage this
+    pipeline exists for: in a canyon frame the red-brown rock owns the mean, so
+    the *sky* is the most distinct thing in the picture and a gray aircraft in
+    the middle is among the least.  **Texture** (#343) removes the flat bright
+    region — ablated on a fixture with a blown-out sky band over textured ground,
+    the ungated detector returns the sky (21.7 % of the frame, centroid y = 0.11)
+    and the gated one the subject (10.7 %, y = 0.51).
+
+    **Enclosure** (#361) is what removes the bright *textured* backdrop, which
+    neither of the other two can.  Real whitewater and real cloud are distinct
+    and structured, so they pass both earlier gates — and on
+    ``video/seed_v6.png`` the aircraft's combined distinctness × texture score is
+    0.26 against the foam's 0.56, with Otsu cutting at 0.38.  That is the whole
+    of G-10: the subject was not merely losing the election, it was **not on the
+    ballot** — no component of the mask covered it, so no amount of re-scoring or
+    vetoing candidates could have reached it.  The enclosure gate multiplies the
+    foam down (barrier 41 Lab units against the airframe's 84, squared against a
+    reference of 80: 0.26 against 1.0) and puts the aircraft in the mask.
+
+    Distinctness is measured on **luminance**, not colour, and the exponent is
+    sub-linear; see :data:`ANCHOR_DISTINCTNESS_EXPONENT`.  Dropping the a/b
+    channels does not change *what* is found — ``seed_v6`` answers (0.54, 0.49)
+    in colour and (0.54, 0.50) in luminance — only *how much of it*: in colour
+    the extra chroma evidence pulls in more of the airframe (3.4 % of the frame
+    against 2.2 %), so the same still measured two legal ways disagreed by 75 %
+    and #360's ≤30 % contract failed.  Feeding this channel luminance makes the
+    still path and the video sampler's gray path agree by construction; the
+    spread is 12 %.
+    """
+    combined = (
+        frequency_tuned_saliency(_as_gray(frame)) ** ANCHOR_DISTINCTNESS_EXPONENT
+        * texture_gate(frame, window)
+        * enclosure_gate(frame)
+    )
+    return (combined - combined.min()) / (float(np.ptp(combined)) + 1e-9)
 
 
 def anchor_stats(
@@ -1471,7 +1536,6 @@ def anchor_stats(
     sigma: float = ANCHOR_CENTER_PRIOR_SIGMA,
     min_area: float = ANCHOR_MIN_AREA,
     rescue: bool = True,
-    background_prior: bool = True,
 ) -> dict[str, float]:
     """Locate the frame's anchor and report its area share and eccentricity.
 
@@ -1493,6 +1557,14 @@ def anchor_stats(
     Asking which region is most strongly "subject" per pixel is the question the
     check actually poses, and it is scale-free — the same object read at 1024²
     and at 2880² scores the same.
+
+    Density is nonetheless only a way of *ranking the ballot*, and #361 is the
+    reminder of what that cannot do.  On ``video/seed_v6.png`` the aircraft was
+    not a low-scoring candidate, it was not a candidate: its distinctness ×
+    texture score is 0.26 where Otsu cuts at 0.38, so no component of the mask
+    covered it and every re-ranking, veto and background prior applied to the
+    candidate list was arguing about the wrong set.  The fix belongs in
+    :func:`structured_saliency` — the enclosure gate — not here.
 
     Density has one failure the #343 work did not close, and #356 is it: the
     measure is *biased towards small regions*.  A region's mean converges on its
@@ -1603,26 +1675,6 @@ def anchor_stats(
     candidates = [i for i in range(1, count) if stats[i, cv2.CC_STAT_AREA] >= credible]
     if not candidates:  # nothing credible in frame — judge the specks as before
         candidates = list(range(1, count))
-
-    # #361: scenery may not stand in the election.  The candidacy gate above
-    # asks "is this region big enough to be a subject"; this one asks "is it a
-    # subject at all, or is it the picture's backdrop".  Distinctness and
-    # texture cannot tell those apart — whitewater and cloud are both, which is
-    # why #343's two fixes left the detector pointing at the river — but the
-    # background prior can: a backdrop reaches the frame's edge without crossing
-    # a colour boundary and a subject does not.  Measured on the owner's
-    # ``seed_v6.png``, the 10.65 % region the detector reported sits at
-    # y = 0.787 (the rapids) and its 10th-percentile barrier is 3.7 Lab units;
-    # the aircraft's core at y = 0.43 scores 18.0.
-    if background_prior:
-        barrier = background_barrier(frame)
-        if barrier.shape == saliency.shape:
-            foreground = [
-                i
-                for i in candidates
-                if float(np.percentile(barrier[labels == i], ANCHOR_BACKGROUND_PERCENTILE)) >= ANCHOR_BACKGROUND_FLOOR
-            ]
-            candidates = foreground or candidates
 
     best_index, best_density = candidates[0], -1.0
     for index in candidates:
