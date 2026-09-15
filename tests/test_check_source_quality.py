@@ -150,6 +150,13 @@ SCRIPT_PATH = REPO_ROOT / "scripts" / "check_source_quality.py"
 OWNER_KEYFRAME = Path(os.environ.get("VR180_OWNER_KEYFRAME", r"C:\Users\musof\Downloads\Gemini_v1.jpg"))
 CANYON_STILL = Path(os.environ.get("VR180_CANYON_STILL", str(REPO_ROOT / "video" / "seed_1x1_drone.png")))
 
+#: The #356 pair: a 2048² keyframe and the 960² clip generated from it.  Same
+#: gorge, same aircraft, two orders of magnitude apart in the old reading — the
+#: evidence the card was filed on.  Git-ignored like the two above, so these
+#: regressions skip everywhere except the owner's machine.
+SEED_STILL = Path(os.environ.get("VR180_SEED_STILL", str(REPO_ROOT / "video" / "seed_v6.png")))
+SEED_CLIP = Path(os.environ.get("VR180_SEED_CLIP", str(REPO_ROOT / "video" / "gen_1x1_720p_v6.mp4")))
+
 FRAME_SIZE = 240
 N_FRAMES = 9  # 9 frames -> 8 adjacent pairs, the CLI default
 
@@ -1271,6 +1278,195 @@ def test_the_rescue_leaves_established_and_noise_cores_alone() -> None:
     for seed in range(1, 9):
         stats = csq.anchor_stats(subjectless_frame(seed=seed))
         assert not stats["found"], f"seed {seed} grew an anchor out of specks: {stats}"
+
+
+# ---------------------------------------------------------------------------
+# anchor — a speck must not veto the subject (G-9 #356)
+# ---------------------------------------------------------------------------
+
+
+def glinted_frame(
+    area_frac: float = 0.11,
+    glint_radius: int = 7,
+    glint_cx: float = 0.25,
+    glint_cy: float = 0.42,
+    size: int = FRAME_SIZE,
+) -> np.ndarray:
+    """:func:`subject_frame` with one tiny, maximally distinct specular glint.
+
+    The #356 composition, reduced to its essentials.  The glint is a 7 px disc —
+    **0.20 % of the frame**, a quarter of the detection floor — of blown-out,
+    finely textured white sitting on the dark field beside the subject.  Nothing
+    about it is reportable: it is far too small to be an anchor and too small
+    even to be rescued.  But it is *pure peak*, and a mean-density score
+    converges on a region's peak as the region shrinks, so it out-scores an
+    11 %-of-frame subject by roughly 2:1 and — under winner-takes-all — takes
+    the frame's verdict with it.
+
+    Real footage is full of these: a rotor highlight, a sun glitter on water, a
+    compression ring around a blown highlight.  What makes them poisonous is not
+    that they exist but that their *survival of the opening* is a coin flip
+    decided by resampling, so the same picture answers two different things at
+    two different resolutions (see
+    ``test_an_unreportable_speck_does_not_move_the_answer_at_any_size``).
+    """
+    frame = subject_frame(area_frac).astype(np.float32)
+    height, width = frame.shape
+    hot = 255.0 + (_fine_texture(height, width, seed=23) - 128.0) / 127.0 * 45.0
+    glint = np.zeros((height, width), np.uint8)
+    cv2.circle(glint, (int(width * glint_cx), int(height * glint_cy)), glint_radius, 1, -1)
+    frame[glint == 1] = hot[glint == 1]
+    return np.clip(frame, 0, 255).astype(np.uint8)
+
+
+def test_a_speck_too_small_to_report_cannot_veto_the_subject() -> None:
+    """Acceptance (#356): the headline failure, in one frame.
+
+    Painting a 0.20 % glint next to an 11 % subject used to delete the subject
+    from the report altogether — ``found=False, area=0.20 %`` — because the
+    glint won the density election outright and was then, inevitably, judged
+    too small to be an anchor.  A region that cannot be *reported* as the
+    anchor has no business *choosing* it.
+
+    Asserted against the same frame without the glint rather than against a
+    constant, so what is pinned is "the speck changed nothing", which is the
+    actual claim.
+    """
+    clean = csq.anchor_stats(subject_frame(0.11))
+    glinted = csq.anchor_stats(glinted_frame(0.11))
+
+    assert clean["found"], f"the fixture itself lost its subject: {clean}"
+    assert glinted["found"], f"a 0.2 % speck deleted an 11 % subject: {glinted}"
+    assert glinted["area"] == pytest.approx(clean["area"], rel=0.10), (
+        f"the speck moved the measured area: {glinted} vs {clean}"
+    )
+    assert glinted["centroid_x"] == pytest.approx(0.5, abs=0.06), f"looking at the glint: {glinted}"
+    assert glinted["centroid_y"] == pytest.approx(0.5, abs=0.06), f"looking at the glint: {glinted}"
+
+
+@pytest.mark.parametrize("size", [240, 480, 960, 1920])
+def test_an_unreportable_speck_does_not_move_the_answer_at_any_size(size: int) -> None:
+    """Acceptance (#356): the *instability*, which is the bug's real shape.
+
+    The card was filed as "same scene, two resolutions, 8× apart", and the
+    tempting reading is that the morphology is resolution-dependent.  It is not
+    — every anchor measurement is taken at
+    :data:`check_source_quality.ANCHOR_ANALYSIS_MAX_DIM`, so the kernel sees the
+    same number of pixels either way.  What changes with resolution is whether
+    the resampler leaves a speck big enough to survive the opening *as its own
+    component*, and that is a coin flip: measured on ``video/seed_v6.png``, the
+    old detector answered 10.7 % at 2048², 1024² and 256² and **0.12 %** at 960²
+    and 512².  Bimodal, not graded.
+
+    So the regression renders one frame at four sizes and demands one answer.
+    """
+    frame = cv2.resize(glinted_frame(0.11), (size, size), interpolation=cv2.INTER_AREA)
+    reference = csq.anchor_stats(subject_frame(0.11))
+    stats = csq.anchor_stats(frame)
+
+    assert stats["found"], f"{size}² lost the subject to the glint: {stats}"
+    assert stats["area"] == pytest.approx(reference["area"], rel=0.30), (
+        f"{size}² disagrees with the un-glinted frame: {stats} vs {reference}"
+    )
+
+
+def test_the_candidacy_gate_does_not_manufacture_an_anchor() -> None:
+    """The other side of #356: gating the election must not invent subjects.
+
+    Restricting the election to credible-sized regions is only safe if a frame
+    with *no* credible region still answers 「没有锚点」.  Two things are checked
+    on every subjectless fixture: that the fallback branch is the one running
+    (no component reaches the credibility floor at all, so the gate cannot be
+    what decides these frames), and that the verdict is still "nothing here".
+
+    ``empty_centre_frame`` is the one that matters and the reason
+    :data:`check_source_quality.ANCHOR_RESCUE_CORE_FLOOR` moved: its busiest rim
+    blob is 0.358 %, the loudest subjectless core on record, and at the old 0.4×
+    gate the rescue grew it to 0.97 % — an anchor conjured out of a textured
+    rim.  Before #356 the frame was saved only by accident, because a smaller,
+    denser speck happened to win the election and fall under the floor.
+    """
+    floor = csq.ANCHOR_RESCUE_CORE_FLOOR * csq.ANCHOR_MIN_AREA
+    frames = {f"subjectless seed={s}": subjectless_frame(seed=s) for s in range(1, 9)}
+    frames["flat gray + noise"] = flat_frame()
+    frames["empty centre, busy rim"] = empty_centre_frame()
+    frames["rim damped"] = rim_damped_frame(0.18)
+
+    for name, frame in frames.items():
+        assert not csq.anchor_stats(frame)["found"], f"{name} grew an anchor: {csq.anchor_stats(frame)}"
+        saliency = csq.structured_saliency(frame)
+        _, raw = cv2.threshold(
+            np.clip(saliency * 255.0, 0, 255).astype(np.uint8),
+            0,
+            1,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        element = np.ones((csq.ANCHOR_MORPH_KERNEL, csq.ANCHOR_MORPH_KERNEL), np.uint8)
+        mask = cv2.morphologyEx(raw, cv2.MORPH_OPEN, element)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, element)
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+        biggest = max(
+            (int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, count)),
+            default=0,
+        ) / float(mask.size)
+        assert biggest < floor, f"{name} now has a credible candidate ({biggest:.4%} >= {floor:.4%})"
+
+
+@pytest.mark.skipif(not SEED_STILL.is_file(), reason=f"seed still not present: {SEED_STILL}")
+def test_the_seed_still_measures_the_same_at_every_resolution() -> None:
+    """Acceptance (#356): ``video/seed_v6.png`` reads one number, not two.
+
+    The card's evidence, reproduced without needing the clip: the same 2048²
+    still resampled to 1024²/960²/512² and read both in colour (the still path)
+    and in luminance (what the video sampler hands over, ``-pix_fmt gray``).
+    Before the candidacy gate those ten readings were 0.12 % or ~11 % with
+    nothing in between — an 88× spread.  They are now 10.65–11.72 %, a 10 %
+    spread, against the card's 30 % bound.
+    """
+    still = csq.read_still(SEED_STILL)
+    areas = {}
+    for size in (2048, 1024, 960, 512):
+        img = still if size == still.shape[0] else cv2.resize(still, (size, size), interpolation=cv2.INTER_AREA)
+        for tag, frame in (("bgr", img), ("gray", csq._as_gray(img))):
+            stats = csq.anchor_stats(frame)
+            assert stats["found"], f"{size}² {tag} lost the subject: {stats}"
+            areas[f"{size}{tag}"] = stats["area"]
+
+    spread = (max(areas.values()) - min(areas.values())) / min(areas.values())
+    assert spread <= 0.30, f"resolution- or colour-path-dependent measurement: {areas} (spread {spread:.1%})"
+
+
+@pytest.mark.skipif(
+    not (SEED_STILL.is_file() and SEED_CLIP.is_file()),
+    reason=f"seed pair not present: {SEED_STILL} / {SEED_CLIP}",
+)
+def test_the_clip_agrees_with_its_own_seed_frame() -> None:
+    """Acceptance (#356): the 2048² still and the 960² clip stop disagreeing.
+
+    Compared **frame to frame**, which is the only comparison that isolates the
+    bug.  ``gen_1x1_720p_v6.mp4`` is a ten-second flight down the gorge and the
+    whitewater's share of the picture genuinely shrinks as the drone descends,
+    so the clip's median over eight sampled frames is not a measurement of the
+    same picture as the seed still and never was.  Its *first* sampled frame is.
+
+    Before: still 10.7 %, first frame 0.12 % (86× apart) and four of the eight
+    frames reporting no anchor at all.  After: 10.65 % against 9.86 %, 8 %
+    apart, with seven of eight frames anchored.
+    """
+    info = csq.probe_source(SEED_CLIP)
+    frames = [first for first, _second in csq.iter_frame_pairs(SEED_CLIP, info, pairs=8)]
+    assert len(frames) == 8, f"expected eight sampled frames, got {len(frames)}"
+
+    still = csq.anchor_stats(csq.read_still(SEED_STILL))
+    per_frame = [csq.anchor_stats(frame) for frame in frames]
+    opening = per_frame[0]
+
+    assert still["found"] and opening["found"], f"still={still} opening={opening}"
+    spread = abs(still["area"] - opening["area"]) / min(still["area"], opening["area"])
+    assert spread <= 0.30, f"still {still['area']:.4%} vs first frame {opening['area']:.4%} ({spread:.1%} apart)"
+
+    detected = sum(1 for stats in per_frame if stats["found"])
+    assert detected >= 6, f"the clip is still losing its subject: {[s['area'] for s in per_frame]}"
 
 
 # ---------------------------------------------------------------------------
