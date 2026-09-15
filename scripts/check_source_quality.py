@@ -101,13 +101,14 @@ The six checks
     frame and a gray aircraft in the middle is one of the least; and scoring
     candidates by total saliency *mass* then hands the verdict to whichever
     region is merely biggest.  The texture gate removes the **flat** impostors
-    (blown highlights, sheet water, clear sky); density removes the **big** ones
-    (cloud and whitewater, which are textured and survive the gate).  Measured on
-    the synthetic fixtures, frames with a subject come out at 11.0–36.1 % of the
-    picture and frames without one at ≤0.22 %, a separation of ~50× (it was ~30×
-    before the gate).  A missing anchor is a WARN, not a FAIL: not every shot
-    needs one, but the operator should know that without one the viewer will go
-    looking at the rim.
+    (blown highlights, sheet water, clear sky); the enclosure gate removes the
+    **scenery** (cloud and whitewater, which are textured, survive the first gate
+    and run off the edge of the picture); density removes the merely big.
+    Measured on the synthetic fixtures, frames with a subject come out at
+    11.1–40.2 % of the picture and frames without one at ≤0.27 %, a separation of
+    ~41× (it was ~30× before any gating).  A missing anchor is a WARN, not a
+    FAIL: not every shot needs one, but the operator should know that without one
+    the viewer will go looking at the rim.
 
 Aggregation across the sampled frames/pairs is by **median**, not mean: one
 scene cut, one fade-to-black frame or one lens flare must not decide the
@@ -295,9 +296,16 @@ ANCHOR_CENTER_PRIOR_SIGMA: float = 0.5
 #: read a hand-sized subject as textured, large enough that a single hard edge
 #: (a cloud rim, a horizon) does not paint a whole flat region as structured.
 #: Measured across 15/21/31 on both of the owner's keyframes and the synthetic
-#: fixtures, 21 gives the widest subject-vs-subjectless separation (50×, against
-#: 42× at 15 and 46× at 31); the real-asset centroids move by <0.01 across the
+#: fixtures, 21 gave the widest subject-vs-subjectless separation (50×, against
+#: 42× at 15 and 46× at 31); the real-asset centroids moved by <0.01 across the
 #: three, so this is a tuning choice, not a knife edge.
+#:
+#: Re-measured after #361 added the enclosure channel: 40.6× at both 15 and 21,
+#: and **64.1×** at 31.  The centroids still barely move between 21 and 31
+#: ((0.539, 0.506) against (0.535, 0.501) on ``seed_v6.png``), so 31 is now the
+#: better-separating choice and is left alone deliberately — re-tuning a #343
+#: constant was not in #361's scope and a window change moves every anchor
+#: number in the suite.  Worth a card of its own.
 ANCHOR_TEXTURE_WINDOW: int = 21
 
 #: **Detection floor — "is there anything there", not "is it big enough".**
@@ -309,12 +317,13 @@ ANCHOR_TEXTURE_WINDOW: int = 21
 #:
 #: Set from the measured gap between "no subject" and "a real but small
 #: subject".  Subjectless fixtures — uniform texture across 8 seeds, flat gray
-#: plus sensor noise, rim-damped/empty-centre — top out at **0.22 %** (#341's
-#: table quotes 0.35 % as the pre-#343 worst case, and the texture channel only
-#: pushed it down).  The smallest *real* subject on record is the quadcopter in
-#: the owner's ``Gemini_v1.jpg`` keyframe at **1.30 %**.  0.8 % sits 3.6× above
-#: the loudest false positive and 1.6× below that true one, so both sides keep
-#: room.
+#: plus sensor noise, rim-damped/empty-centre — top out at **0.27 %** (#341's
+#: table quotes 0.35 % as the pre-#343 worst case; the texture channel pushed it
+#: to 0.22 % and the #361 enclosure channel put it back to 0.27 %, which is the
+#: price of a gate that does not care how bright a region is).  The smallest
+#: *real* subject on record is the quadcopter in the owner's ``Gemini_v1.jpg``
+#: keyframe at **1.30 %**.  0.8 % sits 2.9× above the loudest false positive and
+#: 1.6× below that true one, so both sides keep room.
 #:
 #: It was 1.5 % until #345, which is what made the check answer 「画面里没有
 #: 锚点」 for a frame with a visible drone in it.  That verdict was not merely

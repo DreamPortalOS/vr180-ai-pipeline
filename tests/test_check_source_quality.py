@@ -80,9 +80,11 @@ A factor of ~31 between the quietest true subject and the loudest false one,
 with :data:`~scripts.check_source_quality.ANCHOR_MIN_AREA` sitting between them
 — so "no anchor" is a verdict the check can actually reach, not a branch that
 never fires.  ``test_subject_and_subjectless_frames_are_separated`` pins that
-margin directly; the texture channel added in #343 widens it to ~50× and
-``test_the_texture_channel_widens_the_subject_separation`` pins that it may
-never narrow again.
+margin directly; the texture channel added in #343 widened it to ~50×, the
+enclosure channel added in #361 gives back some of that (~41×, because a gate
+that refuses to look at brightness also refuses to punish bright speckle), and
+``test_the_texture_channel_widens_the_subject_separation`` pins the 32× floor
+that neither may cross.
 
 Two thresholds, two questions (#345)
 ------------------------------------
@@ -102,26 +104,47 @@ pins the headroom on both sides (loudest subjectless fixture 0.22 %, floor
 deliberately **unchanged** — a lower floor that started finding anchors in an
 empty frame would be a worse bug than the one it replaced.
 
-And the sky is not the subject (#343)
--------------------------------------
+And the sky is not the subject (#343), nor the river (#361)
+-----------------------------------------------------------
 The anchor detector's first field trial failed: on the owner's canyon keyframes
 it reported the *cloud band* and the *whitewater* as the subject, because a
 red-rock frame's mean colour is owned by the rock, which leaves bright sky as
-the most colour-"distinct" thing in the picture.  ``flat_sky_frame`` reproduces
-that composition synthetically, and the two checks that matter are a matched
-pair: ``test_a_flat_bright_sky_does_not_pose_as_the_subject`` says the detector
-gets it right, and ``test_removing_the_texture_channel_puts_the_sky_back``
-disables the texture channel and insists the answer goes *wrong* again — so the
-first test cannot quietly start passing for the wrong reason.
+the most colour-"distinct" thing in the picture.  #343 answered the *flat* half
+of that with a texture channel; #361 answered the rest, because real whitewater
+is bright **and** finely textured and passes a structure test honestly.  What
+separates foam from airframe is neither tone nor position but **enclosure**: the
+river runs off the edge of the picture and the aircraft does not.
+
+Each fix owns a fixture and a matched mutation, so no acceptance test can
+quietly start passing for the wrong reason:
+
+============================  ==============================  ====================
+composition                   acceptance                      mutation
+============================  ==============================  ====================
+``flat_sky_frame`` (#343)     subject, not the sky band       blind both structure
+                                                              channels → y = 0.11
+``gorge_frame`` (#361)        subject at y = 0.26, not the    blind enclosure
+                              river at y = 0.75               → y = 0.75
+``thin_limbed_frame`` (#348)  3.97 %, not a 0.73 % skeleton   ``rescue=False``
+                                                              → 「没有锚点」
+============================  ==============================  ====================
+
+The #343 mutation needs *both* channels blinded because a sky band that runs off
+the top edge is unenclosed as well as flat, so either channel alone now disposes
+of it; the texture channel's own necessity is pinned instead on the #341 margin,
+which collapses from 40.6× to 7.6× without it.
 
 Almost everything here runs on synthetic arrays: no test decodes video or shells
-out to ffmpeg.  The two exceptions are the #343 regressions against the frames
-the bug was actually reported on (``OWNER_KEYFRAME``, ``CANYON_STILL``), which
-are read **read-only** and ``skip`` when absent — neither file ships with the
-repo, so they run on the owner's machine and nowhere else.  The ffprobe/ffmpeg
-layer is covered by parsing captured ffprobe JSON and by an AST sweep
-(``test_subprocess_calls_are_list_form_without_shell``) that holds every
-``subprocess.run`` in the module to list form with no ``shell=True``.
+out to ffmpeg.  The exceptions are the regressions against the frames the bugs
+were actually reported on (``OWNER_KEYFRAME``, ``CANYON_STILL``, ``SEED_STILL``,
+``SEED_CLIP``), which are read **read-only** and ``skip`` when absent — none of
+them ships with the repo, so they run on the owner's machine and nowhere else.
+Note that they also skip in a **git worktree**, whose ``video/`` directory does
+not exist; point ``VR180_SEED_STILL`` and friends at the main checkout to run
+them there.  The ffprobe/ffmpeg layer is covered by parsing captured ffprobe
+JSON and by an AST sweep (``test_subprocess_calls_are_list_form_without_shell``)
+that holds every ``subprocess.run`` in the module to list form with no
+``shell=True``.
 """
 
 from __future__ import annotations
@@ -970,8 +993,8 @@ def test_subject_and_subjectless_frames_are_separated() -> None:
     threshold and a margin expressed in units of the thing being moved would have
     silently rescaled with it instead of catching the change.
 
-    Measured today: true subjects 11.0 / 36.1 / 11.1 %, false ones at most
-    0.22 %, i.e. ~50× apart.  The bounds below are deliberately slacker than the
+    Measured today: true subjects 11.1 / 40.2 / 11.3 %, false ones at most
+    0.27 %, i.e. ~41× apart.  The bounds below are deliberately slacker than the
     measurements so that ordinary detector noise does not flake the suite.
     """
     with_subject = [
@@ -1210,20 +1233,18 @@ def test_the_texture_channel_widens_the_subject_separation() -> None:
     """The gate must not buy the sky fix by blurring the #341 margin.
 
     #341's contract is that a frame with a subject and a frame without one are
-    separated by a wide margin rather than a hair.  Gating tightens it (≈50×
-    against ≈32×) because speckle in an evenly-textured frame is exactly what a
-    structure measure declines to promote; this pins that it does not *loosen*
-    it.
+    separated by a wide margin rather than a hair.  Gating widened it (≈50×
+    against the ungated ≈32×) because speckle in an evenly-textured frame is
+    exactly what a structure measure declines to promote; #361's enclosure gate
+    gives part of that back (≈41×) because it judges scenery by where it leaks
+    to and not by how bright it is.  32× is the floor neither may cross.
     """
     with_subject = min(
         csq.anchor_stats(subject_frame(0.11))["area"],
         csq.anchor_stats(subject_frame(0.40))["area"],
         csq.anchor_stats(subject_frame(0.11, cx_frac=0.80))["area"],
     )
-    without = max(
-        [csq.anchor_stats(subjectless_frame(seed=s))["area"] for s in range(1, 9)]
-        + [csq.anchor_stats(flat_frame())["area"], csq.anchor_stats(rim_damped_frame(0.18))["area"]]
-    )
+    without = _loudest_subjectless()
     assert with_subject / max(without, 1e-9) > 32.0, f"separation regressed: {with_subject} vs {without}"
 
 
@@ -1318,16 +1339,15 @@ def test_the_detection_floor_sits_between_noise_and_the_smallest_real_subject() 
     measured rather than asserted.  Headroom on both sides, on the real asset the
     card was filed about and on the subjectless fixtures #341 established:
 
-    * loudest subjectless fixture  0.22 %   → floor is ~3.6× above it
+    * loudest subjectless fixture  0.27 %   → floor is ~2.9× above it
     * floor                        0.80 %
     * smallest real subject        1.30 %   → ~1.6× above the floor
 
-    Written as ratios so the margin, not the constant, is what is pinned.
+    Written as ratios so the margin, not the constant, is what is pinned.  The
+    lower figure was 0.22 % before #361; the enclosure channel costs a little
+    headroom on that side because it does not care how bright a speck is.
     """
-    noise = max(
-        [csq.anchor_stats(subjectless_frame(seed=s))["area"] for s in range(1, 9)]
-        + [csq.anchor_stats(flat_frame())["area"], csq.anchor_stats(rim_damped_frame(0.18))["area"]]
-    )
+    noise = _loudest_subjectless()
     smallest_real = csq.anchor_stats(csq.read_still(OWNER_KEYFRAME))["area"]
 
     assert noise * 2.5 < csq.ANCHOR_MIN_AREA, f"floor too close to the noise: {noise}"
@@ -1342,15 +1362,17 @@ def test_canyon_still_finds_the_aircraft_not_the_whitewater() -> None:
     ``seed_1x1_drone.png`` is 2048² with the aircraft at about (0.50, 0.48) and a
     stretch of whitewater filling the bottom of the gorge.  The old detector
     returned the foam at (0.51, 0.79); anything below y≈0.6 in this frame is
-    river, not subject.
+    river, not subject.  It now reads 1.65 % at (0.506, 0.439).
 
-    Note for #345: the detector picks the aircraft here (0.504, 0.359) but its
-    opened core measures only **0.53 %** of this frame — under the 0.8 %
-    detection floor.  #348 resolved that gap with the rescue
-    (:func:`check_source_quality.anchor_stats` re-grows a credible-but-
-    sub-floor core to its full pre-morphology extent), so this still now reads
-    ~1.38 % and reports 「面积偏小」; what this test guards is unchanged — the
-    foam must not win.
+    **This test is weak on its own and #361 is why**: the detector's answer
+    before that card was (0.510, 0.371) — the bright bend of the river directly
+    above the fuselage — and both assertions below passed on it, because in
+    *this* composition the water that must lose sits within ±0.12 of the
+    airframe that must win.  A regression that can be satisfied by either
+    candidate is a smoke test, not an acceptance test.  The discriminating
+    version is ``test_the_gorge_fixture_finds_the_subject_not_the_water``, whose
+    two candidates are 0.49 apart; this one is kept because it is the only place
+    the real photograph is exercised at all.
     """
     stats = csq.anchor_stats(csq.read_still(CANYON_STILL))
 
