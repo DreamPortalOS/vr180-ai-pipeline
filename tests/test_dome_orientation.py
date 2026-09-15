@@ -48,6 +48,7 @@ import hashlib
 import math
 import shutil
 import subprocess
+import sys
 import unittest.mock
 from pathlib import Path
 
@@ -533,3 +534,184 @@ class TestTheMasterIsMappedStraightToSize:
         mapper = FulldomeMapper(output_size=args.dome_size, coverage_v_fov=90.0)
         cmd = _captured_ffmpeg_cmd(mapper, tmp_path)
         assert _v360_terms(cmd[cmd.index("-filter_complex") + 1])["w"] == "4096"
+
+
+# --------------------------------------------------------------------------- #
+# 4. CLI — the four flags exist, are independent of the VR180 four, and reach
+#    the mapper without being dropped on the way
+# --------------------------------------------------------------------------- #
+
+_DOME_ANGLE_FLAGS = ("dome-pitch", "dome-yaw", "dome-roll")
+
+
+class _MapperConstructedError(Exception):
+    """Sentinel so the dome stage aborts the moment the kwargs are captured."""
+
+
+def _dome_flags_reaching_the_mapper(monkeypatch, argv: list[str], tmp_path: Path) -> dict:
+    """Drive ``run_pipeline.main()`` down the dome branch; return the mapper kwargs.
+
+    #120 / #243 / #294 silent-drop defence: a ``--dome-pitch`` the dome stage
+    quietly ignored would look *exactly* like the bug D-2 fixes, and no
+    assertion about ``parse_args`` alone would catch it — the flag has to be
+    followed all the way to the constructor.  Preflight and the source check
+    are switched off so the test measures the wiring rather than the host.
+    """
+    from scripts import run_pipeline as rp
+
+    captured: dict = {}
+
+    def _recorder(**kwargs):
+        captured.update(kwargs)
+        raise _MapperConstructedError
+
+    # ``_build_parser`` reads INPUT_PROJECTIONS off the class to build the
+    # --dome-input-projection choices, so the stand-in has to carry it too.
+    _recorder.INPUT_PROJECTIONS = FulldomeMapper.INPUT_PROJECTIONS
+    monkeypatch.setattr(rp, "FulldomeMapper", _recorder)
+
+    src = tmp_path / "src.mp4"
+    build = [
+        "ffmpeg", "-y", "-v", "error",
+        "-f", "lavfi", "-i", "testsrc=duration=1:size=64x64:rate=5",
+        "-frames:v", "3", "-pix_fmt", "yuv420p", str(src),
+    ]  # fmt: skip
+    subprocess.run(build, check=True, capture_output=True, timeout=60)
+
+    full_argv = [
+        "run_pipeline.py",
+        "--input", str(src),
+        "--output", str(tmp_path / "out.mp4"),
+        "--projection", "fulldome",
+        "--preflight", "off",
+        "--source-check", "off",
+        *argv,
+    ]  # fmt: skip
+    monkeypatch.setattr(sys, "argv", full_argv)
+    with pytest.raises(_MapperConstructedError):
+        rp.main()
+    return captured
+
+
+class TestCliPassesTheDomeFlagsThrough:
+    """``--dome-*`` on the command line must arrive intact at the mapper."""
+
+    def test_the_help_lists_all_four_flags(self, capsys):
+        from scripts import run_pipeline as rp
+
+        with pytest.raises(SystemExit):
+            rp.parse_args(["--help"])
+        out = capsys.readouterr().out
+        for flag in ("--dome-input-projection", *(f"--{f}" for f in _DOME_ANGLE_FLAGS)):
+            assert flag in out
+
+    def test_the_defaults_are_the_pre_371_behaviour(self):
+        from scripts import run_pipeline as rp
+
+        args = rp.parse_args(["--input", "s.mp4"])
+        assert args.dome_input_projection == "rectilinear"
+        assert (args.dome_pitch, args.dome_yaw, args.dome_roll) == (0.0, 0.0, 0.0)
+
+    @pytest.mark.parametrize("flag", _DOME_ANGLE_FLAGS)
+    def test_each_angle_parses_as_a_float_and_aliases_no_other(self, flag):
+        from scripts import run_pipeline as rp
+
+        args = rp.parse_args(["--input", "s.mp4", f"--{flag}", "-12.5"])
+        assert getattr(args, flag.replace("-", "_")) == -12.5
+        for other in set(_DOME_ANGLE_FLAGS) - {flag}:
+            assert getattr(args, other.replace("-", "_")) == 0.0
+
+    def test_the_projection_choices_are_the_mappers_own(self):
+        """One source of truth — a drift here is how the CLI would start
+        accepting a projection the mapper rejects at construction.
+        """
+        from scripts import run_pipeline as rp
+
+        action = next(a for a in rp._build_parser()._actions if "--dome-input-projection" in (a.option_strings or []))
+        assert tuple(action.choices) == FulldomeMapper.INPUT_PROJECTIONS
+
+    def test_an_unknown_projection_exits_non_zero(self, capsys):
+        from scripts import run_pipeline as rp
+
+        with pytest.raises(SystemExit) as excinfo:
+            rp.parse_args(["--input", "s.mp4", "--dome-input-projection", "domemaster"])
+        assert excinfo.value.code != 0
+        assert "--dome-input-projection" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("angle", ["pitch", "yaw", "roll"])
+    def test_an_out_of_range_angle_fails_at_construction(self, angle):
+        """v360's own ±180° bound, raised while building the mapper rather than
+        surfacing as an ffmpeg option error halfway through a 4096² render.
+        """
+        with pytest.raises(ValueError):
+            FulldomeMapper(**{angle: 181.0})
+
+    def test_the_dome_flags_do_not_disturb_the_vr180_ones(self):
+        """The two sets are independent (#294/#323 keep their meaning): the
+        dome flags are the reason ``--pitch`` on a dome run used to be recorded
+        as the sphere orientation of a VR180 run that never happened.
+        """
+        from scripts import run_pipeline as rp
+
+        domed = rp.parse_args(["--input", "s.mp4", "--dome-pitch", "20", "--dome-input-projection", "fisheye"])
+        assert (domed.pitch, domed.yaw, domed.roll) == (0.0, 0.0, 0.0)
+        assert domed.input_projection == "rectilinear"
+
+        vr180 = rp.parse_args(["--input", "s.mp4", "--pitch", "20", "--input-projection", "fisheye"])
+        assert (vr180.dome_pitch, vr180.dome_yaw, vr180.dome_roll) == (0.0, 0.0, 0.0)
+        assert vr180.dome_input_projection == "rectilinear"
+
+    @_FFMPEG
+    def test_every_dome_flag_reaches_the_mapper(self, monkeypatch, tmp_path: Path):
+        flags = [
+            "--dome-input-projection", "fisheye",
+            "--dome-pitch", "20", "--dome-yaw", "-5", "--dome-roll", "3",
+            "--dome-size", "4096", "--dome-fov", "210", "--dome-coverage-h", "150",
+        ]  # fmt: skip
+        captured = _dome_flags_reaching_the_mapper(monkeypatch, flags, tmp_path)
+        assert captured["input_projection"] == "fisheye"
+        assert (captured["pitch"], captured["yaw"], captured["roll"]) == (20.0, -5.0, 3.0)
+        assert captured["output_size"] == 4096
+        assert (captured["dome_fov"], captured["coverage_h_fov"]) == (210.0, 150.0)
+
+    @_FFMPEG
+    def test_the_dome_defaults_reach_the_mapper_unrotated(self, monkeypatch, tmp_path: Path):
+        """Guard the guard: the pass-through above must not hard-code angles."""
+        captured = _dome_flags_reaching_the_mapper(monkeypatch, [], tmp_path)
+        assert captured["input_projection"] == "rectilinear"
+        assert (captured["pitch"], captured["yaw"], captured["roll"]) == (0.0, 0.0, 0.0)
+        assert captured["output_size"] == 4096
+
+    @_FFMPEG
+    def test_the_vr180_angles_do_not_leak_into_the_dome_mapper(self, monkeypatch, tmp_path: Path):
+        """``--pitch 45`` is a VR180 flag; on a dome run it must change nothing."""
+        captured = _dome_flags_reaching_the_mapper(
+            monkeypatch, ["--pitch", "45", "--input-projection", "fisheye"], tmp_path
+        )
+        assert captured["input_projection"] == "rectilinear"
+        assert (captured["pitch"], captured["yaw"], captured["roll"]) == (0.0, 0.0, 0.0)
+
+    def test_the_sidecar_records_the_dome_flags_not_the_vr180_ones(self, tmp_path: Path, monkeypatch):
+        """A dome artefact written with ``--dome-pitch 20`` used to report
+        ``sphere_orientation`` 0/0/0, because the writer read ``args.pitch``.
+        """
+        from types import SimpleNamespace
+
+        from scripts import run_pipeline as rp
+
+        import pipeline.sidecar as sc
+
+        captured: dict = {}
+        monkeypatch.setattr(sc, "write_sidecar", lambda p, *, immersive, generation: captured.update(g=generation))
+        args = SimpleNamespace(
+            preset=None,
+            input_projection="rectilinear", pitch=0.0, yaw=0.0, roll=0.0,
+            dome_input_projection="fisheye", dome_coverage_h=150.0,
+            dome_pitch=20.0, dome_yaw=-5.0, dome_roll=3.0,
+        )  # fmt: skip
+
+        rp._write_sidecar_from_args(str(tmp_path / "out_dome.mp4"), "fulldome", args, fov=180.0, eye_size=(4096, 4096))
+
+        assert captured["g"]["input_projection"] == "fisheye"
+        assert captured["g"]["fisheye_fov"] == 150.0
+        assert captured["g"]["sphere_orientation"] == {"pitch": 20.0, "yaw": -5.0, "roll": 3.0}
