@@ -14,8 +14,12 @@
 
   var SIZE = 512;        // analysis resolution (downsampled, plenty for this)
   var BINS = 256;        // radial histogram resolution
-  var FILL_THRESHOLD = 0.5;   // a radius "has content" when >= 50% of its ring does
-  var OUTER_LO = 0.8;    // the ring the owner got burned by
+  // A ring counts as SOLID when almost every pixel on it carries content: that
+  // is the radius beyond which the dome starts going dark. A much looser
+  // threshold gives the outer edge of a feathered / vignetted falloff.
+  var SOLID_FILL = 0.98;
+  var SOFT_FILL = 0.5;
+  var OUTER_LO = 0.8;    // the ring the 4096 master turned out to waste
   var OUTER_HI = 0.98;
 
   var canvas = null;
@@ -38,7 +42,7 @@
    */
   function analyze(source, lumaThreshold) {
     var c = ensureCanvas();
-    var thr = typeof lumaThreshold === 'number' ? lumaThreshold : 8;
+    var thr = typeof lumaThreshold === 'number' ? lumaThreshold : 4;
 
     c.clearRect(0, 0, SIZE, SIZE);
     try {
@@ -89,16 +93,17 @@
       fill[b] = total[b] > 0 ? content[b] / total[b] : 0;
     }
 
-    // Coverage radius: walk inwards from the rim, first radius whose ring is
-    // at least half filled (and whose neighbour agrees, to shrug off noise).
-    var covBin = -1;
-    for (var k = BINS - 1; k >= 1; k--) {
-      if (fill[k] >= FILL_THRESHOLD && fill[k - 1] >= FILL_THRESHOLD) {
-        covBin = k;
-        break;
+    // Walk inwards from the rim; the outermost radius whose ring (and its
+    // neighbour, to shrug off noise) passes the threshold is the edge.
+    function edgeAt(threshold) {
+      for (var k = BINS - 1; k >= 1; k--) {
+        if (fill[k] >= threshold && fill[k - 1] >= threshold) return (k + 1) / BINS;
       }
+      return 0;
     }
-    var coverageRadius = covBin < 0 ? 0 : (covBin + 1) / BINS;
+
+    var coverageRadius = edgeAt(SOLID_FILL);
+    var softRadius = Math.max(coverageRadius, edgeAt(SOFT_FILL));
     var coverageDeg = coverageRadius * 90;
     var theta = (coverageDeg * Math.PI) / 180;
 
@@ -107,6 +112,8 @@
       bins: BINS,
       coverageRadius: coverageRadius,
       coverageDeg: coverageDeg,
+      softRadius: softRadius,
+      softDeg: softRadius * 90,
       // fraction of the hemisphere's solid angle actually lit: (1-cos theta)
       solidAngleFrac: 1 - Math.cos(theta),
       outerFill: outerTotal > 0 ? outerContent / outerTotal : 0,
@@ -134,8 +141,9 @@
     return {
       level: 'bad',
       text:
-        '不合规：内容只铺到天顶角 ' + d.toFixed(1) + '°（r=' +
-        stats.coverageRadius.toFixed(2) + '），外圈大片留白。' +
+        '不合规：实心内容只铺到天顶角 ' + d.toFixed(1) + '°（r=' +
+        stats.coverageRadius.toFixed(2) + '），外圈 0.80–0.98 只有 ' +
+        (stats.outerFill * 100).toFixed(1) + '% 有内容。' +
         '出片前必须重做投影映射或扩幅，否则球幕四周是黑的。'
     };
   }
@@ -144,6 +152,8 @@
     analyze: analyze,
     verdict: verdict,
     SIZE: SIZE,
-    BINS: BINS
+    BINS: BINS,
+    SOLID_FILL: SOLID_FILL,
+    SOFT_FILL: SOFT_FILL
   };
 })(window);

@@ -91,9 +91,10 @@
     <div class="note" id="fileInfo">未加载素材（正在显示参考栅格）。</div>
 
     <h2>覆盖度读数</h2>
-    <div class="big"><span id="zenithDeg">—</span><span style="font-size:14px;color:var(--dim)">　天顶角</span></div>
+    <div class="big"><span id="zenithDeg">—</span><span style="font-size:14px;color:var(--dim)">　实心天顶角</span></div>
     <div id="verdict">加载一张 domemaster 图后显示判定。</div>
-    <div class="metric"><span class="k">内容半径 r</span><span class="v" id="covR">—</span></div>
+    <div class="metric"><span class="k">实心内容半径 r</span><span class="v" id="covR">—</span></div>
+    <div class="metric"><span class="k">含羽化最外沿</span><span class="v" id="softDeg">—</span></div>
     <div class="metric"><span class="k">外圈 0.80–0.98 有内容</span><span class="v" id="outerFill">—</span></div>
     <div class="metric"><span class="k">圆内有效像素</span><span class="v" id="contentFrac">—</span></div>
     <div class="metric"><span class="k">覆盖立体角</span><span class="v" id="solidAngle">—</span></div>
@@ -101,8 +102,8 @@
     <div class="note">横轴 = 归一化半径 r（0 天顶 → 1 地平），纵轴 = 该半径环上有内容的像素比例。</div>
     <div class="row">
       <label>亮度阈值</label>
-      <input id="lumaThr" type="range" min="1" max="64" step="1" value="8" />
-      <span class="val" id="lumaThrVal">8</span>
+      <input id="lumaThr" type="range" min="1" max="64" step="1" value="4" />
+      <span class="val" id="lumaThrVal">4</span>
     </div>
 
     <h2>场馆参数</h2>

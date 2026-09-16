@@ -79,7 +79,7 @@
     tilt: 0,           // deg — not documented by the vendor, assumed 0
     eyeHeight: 1.2,    // m above the springline plane (seated audience)
     fov: 75,
-    lumaThr: 8,
+    lumaThr: 4,
     showGrid: true,
     showMark: true,
     showProjectors: true,
@@ -276,6 +276,8 @@
     }
     el('zenithDeg').textContent = stats.coverageDeg.toFixed(1) + '°';
     el('covR').textContent = stats.coverageRadius.toFixed(3);
+    el('softDeg').textContent =
+      stats.softDeg.toFixed(1) + '°　(r=' + stats.softRadius.toFixed(3) + ')';
     el('outerFill').textContent = pct(stats.outerFill);
     el('contentFrac').textContent = pct(stats.contentFrac);
     el('solidAngle').textContent = pct(stats.solidAngleFrac);
