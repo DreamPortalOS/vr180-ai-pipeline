@@ -3541,10 +3541,10 @@ def main():
             # 4096² master is one v360 pass at 4096² — never a 2880² render
             # scaled up afterwards, which would cost half the venue's pixels
             # without adding a single one back.
-            input_projection="rectilinear",
-            pitch=0.0,
-            yaw=0.0,
-            roll=0.0,
+            input_projection=args.dome_input_projection,
+            pitch=args.dome_pitch,
+            yaw=args.dome_yaw,
+            roll=args.dome_roll,
         )
         output = get_output_path(args, suffix="_dome.mp4")
         result = mapper.convert(args.input, output)
