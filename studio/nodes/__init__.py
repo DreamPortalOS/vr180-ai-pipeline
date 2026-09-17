@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from studio.nodes.base import StudioNode
+from studio.nodes.convert import DomeConvertNode, DomeCoverageNode, Vr180ConvertNode
 from studio.nodes.export import ExportBundleNode
 from studio.nodes.llm import LlmPolishNode
 from studio.nodes.mock_video import MockVideoNode
@@ -14,6 +15,8 @@ from studio.nodes.seedance_video import SeedanceVideoNode
 
 __all__ = [
     "NODE_REGISTRY",
+    "DomeConvertNode",
+    "DomeCoverageNode",
     "ExportBundleNode",
     "LlmPolishNode",
     "MockVideoNode",
@@ -22,6 +25,7 @@ __all__ = [
     "SeedanceVideoNode",
     "StoryboardNode",
     "StudioNode",
+    "Vr180ConvertNode",
     "get_node_class",
     "register_node",
 ]
@@ -34,6 +38,9 @@ def _bootstrap() -> None:
         MockVideoNode,
         SeedanceVideoNode,
         QualityCheckNode,
+        DomeConvertNode,
+        DomeCoverageNode,
+        Vr180ConvertNode,
         PreviewNode,
         ExportBundleNode,
     ):
