@@ -19,17 +19,28 @@ def test_m2_types_registered() -> None:
 
 
 def test_dual_export_template_runs(tmp_path) -> None:
-    from studio.templates import dual_export_demo_project
+    from studio.templates import production_pipeline_project
 
-    project = dual_export_demo_project()
+    project = production_pipeline_project()
     for node in project.nodes:
-        if node.type == "video.seedance":
-            node.params["size"] = 64
+        if node.type == "image.batch_stills":
+            node.params["width"] = 96
+            node.params["height"] = 96
+        if node.type == "video.from_stills":
+            node.params["size"] = 96
+            node.params["fps"] = 10
+        if node.type == "script.shot_list":
+            node.params["shot_texts"] = "open\npush"
+            node.params["shot_durations"] = "1,1"
+        if node.type == "convert.dome":
+            node.params["size"] = 96
+        if node.type == "audio.bgm_tone":
+            node.params["duration"] = 2
     report = run_graph(project, work_dir=str(tmp_path))
     assert report.results["n_dome"].status == "ok"
     assert report.results["n_cov"].status == "ok"
     assert report.results["n_vr"].status == "ok"
-    assert Path(report.results["n_exp"].outputs["path"]).is_file()
+    assert Path(report.results["n_export"].outputs["path"]).is_file()
 
 
 def _make_dome_like_frame(size: int = 256, content_radius: float = 0.6) -> np.ndarray:

@@ -72,10 +72,11 @@ def test_index_served(client) -> None:
 
 
 def test_dual_export_template_endpoint(client) -> None:
-    res = client.get("/api/templates/dual-export")
+    res = client.get("/api/templates/production")
     assert res.status_code == 200
     body = res.json()
-    assert body["name"] == "demo-dual-export"
+    assert body["name"].startswith("production")
     types = {n["type"] for n in body["nodes"]}
-    assert "convert.dome" in types
-    assert "qa.dome_coverage" in types
+    assert "script.shot_list" in types
+    assert "video.concat" in types
+    assert "audio.mux" in types

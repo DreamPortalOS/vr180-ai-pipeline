@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from studio.graph import GraphError, list_node_types, run_graph
 from studio.models import Project, StudioModelError, empty_demo_project
-from studio.templates import dual_export_demo_project
+from studio.templates import production_pipeline_project
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -47,7 +47,12 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
 
     @app.get("/api/templates/dual-export")
     def template_dual_export() -> dict[str, Any]:
-        return dual_export_demo_project().to_dict()
+        # kept for older clients
+        return production_pipeline_project().to_dict()
+
+    @app.get("/api/templates/production")
+    def template_production() -> dict[str, Any]:
+        return production_pipeline_project().to_dict()
 
     @app.post("/api/validate")
     def validate(payload: ProjectPayload) -> dict[str, Any]:

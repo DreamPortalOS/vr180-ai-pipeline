@@ -164,40 +164,36 @@
   function fallbackDualProject() {
     return {
       version: 1,
-      name: "demo-dual-export (offline)",
+      name: "production (offline fallback)",
       nodes: [
-        {
-          id: "n_script",
-          type: "script.storyboard",
-          pos: [24, 160],
-          params: {
-            title: "dual",
-            prompt: "FPV drone flying slowly through a red canyon",
-            duration: 2,
-            aspect_ratio: "1:1",
-          },
-          muted: false,
-        },
-        { id: "n_polish", type: "text.llm_polish", pos: [260, 40], params: { provider: "mock", target: "vr180" }, muted: false },
-        { id: "n_vid", type: "video.seedance", pos: [500, 160], params: { provider: "mock", size: 96, ratio: "1:1" }, muted: false },
-        { id: "n_qa", type: "qa.source_quality", pos: [740, 40], params: { mode: "mock" }, muted: false },
-        { id: "n_dome", type: "convert.dome", pos: [260, 320], params: { size: 128, coverage_h: 150 }, muted: false },
-        { id: "n_cov", type: "qa.dome_coverage", pos: [500, 320], params: { min_deg: 70 }, muted: false },
-        { id: "n_vr", type: "convert.vr180", pos: [740, 320], params: { mode: "mock" }, muted: false },
-        { id: "n_exp", type: "export.bundle", pos: [980, 160], params: { filename: "dual_demo.mp4" }, muted: false },
+        { id: "n_brief", type: "script.project", pos: [20, 160], params: { title: "demo", theme: "canyon", style: "cinematic", total_seconds: 6 }, muted: false },
+        { id: "n_shots", type: "script.shot_list", pos: [250, 100], params: { shot_texts: "open\npush", shot_durations: "3,3" }, muted: false },
+        { id: "n_polish", type: "text.polish_shots", pos: [480, 40], params: { provider: "mock" }, muted: false },
+        { id: "n_stills", type: "image.batch_stills", pos: [710, 40], params: { width: 160, height: 160 }, muted: false },
+        { id: "n_review", type: "checkpoint.review", pos: [940, 40], params: { ack: true }, muted: false },
+        { id: "n_clips", type: "video.from_stills", pos: [710, 260], params: { size: 128, fps: 10 }, muted: false },
+        { id: "n_concat", type: "video.concat", pos: [940, 260], params: {}, muted: false },
+        { id: "n_bgm", type: "audio.bgm_tone", pos: [940, 420], params: { duration: 6 }, muted: false },
+        { id: "n_mux", type: "audio.mux", pos: [1170, 260], params: {}, muted: false },
+        { id: "n_dome", type: "convert.dome", pos: [20, 400], params: { size: 128 }, muted: false },
+        { id: "n_vr", type: "convert.vr180", pos: [250, 400], params: { mode: "mock" }, muted: false },
+        { id: "n_export", type: "export.bundle", pos: [480, 400], params: { filename: "final.mp4" }, muted: false },
       ],
       edges: [
-        { id: "e1", from: ["n_script", "prompt"], to: ["n_polish", "prompt"] },
-        { id: "e2", from: ["n_polish", "prompt"], to: ["n_vid", "prompt"] },
-        { id: "e3", from: ["n_script", "duration"], to: ["n_vid", "duration"] },
-        { id: "e4", from: ["n_vid", "video"], to: ["n_qa", "video"] },
-        { id: "e5", from: ["n_qa", "video"], to: ["n_dome", "video"] },
-        { id: "e6", from: ["n_dome", "video"], to: ["n_cov", "video"] },
-        { id: "e7", from: ["n_qa", "video"], to: ["n_vr", "video"] },
-        { id: "e8", from: ["n_vr", "video"], to: ["n_exp", "video"] },
-        { id: "e9", from: ["n_polish", "prompt"], to: ["n_exp", "prompt"] },
+        { id: "e1", from: ["n_brief", "brief"], to: ["n_shots", "brief"] },
+        { id: "e2", from: ["n_shots", "shots"], to: ["n_polish", "shots"] },
+        { id: "e3", from: ["n_polish", "shots"], to: ["n_stills", "shots"] },
+        { id: "e4", from: ["n_stills", "stills"], to: ["n_review", "stills"] },
+        { id: "e5", from: ["n_review", "stills"], to: ["n_clips", "stills"] },
+        { id: "e6", from: ["n_clips", "videos"], to: ["n_concat", "videos"] },
+        { id: "e7", from: ["n_shots", "total_seconds"], to: ["n_bgm", "duration"] },
+        { id: "e8", from: ["n_concat", "video"], to: ["n_mux", "video"] },
+        { id: "e9", from: ["n_bgm", "audio"], to: ["n_mux", "audio"] },
+        { id: "e10", from: ["n_mux", "video"], to: ["n_dome", "video"] },
+        { id: "e11", from: ["n_mux", "video"], to: ["n_vr", "video"] },
+        { id: "e12", from: ["n_vr", "video"], to: ["n_export", "video"] },
       ],
-      settings: { default_video_provider: "mock" },
+      settings: { workflow: "script→stills→review→video→concat→audio→export" },
     };
   }
 
@@ -700,12 +696,12 @@
 
   async function loadDualTemplate() {
     if (state.online) {
-      const data = await api("/api/templates/dual-export");
+      const data = await api("/api/templates/production");
       loadProjectObject(data);
     } else {
       loadProjectObject(fallbackDualProject());
     }
-    setStatus("已载入双路模板");
+    setStatus("已载入生产流程模板（脚本→分镜图→视频→拼合→配乐→导出）");
   }
 
   async function runProject() {
