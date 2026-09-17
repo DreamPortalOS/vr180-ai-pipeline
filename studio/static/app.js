@@ -723,6 +723,7 @@
         Object.entries(report.results || {}).map(([id, r]) => [id, r.status]),
       );
       runOutEl.textContent = JSON.stringify(report, null, 2);
+      renderGallery(report.gallery);
       // Feed 3D panel if a coverage node ran
       const cov = (report.results && (report.results.n_cov || report.results.cov)) || null;
       if (cov && cov.outputs && cov.outputs.report) {
@@ -909,6 +910,27 @@
       }
     });
     window.addEventListener("resize", resizeCanvas);
+  }
+
+  function renderGallery(gallery) {
+    const box = document.getElementById("galleryBox");
+    if (!box) return;
+    if (!gallery || (!gallery.sheet && !(gallery.shots && gallery.shots.length))) {
+      box.classList.add("hidden");
+      box.innerHTML = "";
+      return;
+    }
+    box.classList.remove("hidden");
+    const shots = (gallery.shots || [])
+      .map(
+        (s) =>
+          `<li><b>${s.id || "?"}</b> ${s.duration || ""}s — ${s.description || ""}<br/><span class="sheet-path">${s.image || ""}</span></li>`,
+      )
+      .join("");
+    box.innerHTML = `
+      <div><strong>分镜图廊</strong>（${gallery.count || 0} 镜）</div>
+      <div class="sheet-path">联络表：${gallery.sheet || "—"}</div>
+      <ul>${shots}</ul>`;
   }
 
   function bindTabs() {

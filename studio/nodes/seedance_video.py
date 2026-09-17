@@ -12,8 +12,7 @@ from studio.nodes.base import PortSpec, StudioNode
 from studio.settings import settings_from_params
 
 # Rough operator-facing estimates (元). Not a bill — used only for pre-submit UI.
-# Seedance 4k/10s measured ~50 元 (OWNER_BRIEF); lower tiers scale roughly with
-# resolution tokens. Unverified for live pricing changes — see DECISION_MINIMAX.
+# Seedance 4k/10s measured ~50 元 (OWNER_BRIEF); MiniMax 2K API ~9.5 元/10s (DECISION_MINIMAX).
 _COST_TABLE_YUAN = {
     ("480p", 5): 1.0,
     ("480p", 10): 2.0,
@@ -23,6 +22,10 @@ _COST_TABLE_YUAN = {
     ("1080p", 10): 24.0,
     ("4k", 5): 25.0,
     ("4k", 10): 50.0,
+    ("minimax-2k", 5): 4.8,
+    ("minimax-2k", 10): 9.5,
+    ("minimax-768p", 5): 3.0,
+    ("minimax-768p", 10): 6.0,
 }
 
 
@@ -59,7 +62,7 @@ class SeedanceVideoNode(StudioNode):
                 "name": "provider",
                 "type": "string",
                 "default": "mock",
-                "label": "provider (mock|seedance)",
+                "label": "provider (mock|seedance|minimax)",
             },
             {"name": "model", "type": "string", "default": "doubao-seedance-2-0-fast-260128", "label": "模型"},
             {"name": "duration", "type": "number", "default": 5, "label": "时长(秒)"},
@@ -86,55 +89,75 @@ class SeedanceVideoNode(StudioNode):
         if provider == "mock" or (not provider and settings.seedance_provider == "mock"):
             return self._mock_render(prompt, duration, params, work_dir, node_id)
 
-        if provider != "seedance":
-            raise ValueError(f"unknown video provider {provider!r}; use mock|seedance")
+        if provider not in {"seedance", "minimax"}:
+            raise ValueError(f"unknown video provider {provider!r}; use mock|seedance|minimax")
 
         resolution = str(params.get("resolution") or "480p")
-        estimate = estimate_cost_yuan(resolution, duration)
+        if provider == "minimax":
+            # Map studio resolution labels onto MiniMax cost tiers.
+            res_key = resolution if resolution in {"minimax-2k", "minimax-768p"} else "minimax-2k"
+        else:
+            res_key = resolution
+        estimate = estimate_cost_yuan(res_key, duration)
         confirm = bool(params.get("confirm_paid", False))
         if not confirm:
             raise ValueError(
-                "paid Seedance submit blocked: set confirm_paid=true after reviewing cost estimate "
-                f"(~{estimate} 元 for {resolution}/{duration:.0f}s). Use provider=mock for free canvas runs."
+                f"paid {provider} submit blocked: set confirm_paid=true after reviewing cost estimate "
+                f"(~{estimate} 元 for {res_key}/{duration:.0f}s). Use provider=mock for free canvas runs."
             )
 
-        # Ensure ARK key is present before constructing the provider.
-        if not os.environ.get("ARK_API_KEY") and not settings.ark_api_key:
-            raise ValueError("ARK_API_KEY is not set; configure Volcengine Ark credentials")
-
-        from integrations.seedance import SeedanceProvider
-
-        provider_obj = SeedanceProvider(api_key=settings.ark_api_key or None)
         out_dir = Path(work_dir) / "studio_out" / node_id
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / "seedance.mp4"
-
         ratio = str(params.get("ratio") or "1:1")
-        model = str(params.get("model") or "doubao-seedance-2-0-fast-260128")
-        if image:
-            result = provider_obj.generate_from_image(
-                str(image),
-                prompt=prompt,
-                duration=int(duration),
-                aspect_ratio=ratio,
-                resolution=resolution,
-                model=model,
-            )
+
+        if provider == "minimax":
+            if not os.environ.get("MINIMAX_API_KEY"):
+                raise ValueError("MINIMAX_API_KEY is not set; configure MiniMax open-platform credentials")
+            from integrations.minimax import MiniMaxProvider
+
+            provider_obj = MiniMaxProvider()
+            out_path = out_dir / "minimax.mp4"
+            model = str(params.get("model") or "")
+            kwargs: dict[str, Any] = {"duration": int(duration), "aspect_ratio": ratio}
+            if model:
+                kwargs["model"] = model
+            if res_key.endswith("2k"):
+                kwargs.setdefault("resolution", "2k")
+            if image:
+                result = provider_obj.generate_from_image(str(image), prompt=prompt, **kwargs)
+            else:
+                result = provider_obj.generate(prompt, **kwargs)
         else:
-            result = provider_obj.generate(
-                prompt,
-                duration=int(duration),
-                aspect_ratio=ratio,
-                resolution=resolution,
-                model=model,
-            )
+            if not os.environ.get("ARK_API_KEY") and not settings.ark_api_key:
+                raise ValueError("ARK_API_KEY is not set; configure Volcengine Ark credentials")
+            from integrations.seedance import SeedanceProvider
+
+            provider_obj = SeedanceProvider(api_key=settings.ark_api_key or None)
+            out_path = out_dir / "seedance.mp4"
+            model = str(params.get("model") or "doubao-seedance-2-0-fast-260128")
+            if image:
+                result = provider_obj.generate_from_image(
+                    str(image),
+                    prompt=prompt,
+                    duration=int(duration),
+                    aspect_ratio=ratio,
+                    resolution=resolution,
+                    model=model,
+                )
+            else:
+                result = provider_obj.generate(
+                    prompt,
+                    duration=int(duration),
+                    aspect_ratio=ratio,
+                    resolution=resolution,
+                    model=model,
+                )
 
         self._download(result.video_url, out_path)
         meta = {
-            "provider": "seedance",
+            "provider": provider,
             "job_id": result.job_id,
-            "model": model,
-            "resolution": resolution,
+            "resolution": res_key if provider == "minimax" else resolution,
             "duration": duration,
             "cost_estimate_yuan": estimate,
             "path": str(out_path),

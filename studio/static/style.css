@@ -397,3 +397,27 @@ button.primary:hover { filter: brightness(1.06); }
   margin-bottom: 2px;
 }
 .venue-grid b { font-weight: 600; }
+
+.gallery-box {
+  margin-bottom: 8px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+  font-size: 12px;
+}
+.gallery-box.hidden { display: none; }
+.gallery-box .sheet-path {
+  color: var(--accent);
+  word-break: break-all;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+}
+.gallery-box ul {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  color: var(--muted);
+}
+.gallery-box li { margin: 2px 0; }
+.gallery-box li b { color: var(--ink); font-weight: 600; }
+.gallery-actions { margin-top: 6px; display: flex; gap: 6px; }

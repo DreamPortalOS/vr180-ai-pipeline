@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from studio.graph import GraphError, list_node_types, run_graph
+from studio.graph import GraphError, extract_gallery, list_node_types, run_graph
 from studio.models import Project, StudioModelError, empty_demo_project
 from studio.templates import production_pipeline_project
 
@@ -25,6 +25,7 @@ class ProjectPayload(BaseModel):
 
 class RunRequest(ProjectPayload):
     only_downstream_of: str | None = None
+    dirty_from: str | None = None
 
 
 def create_app(*, default_work_dir: str | None = None) -> FastAPI:
@@ -82,11 +83,14 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
                 project,
                 work_dir=str(work_dir),
                 only_downstream_of=request.only_downstream_of,
+                dirty_from=request.dirty_from,
                 cache=run_cache,
             )
         except GraphError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return report.to_dict()
+        payload = report.to_dict()
+        payload["gallery"] = extract_gallery(report)
+        return payload
 
     # Serve assets at BOTH /static/* (absolute) and /* (relative) so
     # index.html works from the FastAPI root and from file:// next to the files.

@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import numpy as np
 import pytest
+
 from integrations.base import GenerationResult, VideoGenProvider
 from integrations.factory import get_provider, list_providers
 from integrations.kling import KlingProvider
@@ -85,10 +86,11 @@ class TestFactory:
         providers = list_providers()
         assert "kling" in providers
         assert "local-svd" in providers
+        assert "minimax" in providers
         assert "seedance" in providers
         assert "veo" in providers
         assert "mock" in providers
-        assert len(providers) == 5
+        assert len(providers) == 6
 
     def test_get_provider_kling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("KLING_API_KEY", "key")
@@ -1733,6 +1735,7 @@ class TestLocalSVDMockBackend:
     def test_generate_from_image_full_path_with_mock(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
         import cv2
         import numpy as np
+
         from integrations.local_svd import LocalSVDProvider, MockSVDBackend
 
         monkeypatch.setenv("SVD_PROVIDER_OUTPUT_DIR", str(tmp_path))
@@ -1761,6 +1764,7 @@ class TestLocalSVDMockBackend:
         """Mock backend must be called with the params the provider chose."""
         import cv2
         import numpy as np
+
         from integrations.local_svd import LocalSVDProvider, MockSVDBackend
 
         monkeypatch.setenv("SVD_PROVIDER_OUTPUT_DIR", str(tmp_path))
@@ -1811,6 +1815,7 @@ class TestLocalSVDMockBackend:
         """Backend.load() must run before backend.generate()."""
         import cv2
         import numpy as np
+
         from integrations.local_svd import LocalSVDProvider, MockSVDBackend
 
         monkeypatch.setenv("SVD_PROVIDER_OUTPUT_DIR", str(tmp_path))
