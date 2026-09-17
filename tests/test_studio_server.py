@@ -69,3 +69,13 @@ def test_index_served(client) -> None:
     res = client.get("/")
     assert res.status_code == 200
     assert "Immersive Node Studio" in res.text
+
+
+def test_dual_export_template_endpoint(client) -> None:
+    res = client.get("/api/templates/dual-export")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["name"] == "demo-dual-export"
+    types = {n["type"] for n in body["nodes"]}
+    assert "convert.dome" in types
+    assert "qa.dome_coverage" in types

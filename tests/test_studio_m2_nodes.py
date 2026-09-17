@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from studio.coverage import analyze_frame
-from studio.graph import list_node_types
+from studio.graph import list_node_types, run_graph
 from studio.models import EdgeSpec, NodeSpec, Project
 from studio.nodes.convert import DomeConvertNode, DomeCoverageNode, Vr180ConvertNode
 
@@ -16,6 +16,20 @@ from studio.nodes.convert import DomeConvertNode, DomeCoverageNode, Vr180Convert
 def test_m2_types_registered() -> None:
     types = {t["type"] for t in list_node_types()}
     assert {"convert.dome", "qa.dome_coverage", "convert.vr180"} <= types
+
+
+def test_dual_export_template_runs(tmp_path) -> None:
+    from studio.templates import dual_export_demo_project
+
+    project = dual_export_demo_project()
+    for node in project.nodes:
+        if node.type == "video.seedance":
+            node.params["size"] = 64
+    report = run_graph(project, work_dir=str(tmp_path))
+    assert report.results["n_dome"].status == "ok"
+    assert report.results["n_cov"].status == "ok"
+    assert report.results["n_vr"].status == "ok"
+    assert Path(report.results["n_exp"].outputs["path"]).is_file()
 
 
 def _make_dome_like_frame(size: int = 256, content_radius: float = 0.6) -> np.ndarray:

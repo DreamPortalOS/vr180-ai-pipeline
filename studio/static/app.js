@@ -406,6 +406,17 @@
     setStatus("demo project loaded");
   }
 
+  async function loadDualTemplate() {
+    const data = await api("/api/templates/dual-export");
+    state.project = data;
+    projectNameEl.textContent = data.name;
+    state.selectedId = null;
+    state.status = {};
+    renderInspector();
+    draw();
+    setStatus("dual-export template loaded");
+  }
+
   async function runProject() {
     setStatus("running…");
     runOutEl.textContent = "…";
@@ -430,6 +441,7 @@
   }
 
   document.getElementById("btnDemo").addEventListener("click", () => loadDemo().catch((e) => setStatus(e.message)));
+  document.getElementById("btnDual").addEventListener("click", () => loadDualTemplate().catch((e) => setStatus(e.message)));
   document.getElementById("btnSave").addEventListener("click", saveProject);
   document.getElementById("btnLoad").addEventListener("click", () => fileInput.click());
   document.getElementById("btnRun").addEventListener("click", () => runProject());

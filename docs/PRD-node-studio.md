@@ -378,6 +378,10 @@ ARK_API_KEY=...   # Seedance
 
 ## 10. 里程碑
 
+> **2026-09-17 实现进度**（分支 `feat/node-studio-m0` / PR #380）
+> M0 ✅ · M1 节点层 ✅（litellm/sensenova 需真实 key 联调）· M2 节点层 ✅（3D 半球 WebGL 预览仍依赖 #376 合入后嵌入）
+> M3/M4 未开始。
+
 ### M0 — 骨架（1 个可运行故事）
 
 - 本地 FastAPI + 静态前端；画布可加节点、连线、保存/加载 JSON
