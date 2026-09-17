@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Immersive Node Studio</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Immersive Node Studio</div>
+    <div class="project-name" id="projectName">untitled</div>
+    <div class="actions">
+      <button id="btnDemo" type="button">载入演示工程</button>
+      <button id="btnSave" type="button">保存 JSON</button>
+      <button id="btnLoad" type="button">打开 JSON</button>
+      <button id="btnRun" type="button" class="primary">运行</button>
+      <input id="fileInput" type="file" accept="application/json,.json" hidden />
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <h2>节点库</h2>
+      <div id="nodePalette" class="palette"></div>
+      <h2>说明</h2>
+      <p class="hint">拖端口连线 · 双击节点编辑参数 · Ctrl+Enter 运行 · Ctrl+S 保存</p>
+    </aside>
+
+    <section class="canvas-wrap">
+      <canvas id="canvas" width="1200" height="720"></canvas>
+      <div id="statusBar" class="status">ready</div>
+    </section>
+
+    <aside class="inspector">
+      <h2>检查器</h2>
+      <div id="inspectorBody" class="inspector-body">选中一个节点以编辑参数</div>
+      <h2>运行结果</h2>
+      <pre id="runOut" class="run-out">—</pre>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
