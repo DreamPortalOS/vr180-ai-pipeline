@@ -4,17 +4,22 @@ from __future__ import annotations
 
 from studio.nodes.base import StudioNode
 from studio.nodes.export import ExportBundleNode
+from studio.nodes.llm import LlmPolishNode
 from studio.nodes.mock_video import MockVideoNode
 from studio.nodes.preview import PreviewNode
+from studio.nodes.quality import QualityCheckNode
 from studio.nodes.registry import NODE_REGISTRY, get_node_class, register_node
 from studio.nodes.script import StoryboardNode
+from studio.nodes.seedance_video import SeedanceVideoNode
 
-# Import for side-effect registration
 __all__ = [
     "NODE_REGISTRY",
     "ExportBundleNode",
+    "LlmPolishNode",
     "MockVideoNode",
     "PreviewNode",
+    "QualityCheckNode",
+    "SeedanceVideoNode",
     "StoryboardNode",
     "StudioNode",
     "get_node_class",
@@ -25,7 +30,10 @@ __all__ = [
 def _bootstrap() -> None:
     for cls in (
         StoryboardNode,
+        LlmPolishNode,
         MockVideoNode,
+        SeedanceVideoNode,
+        QualityCheckNode,
         PreviewNode,
         ExportBundleNode,
     ):

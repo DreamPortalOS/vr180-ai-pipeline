@@ -340,6 +340,27 @@
 - [ ] 跑通：同一 prompt 出图 → 作为 I2V 首帧 → 若支持视频则出 5s
 - [ ] 记录限额、时延、分辨率上限；写入本 PRD 附录
 
+#### 附录 · SenseNova / LiteLLM 接入状态（2026-09-17）
+
+| 项 | 状态 |
+|---|---|
+| Studio 节点 `text.llm_polish` provider=`sensenova` | **已实现**：要求 `base_url` + `api_key` + `model`，走 OpenAI 兼容 `/chat/completions` |
+| Studio 节点 `text.llm_polish` provider=`litellm` | **已实现**：同上，配置 `STUDIO_LITELLM_*` |
+| 免费档是否覆盖 U1 文生图/图生视频 | **未查实** — 需 owner 提供控制台开通状态与模型 ID |
+| CI | 仅 `provider=mock`（本地 `prompt_builder.wrap_prompt` 确定性润色），不调外网 |
+
+环境变量（密钥不进 git / 不进工程 JSON）：
+
+```
+STUDIO_LITELLM_BASE_URL=...
+STUDIO_LITELLM_API_KEY=...
+STUDIO_LITELLM_MODEL=...
+STUDIO_SENSENOVA_BASE_URL=...
+STUDIO_SENSENOVA_API_KEY=...
+STUDIO_SENSENOVA_MODEL=...
+ARK_API_KEY=...   # Seedance
+```
+
 ---
 
 ## 9. 导出规格
