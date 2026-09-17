@@ -6,14 +6,14 @@ from studio.models import EdgeSpec, NodeSpec, Project
 
 
 def dual_export_demo_project() -> Project:
-    """Canvas template: storyboard → polish → mock video → QA → dome+coverage + VR180 mock + export."""
+    """Canvas template laid out to fit a typical laptop viewport without scrolling."""
     return Project(
         name="demo-dual-export",
         nodes=[
             NodeSpec(
                 id="n_script",
                 type="script.storyboard",
-                pos=(40, 120),
+                pos=(24, 160),
                 params={
                     "title": "dual route demo",
                     "prompt": "FPV drone flying slowly through a red canyon at golden hour",
@@ -22,19 +22,47 @@ def dual_export_demo_project() -> Project:
                 },
             ),
             NodeSpec(
-                id="n_polish", type="text.llm_polish", pos=(280, 40), params={"provider": "mock", "target": "vr180"}
+                id="n_polish",
+                type="text.llm_polish",
+                pos=(260, 40),
+                params={"provider": "mock", "target": "vr180"},
             ),
             NodeSpec(
                 id="n_vid",
                 type="video.seedance",
-                pos=(520, 120),
+                pos=(500, 160),
                 params={"provider": "mock", "size": 96, "ratio": "1:1"},
             ),
-            NodeSpec(id="n_qa", type="qa.source_quality", pos=(760, 40), params={"mode": "mock"}),
-            NodeSpec(id="n_dome", type="convert.dome", pos=(1000, 40), params={"size": 128, "coverage_h": 150}),
-            NodeSpec(id="n_cov", type="qa.dome_coverage", pos=(1240, 40), params={"min_deg": 70}),
-            NodeSpec(id="n_vr", type="convert.vr180", pos=(1000, 220), params={"mode": "mock"}),
-            NodeSpec(id="n_exp", type="export.bundle", pos=(1480, 120), params={"filename": "dual_demo.mp4"}),
+            NodeSpec(
+                id="n_qa",
+                type="qa.source_quality",
+                pos=(740, 40),
+                params={"mode": "mock"},
+            ),
+            NodeSpec(
+                id="n_dome",
+                type="convert.dome",
+                pos=(260, 320),
+                params={"size": 128, "coverage_h": 150},
+            ),
+            NodeSpec(
+                id="n_cov",
+                type="qa.dome_coverage",
+                pos=(500, 320),
+                params={"min_deg": 70},
+            ),
+            NodeSpec(
+                id="n_vr",
+                type="convert.vr180",
+                pos=(740, 320),
+                params={"mode": "mock"},
+            ),
+            NodeSpec(
+                id="n_exp",
+                type="export.bundle",
+                pos=(980, 160),
+                params={"filename": "dual_demo.mp4"},
+            ),
         ],
         edges=[
             EdgeSpec(id="e1", from_node="n_script", from_port="prompt", to_node="n_polish", to_port="prompt"),

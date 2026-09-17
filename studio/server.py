@@ -83,12 +83,23 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return report.to_dict()
 
+    # Serve assets at BOTH /static/* (absolute) and /* (relative) so
+    # index.html works from the FastAPI root and from file:// next to the files.
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+        app.mount("/assets", StaticFiles(directory=str(STATIC_DIR)), name="assets")
 
         @app.get("/")
         def index() -> FileResponse:
-            return FileResponse(STATIC_DIR / "index.html")
+            return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
+
+        @app.get("/style.css")
+        def style_css() -> FileResponse:
+            return FileResponse(STATIC_DIR / "style.css", media_type="text/css")
+
+        @app.get("/app.js")
+        def app_js() -> FileResponse:
+            return FileResponse(STATIC_DIR / "app.js", media_type="application/javascript")
 
     return app
 
@@ -100,4 +111,8 @@ def main() -> None:
     """Dev entry: ``python -m studio.server``."""
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8787)
+    uvicorn.run("studio.server:app", host="127.0.0.1", port=8787, reload=False)
+
+
+if __name__ == "__main__":
+    main()

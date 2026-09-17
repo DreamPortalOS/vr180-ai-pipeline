@@ -4,43 +4,73 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Immersive Node Studio</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Relative paths work for file:// next to assets AND FastAPI routes /style.css /app.js -->
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">Immersive Node Studio</div>
+    <div class="brand">
+      <span class="logo-dot"></span>
+      Immersive Node Studio
+    </div>
     <div class="project-name" id="projectName">untitled</div>
     <div class="actions">
-      <button id="btnDemo" type="button">载入演示工程</button>
-      <button id="btnDual" type="button">双路模板</button>
-      <button id="btnSave" type="button">保存 JSON</button>
-      <button id="btnLoad" type="button">打开 JSON</button>
-      <button id="btnRun" type="button" class="primary">运行</button>
+      <button id="btnDemo" type="button" title="载入简易演示">演示</button>
+      <button id="btnDual" type="button" title="脚本→润色→视频→球幕+VR180 双路">双路模板</button>
+      <button id="btnSave" type="button">保存</button>
+      <button id="btnLoad" type="button">打开</button>
+      <button id="btnClear" type="button" title="清空画布">清空</button>
+      <button id="btnRun" type="button" class="primary" title="Ctrl+Enter">▶ 运行</button>
       <input id="fileInput" type="file" accept="application/json,.json" hidden />
     </div>
   </header>
 
   <main class="layout">
     <aside class="sidebar">
-      <h2>节点库</h2>
-      <div id="nodePalette" class="palette"></div>
-      <h2>说明</h2>
-      <p class="hint">拖端口连线 · 双击节点编辑参数 · Ctrl+Enter 运行 · Ctrl+S 保存</p>
+      <section>
+        <h2>节点库</h2>
+        <input id="paletteSearch" class="search" type="search" placeholder="搜索节点…" />
+        <div id="nodePalette" class="palette"></div>
+      </section>
+      <section>
+        <h2>操作</h2>
+        <p class="hint">
+          从左侧点选添加节点 · 拖右侧端口连到左侧端口 · 拖节点标题移动<br/>
+          双击/选中改参数 · Delete 删除 · Ctrl+Enter 运行 · Ctrl+S 保存
+        </p>
+      </section>
+      <section>
+        <h2>后端</h2>
+        <p class="hint" id="backendStatus">检测中…</p>
+      </section>
     </aside>
 
-    <section class="canvas-wrap">
-      <canvas id="canvas" width="1200" height="720"></canvas>
+    <section class="canvas-wrap" id="canvasWrap">
+      <canvas id="canvas"></canvas>
+      <div class="canvas-overlay" id="canvasEmpty">
+        <div class="empty-card">
+          <strong>Immersive Node Studio</strong>
+          <p>点「双路模板」开始，或从左侧添加节点</p>
+          <button id="btnEmptyDual" type="button" class="primary">载入双路模板</button>
+        </div>
+      </div>
       <div id="statusBar" class="status">ready</div>
     </section>
 
     <aside class="inspector">
-      <h2>检查器</h2>
-      <div id="inspectorBody" class="inspector-body">选中一个节点以编辑参数</div>
-      <h2>运行结果</h2>
-      <pre id="runOut" class="run-out">—</pre>
+      <section>
+        <h2>检查器</h2>
+        <div id="inspectorBody" class="inspector-body">
+          <p class="hint">选中画布上的节点以编辑参数</p>
+        </div>
+      </section>
+      <section class="grow">
+        <h2>运行结果</h2>
+        <pre id="runOut" class="run-out">尚未运行</pre>
+      </section>
     </aside>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
