@@ -80,3 +80,13 @@ def test_dual_export_template_endpoint(client) -> None:
     assert "script.shot_list" in types
     assert "video.concat" in types
     assert "audio.mux" in types
+
+
+def test_preview3d_and_dome_assets_served(client) -> None:
+    res = client.get("/preview3d.js")
+    assert res.status_code == 200
+    assert "DomePreview" in res.text
+    res = client.get("/")
+    assert "domeCanvas" in res.text
+    assert "preview3d.js" in res.text
+    assert "画幅" in res.text

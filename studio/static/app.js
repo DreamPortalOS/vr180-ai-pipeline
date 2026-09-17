@@ -723,6 +723,27 @@
         Object.entries(report.results || {}).map(([id, r]) => [id, r.status]),
       );
       runOutEl.textContent = JSON.stringify(report, null, 2);
+      // Feed 3D panel if a coverage node ran
+      const cov = (report.results && (report.results.n_cov || report.results.cov)) || null;
+      if (cov && cov.outputs && cov.outputs.report) {
+        const rep = cov.outputs.report;
+        window.dispatchEvent(
+          new CustomEvent("studio:coverage", {
+            detail: {
+              coverageRadius: rep.coverage_radius != null ? rep.coverage_radius : rep.coverageRadius,
+              coverageDeg: rep.coverage_deg != null ? rep.coverage_deg : rep.coverageDeg,
+              softRadius: rep.soft_radius != null ? rep.soft_radius : rep.softRadius,
+              outerFill: rep.outer_fill != null ? rep.outer_fill : rep.outerFill,
+              solidAngleFrac: rep.solid_angle_frac != null ? rep.solid_angle_frac : rep.solidAngleFrac,
+              level: rep.level,
+              text: rep.text,
+            },
+          }),
+        );
+        // auto-switch to dome tab when coverage arrives
+        const domeTab = document.querySelector('.tab[data-tab="dome"]');
+        if (domeTab) domeTab.click();
+      }
       setStatus("运行完成");
       draw();
     } catch (err) {
@@ -890,7 +911,24 @@
     window.addEventListener("resize", resizeCanvas);
   }
 
+  function bindTabs() {
+    document.querySelectorAll(".tab").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const name = btn.getAttribute("data-tab");
+        document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b === btn));
+        document.querySelectorAll(".tab-panel").forEach((p) => {
+          p.classList.toggle("active", p.id === "tab-" + name);
+        });
+        // resize dome canvas when its tab becomes visible
+        if (name === "dome" && window.StudioDomePreview) {
+          window.dispatchEvent(new Event("resize"));
+        }
+      });
+    });
+  }
+
   async function boot() {
+    bindTabs();
     bindUi();
     renderPalette();
     updateEmpty();

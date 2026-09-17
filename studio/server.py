@@ -106,6 +106,14 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
         def app_js() -> FileResponse:
             return FileResponse(STATIC_DIR / "app.js", media_type="application/javascript")
 
+        @app.get("/preview3d.js")
+        def preview3d_js() -> FileResponse:
+            return FileResponse(STATIC_DIR / "preview3d.js", media_type="application/javascript")
+
+        @app.get("/dome3d.html")
+        def dome3d_html() -> FileResponse:
+            return FileResponse(STATIC_DIR / "dome3d.html", headers={"Cache-Control": "no-store"})
+
     return app
 
 

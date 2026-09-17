@@ -4,7 +4,6 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Immersive Node Studio</title>
-  <!-- Relative paths work for file:// next to assets AND FastAPI routes /style.css /app.js -->
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -57,20 +56,57 @@
       <div id="statusBar" class="status">ready</div>
     </section>
 
-    <aside class="inspector">
-      <section>
-        <h2>检查器</h2>
-        <div id="inspectorBody" class="inspector-body">
-          <p class="hint">选中画布上的节点以编辑参数</p>
-        </div>
-      </section>
-      <section class="grow">
-        <h2>运行结果</h2>
-        <pre id="runOut" class="run-out">尚未运行</pre>
-      </section>
+    <aside class="inspector right-rail">
+      <div class="tabs">
+        <button type="button" class="tab active" data-tab="inspect">检查器</button>
+        <button type="button" class="tab" data-tab="dome">3D 球幕</button>
+        <button type="button" class="tab" data-tab="specs">画幅/场馆</button>
+      </div>
+
+      <div class="tab-panel active" id="tab-inspect">
+        <section>
+          <h2>检查器</h2>
+          <div id="inspectorBody" class="inspector-body">
+            <p class="hint">选中画布上的节点以编辑参数</p>
+          </div>
+        </section>
+        <section class="grow">
+          <h2>运行结果</h2>
+          <pre id="runOut" class="run-out">尚未运行</pre>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="tab-dome">
+        <section>
+          <h2>穹面 3D 预览</h2>
+          <p class="hint">拖拽旋转 · 滚轮缩放 · 黄线=实心覆盖边界 · 红=留白区</p>
+          <canvas id="domeCanvas" class="dome-canvas" width="480" height="280"></canvas>
+          <div class="dome-actions">
+            <label class="file-btn">
+              加载母版/分镜图
+              <input id="domeFile" type="file" accept="image/*,video/*" hidden />
+            </label>
+            <button type="button" id="btnCovGood">合规预设</button>
+            <button type="button" id="btnCovBad">坏母版预设</button>
+          </div>
+          <div id="covReadout" class="cov-readout">加载中…</div>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="tab-specs">
+        <section>
+          <h2>画幅比例对照</h2>
+          <div id="ratioList" class="ratio-list"></div>
+        </section>
+        <section>
+          <h2>场馆参数（12m Fulldome.pro）</h2>
+          <div id="venueFacts"></div>
+        </section>
+      </div>
     </aside>
   </main>
 
   <script src="app.js"></script>
+  <script src="preview3d.js"></script>
 </body>
 </html>
