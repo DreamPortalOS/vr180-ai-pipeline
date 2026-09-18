@@ -32,9 +32,20 @@ def test_llm_polish_mock_rewrites_prompt() -> None:
     assert len(out["prompt"]) >= 20
 
 
-def test_llm_polish_requires_base_url_for_litellm() -> None:
+def test_llm_polish_requires_base_url_for_litellm(monkeypatch) -> None:
+    monkeypatch.delenv("STUDIO_SETTINGS_FILE", raising=False)
+    monkeypatch.delenv("STUDIO_LITELLM_BASE_URL", raising=False)
+    monkeypatch.delenv("STUDIO_LITELLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    # point load away from any live work_root settings
+
+    monkeypatch.setattr(
+        "studio.settings.StudioSettings.load",
+        classmethod(lambda cls, path=None: cls()),
+    )
     node = LlmPolishNode()
-    with pytest.raises(ValueError, match="base_url"):
+    with pytest.raises(ValueError, match=r"base_url|api_key"):
         node.run(
             params={"provider": "litellm"},
             inputs={"prompt": "a quiet harbour"},

@@ -132,33 +132,42 @@ class LlmPolishNode(StudioNode):
     @staticmethod
     def _chat(base_url: str, api_key: str, model: str, prompt: str, instruction: str) -> str:
         user = prompt if not instruction else f"{prompt}\n\nEditor instruction: {instruction}"
-        url = f"{base_url}/chat/completions"
+        url = f"{base_url.rstrip('/')}/chat/completions"
         payload = {
-            "model": model,
+            "model": model or "auto",
             "messages": [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user},
             ],
             "temperature": 0.4,
         }
-        try:
-            res = httpx.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                timeout=60.0,
-            )
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"LLM request failed: {exc}") from exc
-        if res.status_code >= 400:
-            detail = res.text[:400]
-            raise RuntimeError(f"LLM HTTP {res.status_code}: {detail}")
-        try:
-            data = res.json()
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            raise RuntimeError(f"unexpected LLM response shape: {res.text[:300]}") from exc
-        text = str(content).strip()
-        if not text:
-            raise RuntimeError("LLM returned empty content")
-        return text
+        last_err = ""
+        for attempt in range(3):
+            try:
+                res = httpx.post(
+                    url,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    timeout=90.0,
+                )
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"LLM request failed: {exc}") from exc
+            if res.status_code == 429 and attempt < 2:
+                import time
+
+                time.sleep(1.5 * (attempt + 1))
+                last_err = f"LLM HTTP 429: {res.text[:300]}"
+                continue
+            if res.status_code >= 400:
+                detail = res.text[:400]
+                raise RuntimeError(f"LLM HTTP {res.status_code}: {detail}")
+            try:
+                data = res.json()
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                raise RuntimeError(f"unexpected LLM response shape: {res.text[:300]}") from exc
+            text = str(content).strip()
+            if not text:
+                raise RuntimeError("LLM returned empty content")
+            return text
+        raise RuntimeError(last_err or "LLM rate limited after retries")

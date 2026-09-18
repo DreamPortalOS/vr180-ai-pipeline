@@ -59,7 +59,7 @@ class StudioSettings:
         return cls(
             litellm_base_url=pick("litellm_base_url", "STUDIO_LITELLM_BASE_URL"),
             litellm_api_key=pick("litellm_api_key", "STUDIO_LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY", ""),
-            litellm_model=pick("litellm_model", "STUDIO_LITELLM_MODEL", "gpt-4o-mini"),
+            litellm_model=pick("litellm_model", "STUDIO_LITELLM_MODEL", "auto"),
             seedance_provider=pick("seedance_provider", "STUDIO_SEEDANCE_PROVIDER", "mock"),
             ark_api_key=pick("ark_api_key", "ARK_API_KEY"),
             sensenova_base_url=pick("sensenova_base_url", "STUDIO_SENSENOVA_BASE_URL"),

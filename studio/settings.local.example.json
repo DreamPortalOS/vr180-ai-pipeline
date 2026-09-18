@@ -1,8 +1,9 @@
 {
-  "_comment": "Copy to work_root/studio_settings.json via Studio UI「工程」→设置, or POST /api/settings. NEVER commit real keys.",
+  "_comment": "Copy values into Studio UI 工程→设置, or write to work_root/studio_settings.json. NEVER commit real keys.",
+  "_gateway_note": "Local/company LiteLLM (OpenAI-compatible /v1/chat/completions). Confirmed chat model groups: glm-5.2, auto (fallback), internlm-s2. deepseek-pro often 429 under quota. Image/video ids like sensenova-u1-fast may not be chat groups.",
   "litellm_base_url": "http://127.0.0.1:4000",
-  "litellm_model": "gpt-4o-mini",
-  "litellm_api_key": "sk-local-not-for-git",
+  "litellm_model": "auto",
+  "litellm_api_key": "sk-...",
   "seedance_provider": "mock",
   "sensenova_base_url": "",
   "sensenova_model": "",

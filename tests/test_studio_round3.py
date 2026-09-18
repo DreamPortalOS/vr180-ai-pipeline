@@ -63,9 +63,14 @@ def test_g11_constants_already_optimal() -> None:
 
 
 def test_settings_load_from_work_root(tmp_path, monkeypatch) -> None:
-    monkeypatch.delenv("STUDIO_LITELLM_BASE_URL", raising=False)
-    monkeypatch.delenv("STUDIO_LITELLM_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    for env in (
+        "STUDIO_LITELLM_BASE_URL",
+        "STUDIO_LITELLM_API_KEY",
+        "STUDIO_LITELLM_MODEL",
+        "OPENAI_API_KEY",
+        "STUDIO_SETTINGS_FILE",
+    ):
+        monkeypatch.delenv(env, raising=False)
     path = tmp_path / "studio_settings.json"
     path.write_text(
         '{"litellm_base_url":"http://127.0.0.1:4000","litellm_model":"local-model","litellm_api_key":"sk-test"}',
@@ -77,7 +82,7 @@ def test_settings_load_from_work_root(tmp_path, monkeypatch) -> None:
     assert s.litellm_api_key == "sk-test"
 
 
-def test_media_and_settings_api(tmp_path) -> None:
+def test_media_and_settings_api(tmp_path, monkeypatch) -> None:
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
@@ -93,8 +98,10 @@ def test_media_and_settings_api(tmp_path) -> None:
     body = res.json()
     assert body["litellm_base_url"] == "http://127.0.0.1:4000"
     assert body["litellm_api_key_set"] is True
-    assert "sk-abc" not in body.get("litellm_api_key_masked", "") or body["litellm_api_key_masked"] != "sk-abc"
+    assert body["litellm_api_key_masked"] != "sk-abc"
 
+    # Force read from this app's work_root, not ambient STUDIO_SETTINGS_FILE
+    monkeypatch.setenv("STUDIO_SETTINGS_FILE", str(tmp_path / "w" / "studio_settings.json"))
     res = client.get("/api/settings")
     assert res.status_code == 200
     assert res.json()["litellm_model"] == "glm-5.2"
