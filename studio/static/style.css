@@ -450,6 +450,33 @@ button.primary:hover { filter: brightness(1.06); }
   font-size: 12px;
 }
 
+.status-legend {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--muted);
+  background: rgba(10, 14, 20, 0.7);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 8px;
+}
+.status-legend .lg {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 2px;
+}
+.status-legend .lg.idle { background: #2a3a52; }
+.status-legend .lg.run { background: #7a5a1d; }
+.status-legend .lg.ok { background: #1f6b4a; }
+.status-legend .lg.err { background: #7a2e35; }
+.status-legend .lg.skip { background: #3a4454; }
+
 .gallery-box {
   margin-bottom: 8px;
   padding: 8px;

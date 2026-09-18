@@ -598,6 +598,21 @@
     del.textContent = "删除节点";
     del.addEventListener("click", () => removeNode(node.id));
     inspectorEl.appendChild(del);
+
+    const dirty = document.createElement("button");
+    dirty.type = "button";
+    dirty.textContent = "仅重跑此节点下游";
+    dirty.title = "POST /api/run with dirty_from=" + node.id;
+    dirty.style.marginTop = "8px";
+    dirty.addEventListener("click", () => runProject({ dirty_from: node.id }));
+    inspectorEl.appendChild(dirty);
+
+    const onlyAnc = document.createElement("button");
+    onlyAnc.type = "button";
+    onlyAnc.textContent = "仅跑此节点+上游";
+    onlyAnc.style.marginTop = "6px";
+    onlyAnc.addEventListener("click", () => runProject({ only_downstream_of: node.id }));
+    inspectorEl.appendChild(onlyAnc);
   }
 
   function removeNode(id) {
@@ -704,20 +719,29 @@
     setStatus("已载入生产流程模板（脚本→分镜图→视频→拼合→配乐→导出）");
   }
 
-  async function runProject() {
+  async function runProject(opts) {
+    opts = opts || {};
     if (!state.online) {
       runOutEl.textContent =
         "后端未连接，无法执行图。\n请在仓库根目录运行：\n  python -m studio.server\n然后打开 http://127.0.0.1:8787";
       setStatus("需要后端才能运行");
       return;
     }
-    setStatus("运行中…");
+    const label = opts.dirty_from
+      ? `重跑下游 ${opts.dirty_from}…`
+      : opts.only_downstream_of
+        ? `仅跑 ${opts.only_downstream_of}+上游…`
+        : "运行中…";
+    setStatus(label);
     runOutEl.textContent = "…";
     try {
+      const payload = { project: toServerProject(state.project) };
+      if (opts.dirty_from) payload.dirty_from = opts.dirty_from;
+      if (opts.only_downstream_of) payload.only_downstream_of = opts.only_downstream_of;
       const report = await api("/api/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project: toServerProject(state.project) }),
+        body: JSON.stringify(payload),
       });
       state.status = Object.fromEntries(
         Object.entries(report.results || {}).map(([id, r]) => [id, r.status]),
