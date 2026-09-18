@@ -872,8 +872,13 @@
         const t = document.querySelector('.tab[data-tab="projects"]');
         if (t) t.click();
         refreshProjects();
+        loadSettings();
       });
     }
+    const bSetLoad = document.getElementById("btnSettingsLoad");
+    if (bSetLoad) bSetLoad.addEventListener("click", () => loadSettings());
+    const bSetSave = document.getElementById("btnSettingsSave");
+    if (bSetSave) bSetSave.addEventListener("click", () => saveSettings());
     document.getElementById("btnLoad").addEventListener("click", () => fileInput.click());
     document.getElementById("btnClear").addEventListener("click", () => {
       state.project = { version: 1, name: "untitled", nodes: [], edges: [], settings: {} };
@@ -922,6 +927,11 @@
     window.addEventListener("resize", resizeCanvas);
   }
 
+  function mediaUrl(p) {
+    if (!p) return "";
+    return `/api/media?path=${encodeURIComponent(p)}`;
+  }
+
   function renderGallery(gallery) {
     const box = document.getElementById("galleryBox");
     if (!box) return;
@@ -934,12 +944,20 @@
     const shots = (gallery.shots || [])
       .map(
         (s) =>
-          `<li><b>${s.id || "?"}</b> ${s.duration || ""}s — ${s.description || ""}<br/><span class="sheet-path">${s.image || ""}</span></li>`,
+          `<li><b>${s.id || "?"}</b> ${s.duration || ""}s — ${s.description || ""}` +
+          (s.image
+            ? `<br/><img class="shot-thumb" src="${mediaUrl(s.image)}" alt="${s.id || ""}" />`
+            : "") +
+          `<br/><span class="sheet-path">${s.image || ""}</span></li>`,
       )
       .join("");
+    const sheetImg = gallery.sheet
+      ? `<img class="sheet-thumb" src="${mediaUrl(gallery.sheet)}" alt="contact sheet" />`
+      : "";
     box.innerHTML = `
       <div><strong>分镜图廊</strong>（${gallery.count || 0} 镜）</div>
       <div class="sheet-path">联络表：${gallery.sheet || "—"}</div>
+      ${sheetImg}
       <ul>${shots}</ul>`;
   }
 
@@ -1014,6 +1032,61 @@
       });
     } catch (err) {
       listEl.innerHTML = `<p class="hint err">${err.message}</p>`;
+    }
+    await loadSettings();
+  }
+
+  async function loadSettings() {
+    if (!state.online) return;
+    try {
+      const s = await api("/api/settings");
+      const set = (id, v) => {
+        const el = document.getElementById(id);
+        if (el) el.value = v || "";
+      };
+      set("setLlmUrl", s.litellm_base_url);
+      set("setLlmModel", s.litellm_model);
+      set("setSnUrl", s.sensenova_base_url);
+      set("setSnModel", s.sensenova_model);
+      const st = document.getElementById("settingsStatus");
+      if (st) {
+        st.textContent = s.litellm_api_key_set
+          ? `已配置 LiteLLM（key ${s.litellm_api_key_masked}）· model=${s.litellm_model || "—"}`
+          : "尚未写入 LiteLLM key；润色节点 provider=mock 仍可用";
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  async function saveSettings() {
+    if (!state.online) {
+      setStatus("离线无法保存设置");
+      return;
+    }
+    const val = (id) => {
+      const el = document.getElementById(id);
+      return el ? el.value.trim() : "";
+    };
+    const body = {
+      litellm_base_url: val("setLlmUrl") || null,
+      litellm_model: val("setLlmModel") || null,
+      sensenova_base_url: val("setSnUrl") || null,
+      sensenova_model: val("setSnModel") || null,
+    };
+    const key = val("setLlmKey");
+    if (key) body.litellm_api_key = key;
+    try {
+      const s = await api("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const st = document.getElementById("settingsStatus");
+      if (st) st.textContent = `已保存 · base=${s.litellm_base_url || "—"} model=${s.litellm_model || "—"}`;
+      setStatus("供应商设置已保存到本机");
+    } catch (err) {
+      setStatus("设置保存失败: " + err.message);
     }
   }
 

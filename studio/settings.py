@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,12 +32,22 @@ class StudioSettings:
     @classmethod
     def load(cls, path: str | Path | None = None) -> StudioSettings:
         data: dict[str, Any] = {}
+        candidates: list[Path] = []
         if path:
-            p = Path(path)
+            candidates.append(Path(path))
+        env_path = os.environ.get("STUDIO_SETTINGS_FILE", "")
+        if env_path:
+            candidates.append(Path(env_path))
+        # Server default work_root
+        candidates.append(Path(tempfile.gettempdir()) / "vr180-studio" / "studio_settings.json")
+        candidates.append(Path(DEFAULT_SETTINGS_FILENAME))
+        for p in candidates:
             if p.is_file():
-                data = json.loads(p.read_text(encoding="utf-8"))
-        elif Path(DEFAULT_SETTINGS_FILENAME).is_file():
-            data = json.loads(Path(DEFAULT_SETTINGS_FILENAME).read_text(encoding="utf-8"))
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    break
+                except (OSError, json.JSONDecodeError):
+                    continue
 
         def pick(key: str, env: str, default: str = "") -> str:
             env_val = os.environ.get(env, "")

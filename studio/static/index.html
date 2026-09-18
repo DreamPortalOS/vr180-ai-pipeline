@@ -115,6 +115,21 @@
             <p class="hint">点「工程」刷新</p>
           </div>
         </section>
+        <section>
+          <h2>本地 LiteLLM / 供应商</h2>
+          <div id="settingsForm" class="settings-form">
+            <label>LiteLLM Base URL<input id="setLlmUrl" type="text" placeholder="http://127.0.0.1:4000" /></label>
+            <label>LiteLLM Model<input id="setLlmModel" type="text" placeholder="gpt-4o-mini / glm-5.2 / …" /></label>
+            <label>LiteLLM API Key<input id="setLlmKey" type="password" placeholder="sk-…（写入服务器 settings，不进 git）" /></label>
+            <label>SenseNova Base URL<input id="setSnUrl" type="text" placeholder="https://…" /></label>
+            <label>SenseNova Model<input id="setSnModel" type="text" /></label>
+            <div class="gallery-actions" style="margin-top:10px">
+              <button type="button" id="btnSettingsLoad">读取</button>
+              <button type="button" id="btnSettingsSave" class="primary">保存设置</button>
+            </div>
+            <p class="hint" id="settingsStatus">密钥保存在 work_root/studio_settings.json，不会写入工程 JSON / git。</p>
+          </div>
+        </section>
       </div>
     </aside>
   </main>

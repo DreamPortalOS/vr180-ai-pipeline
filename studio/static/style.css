@@ -412,6 +412,44 @@ button.primary:hover { filter: brightness(1.06); }
 .project-actions { display: flex; gap: 6px; }
 .project-row button { font-size: 12px; padding: 4px 8px; }
 
+.sheet-thumb {
+  display: block;
+  max-width: 100%;
+  max-height: 96px;
+  margin-top: 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #0a0e14;
+}
+.shot-thumb {
+  display: inline-block;
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  margin-top: 4px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.settings-form label {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 8px;
+}
+.settings-form input {
+  width: 100%;
+  margin-top: 3px;
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+
 .gallery-box {
   margin-bottom: 8px;
   padding: 8px;

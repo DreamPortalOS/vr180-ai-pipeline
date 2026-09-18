@@ -10,10 +10,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.requests import Request
 
 from studio.graph import GraphError, extract_gallery, list_node_types, run_graph
 from studio.models import Project, StudioModelError, empty_demo_project
 from studio.projects import ProjectStore, ProjectStoreError
+from studio.settings import StudioSettings
 from studio.templates import production_pipeline_project
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -34,6 +36,16 @@ class SaveProjectRequest(BaseModel):
     project_id: str | None = None
 
 
+class SettingsPatch(BaseModel):
+    litellm_base_url: str | None = None
+    litellm_api_key: str | None = None
+    litellm_model: str | None = None
+    sensenova_base_url: str | None = None
+    sensenova_api_key: str | None = None
+    sensenova_model: str | None = None
+    seedance_provider: str | None = None
+
+
 def create_app(*, default_work_dir: str | None = None) -> FastAPI:
     app = FastAPI(title="Immersive Node Studio", version="0.1.0")
     work_root = Path(default_work_dir) if default_work_dir else Path(tempfile.gettempdir()) / "vr180-studio"
@@ -42,8 +54,79 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
     project_store = ProjectStore(work_root / "projects")
 
     @app.get("/api/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok", "work_root": str(work_root), "projects_root": str(project_store.root)}
+    def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "work_root": str(work_root),
+            "projects_root": str(project_store.root),
+            "settings_path": str(work_root / "studio_settings.json"),
+        }
+
+    @app.get("/api/settings")
+    def get_settings() -> dict[str, Any]:
+        """Non-secret view of provider settings (keys masked)."""
+        s = StudioSettings.load(work_root / "studio_settings.json")
+
+        def mask(v: str) -> str:
+            if not v:
+                return ""
+            return v[:3] + "…" + v[-2:] if len(v) > 8 else "***"
+
+        return {
+            "litellm_base_url": s.litellm_base_url,
+            "litellm_model": s.litellm_model,
+            "litellm_api_key_set": bool(s.litellm_api_key),
+            "litellm_api_key_masked": mask(s.litellm_api_key),
+            "sensenova_base_url": s.sensenova_base_url,
+            "sensenova_model": s.sensenova_model,
+            "sensenova_api_key_set": bool(s.sensenova_api_key),
+            "seedance_provider": s.seedance_provider,
+            "ark_api_key_set": bool(s.ark_api_key),
+        }
+
+    @app.post("/api/settings")
+    def put_settings(patch: SettingsPatch) -> dict[str, Any]:
+        """Merge provider settings into studio_settings.json under work_root."""
+        path = work_root / "studio_settings.json"
+        current: dict[str, Any] = {}
+        if path.is_file():
+            import json
+
+            current = json.loads(path.read_text(encoding="utf-8"))
+        payload = patch.model_dump(exclude_none=True)
+        current.update(payload)
+        import json
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return get_settings()
+
+    @app.get("/api/media")
+    def media(request: Request, path: str) -> FileResponse:
+        """Serve a local artefact (stills/sheet/video) for canvas thumbnails.
+
+        Only files under work_root or the system temp studio dir are allowed.
+        """
+        target = Path(path).resolve()
+        allowed_roots = [
+            work_root.resolve(),
+            Path(tempfile.gettempdir()).resolve(),
+        ]
+        if not any(target.is_relative_to(root) for root in allowed_roots):
+            raise HTTPException(status_code=403, detail=f"path outside studio work_root: {target}")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail=f"file not found: {target}")
+        suffix = target.suffix.lower()
+        media_type = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+            ".mp4": "video/mp4",
+            ".json": "application/json",
+        }.get(suffix, "application/octet-stream")
+        return FileResponse(target, media_type=media_type)
 
     @app.get("/api/node-types")
     def node_types() -> list[dict[str, Any]]:

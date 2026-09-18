@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy to work_root/studio_settings.json via Studio UI「工程」→设置, or POST /api/settings. NEVER commit real keys.",
+  "litellm_base_url": "http://127.0.0.1:4000",
+  "litellm_model": "gpt-4o-mini",
+  "litellm_api_key": "sk-local-not-for-git",
+  "seedance_provider": "mock",
+  "sensenova_base_url": "",
+  "sensenova_model": "",
+  "sensenova_api_key": ""
+}

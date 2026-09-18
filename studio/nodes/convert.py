@@ -138,6 +138,12 @@ class Vr180ConvertNode(StudioNode):
             {"name": "src_hfov", "type": "number", "default": 120, "label": "源水平 FOV°"},
             {"name": "max_disparity", "type": "number", "default": 0.02, "label": "最大视差"},
             {"name": "eye_size", "type": "number", "default": 256, "label": "每眼边长 (生产 2880)"},
+            {
+                "name": "backend",
+                "type": "string",
+                "default": "apache",
+                "label": "backend (apache|full|auto)",
+            },
             {"name": "extra_args", "type": "string", "default": "", "label": "额外 CLI 参数（空格分隔）"},
         ]
 
@@ -181,6 +187,7 @@ class Vr180ConvertNode(StudioNode):
         eye = int(params.get("eye_size") or 256)
         if eye % 2:
             eye += 1
+        backend = str(params.get("backend") or "apache").lower()
         cmd = [
             sys.executable,
             "-m",
@@ -204,6 +211,22 @@ class Vr180ConvertNode(StudioNode):
             "--max-frames",
             str(params.get("max_frames") or 8),
         ]
+        if backend == "apache":
+            # Commercial-safe profile (#368): no DepthCrafter / StereoCrafter.
+            cmd.extend(
+                [
+                    "--depth-model",
+                    "depth-anything",
+                    "--stereo-model",
+                    "default",
+                    "--no-temporal",
+                ]
+            )
+        elif backend == "full":
+            # Advanced backends if deployed; pipeline falls back with a warning.
+            cmd.extend(["--depth-model", "depthcrafter", "--stereo-model", "stereocrafter"])
+        elif backend != "auto":
+            raise ValueError(f"unknown vr180 backend {backend!r}; use apache|full|auto")
         extra = str(params.get("extra_args") or "").strip()
         if extra:
             cmd.extend(extra.split())
@@ -217,6 +240,7 @@ class Vr180ConvertNode(StudioNode):
             "video": str(out_path),
             "meta": {
                 "mode": "cli",
+                "backend": backend,
                 "path": str(out_path),
                 "eye_size": eye,
                 "src_hfov": float(params.get("src_hfov") or 120),
