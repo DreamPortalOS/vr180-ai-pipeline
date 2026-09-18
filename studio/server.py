@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from studio.graph import GraphError, extract_gallery, list_node_types, run_graph
 from studio.models import Project, StudioModelError, empty_demo_project
+from studio.projects import ProjectStore, ProjectStoreError
 from studio.templates import production_pipeline_project
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -28,15 +29,21 @@ class RunRequest(ProjectPayload):
     dirty_from: str | None = None
 
 
+class SaveProjectRequest(BaseModel):
+    project: dict[str, Any]
+    project_id: str | None = None
+
+
 def create_app(*, default_work_dir: str | None = None) -> FastAPI:
     app = FastAPI(title="Immersive Node Studio", version="0.1.0")
     work_root = Path(default_work_dir) if default_work_dir else Path(tempfile.gettempdir()) / "vr180-studio"
     work_root.mkdir(parents=True, exist_ok=True)
     run_cache: dict[str, dict[str, Any]] = {}
+    project_store = ProjectStore(work_root / "projects")
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "work_root": str(work_root)}
+        return {"status": "ok", "work_root": str(work_root), "projects_root": str(project_store.root)}
 
     @app.get("/api/node-types")
     def node_types() -> list[dict[str, Any]]:
@@ -91,6 +98,31 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
         payload = report.to_dict()
         payload["gallery"] = extract_gallery(report)
         return payload
+
+    @app.get("/api/projects")
+    def list_saved_projects() -> list[dict[str, Any]]:
+        return project_store.list_projects()
+
+    @app.post("/api/projects")
+    def save_project(req: SaveProjectRequest) -> dict[str, Any]:
+        try:
+            return project_store.save(req.project, req.project_id)
+        except ProjectStoreError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/projects/{project_id}")
+    def load_project(project_id: str) -> dict[str, Any]:
+        try:
+            return project_store.load(project_id)
+        except ProjectStoreError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/projects/{project_id}")
+    def delete_project(project_id: str) -> dict[str, Any]:
+        ok = project_store.delete(project_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"project not found: {project_id}")
+        return {"deleted": project_id}
 
     # Serve assets at BOTH /static/* (absolute) and /* (relative) so
     # index.html works from the FastAPI root and from file:// next to the files.

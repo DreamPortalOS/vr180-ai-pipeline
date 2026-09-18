@@ -864,6 +864,16 @@
     document.getElementById("btnDual").addEventListener("click", () => loadDualTemplate().catch((e) => setStatus(e.message)));
     document.getElementById("btnEmptyDual").addEventListener("click", () => loadDualTemplate().catch((e) => setStatus(e.message)));
     document.getElementById("btnSave").addEventListener("click", saveProject);
+    const btnSaveServer = document.getElementById("btnSaveServer");
+    if (btnSaveServer) btnSaveServer.addEventListener("click", () => saveToServer());
+    const btnProjects = document.getElementById("btnProjects");
+    if (btnProjects) {
+      btnProjects.addEventListener("click", () => {
+        const t = document.querySelector('.tab[data-tab="projects"]');
+        if (t) t.click();
+        refreshProjects();
+      });
+    }
     document.getElementById("btnLoad").addEventListener("click", () => fileInput.click());
     document.getElementById("btnClear").addEventListener("click", () => {
       state.project = { version: 1, name: "untitled", nodes: [], edges: [], settings: {} };
@@ -931,6 +941,80 @@
       <div><strong>分镜图廊</strong>（${gallery.count || 0} 镜）</div>
       <div class="sheet-path">联络表：${gallery.sheet || "—"}</div>
       <ul>${shots}</ul>`;
+  }
+
+  async function saveToServer() {
+    if (!state.online) {
+      setStatus("离线无法存库；请先启动 studio.server");
+      return;
+    }
+    try {
+      const res = await api("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project: toServerProject(state.project),
+          project_id: state.project.name || undefined,
+        }),
+      });
+      state.project.name = res.name || state.project.name;
+      projectNameEl.textContent = state.project.name;
+      setStatus(`已存库 ${res.id} · ${res.nodes} 节点`);
+      await refreshProjects();
+    } catch (err) {
+      setStatus("存库失败: " + err.message);
+    }
+  }
+
+  async function refreshProjects() {
+    const listEl = document.getElementById("projectsList");
+    if (!listEl) return;
+    if (!state.online) {
+      listEl.innerHTML = '<p class="hint">后端未连接</p>';
+      return;
+    }
+    try {
+      const items = await api("/api/projects");
+      if (!items.length) {
+        listEl.innerHTML = '<p class="hint">暂无已保存工程</p>';
+        return;
+      }
+      listEl.innerHTML = "";
+      items.forEach((it) => {
+        const row = document.createElement("div");
+        row.className = "project-row";
+        row.innerHTML = `
+          <div>
+            <strong>${it.name}</strong>
+            <div class="hint">${it.id} · ${it.nodes} 节点 · ${it.mtime_iso}</div>
+          </div>
+          <div class="project-actions">
+            <button type="button" data-act="open">打开</button>
+            <button type="button" data-act="del">删</button>
+          </div>`;
+        row.querySelector('[data-act="open"]').addEventListener("click", async () => {
+          try {
+            const data = await api(`/api/projects/${encodeURIComponent(it.id)}`);
+            loadProjectObject(data);
+            setStatus("已打开 " + it.id);
+          } catch (e) {
+            setStatus("打开失败: " + e.message);
+          }
+        });
+        row.querySelector('[data-act="del"]').addEventListener("click", async () => {
+          try {
+            await api(`/api/projects/${encodeURIComponent(it.id)}`, { method: "DELETE" });
+            await refreshProjects();
+            setStatus("已删除 " + it.id);
+          } catch (e) {
+            setStatus("删除失败: " + e.message);
+          }
+        });
+        listEl.appendChild(row);
+      });
+    } catch (err) {
+      listEl.innerHTML = `<p class="hint err">${err.message}</p>`;
+    }
   }
 
   function bindTabs() {
