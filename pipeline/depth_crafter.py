@@ -424,11 +424,52 @@ class DepthCrafterBackend(ABC):
 # ---------------------------------------------------------------------------
 # The repo root is two parents up from this file (pipeline/depth_crafter.py).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-INREPO_REPO_DIR = _REPO_ROOT / "third_party" / "DepthCrafter"
+
+
+def _main_checkout_root(root: Path) -> Path | None:
+    """Main checkout of a git *worktree*, or ``None`` if *root* is not one.
+
+    A linked worktree's ``.git`` is a file ``gitdir: <main>/.git/worktrees/<name>``.
+    Parsed directly (no git subprocess) so import stays cheap and CI-safe.
+    """
+    marker = root / ".git"
+    if not marker.is_file():
+        return None
+    try:
+        text = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    gitdir = Path(text[len("gitdir:") :].strip())
+    if not gitdir.is_absolute():
+        gitdir = (root / gitdir).resolve()
+    if gitdir.parent.name == "worktrees" and gitdir.parent.parent.name == ".git":
+        return gitdir.parent.parent.parent
+    return None
+
+
+def _deploy_root(root: Path = _REPO_ROOT) -> Path:
+    """Where the in-repo DepthCrafter deployment lives (#410).
+
+    ``setup_depthcrafter.py`` deploys into the main checkout's ``third_party/``
+    (git-ignored), so a linked worktree has none of it.  Prefer *root* when it
+    has a deployment; otherwise fall back to the main checkout's; else *root*.
+    """
+    if (root / "third_party" / "DepthCrafter").is_dir():
+        return root
+    main = _main_checkout_root(root)
+    if main is not None and (main / "third_party" / "DepthCrafter").is_dir():
+        return main
+    return root
+
+
+_DEPLOY_ROOT = _deploy_root()
+INREPO_REPO_DIR = _DEPLOY_ROOT / "third_party" / "DepthCrafter"
 INREPO_PYTHON_EXE = (
     INREPO_REPO_DIR / ".venv" / (Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python")
 )
-INREPO_MODEL_DIR = _REPO_ROOT / "models" / "DepthCrafter"
+INREPO_MODEL_DIR = _DEPLOY_ROOT / "models" / "DepthCrafter"
 
 # Default cache root for depth products (issue #182, I-8a): the in-repo
 # ``models/.cache/depth`` dir, which is gitignored alongside ``models/``.
