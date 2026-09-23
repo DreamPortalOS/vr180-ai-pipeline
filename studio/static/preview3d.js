@@ -556,8 +556,23 @@
     return c;
   }
 
-  /** POST a canvas image to the server and return its coverage stats.
-   * Resolves to {error} on any failure so the UI can degrade gracefully. */
+  /** Map the server's snake_case CoverageStats to the camelCase shape the rest
+   * of the UI (setCoverageUi / applyStats) reads — the same shape the old
+   * client-side analyzeImage returned, so no other call site changes. */
+  function normalizeCoverage(d) {
+    return {
+      coverageRadius: d.coverage_radius,
+      coverageDeg: d.coverage_deg,
+      softRadius: d.soft_radius,
+      outerFill: d.outer_fill,
+      solidAngleFrac: d.solid_angle_frac,
+      level: d.level,
+      text: d.text,
+    };
+  }
+
+  /** POST a canvas image to the server and return its coverage stats
+   * (camelCase). Resolves to {error} on any failure so the UI degrades. */
   async function analyzeOnServer(canvas) {
     let blob;
     try {
@@ -575,7 +590,7 @@
         const txt = await res.text().catch(() => "");
         return { error: `HTTP ${res.status}${txt ? ": " + txt.slice(0, 120) : ""}` };
       }
-      return await res.json();
+      return normalizeCoverage(await res.json());
     } catch (err) {
       return { error: err.message || "network" };
     }
