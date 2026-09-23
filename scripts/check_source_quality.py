@@ -431,6 +431,19 @@ ANCHOR_MAX_DEG: float = 12.0
 #: barely-credible subject reads "too small", not "missing".
 ANCHOR_MIN_DEG_FLOOR: float = 7.0
 
+#: Minimum local contrast a **sub-floor** anchor must show on the fisheye route.
+#: Lowering the area floor to :data:`ANCHOR_MIN_DEG_FLOOR` lets a 9° subject
+#: through, but at that size speck in an even texture reads the same area as a
+#: real subject (0.14–0.26 % vs ≈0.2 %), so area alone cannot separate them.
+#: What does separate them is how much the candidate stands out from its
+#: surroundings: ``|mean(disc) − mean(ring)| / std(ring)``, with the disc sized
+#: to the candidate's area and the ring at 1.5–2.5 × its radius.  Measured on
+#: the test fixtures: subjectless speck 1.45–2.29, real subjects 12.6–18.5, so
+#: 5 sits well clear of both.  Only candidates below :data:`ANCHOR_MIN_AREA`
+#: (the rect floor) are gated — every anchor the detector found before #398 is
+#: judged exactly as before.
+ANCHOR_SMALL_MIN_CONTRAST: float = 5.0
+
 #: Barrier distance, in CIE-Lab units at :data:`ANCHOR_ANALYSIS_MAX_DIM`, at
 #: which :func:`enclosure_gate` saturates — the step you have to climb to get
 #: *inside* something that counts as fully enclosed.
@@ -1699,6 +1712,30 @@ def structured_saliency(frame: np.ndarray, window: int = ANCHOR_TEXTURE_WINDOW) 
     return (combined - combined.min()) / (float(np.ptp(combined)) + 1e-9)
 
 
+def anchor_local_contrast(frame: np.ndarray, stats: dict) -> float:
+    """How much a found anchor stands out from the ring around it.
+
+    ``|mean(disc) − mean(ring)| / std(ring)`` on the grayscale frame, the disc
+    being the equal-area circle at the candidate's centroid and the ring the
+    annulus 1.5–2.5 × that radius out.  See :data:`ANCHOR_SMALL_MIN_CONTRAST`.
+    Returns 0.0 when nothing was found or the ring falls entirely off-frame.
+    """
+    if not stats.get("found") or stats.get("area", 0.0) <= 0.0:
+        return 0.0
+    gray = _as_gray(frame).astype(np.float64)
+    h, w = gray.shape[:2]
+    cx = float(stats["centroid_x"]) * w
+    cy = float(stats["centroid_y"]) * h
+    radius = math.sqrt(float(stats["area"]) * h * w / math.pi)
+    yy, xx = np.mgrid[:h, :w]
+    dist = np.hypot(xx - cx, yy - cy)
+    disc = gray[dist <= radius]
+    ring = gray[(dist > 1.5 * radius) & (dist <= 2.5 * radius)]
+    if disc.size == 0 or ring.size == 0:
+        return 0.0
+    return float(abs(disc.mean() - ring.mean()) / (ring.std() + 1e-6))
+
+
 def anchor_stats(
     frame: np.ndarray,
     kernel: int = ANCHOR_MORPH_KERNEL,
@@ -2262,7 +2299,16 @@ def run_checks(
         if "detail_ratio" not in skipped:
             detail_stats.append(center_detail_stats(frame))
         if "anchor" not in skipped:
-            subject_stats.append(anchor_stats(frame, min_area=anchor_min_area, rescue=anchor_rescue))
+            stats = anchor_stats(frame, min_area=anchor_min_area, rescue=anchor_rescue)
+            if (
+                input_projection == "fisheye"
+                and stats.get("found")
+                and stats.get("area", 0.0) < ANCHOR_MIN_AREA
+                and anchor_local_contrast(frame, stats) < ANCHOR_SMALL_MIN_CONTRAST
+            ):
+                # Sub-floor candidate that does not stand out: speck, not a subject.
+                stats = {**stats, "found": False}
+            subject_stats.append(stats)
 
     if needs_frames and still:
         try:
