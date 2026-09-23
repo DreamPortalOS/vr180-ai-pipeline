@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import pytest
 import scripts.segment_chain as sc
+
 from integrations import usage_ledger
 from integrations.base import GenerationResult, VideoGenProvider
 

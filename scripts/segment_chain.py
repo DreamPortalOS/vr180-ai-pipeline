@@ -50,6 +50,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import httpx  # noqa: E402
+
 from integrations.base import GenerationResult, VideoGenProvider  # noqa: E402
 from integrations.factory import get_provider, list_providers  # noqa: E402
 from integrations.seedance import MODEL_FAST, VALID_RESOLUTIONS  # noqa: E402
