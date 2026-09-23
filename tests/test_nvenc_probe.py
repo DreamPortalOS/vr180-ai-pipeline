@@ -214,6 +214,8 @@ class TestHwEncoderCliPassthrough(unittest.TestCase):
             # pin the flag off and stub the passthrough helper so no real
             # ffmpeg/ffprobe runs here.
             args.copy_audio_from = None
+            # S-4 (#396): same truthy-MagicMock trap — pin the ambience-mix flag.
+            args.audio_mix = None
 
             pipeline_inst = MagicMock()
             pipeline_inst.process_stream.return_value = "out.mp4"

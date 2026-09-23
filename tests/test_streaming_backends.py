@@ -747,6 +747,8 @@ class TestStreamingBranchInjection(unittest.TestCase):
             # H-1.2 (#132): bare MagicMock attributes are truthy — pin the
             # audio-passthrough flag so the branch under test is explicit.
             args.copy_audio_from = None
+            # S-4 (#396): same trap for the ambience-mix flag.
+            args.audio_mix = None
 
             captured = {}
 
@@ -856,6 +858,9 @@ class TestStreamingAudioPassthrough(unittest.TestCase):
             args.depth_model = "depthcrafter"
             args.stereo_model = "stereocrafter"
             args.copy_audio_from = copy_audio_from
+            # S-4 (#396): pin the ambience-mix flag off — these tests exercise
+            # the copy-audio path, not the mix path.
+            args.audio_mix = None
 
             pipeline_inst = MagicMock()
             pipeline_inst.process_stream.return_value = "out.mp4"

@@ -361,6 +361,8 @@ def _main_args(**overrides):
     args.depth_model = "depth-anything"
     args.stereo_model = "default"
     args.copy_audio_from = None
+    # S-4 (#396): pin the ambience-mix flag off (truthy-MagicMock trap).
+    args.audio_mix = None
     args.manifest = None
     args.stages = None
     args.resume_from = None

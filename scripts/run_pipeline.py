@@ -937,6 +937,34 @@ def _build_parser() -> argparse.ArgumentParser:
         "to attach a different track.",
     )
 
+    # S-4: external ambience mix-in (issue #396)
+    parser.add_argument(
+        "--audio-mix",
+        default=None,
+        metavar="PATH",
+        help="S-4: mix an external ambience track into the final output (dome + VR180 "
+        "routes). Video is -c:v copy (never re-encoded); audio is AAC 192k stereo. "
+        "Given alone the ambience replaces any existing audio; with --copy-audio-from "
+        "the two tracks are amix'd (copy track passes through, ambience gain/loop/fade'd).",
+    )
+    parser.add_argument(
+        "--audio-gain-db",
+        type=float,
+        default=0.0,
+        help="S-4: gain applied to the ambience track in dB (default 0).",
+    )
+    parser.add_argument(
+        "--audio-loop",
+        action="store_true",
+        help="S-4: loop the ambience track when it is shorter than the video.",
+    )
+    parser.add_argument(
+        "--audio-fade",
+        type=float,
+        default=1.0,
+        help="S-4: ambience fade in/out length in seconds (default 1.0; <=0 disables both).",
+    )
+
     # R-6: 180° Outpaint fill
     parser.add_argument(
         "--outpaint",
@@ -2643,6 +2671,12 @@ _STREAMING_SUPPORTED: dict[str, str] = {
     # honour it and it must not be reported as a swallowed flag.
     "source_check": "source-health gate",
     "copy_audio_from": "audio source",
+    # S-4 (#396): the ambience mix is applied to the streaming output just
+    # like the batch / dome outputs, so the stream must honour these.
+    "audio_mix": "ambience mix track",
+    "audio_gain_db": "ambience gain",
+    "audio_loop": "ambience loop",
+    "audio_fade": "ambience fade",
 }
 
 
@@ -3237,7 +3271,9 @@ def _stage_all_body(args, temp_dir, is_sbs, manifest, manifest_skip, manifest_st
     if output:
         log.info(f"✅ Pipeline complete → {output}")
 
-    if output and getattr(args, "copy_audio_from", None):
+    if output and getattr(args, "audio_mix", None):
+        _apply_audio_mix(output, args, re_inject=True)
+    elif output and getattr(args, "copy_audio_from", None):
         _copy_audio_to_output(output, args.copy_audio_from, re_inject=True)
     elif output:
         _maybe_copy_audio_from_input(output, args.input, re_inject=True)
@@ -3514,7 +3550,9 @@ def main():
         # returned before reaching it, silently producing a silent video.
         # Reuse the same helpers — re_inject=True re-embeds sv3d/st3d after
         # the remux (issue #91: ffmpeg -c copy drops the sample-entry boxes).
-        if getattr(args, "copy_audio_from", None):
+        if getattr(args, "audio_mix", None):
+            _apply_audio_mix(result, args, re_inject=True)
+        elif getattr(args, "copy_audio_from", None):
             _copy_audio_to_output(result, args.copy_audio_from, re_inject=True)
         else:
             _maybe_copy_audio_from_input(result, args.input, re_inject=True)
@@ -3549,6 +3587,14 @@ def main():
         output = get_output_path(args, suffix="_dome.mp4")
         result = mapper.convert(args.input, output)
         log.info(f"✅ Fulldome conversion complete → {result}")
+        # S-4 (#396): attach audio to the dome master too.  The dome route
+        # carries no sv3d/st3d boxes, so re_inject is False (unlike VR180).
+        if getattr(args, "audio_mix", None):
+            _apply_audio_mix(result, args, re_inject=False)
+        elif getattr(args, "copy_audio_from", None):
+            _copy_audio_to_output(result, args.copy_audio_from, re_inject=False)
+        else:
+            _maybe_copy_audio_from_input(result, args.input, re_inject=False)
         _write_sidecar_from_args(result, "fulldome", args, fov=args.dome_fov, eye_size=(args.dome_size, args.dome_size))
         return
 
@@ -3682,6 +3728,51 @@ def _maybe_copy_audio_from_input(output: str, input_path: str, *, re_inject: boo
         return
     log.info("🔊 Input %s has an audio stream — remuxing into %s", input_path, output)
     _copy_audio_to_output(output, input_path, re_inject=re_inject)
+
+
+def _apply_audio_mix(output: str, args, *, re_inject: bool = False) -> None:
+    """Mix the external ambience track (``--audio-mix``) into *output* (S-4).
+
+    Single-track when ``--audio-mix`` is given alone — the ambience replaces
+    any existing audio (the filter maps only ``0:v`` + ``[aout]``).  Dual
+    amix when ``--copy-audio-from`` is also given — the copy track passes
+    through (``anull``) and the ambience chain (gain / loop / fade) is amix'd
+    with it.  Video is ``-c:v copy`` (never re-encoded); audio is AAC 192k
+    stereo.  For the VR180 route the sv3d/st3d boxes are re-injected after
+    the mix (issue #91: ``-c:v copy`` with a remapped audio stream drops the
+    sample-entry boxes); the dome route carries no spherical boxes and skips
+    that step (``re_inject=False``).
+    """
+    from pipeline.audio_mix import mix_external_audio
+    from pipeline.audio_mux import _atomic_replace
+    from pipeline.spherical_injector import inject_spherical_metadata
+
+    copy_audio_from = getattr(args, "copy_audio_from", None)
+    log.info(
+        "🎧 Mixing ambience %s → %s (dual=%s, gain=%sdB, loop=%s, fade=%ss)",
+        args.audio_mix,
+        output,
+        copy_audio_from is not None,
+        args.audio_gain_db,
+        args.audio_loop,
+        args.audio_fade,
+    )
+    tmp = str(Path(output).with_suffix(".amix.mp4"))
+    mix_external_audio(
+        output,
+        args.audio_mix,
+        tmp,
+        copy_audio_from=copy_audio_from,
+        gain_db=args.audio_gain_db,
+        loop=args.audio_loop,
+        fade_s=args.audio_fade,
+    )
+    _atomic_replace(tmp, output)
+    if re_inject:
+        log.info("🎧 Re-injecting sv3d/st3d (ffmpeg -c:v copy drops sample-entry boxes)")
+        inject_spherical_metadata(output, output + ".vr.mp4", stereo_mode="sbs")
+        os.replace(output + ".vr.mp4", output)
+    log.info("✅ Audio mix complete → %s", output)
 
 
 # ---------------------------------------------------------------------------
