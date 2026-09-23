@@ -1,5 +1,8 @@
 # Immersive Node Studio — 产品需求文档 (PRD)
 
+> **2026-09-22 决定**：MiniMax 整条线已删除（owner：只到 2K，不能到 4K）。下文凡提到 MiniMax 的供应商/里程碑均作废，视频节点只保留 mock | Seedance。
+
+
 > **项目名（暂定）**: Immersive Node Studio / 沉浸式节点工作室
 > **版本**: v0.1 DRAFT
 > **日期**: 2026-09-17
@@ -434,7 +437,7 @@ ARK_API_KEY=...   # Seedance
 |---|---|---|
 | Q1 | 「LibTV」是否就是 LiblibAI 视频工作流？有无账号可再体验 | 按 LiblibAI 模式设计；有链接请给 |
 | Q2 | SenseNova U1 的 LiteLLM 接入方式与真实免费额度 | 先开验证卡，不阻塞 Mock/Seedance |
-| Q3 | MiniMax 是否恢复合并（曾 #373 后 revert #374） | M3 恢复；原因若为质量问题请说明 |
+| Q3 | MiniMax 是否恢复合并（曾 #373 后 revert #374） | **已决定：不恢复**。Owner：只到 2K、不能到 4K，整条线删除，缩短流程（2026-09-22 从本 PR 剔除） |
 | Q4 | Studio 代码放哪：本仓 `studio/` 还是独立仓 | **建议本仓 `studio/`**，复用 pipeline 测试 |
 | Q5 | 前端是否允许引入构建链（Vite/React） | **建议允许**；产物可 dist 进仓或构建脚本 |
 | Q6 | VR180 节点是子进程调 CLI 还是 in-process API | MVP 子进程（稳）；M3 in-process |

@@ -54,7 +54,7 @@
 |---|---|---|
 | E1 | `video.seedance` provider=mock | 产出 mp4；cost=0 |
 | E2 | provider=seedance 且 confirm_paid=false | 拒绝提交，提示费用估算 |
-| E3 | provider=minimax 且无 confirm | 同样拦截；费用表含 minimax-2k≈9.5 元/10s |
+| E3 | provider=minimax | 报错「unknown video provider」（MiniMax 已按 owner 决定删除） |
 | E4 | `video.seedvr2` mode=mock | lanczos 放大，文件变大 |
 | E5 | mode=seedvr2 无 CUDA/权重 | 明确报错并提示 mock / setup_seedvr2 |
 
