@@ -227,6 +227,8 @@ class TestStreamingMetadataInjection(unittest.TestCase):
             # ffmpeg/ffprobe runs here (the H-1.2 wiring is covered in
             # tests/test_streaming_backends.py).
             args.copy_audio_from = None
+            # S-4 (#396): pin the ambience-mix flag off (same truthy-MagicMock trap).
+            args.audio_mix = None
 
             pipeline_inst = MagicMock()
             pipeline_inst.process_stream.return_value = "out.mp4"
