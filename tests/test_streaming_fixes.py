@@ -82,6 +82,25 @@ class TestSbsLayout(unittest.TestCase):
         s_idx = cmd.index("-s")
         self.assertEqual(cmd[s_idx + 1], "7680x3840")
 
+    def test_ffmpeg_cmd_pix_fmt_defaults_to_yuv420p(self):
+        # S-6 (#397): the output planar format used to be hard-coded to
+        # yuv420p.  It is now a knob, but the default must stay yuv420p so
+        # every pre-S-6 stream is byte-identical.
+        p = _make_pipeline(output_width=100, output_height=50)
+        cmd = p._build_ffmpeg_cmd("out.mp4", p.output_width * 2, p.output_height)
+        # The command carries two -pix_fmt args: rgb24 for the input pipe and
+        # the output planar format next last.  The output one is the last.
+        self.assertEqual(cmd[-3], "-pix_fmt")
+        self.assertEqual(cmd[-2], "yuv420p")
+
+    def test_ffmpeg_cmd_pix_fmt_10bit_is_forwarded(self):
+        # S-6 (#397): a 10-bit HEVC delivery master passes yuv420p10le through
+        # untouched (ffmpeg validates the format, not the pipeline).
+        p = _make_pipeline(output_width=100, output_height=50, pix_fmt="yuv420p10le")
+        cmd = p._build_ffmpeg_cmd("out.mp4", p.output_width * 2, p.output_height)
+        self.assertEqual(cmd[-3], "-pix_fmt")
+        self.assertEqual(cmd[-2], "yuv420p10le")
+
     def test_open_ffmpeg_writer_receives_horizontal_sbs_size(self):
         """The writer opened by process_stream must declare 2W×H (mock ffmpeg)."""
         import numpy as np

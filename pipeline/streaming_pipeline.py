@@ -702,6 +702,13 @@ class StreamingPipeline:
         gop: int | None = None,
         force_idr: bool = False,
         faststart: bool | None = None,
+        # S-6 (#397): the output pix_fmt.  ``"yuv420p"`` (default) is the
+        # historical 8-bit planar setting — the bytes handed to ffmpeg are
+        # unchanged, so every existing stream stays byte-identical.  A
+        # 10-bit delivery master (Quest HMD, where the 10-bit ladder reduces
+        # banding on graded HDR-ish footage) passes ``"yuv420p10le"``; the
+        # rgb24 pipe frames are converted by ffmpeg before encoding.
+        pix_fmt: str = "yuv420p",
         # K-21 (#224): when a caller owns an intermediate directory (e.g.
         # run_pipeline's --temp-dir / make_comparison's per-recipe work dir),
         # pass it here so the streaming path writes depth products into
@@ -794,6 +801,11 @@ class StreamingPipeline:
         self.gop = gop
         self.force_idr = force_idr
         self.faststart = faststart
+        # S-6 (#397): output pix_fmt.  Kept as a plain string — validation is
+        # ffmpeg's job (an unknown planar format fails fast in the probe or the
+        # real encode, with the encoder name in the error), so the pipeline
+        # does not duplicate ffmpeg's pix_fmt whitelist.
+        self.pix_fmt = pix_fmt
         # K-21 (#224): caller-owned work directory. None ⇒ streaming path uses
         # (and owns cleanup of) a fresh tempfile.mkdtemp.
         self.temp_dir = temp_dir
@@ -968,7 +980,7 @@ class StreamingPipeline:
             cmd += ["-movflags", "+faststart"]
         cmd += [
             "-pix_fmt",
-            "yuv420p",
+            self.pix_fmt,
             output_path,
         ]
         return cmd
