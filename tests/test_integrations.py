@@ -86,11 +86,10 @@ class TestFactory:
         providers = list_providers()
         assert "kling" in providers
         assert "local-svd" in providers
-        assert "minimax" in providers
         assert "seedance" in providers
         assert "veo" in providers
         assert "mock" in providers
-        assert len(providers) == 6
+        assert len(providers) == 5
 
     def test_get_provider_kling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("KLING_API_KEY", "key")

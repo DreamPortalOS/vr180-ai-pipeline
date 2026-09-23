@@ -319,8 +319,6 @@ PROJECT_ENV_VARS = frozenset(
         "SEEDANCE_API_KEY",  # legacy alias, must stay rejected (see #330 test)
         "KLING_API_KEY",
         "VEO_API_KEY",
-        "MINIMAX_API_KEY",
-        "MINIMAX_API_BASE",
         "GCP_PROJECT_ID",
         # --- Usage ledger / budget gate (#328, #329) -----------------------
         "VR180_LEDGER_PATH",

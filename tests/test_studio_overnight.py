@@ -1,4 +1,4 @@
-"""Overnight: dirty subgraph rerun, gallery extraction, MiniMax provider registry."""
+"""Overnight: dirty subgraph rerun, gallery extraction, paid-provider guard."""
 
 from __future__ import annotations
 
@@ -95,23 +95,19 @@ def test_extract_gallery_from_production(tmp_path) -> None:
     assert gallery["shots"][0]["image"]
 
 
-def test_minimax_registered() -> None:
-    from integrations.factory import get_provider, list_providers
+def test_minimax_not_registered() -> None:
+    """Owner decision: MiniMax tops out at 2K, so the whole line was dropped (#374)."""
+    from integrations.factory import list_providers
 
-    assert "minimax" in list_providers()
-    with pytest.raises(ValueError, match="MINIMAX_API_KEY"):
-        get_provider("minimax")
+    assert "minimax" not in list_providers()
 
 
-def test_minimax_cost_estimate_in_studio_node() -> None:
-    from studio.nodes.seedance_video import estimate_cost_yuan
-
-    assert estimate_cost_yuan("minimax-2k", 10) == 9.5
+def test_studio_video_node_rejects_minimax() -> None:
     from studio.nodes.seedance_video import SeedanceVideoNode
 
-    with pytest.raises(ValueError, match="confirm_paid"):
+    with pytest.raises(ValueError, match="unknown video provider"):
         SeedanceVideoNode().run(
-            params={"provider": "minimax", "resolution": "minimax-2k"},
+            params={"provider": "minimax"},
             inputs={"prompt": "x"},
             work_dir=".",
             node_id="n",
