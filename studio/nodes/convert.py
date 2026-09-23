@@ -108,8 +108,12 @@ class DomeCoverageNode(StudioNode):
         if not media:
             raise ValueError("coverage node requires a video/image input")
         stats = analyze_media(str(media), frame_index=int(params.get("frame_index") or 0))
+        # Issue #401: ``passed`` follows the shared ``level`` (bad ⇒ 0, warn ⇒ 1
+        # with level passed through so the UI can mark it yellow), not a second
+        # ``coverage_deg >= min_deg`` threshold that disagreed with ``level`` and
+        # let a ``level="bad"`` master read ``passed=True``.
         min_deg = float(params.get("min_deg") or 85)
-        passed = 1 if stats.coverage_deg >= min_deg else 0
+        passed = 0 if stats.level == "bad" else 1
         report = stats.to_dict()
         report["min_deg"] = min_deg
         report["passed"] = bool(passed)
