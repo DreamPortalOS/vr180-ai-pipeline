@@ -11,9 +11,13 @@ Checks (each PASS/FAIL + measured value, worst frame wins over the sample):
   1. resolution — frame is square and exactly ``--size``² (default 4096²)
   2. circular mask — pixels outside the inscribed circle average < ``--mask-thresh``
      (black), pixels inside average above it (non-black)
-  3. coverage radius — annulus-by-annulus "has content" scan (ring std / mean
-     local-std above ``--content-thresh``); the outermost content ring is
-     reported as r/R and must be >= ``--min-coverage`` (default 0.9)
+  3. coverage radius — annulus-by-annulus "has content" scan; a pixel counts as
+     content when it is bright (gray > ``--content-thresh``) or textured (local
+     energy above the same floor). A ring PASSES only when its content-pixel
+     fraction reaches ``--ring-fill`` (default 0.9), so a ring is judged by how
+     much of its circumference is filled rather than by whether any azimuth has
+     content; the outermost passing ring is reported as r/R and must be >=
+     ``--min-coverage`` (default 0.9)
   4. zenith orientation — centre-disc vs bottom (forward-horizon) brightness /
      content is REPORTED ONLY, never FAILs
   5. mono metadata — the file must NOT contain st3d/sv3d boxes (dome is mono);
@@ -60,13 +64,24 @@ DEFAULT_SIZE = 4096
 DEFAULT_FRAMES = 5
 DEFAULT_MIN_COVERAGE = 0.9
 DEFAULT_MASK_THRESH = 8.0
-DEFAULT_CONTENT_THRESH = 5.0
+# Per-pixel content floor: a pixel is "content" when its gray value OR its
+# local texture energy exceeds this. 16 matches the brightness floor used to
+# derive the gate on a real 4K domemaster (content ends ~r/R 0.65).
+DEFAULT_CONTENT_THRESH = 16.0
+# A ring passes the coverage scan only when this fraction of its pixels are
+# content (full-circumference fill), not merely "any azimuth has content".
+DEFAULT_RING_FILL = 0.9
 
-# Annulus resolution of the coverage scan (1/25 R = 0.04 R per ring).
-NBINS = 25
+# Annulus resolution of the coverage scan (1/50 R = 0.02 R per ring).
+NBINS = 50
 # Frames are downscaled to this max dimension before analysis — coverage r/R
 # and mask means are scale-invariant, full-4K analysis only costs RAM.
 ANALYZE_MAX_DIM = 1024
+
+# Acceptance verdicts: the bottom line is a plain PASS/FAIL so a failing
+# domemaster (e.g. insufficient rim coverage) is not misread as "domemaster".
+VERDICT_PASS = "PASS"
+VERDICT_FAIL = "FAIL"
 
 
 @dataclass
@@ -88,11 +103,15 @@ class QAReport:
     duration_s: float = 0.0
     codec: str = ""
     coverage_r: float = 0.0
+    ring_fill: float = DEFAULT_RING_FILL
     outside_mean: float = 0.0
     inside_mean: float = 0.0
     zenith_center: float = 0.0
     zenith_bottom: float = 0.0
     frames_sampled: int = 0
+    # Per-ring {r, fill, mean} of the worst (coverage-setting) frame, so a
+    # human can see exactly where full-ring fill ends. Empty before analysis.
+    ring_profile: list[dict] = field(default_factory=list)
 
     @property
     def failed(self) -> bool:
@@ -183,12 +202,19 @@ def analyze_frame(
     frame: np.ndarray,
     mask_thresh: float = DEFAULT_MASK_THRESH,
     content_thresh: float = DEFAULT_CONTENT_THRESH,
+    ring_fill: float = DEFAULT_RING_FILL,
 ) -> dict:
     """Pure-numpy per-frame analysis (no I/O — unit-testable without ffmpeg).
 
     Returns dict with outside_mean / inside_mean (mask means), coverage_r
-    (outermost content ring as r/R), zenith_center / zenith_bottom (mean
-    texture energy of centre disc vs bottom patch), plus the ring table.
+    (outermost ring whose content-pixel fraction clears *ring_fill*, as r/R),
+    zenith_center / zenith_bottom (mean texture energy of centre disc vs
+    bottom patch), and ring_profile (per-ring {r, fill, mean} for review).
+
+    Coverage is a *full-circumference* measure: a ring passes only when at
+    least ``ring_fill`` of its pixels are content (bright or textured), so a
+    disc that merely fills one side of every ring cannot push the reported
+    radius out to the rim — the half-dome regression this gate exists to catch.
     """
     gray = _gray(frame)
     h, w = gray.shape
@@ -203,17 +229,23 @@ def analyze_frame(
     blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=3.0)
     energy = np.abs(gray - blur)
 
-    ring_std = np.zeros(NBINS, dtype=np.float64)
-    ring_energy = np.zeros(NBINS, dtype=np.float64)
+    # Per-pixel "has content": bright OR textured. A ring is judged by how
+    # much of its circumference is content (fill fraction), not by whether any
+    # single azimuth happens to be bright — that old rule let a half-filled
+    # disc read as fully covered.
+    has_content = (gray > content_thresh) | (energy > content_thresh)
+
+    ring_fill_frac = np.zeros(NBINS, dtype=np.float64)
+    ring_mean = np.zeros(NBINS, dtype=np.float64)
     for i in range(NBINS):
         lo, hi = i / NBINS, (i + 1) / NBINS
         m = (rr > lo) & (rr <= hi) & inside
         if m.any():
-            ring_std[i] = float(gray[m].std())
-            ring_energy[i] = float(energy[m].mean())
+            ring_fill_frac[i] = float(has_content[m].mean())
+            ring_mean[i] = float(gray[m].mean())
 
-    content = (ring_std > content_thresh) | (ring_energy > content_thresh)
-    outer = int(np.nonzero(content)[0].max()) if content.any() else -1
+    passing = ring_fill_frac >= ring_fill
+    outer = int(np.nonzero(passing)[0].max()) if passing.any() else -1
     coverage_r = (outer + 1) / NBINS if outer >= 0 else 0.0
 
     center = rr <= 0.25
@@ -221,14 +253,17 @@ def analyze_frame(
     fwd = (rr <= 1.0) & (np.mgrid[0:h, 0:w][0].astype(np.float32) > h * 0.72)
     zenith_bottom = float(energy[fwd].mean()) if fwd.any() else 0.0
 
+    ring_profile = [
+        {"r": (i + 1) / NBINS, "fill": float(ring_fill_frac[i]), "mean": float(ring_mean[i])} for i in range(NBINS)
+    ]
+
     return {
         "outside_mean": outside_mean,
         "inside_mean": inside_mean,
         "coverage_r": coverage_r,
         "zenith_center": zenith_center,
         "zenith_bottom": zenith_bottom,
-        "ring_std": ring_std.tolist(),
-        "ring_energy": ring_energy.tolist(),
+        "ring_profile": ring_profile,
     }
 
 
@@ -300,6 +335,7 @@ def run_qa(
     min_coverage: float = DEFAULT_MIN_COVERAGE,
     mask_thresh: float = DEFAULT_MASK_THRESH,
     content_thresh: float = DEFAULT_CONTENT_THRESH,
+    ring_fill: float = DEFAULT_RING_FILL,
     ffprobe: str = "ffprobe",
     ffmpeg: str = "ffmpeg",
     frames: list[np.ndarray] | None = None,
@@ -312,7 +348,7 @@ def run_qa(
     CI without ffmpeg can test the full gate on synthetic numpy frames;
     when omitted the file is probed/sampled for real.
     """
-    report = QAReport(path=path)
+    report = QAReport(path=path, ring_fill=ring_fill)
 
     if not Path(path).is_file() and frames is None:
         report.checks.append(Check("input file", "fail", f"file not found: {path}"))
@@ -365,12 +401,20 @@ def run_qa(
     report.frames_sampled = len(sampled)
     report.checks.append(Check("frame sampling", "pass", f"{len(sampled)} frame(s) sampled"))
 
-    per = [analyze_frame(_downscale(f), mask_thresh=mask_thresh, content_thresh=content_thresh) for f in sampled]
+    per = [
+        analyze_frame(_downscale(f), mask_thresh=mask_thresh, content_thresh=content_thresh, ring_fill=ring_fill)
+        for f in sampled
+    ]
     report.coverage_r = min(p["coverage_r"] for p in per)
     report.outside_mean = max(p["outside_mean"] for p in per)
     report.inside_mean = min(p["inside_mean"] for p in per)
     report.zenith_center = sum(p["zenith_center"] for p in per) / len(per)
     report.zenith_bottom = sum(p["zenith_bottom"] for p in per) / len(per)
+    # Emit the ring profile of the frame that set the coverage radius, so the
+    # JSON shows exactly where full-ring fill ends (worst-of-sample, like
+    # coverage_r itself) — not an average that could hide a thin rim.
+    worst = min(per, key=lambda p: p["coverage_r"])
+    report.ring_profile = worst["ring_profile"]
 
     # ── 2. circular mask ──────────────────────────────────────────────────
     if report.outside_mean < mask_thresh:
@@ -427,7 +471,7 @@ def run_qa(
     else:
         report.checks.append(Check("mono metadata", "pass", "no st3d/sv3d — mono domemaster"))
 
-    report.verdict = "domemaster" if not report.failed else "not domemaster"
+    report.verdict = VERDICT_PASS if not report.failed else VERDICT_FAIL
     return report
 
 
@@ -452,7 +496,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--frames", type=int, default=DEFAULT_FRAMES, help="Frames to sample (default 5)")
     parser.add_argument("--min-coverage", type=float, default=DEFAULT_MIN_COVERAGE, help="Min coverage r/R (0.9)")
     parser.add_argument("--mask-thresh", type=float, default=DEFAULT_MASK_THRESH, help="Outside black threshold")
-    parser.add_argument("--content-thresh", type=float, default=DEFAULT_CONTENT_THRESH, help="Ring content threshold")
+    parser.add_argument(
+        "--content-thresh",
+        type=float,
+        default=DEFAULT_CONTENT_THRESH,
+        help="Per-pixel content floor (bright OR textured)",
+    )
+    parser.add_argument(
+        "--ring-fill",
+        type=float,
+        default=DEFAULT_RING_FILL,
+        help="Fraction of a ring that must be content to count as covered (0.9 = full circumference)",
+    )
     parser.add_argument("--ffprobe", default="ffprobe", help="Path to ffprobe binary")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="Path to ffmpeg binary")
     args = parser.parse_args(argv)
@@ -464,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
         min_coverage=args.min_coverage,
         mask_thresh=args.mask_thresh,
         content_thresh=args.content_thresh,
+        ring_fill=args.ring_fill,
         ffprobe=args.ffprobe,
         ffmpeg=args.ffmpeg,
     )

@@ -34,6 +34,24 @@ def _domemaster(fill_r: float, size: int = SIZE, seed: int = 0) -> np.ndarray:
     return frame
 
 
+def _half_dome(size: int = SIZE, seed: int = 0) -> np.ndarray:
+    """Asymmetric dome: bottom semicircle filled to r=0.95, top only to r=0.6.
+
+    The VR180→dome defect this gate exists to catch — content packed into one
+    side and stretched to the rim. One azimuth reaches r≈0.95, but only ~half
+    the circumference does, so full-ring-fill coverage must collapse to ~0.6.
+    """
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:size, 0:size].astype(float)
+    rr = np.sqrt((xx - (size - 1) / 2.0) ** 2 + (yy - (size - 1) / 2.0) ** 2) / (size / 2.0)
+    noise = rng.integers(0, 256, size=(size, size)).astype(np.uint8)
+    bottom = yy > (size - 1) / 2.0
+    fill = (bottom & (rr <= 0.95)) | (~bottom & (rr <= 0.6))
+    frame = np.zeros((size, size, 3), dtype=np.uint8)
+    frame[fill] = np.stack([noise[fill]] * 3, axis=1)
+    return frame
+
+
 def _probe_data(size: int = SIZE) -> dict:
     return {
         "streams": [
@@ -241,6 +259,90 @@ class TestExitCodesAndJson:
 
         monkeypatch.setattr(dome_qa, "_probe", _boom)
         assert run_qa(path, size=SIZE).failed
+
+
+class TestHalfDomeRegression:
+    """The VR180→dome defect: one side packed to the rim, the other short.
+
+    Under the old any-azimuth rule every outer ring had *some* content (the
+    filled bottom half) and the disc read as ~0.95 covered. Full-ring-fill
+    coverage must instead collapse to the short side (~0.6) and FAIL.
+    """
+
+    def test_half_dome_coverage_collapses(self):
+        got = analyze_frame(_half_dome())
+        # bottom reaches r≈0.95 but only ~half the circumference does
+        assert got["coverage_r"] < 0.7
+        assert got["coverage_r"] < 0.9
+
+    def test_half_dome_gate_rejects(self, tmp_path):
+        path = str(tmp_path / "half.mp4")
+        tmp_path.joinpath("half.mp4").write_bytes(b"fake")
+        report = run_qa(path, size=SIZE, frames=[_half_dome()], probe_data=_probe_data(), stereo_boxes=[])
+        assert _status(report, "coverage radius") == "fail"
+        assert report.failed
+        assert report.verdict == "FAIL"
+
+    def test_half_dome_worst_frame_wins(self, tmp_path):
+        # a clean full dome in the sample must not rescue the half-dome frame
+        path = str(tmp_path / "mix.mp4")
+        tmp_path.joinpath("mix.mp4").write_bytes(b"fake")
+        report = run_qa(
+            path,
+            size=SIZE,
+            frames=[_domemaster(0.95), _half_dome()],
+            probe_data=_probe_data(),
+            stereo_boxes=[],
+        )
+        assert _status(report, "coverage radius") == "fail"
+        assert report.verdict == "FAIL"
+
+
+class TestRingProfile:
+    """JSON carries a per-ring {r, fill, mean} trace for human review."""
+
+    def test_ring_profile_well_formed(self):
+        got = analyze_frame(_domemaster(0.95))
+        rp = got["ring_profile"]
+        assert len(rp) == dome_qa.NBINS
+        assert set(rp[0]) == {"r", "fill", "mean"}
+        for entry in rp:
+            assert 0.0 < entry["r"] <= 1.0
+            assert 0.0 <= entry["fill"] <= 1.0
+
+    def test_ring_profile_traces_fill_edge(self):
+        # a 0.6 fill: rings inside are full, rings beyond are empty
+        got = analyze_frame(_domemaster(0.6))
+        rp = got["ring_profile"]
+        full = [e["fill"] for e in rp if e["r"] <= 0.58]
+        empty = [e["fill"] for e in rp if e["r"] >= 0.70]
+        assert min(full) >= 0.9
+        assert max(empty) < 0.1
+
+    def test_ring_profile_in_payload(self, tmp_path):
+        path = str(tmp_path / "d.mp4")
+        tmp_path.joinpath("d.mp4").write_bytes(b"fake")
+        report = run_qa(path, size=SIZE, frames=[_domemaster(0.95)], probe_data=_probe_data(), stereo_boxes=[])
+        assert len(report.ring_profile) == dome_qa.NBINS
+        assert report.ring_fill == dome_qa.DEFAULT_RING_FILL
+
+
+class TestVerdictText:
+    """Acceptance verdict is a plain PASS/FAIL, not 'domemaster'/'not domemaster'."""
+
+    def test_pass_verdict(self, tmp_path):
+        path = str(tmp_path / "d.mp4")
+        tmp_path.joinpath("d.mp4").write_bytes(b"fake")
+        report = run_qa(path, size=SIZE, frames=[_domemaster(0.95)], probe_data=_probe_data(), stereo_boxes=[])
+        assert not report.failed
+        assert report.verdict == "PASS"
+
+    def test_fail_verdict(self, tmp_path):
+        path = str(tmp_path / "d.mp4")
+        tmp_path.joinpath("d.mp4").write_bytes(b"fake")
+        report = run_qa(path, size=SIZE, frames=[_domemaster(0.6)], probe_data=_probe_data(), stereo_boxes=[])
+        assert report.failed
+        assert report.verdict == "FAIL"
 
 
 class TestSubprocessDiscipline:
