@@ -14,14 +14,18 @@ Subcommands
 ``pad169 <in.jpg|png> <out>``
     1:1 → 16:9: place the square image centred on a **black** canvas, height
     unchanged, ``width = round(height * 16 / 9)`` rounded up to even (ffmpeg
-    needs even dimensions).  Written as a lossless PNG/JPEG by OpenCV.
+    needs even dimensions).  Written by OpenCV — PNG stays lossless, JPEG is
+    lossy (q=95).
 
 ``crop11 <in.mp4|jpg|png> <out>``
     16:9 → 1:1: centred square crop (side = input height) and erase everything
     outside the inscribed circle to pure black.  Images go through OpenCV;
     videos go through **ffmpeg** (subprocess *list* form, never ``shell=True``)
     with ``crop=ih:ih`` plus a ``geq`` circle mask, and the audio track is
-    stream-copied (``-c:a copy``) so the clip keeps its sound untouched.
+    stream-copied (``-c:a copy``) so the clip keeps its sound untouched.  The
+    mask is exact in the frames ffmpeg builds; the H.264 4:2:0 encode
+    afterwards puts a 1–3 px chroma/ringing halo on the hard circle edge (mean
+    over the whole surround is still < 1.5 / 255).
 
 ``rimlift <in> <out> [--target 0.55] [--start 0.5] [--max-gain 4]``
     Radial brightness lift by radius profile: for every ring ``r >= start`` the
@@ -238,6 +242,15 @@ def crop11_filter() -> str:
     full-range RGB planes with no chroma subsampling to smear the circle edge,
     and ``r(X,Y)``/``g(X,Y)``/``b(X,Y)`` pass the inside pixels through
     unchanged while the outside gets a literal 0 in every plane.
+
+    The frames handed to the encoder are therefore exactly black outside the
+    circle; what the *decoder* gives back is not, quite: 4:2:0 shares one
+    chroma sample per 2×2 luma block, so the blocks straddling the circle edge
+    carry content chroma onto their black luma, and the DCT rings a little
+    further out.  Measured on a 180² testsrc2 clip at crf 18: mean 1.3/255 over
+    the whole surround (the dome gate's own outside threshold is 8), halo
+    amplitude < 16 beyond 3 px.  Nothing in a 4:2:0 bitstream can avoid that;
+    ``yuv444p`` could, at the cost of player compatibility.
     """
     circle = geq_circle_expression()
     return (
