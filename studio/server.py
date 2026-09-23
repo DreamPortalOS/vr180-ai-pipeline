@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 
+from studio.coverage import _downscale, analyze_frame
 from studio.graph import GraphError, extract_gallery, list_node_types, run_graph
 from studio.models import Project, StudioModelError, empty_demo_project
 from studio.projects import ProjectStore, ProjectStoreError
@@ -152,6 +153,30 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
         except StudioModelError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "name": project.name, "nodes": len(project.nodes), "edges": len(project.edges)}
+
+    @app.post("/api/coverage")
+    async def analyze_coverage(request: Request) -> dict[str, Any]:
+        """Measure the coverage radius of a domemaster frame sent by the 3D preview.
+
+        The request body is a decodable image (png/jpg/webp). It is analysed by
+        ``studio.coverage.analyze_frame`` — the single shared full-ring-fill
+        scan also used by ``scripts/dome_qa.py`` and the ``qa.dome_coverage``
+        node — so the browser readout, the Studio node and the release gate
+        all report the same number for the same master (issue #405: the panel
+        previously ran a third, client-side scan at ``edgeAt(0.98)`` that could
+        disagree). The frontend now only draws the circle; the reading is the
+        server's.
+        """
+        import cv2
+        import numpy as np
+
+        data = await request.body()
+        if not data:
+            raise HTTPException(status_code=400, detail="empty body: POST a domemaster image")
+        frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None or frame.shape[0] < 2 or frame.shape[1] < 2:
+            raise HTTPException(status_code=400, detail="unsupported or truncated image")
+        return analyze_frame(_downscale(frame)).to_dict()
 
     @app.post("/api/run")
     def run(request: RunRequest) -> dict[str, Any]:
