@@ -711,7 +711,7 @@ class TestStreamingBranchInjection(unittest.TestCase):
     """The streaming CLI branch must inject the factory-built backends into
     StreamingPipeline (this is the wiring that was missing pre-I-5)."""
 
-    def _run_main(self):
+    def _run_main(self, *, allow_fallback=False, depth_error=None):
         sys.path.insert(0, os.path.join(PROJECT_ROOT, "scripts"))
         try:
             import run_pipeline
@@ -749,6 +749,9 @@ class TestStreamingBranchInjection(unittest.TestCase):
             args.copy_audio_from = None
             # S-4 (#396): same trap for the ambience-mix flag.
             args.audio_mix = None
+            # #410: degrading is opt-in; pin it so the MagicMock default
+            # (a truthy mock) cannot switch it on by accident.
+            args.allow_backend_fallback = allow_fallback
 
             captured = {}
 
@@ -764,7 +767,12 @@ class TestStreamingBranchInjection(unittest.TestCase):
             with (
                 patch.object(run_pipeline, "parse_args", return_value=args),
                 patch.object(run_pipeline, "apply_quality_preset"),
-                patch.object(run_pipeline, "build_depth_backend", return_value=(fake_depth, "depthcrafter")),
+                patch.object(
+                    run_pipeline,
+                    "build_depth_backend",
+                    return_value=(fake_depth, "depthcrafter"),
+                    side_effect=depth_error,
+                ),
                 patch.object(
                     run_pipeline, "build_stereo_backend", return_value=(fake_stereo, "stereocrafter")
                 ) as mock_stereo_factory,
@@ -780,6 +788,7 @@ class TestStreamingBranchInjection(unittest.TestCase):
                 patch("os.replace"),
             ):
                 run_pipeline.main()
+            self._last_args = args
             return captured, mock_stereo_factory
         finally:
             import contextlib
@@ -797,15 +806,44 @@ class TestStreamingBranchInjection(unittest.TestCase):
         self.assertEqual(captured.get("depth_backend_name"), "depthcrafter")
         self.assertEqual(captured.get("stereo_backend_name"), "stereocrafter")
 
-    def test_streaming_branch_uses_fallback_policy_for_stereo(self):
-        """I-7 (#137) acceptance: the streaming branch builds the stereo backend
-        with ``fallback=True`` — an unavailable StereoCrafter degrades to the
-        default renderer with a loud WARNING, never a silent wrong-model run and
-        never a hard crash of the whole streaming job."""
+    def test_streaming_branch_refuses_fallback_by_default(self):
+        """#410 supersedes I-7 (#137): degrading is now opt-in.
+
+        I-7 accepted "degrade with a loud WARNING, never crash the job".  On
+        2026-09-24 that policy let an A/B render run DepthCrafter-vs-Depth-Anything
+        as Depth-Anything twice (DepthCrafter paths missing in a worktree) and
+        produce two byte-identical files that nearly went to a blind review.
+        The streaming branch now builds both backends with ``fallback=False``
+        unless ``--allow-backend-fallback`` is passed.
+        """
         _, mock_stereo_factory = self._run_main()
-        mock_stereo_factory.assert_called_once()
+        _, kwargs = mock_stereo_factory.call_args
+        self.assertEqual(kwargs.get("fallback"), False)
+
+    def test_allow_backend_fallback_restores_the_degrade_policy(self):
+        _, mock_stereo_factory = self._run_main(allow_fallback=True)
         _, kwargs = mock_stereo_factory.call_args
         self.assertEqual(kwargs.get("fallback"), True)
+
+    def test_unavailable_requested_backend_exits_2_with_setup_hint(self):
+        """#410: an explicitly requested backend that cannot be built stops the run."""
+        with self.assertLogs(level="ERROR") as cm, self.assertRaises(SystemExit) as ctx:
+            self._run_main(depth_error=RuntimeError("DepthCrafter repository directory not specified."))
+        self.assertEqual(ctx.exception.code, 2)
+        joined = "\n".join(cm.output)
+        for name in (
+            "DEPTHCRAFTER_REPO_DIR",
+            "DEPTHCRAFTER_PYTHON",
+            "DEPTHCRAFTER_MODEL_DIR",
+            "--allow-backend-fallback",
+        ):
+            self.assertIn(name, joined)
+
+    def test_streaming_branch_records_the_backends_that_ran(self):
+        """#410: the names reach args so the sidecar can record them."""
+        self._run_main()
+        self.assertEqual(self._last_args.depth_backend_used, "depthcrafter")
+        self.assertEqual(self._last_args.stereo_backend_used, "stereocrafter")
 
 
 # ---------------------------------------------------------------------------
