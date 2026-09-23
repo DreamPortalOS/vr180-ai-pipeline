@@ -342,6 +342,8 @@ PROJECT_ENV_VARS = frozenset(
         "DEPTHCRAFTER_REPO_DIR",
         "DEPTHCRAFTER_TARGET_FPS",
         "DEPTHCRAFTER_TIMEOUT_SEC",
+        # S-6 (#397): worktree cache-root override (depth side).
+        "VR180_DEPTH_CACHE_DIR",
         # --- StereoCrafter backend -----------------------------------------
         "STEREOCRAFTER_CKPT_DIR",
         "STEREOCRAFTER_FRAMES_CHUNK",
