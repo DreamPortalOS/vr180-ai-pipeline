@@ -106,6 +106,35 @@
 - FastAPI schema 设计合理（Pydantic v2）
 - Dockerfile 存在，容器化基础已有
 
+### 2.3 音频处理：audio_mux + audio_mix
+
+VR180 / Fulldome 转换本身只产出无声视频，音频由两个独立模块在最终成品上挂载，
+两者都走 ffmpeg/ffprobe 的 **subprocess list 形式**（禁 `shell=True`），命令构造
+是纯函数，可在 CI（CPU-only、无模型、无网络）单测：
+
+- `pipeline/audio_mux.py`（issue #73, H-1）— **无损直通**。`--copy-audio-from`
+  把源视频的音轨以 `-c copy` 原样 remux 进 VR180 输出（不重编码），并保留已注入的
+  sv3d/st3d 盒子（`-c copy` 不动 user-data 盒子）。
+- `pipeline/audio_mix.py`（issue #396, S-4）— **外部环境音混入**。`--audio-mix <file>`
+  把一条环境音轨混入最终输出，视频流 `-c:v copy` 不重编码，音频 AAC 192k 立体声：
+
+  ```bash
+  # 单轨：环境音替换任何已有音轨
+  python scripts/run_pipeline.py -i in.mp4 --audio-mix ambience.wav --audio-loop --audio-fade 1.0
+  # 双轨：与 --copy-audio-from 同时给 → amix（直通轨 + 环境轨）
+  python scripts/run_pipeline.py -i in.mp4 --copy-audio-from src.mp4 --audio-mix ambience.wav --audio-gain-db 3
+  # 穹顶路线同样支持（dome 输出无 sv3d/st3d，故不做 re-inject）
+  python scripts/run_pipeline.py -i in.mp4 --projection fulldome --audio-mix ambience.wav
+  ```
+
+  参数：`--audio-gain-db`（默认 0）、`--audio-loop`（音轨短于视频时循环）、
+  `--audio-fade`（首尾淡入淡出秒，默认 1.0，`<=0` 关闭）。循环实现走 filtergraph 内
+  `aloop + atrim + asetpts`（重新引入有限 EOF，避免 `-stream_loop -1` 永不 EOF 导致
+  `areverse` 淡出挂死）。dome + VR180 两条路线都在 `scripts/run_pipeline.py` 的三个
+  音频挂载点（batch VR180 / 流式 VR180 / fulldome）接上 `--audio-mix`；VR180 路线在
+  混音后重新注入 sv3d/st3d（issue #91：`-c:v copy` + 重映射音轨会丢 sample-entry 盒子），
+  dome 路线无球形盒子故跳过该步。
+
 ---
 
 ## 3. 目标架构
