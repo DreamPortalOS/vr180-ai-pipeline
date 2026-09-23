@@ -38,3 +38,24 @@
 - [ ] `run_pipeline --stereo-backend apache`（或等价）存在且默认可选
 - [ ] CI 不下载非 Apache 权重
 - [ ] 质量对比表（哪怕只有 2 条样片）写入 docs
+
+## 实测（2026-09-24）
+
+同一素材双臂实测（#397）。源片：`video/gen_v10_4k.mp4`（2880×2880，241 帧，24 fps）。
+两臂命令完全一致：`--quality standard --comfort balanced --preset standalone
+--input-projection fisheye --fisheye-fov 180 --pix-fmt yuv420p10le`；立体渲染两臂均使用
+本仓默认 renderer（**非** StereoCrafter），唯一变量是深度模型。
+
+| 臂 | 耗时 | 显存峰值 | 许可 |
+|---|---|---|---|
+| DepthCrafter | 1090 s（深度命中缓存；冷深度按本仓笔记约 +34 min） | 3575 MiB | 学术/研究限定，**不可商用** |
+| Depth-Anything-V2-Small | 1146 s | 4132 MiB | **Apache-2.0**（已从缓存的 HF model card 核实） |
+
+- 两条产物均通过 `vr180_qa` 6/6：5760×2880 HEVC 10-bit、sv3d+st3d box、SBS 2×2880² 方眼布局。
+- **许可陷阱**：Depth-Anything-V2 的 Base/Large 变体是 CC-BY-NC，**不是** Apache；
+  商用链路必须钉死 **Small**。
+- **教训**：第一次对比跑在 worktree 里因 DepthCrafter 路径缺失**静默回退**到 depth-anything，
+  两臂产出字节级相同（无效对比）。通过显式设置 `DEPTHCRAFTER_REPO_DIR` / `DEPTHCRAFTER_PYTHON` /
+  `DEPTHCRAFTER_MODEL_DIR` 修复；防回退护栏见 issue #410。
+- **质量判定**：PENDING —— 待 owner 在 Quest 上盲审 `video/ab/ab_A.mp4` vs `video/ab/ab_B.mp4`
+  （臂↔文件映射密封于 KEY.txt，不入仓）。
