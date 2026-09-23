@@ -364,6 +364,73 @@ ANCHOR_OFFSET_MAX: float = 0.30
 #: forgiving gate for a check that only ever WARNs.
 ANCHOR_DETECTED_FRAC_MIN: float = 0.5
 
+# --- Anchor angle thresholds (G-12 #372, landed in #398) -------------------
+# The area band above (8–15 %) was measured on Red Raion's *plane* stills and
+# is the right yardstick for the dome route (a flat picture mapped onto a
+# dome).  It is the *wrong* yardstick for the VR180 route, which maps a
+# flat source onto a 180° sphere via an equidistant fisheye: under that
+# projection angular size is linear in width (``r ∝ θ``), so 8 % of the frame
+# is ≈28 % of the frame width is ≈51° of the viewer's field — a subject the
+# owner reported as "still too big, it blocks the forward view" across three
+# rounds of Quest testing.  #372's table (area → width → angle at fov 180):
+#
+#   8 %   → ~28 % width → ~51°   (the old area-band floor)
+#   2.2 % → ~15 % width → ~27°
+#   0.4 % → ~6 %  width → ~10°
+#
+# The linear↔area convention in that table is ``width_frac = √area_frac``
+# (the equivalent-square width), which is why 8 % area reads as 28 % width
+# and not as 32 % (the bounding-box width of a disc).  ``anchor_angle`` uses
+# exactly that convention so the numbers in this block reproduce.
+
+#: Which projection the source is destined for, mirroring ``run_pipeline``'s
+#: ``--input-projection``.  ``rect`` keeps the area band above (dome / plane
+#: stills); ``fisheye`` judges the anchor by its **angular size** instead.
+DEFAULT_INPUT_PROJECTION: str = "rect"
+
+#: Full angular span across the frame for an equidistant fisheye source, in
+#: degrees — the same quantity ``run_pipeline``'s ``--fisheye-fov`` carries
+#: (default 180 = the inscribed image circle spans the whole hemisphere).
+DEFAULT_FISHEYE_FOV: float = 180.0
+
+#: Source horizontal FOV for the rectilinear (pinhole) route, in degrees.
+#: Mirrors ``run_pipeline``'s ``--src-hfov`` so the two tools agree on what a
+#: "degree" means; ``70`` is the stereo renderer's legacy default.
+DEFAULT_SRC_HFOV: float = 70.0
+
+#: Target angular size band for a VR180 fisheye anchor, in degrees.  Below
+#: :data:`ANCHOR_MIN_DEG` the subject is too small to hold the eye; above
+#: :data:`ANCHOR_MAX_DEG` it occludes the forward view.  **Both are FAILs** on
+#: the fisheye route (a subject the wrong *size* is a generation defect, not
+#: a stylistic preference), each carrying a suggested rescale factor.  The band
+#: was the owner's three-round Quest convergence, not a measurement.
+ANCHOR_MIN_DEG: float = 6.0
+ANCHOR_MAX_DEG: float = 12.0
+
+#: Fisheye-route detection floor as an angle, in degrees.  A subject smaller
+#: than this is reported as *missing* rather than *too small*: a subject the
+#: detector cannot separate from speckle carries no usable evidence either
+#: way, so it lands in the same ``没有锚点`` branch the rect route uses for a
+#: genuinely empty frame.
+#:
+#: It is an **angle, not an area**, because the rect route's area floor
+#: :data:`ANCHOR_MIN_AREA` (0.8 %) corresponds to √0.008 × 180 ≈ **16°** at the
+#: default fisheye fov — directly above :data:`ANCHOR_MAX_DEG`, which would
+#: make every anchor the detector can find report "too big" and leave the
+#: 6–12° pass band permanently unreachable.  Lowering the *area* floor to let
+#: a 9° anchor through is not an option: the rescue path
+#: (:func:`anchor_stats`'s ``rescue`` step) amplifies sub-floor speck four- to
+#: five-fold, so a 0.25 % floor fabricates 2 % anchors out of empty frames
+#: (measured: 9 of 11 subjectless fixtures report a found anchor at area-floor
+#: 0.003).  The angle floor sidesteps that by judging *after* the detector's
+#: own (unchanged) mask, not by opening the mask wider.
+#:
+#: Set between the loudest subjectless fixture — 0.21 % of the frame = √0.0021 ≈
+#: 4.6 % width ≈ **8.2°** as the detector reports it — and the 6° pass-band
+#: floor.  7° clears the noise by ~1.3° and stays 1° under the band so a
+#: barely-credible subject reads "too small", not "missing".
+ANCHOR_MIN_DEG_FLOOR: float = 7.0
+
 #: Barrier distance, in CIE-Lab units at :data:`ANCHOR_ANALYSIS_MAX_DIM`, at
 #: which :func:`enclosure_gate` saturates — the step you have to climb to get
 #: *inside* something that counts as fully enclosed.
@@ -615,6 +682,28 @@ ANCHOR_OFF_SPEC_ADVICE = (
     "注意：主体是找到了的，要改的是它的大小/位置，不是从头加一个主体——"
     "偏小就把它拉近或放大（提示词写明主体占画面 1/3 左右、镜头更贴近），"
     "偏大就退远一点，偏心就把它挪回中央 1/3 区，然后重生成再体检一次。"
+)
+
+#: Fisheye route — the anchor subtends too large an angle and occludes the
+#: forward view.  A format string: ``{scale}`` is the factor to *shrink* the
+#: subject by (< 1) so the rescaled anchor lands at :data:`ANCHOR_MAX_DEG`,
+#: ``{max_deg}`` is that ceiling.  The owner's three Quest rounds said every
+#: anchor the old area band called 偏小 was in fact 太大 once mapped onto the
+#: 180° sphere — this is the advice that was missing.
+ANCHOR_TOO_BIG_ADVICE = (
+    "鱼眼 180° 路线下主体张角过大、遮挡正前方视野（owner 三轮真机反馈的「太大」，#372）。"
+    "重生成时把主体在画面里的占比缩到约 {scale:.2f}×（张角收到 {max_deg:g}° 以内）留出前方视野再进管线。"
+    "注意：这是 VR180 鱼眼路线的判据，与球幕/平面剧照的面积区间不同——鱼眼下按张角判，不按面积。"
+)
+
+#: Fisheye route — the anchor is real but subtends too small an angle to hold
+#: the eye, so the viewer's gaze drifts to the rim where the projection is
+#: weakest.  ``{scale}`` is the factor to *enlarge* the subject by (> 1) so it
+#: clears :data:`ANCHOR_MIN_DEG`, ``{min_deg}`` is that floor.
+ANCHOR_TOO_SMALL_ADVICE = (
+    "鱼眼 180° 路线下主体张角太小、几乎不可见，视线会飘向边缘瑕疵（#372）。"
+    "重生成时把主体在画面里的占比放到约 {scale:.2f}×（张角放到 {min_deg:g}° 以上）让它足以抓住视线再进管线。"
+    "注意：这是 VR180 鱼眼路线的判据，与球幕/平面剧照的面积区间不同——鱼眼下按张角判，不按面积。"
 )
 
 #: Non-square is legitimate (fisheye / 16:9 routes), so this is guidance, not
@@ -1797,8 +1886,47 @@ def anchor_stats(
     }
 
 
+def anchor_angle(
+    area_frac: float,
+    projection: str,
+    fisheye_fov: float = DEFAULT_FISHEYE_FOV,
+    src_hfov: float = DEFAULT_SRC_HFOV,
+) -> float:
+    """Angular size of an anchor of ``area_frac`` of the frame, in degrees.
+
+    The VR180 route maps a flat source onto a sphere via an **equidistant
+    fisheye** (``r ∝ θ``), under which angular size is linear in the share of
+    the frame width the subject spans::
+
+        deg = width_frac × fisheye_fov        # fisheye
+        deg = width_frac × src_hfov            # rectilinear / pinhole
+
+    (the rectilinear rule is the small-angle linearisation, which is what
+    ``run_pipeline``'s ``--src-hfov`` means).  ``anchor_stats`` reports an
+    *area*, not a width, so the linear fraction is recovered as the
+    **equivalent-square width** ``√area_frac`` — the repo's convention in #372's
+    area→width→angle table (8 % area ≈ 28 % width ≈ 51° at fov 180, which this
+    reproduces exactly).  The equivalent-square rather than the bounding-box
+    width (``2√(area/π)`` for a disc) because the table is what the owner's Quest
+    feedback calibrated against, and because the subject is rarely a clean disc.
+
+    ``rect`` (the dome / still route) keeps judging by area in :func:`check_anchor`;
+    the angle is still reported there, but only as context.
+    """
+    if area_frac <= 0.0:
+        return 0.0
+    width_frac = math.sqrt(area_frac)
+    fov = fisheye_fov if projection == "fisheye" else src_hfov
+    return width_frac * fov
+
+
 def check_anchor(
     per_frame: Sequence[dict[str, float]],
+    projection: str = DEFAULT_INPUT_PROJECTION,
+    fisheye_fov: float = DEFAULT_FISHEYE_FOV,
+    src_hfov: float = DEFAULT_SRC_HFOV,
+    anchor_min_deg: float = ANCHOR_MIN_DEG,
+    anchor_max_deg: float = ANCHOR_MAX_DEG,
     area_min: float = ANCHOR_AREA_MIN,
     area_max: float = ANCHOR_AREA_MAX,
     offset_max: float = ANCHOR_OFFSET_MAX,
@@ -1806,15 +1934,30 @@ def check_anchor(
 ) -> CheckResult:
     """Verdict over the sampled frames: is something holding the eye up front?
 
-    Never a FAIL.  Plenty of legitimate shots — a pure landscape fly-through, an
-    abstract tunnel — have no subject, so blocking a run over it would be wrong;
-    what the operator needs is to be *told*, because the alternative to looking
-    at an anchor is looking at the rim, and the rim is where our geometry is
-    weakest.
+    Two routes, selected by ``projection``:
+
+    * ``rect`` (default, the dome / still route): the area band
+      :data:`ANCHOR_AREA_MIN`–:data:`ANCHOR_AREA_MAX` (8–15 %), a WARN never a
+      FAIL — unchanged from before this card.  A landscape fly-through with no
+      hero is a legitimate shot, so blocking a run over it would be wrong; the
+      operator needs to be *told*, because the alternative to looking at an
+      anchor is looking at the rim, and the rim is where our geometry is
+      weakest.
+
+    * ``fisheye`` (the VR180 route, ``--input-projection fisheye``): the verdict
+      is taken on the anchor's **angular size** instead, against
+      :data:`ANCHOR_MIN_DEG`/:data:`ANCHOR_MAX_DEG` (6–12°).  The area band is
+      wrong here — under an equidistant fisheye 8 % of the frame is ≈51° of the
+      viewer's field, which the owner reported as 太大 across three Quest rounds
+      (#372).  Both sides of the band are **FAILs** (a subject the wrong size is
+      a generation defect on this route), and each carries a ``suggested_scale``
+      rescale factor that lands the subject back in the band.
 
     Aggregation is the median over the frames that *had* a subject, with a
     separate detection rate, so a clip that only shows its hero half the time
-    reports an honest 50 % rather than an area averaged with zeros.
+    reports an honest 50 % rather than an area averaged with zeros.  The angle
+    is computed per-frame and medians separately, so it stays the median of
+    angles rather than the angle of the median area.
     """
     if not per_frame:
         return CheckResult(
@@ -1837,11 +1980,19 @@ def check_anchor(
         "offset_max": offset_max,
         "reference_area": 0.113,
         "reference_offset": 0.236,
+        "projection": projection,
+        "fisheye_fov": fisheye_fov,
+        "src_hfov": src_hfov,
+        "anchor_min_deg": anchor_min_deg,
+        "anchor_max_deg": anchor_max_deg,
     }
 
     if detected_frac < detected_frac_min:
         measured["area"] = 0.0
         measured["offset"] = 0.0
+        measured["anchor_deg"] = 0.0
+        measured["anchor_verdict"] = "missing"
+        measured["suggested_scale"] = None
         return CheckResult(
             "anchor",
             STATUS_WARN,
@@ -1853,29 +2004,60 @@ def check_anchor(
 
     area = float(np.median([f["area"] for f in found]))
     offset = float(np.median([f["offset"] for f in found]))
+    deg = float(np.median([anchor_angle(f["area"], projection, fisheye_fov, src_hfov) for f in found]))
     measured["area"] = round(area, 4)
     measured["offset"] = round(offset, 4)
+    measured["anchor_deg"] = round(deg, 2)
+    measured["anchor_width_frac"] = round(math.sqrt(area), 4)
+    measured["suggested_scale"] = None
+    measured["anchor_verdict"] = "ok"
     numbers = (
-        f"主体面积 {area * 100:.1f}%、偏心 {offset:.2f}"
+        f"主体面积 {area * 100:.1f}%、张角 {deg:.1f}°、偏心 {offset:.2f}"
         f"（{len(found)}/{len(per_frame)} 帧检出；竞品实测中位 11.3% / 0.236）"
     )
 
     problems: list[str] = []
-    if area > area_max:
-        problems.append(f"面积偏大：{area * 100:.1f}% > {area_max * 100:g}%，主体糊住了画幅")
-    elif area < area_min:
-        problems.append(f"面积偏小：{area * 100:.1f}% < {area_min * 100:g}%，抓不住视线")
-    if offset > offset_max:
-        problems.append(f"偏离中心：偏心 {offset:.2f} > {offset_max:g}，锚点不在正前方")
+    advice: str = ""
+    if projection == "fisheye":
+        # Angle route (VR180).  A subject below the angle floor never reaches
+        # here as ``found``: the detector's area floor (0.8 % ≈ 16° at fov 180)
+        # is above the pass band, and the ``--anchor-min-deg-floor`` option
+        # exists for the rare case a smaller subject is provably real.  So the
+        # only two outcomes on a found anchor are too-big (the common one, since
+        # every anchor the detector can see at 180° is ≥16°) and in-band.
+        if deg > anchor_max_deg:
+            scale = anchor_max_deg / deg
+            measured["suggested_scale"] = round(scale, 3)
+            measured["anchor_verdict"] = "too_big"
+            problems.append(f"张角偏大：{deg:.1f}° > {anchor_max_deg:g}°，主体糊住前方视野（建议缩到 {scale:.2f}×）")
+            advice = ANCHOR_TOO_BIG_ADVICE.format(scale=scale, max_deg=anchor_max_deg)
+        elif deg < anchor_min_deg:
+            scale = anchor_min_deg / deg
+            measured["suggested_scale"] = round(scale, 3)
+            measured["anchor_verdict"] = "too_small"
+            problems.append(f"张角偏小：{deg:.1f}° < {anchor_min_deg:g}°，几乎不可见（建议放到 {scale:.2f}×）")
+            advice = ANCHOR_TOO_SMALL_ADVICE.format(scale=scale, min_deg=anchor_min_deg)
+        if offset > offset_max:
+            problems.append(f"偏离中心：偏心 {offset:.2f} > {offset_max:g}，锚点不在正前方")
+    else:
+        # Area route (dome / still) — backward compatible: WARN, never FAIL.
+        if area > area_max:
+            problems.append(f"面积偏大：{area * 100:.1f}% > {area_max * 100:g}%，主体糊住了画幅")
+        elif area < area_min:
+            problems.append(f"面积偏小：{area * 100:.1f}% < {area_min * 100:g}%，抓不住视线")
+        if offset > offset_max:
+            problems.append(f"偏离中心：偏心 {offset:.2f} > {offset_max:g}，锚点不在正前方")
+        if problems:
+            advice = ANCHOR_OFF_SPEC_ADVICE
 
     if not problems:
         return CheckResult("anchor", STATUS_PASS, f"正前方有锚点主体：{numbers}", measured)
     return CheckResult(
         "anchor",
-        STATUS_WARN,
+        STATUS_WARN if projection != "fisheye" else STATUS_FAIL,
         f"{'；'.join(problems)}。{numbers}",
         measured,
-        ANCHOR_OFF_SPEC_ADVICE,
+        advice,
     )
 
 
@@ -1998,6 +2180,12 @@ def run_checks(
     tolerance: float = DEFAULT_ASPECT_TOLERANCE,
     band: int = DEFAULT_EDGE_BAND,
     min_radial_rate: float = DEFAULT_MIN_RADIAL_RATE,
+    input_projection: str = DEFAULT_INPUT_PROJECTION,
+    fisheye_fov: float = DEFAULT_FISHEYE_FOV,
+    src_hfov: float = DEFAULT_SRC_HFOV,
+    anchor_min_deg: float = ANCHOR_MIN_DEG,
+    anchor_max_deg: float = ANCHOR_MAX_DEG,
+    anchor_min_deg_floor: float = ANCHOR_MIN_DEG_FLOOR,
     skip: Sequence[str] = (),
     ffmpeg: str = "ffmpeg",
     ffprobe: str = "ffprobe",
@@ -2013,7 +2201,18 @@ def run_checks(
     ``forward_motion`` comes back ``skipped`` rather than judged.  Everything
     else — including both composition checks, the ones that make vetting a
     keyframe worth doing — runs identically to the video path.
+
+    ``input_projection`` selects the anchor route (G-12 #372): ``rect`` (the
+    dome / still route, area band) or ``fisheye`` (the VR180 route, angular
+    band).  On the fisheye route the detector's area floor is lowered to the
+    angle floor ``anchor_min_deg_floor`` (converted to an area by squaring, the
+    #372 convention) **with the rescue path off** — a low area floor plus the
+    rescue amplifies speck four- to five-fold and fabricates anchors out of
+    empty frames, so the rescue is gated off there.  Real VR180 subjects
+    (drones, airframes) are blobby and clear the lowered floor without it.
     """
+    if input_projection not in ("rect", "fisheye"):
+        raise ValueError(f"input_projection must be 'rect' or 'fisheye', got {input_projection!r}")
     report = SourceReport(source=str(path))
     skipped = set(skip)
     unknown = skipped - set(CHECK_NAMES)
@@ -2042,6 +2241,20 @@ def run_checks(
     subject_stats: list[dict[str, float]] = []
     circle_frac: float | None = None
 
+    # G-12 (#372): the fisheye route judges the anchor by its angular size, so
+    # the detector's area floor has to move with the angle floor — the rect
+    # route's 0.8 % floor is ≈16° at fov 180, directly above the 6–12° pass
+    # band.  The angle floor becomes an area by squaring (the #372 linear↔area
+    # convention), and the rescue path is gated off on this route because a low
+    # area floor plus the rescue amplifies speck into 2 % false anchors (see
+    # :data:`ANCHOR_MIN_DEG_FLOOR`).
+    if input_projection == "fisheye":
+        anchor_min_area = (anchor_min_deg_floor / fisheye_fov) ** 2
+        anchor_rescue = False
+    else:
+        anchor_min_area = ANCHOR_MIN_AREA
+        anchor_rescue = True
+
     def measure(frame: np.ndarray) -> None:
         """Every per-frame measurement, taken on the one frame we decoded."""
         if "edges" not in skipped:
@@ -2049,7 +2262,7 @@ def run_checks(
         if "detail_ratio" not in skipped:
             detail_stats.append(center_detail_stats(frame))
         if "anchor" not in skipped:
-            subject_stats.append(anchor_stats(frame))
+            subject_stats.append(anchor_stats(frame, min_area=anchor_min_area, rescue=anchor_rescue))
 
     if needs_frames and still:
         try:
@@ -2094,7 +2307,14 @@ def run_checks(
         "forward_motion": forward_motion_result,
         "edges": lambda: check_edges(band_stats, band=band),
         "detail_ratio": lambda: check_detail_ratio(detail_stats),
-        "anchor": lambda: check_anchor(subject_stats),
+        "anchor": lambda: check_anchor(
+            subject_stats,
+            projection=input_projection,
+            fisheye_fov=fisheye_fov,
+            src_hfov=src_hfov,
+            anchor_min_deg=anchor_min_deg,
+            anchor_max_deg=anchor_max_deg,
+        ),
     }
     for name in CHECK_NAMES:
         if name in skipped:
@@ -2188,6 +2408,52 @@ def build_parser() -> argparse.ArgumentParser:
             f"（默认 {DEFAULT_MIN_RADIAL_RATE}，与分辨率无关）"
         ),
     )
+    # G-12 (#372): anchor is judged by angular size on the fisheye route, so
+    # the projection and FOV the source is destined for have to be declared
+    # here — same flag names as run_pipeline.py's --input-projection /
+    # --fisheye-fov, so the operator passes the same values to both.
+    parser.add_argument(
+        "--input-projection",
+        choices=["rect", "fisheye"],
+        default=DEFAULT_INPUT_PROJECTION,
+        help=(
+            "锚点判定所按的投影：rect（默认，球幕/平面剧照，按面积 8–15%% 判）或 "
+            "fisheye（VR180 鱼眼路线，按张角 6–12° 判，与 run_pipeline 同名参数一致）"
+        ),
+    )
+    parser.add_argument(
+        "--fisheye-fov",
+        type=float,
+        default=DEFAULT_FISHEYE_FOV,
+        help=f"--input-projection fisheye 时成像圆的张角（度，默认 {DEFAULT_FISHEYE_FOV:g}，与 run_pipeline 一致）",
+    )
+    parser.add_argument(
+        "--src-hfov",
+        type=float,
+        default=DEFAULT_SRC_HFOV,
+        help=(
+            f"--input-projection rect 时源片横向视场（度，默认 {DEFAULT_SRC_HFOV:g}，"
+            "张角按此换算；与 run_pipeline 的 --src-hfov 同名）"
+        ),
+    )
+    parser.add_argument(
+        "--anchor-min-deg",
+        type=float,
+        default=ANCHOR_MIN_DEG,
+        help=f"fisheye 路线锚点张角下限（度，默认 {ANCHOR_MIN_DEG:g}），低于判「太小/不可见」FAIL",
+    )
+    parser.add_argument(
+        "--anchor-max-deg",
+        type=float,
+        default=ANCHOR_MAX_DEG,
+        help=f"fisheye 路线锚点张角上限（度，默认 {ANCHOR_MAX_DEG:g}），高于判「太大」FAIL",
+    )
+    parser.add_argument(
+        "--anchor-min-deg-floor",
+        type=float,
+        default=ANCHOR_MIN_DEG_FLOOR,
+        help=(f"fisheye 路线锚点检出角度门槛（度，默认 {ANCHOR_MIN_DEG_FLOOR:g}），低于此判「没有锚点」而非「太小」"),
+    )
     parser.add_argument(
         "--skip",
         action="append",
@@ -2219,6 +2485,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             tolerance=args.tolerance,
             band=args.edge_band,
             min_radial_rate=args.min_radial_rate,
+            input_projection=args.input_projection,
+            fisheye_fov=args.fisheye_fov,
+            src_hfov=args.src_hfov,
+            anchor_min_deg=args.anchor_min_deg,
+            anchor_max_deg=args.anchor_max_deg,
+            anchor_min_deg_floor=args.anchor_min_deg_floor,
             skip=args.skip,
             ffmpeg=args.ffmpeg,
             ffprobe=args.ffprobe,
