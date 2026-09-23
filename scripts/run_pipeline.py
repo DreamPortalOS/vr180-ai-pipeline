@@ -787,6 +787,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Depth model selection
     parser.add_argument(
+        "--allow-backend-fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "#410: in streaming mode, let an explicitly requested but unavailable "
+            "--depth-model depthcrafter / --stereo-model stereocrafter degrade to the "
+            "default backend with a WARNING. Off by default: an unavailable requested "
+            "backend is a hard error (exit 2), because a silent degrade once produced "
+            "two byte-identical 'A/B' renders."
+        ),
+    )
+    parser.add_argument(
         "--depth-model",
         choices=["depth-anything", "depthcrafter"],
         default="depth-anything",
@@ -3456,8 +3468,27 @@ def main():
         # as the batch stages) and inject them.  fallback=True → an unavailable
         # DepthCrafter/StereoCrafter logs a loud WARNING and degrades to the
         # default instead of running silently with the wrong model.
-        depth_backend, depth_backend_name = build_depth_backend(args, fallback=True)
-        stereo_backend, stereo_backend_name = build_stereo_backend(args, fallback=True)
+        # #410: degrading is now opt-in (--allow-backend-fallback).  Without it an
+        # explicitly requested backend that cannot be built stops the run.
+        allow_fallback = getattr(args, "allow_backend_fallback", False) is True
+        try:
+            depth_backend, depth_backend_name = build_depth_backend(args, fallback=allow_fallback)
+            stereo_backend, stereo_backend_name = build_stereo_backend(args, fallback=allow_fallback)
+        except (RuntimeError, OSError) as exc:
+            log.error(
+                "❌ Requested backend is unavailable, refusing to run with a different model.\n"
+                "  Reason: %s\n"
+                "  DepthCrafter: set DEPTHCRAFTER_REPO_DIR, DEPTHCRAFTER_PYTHON and DEPTHCRAFTER_MODEL_DIR "
+                "(or --depthcrafter-repo-dir / --depthcrafter-python / --depthcrafter-checkpoint-dir).\n"
+                "  StereoCrafter: set --stereocrafter-repo-dir / --stereocrafter-python / "
+                "--stereocrafter-checkpoint-dir.\n"
+                "  To degrade to the default backend instead, pass --allow-backend-fallback.",
+                exc,
+            )
+            sys.exit(2)
+        # #410: record what actually ran, so the sidecar can prove it afterwards.
+        args.depth_backend_used = depth_backend_name
+        args.stereo_backend_used = stereo_backend_name
         pipeline = StreamingPipeline(
             model_size=args.model_size,
             device=args.device,
@@ -3851,6 +3882,12 @@ def _write_sidecar_from_args(
         preset = getattr(args, "preset", None)
         if preset:
             generation["preset"] = preset
+        # #410: the depth/stereo backends that actually ran (set by the streaming
+        # branch after any fallback), not merely the ones requested.
+        for key in ("depth_backend_used", "stereo_backend_used"):
+            used = getattr(args, key, None)
+            if isinstance(used, str) and used:
+                generation[key] = used
         # C-2 (#294): record how the source was interpreted.  The container
         # cannot express it, and it is the one knob that decides whether the
         # artefact's geometry is reproducible from the source file alone.
