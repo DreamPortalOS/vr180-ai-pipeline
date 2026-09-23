@@ -273,6 +273,23 @@ class VideoGenClient(ABC):
 - 输入：场景描述（中文）→ 输出：视频生成 API 的 prompt（英文，带 FPV 相关关键词）
 - 文件：`api/routers/generate.py` 中的 `build_fpv_prompt()` 函数
 
+**B5 — 场景链式生成（`scripts/segment_chain.py`）**
+
+多场景穹顶/VR180 短片需要场景间连续。Seedance 已支持 `--return-last-frame`
+（`scripts/generate.py` 的 `--return-last-frame` → `integrations/seedance.py` 的
+`PASSTHROUGH_FIELDS`）；`segment_chain.py` 把它做成链式驱动：场景 N 的末帧作为
+场景 N+1 的 i2v 首帧。
+
+- 输入：一个 JSON 计划 `[{"prompt": "...", "duration": 10, "seed_image": "first.png"(仅第一场可选)}, ...]` + `--out-dir`
+- 每场**进程内 import** 复用 `scripts/generate.py` 的 provider 接口（不 subprocess 调自己），
+  传 `return_last_frame=True`，取末帧图落盘 `scene_N_last.png`，作为下一场 `image` 输入
+- `--resume`：已存在的 `scene_N.mp4`（且末帧 `scene_N_last.png` 在）跳过，支持断点续跑
+- `--dry-run`：只打印每场请求参数与预估费用（复用 `integrations/usage_ledger.py` 的估价），零 POST
+- 预算门：复用 usage_ledger 现有 budget gate，超限抛 `BudgetExceededError` 并停链（退出码 2）
+- `--concat`：ffmpeg concat demuxer 拼接为 `chain.mp4`（subprocess list 形式）
+
+示例：`python -m scripts.segment_chain plan.json --out-dir video/chain --concat`
+
 ---
 
 ### Phase C：前端工作流 UI

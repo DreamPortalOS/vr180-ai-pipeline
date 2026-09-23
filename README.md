@@ -131,6 +131,14 @@ pytest tests/test_image_to_vr180.py -q          # 干净仓库（无模型/key�
 pytest -q
 ```
 
+### Immersive Node Studio
+浏览器里的可视化编排台，用于串联生成 / 升采样 / 转换节点。
+```bash
+python -m studio.server          # uvicorn，监听 127.0.0.1:8787
+```
+打开 <http://127.0.0.1:8787> 即可。新建项目时选 **production** 模板；
+本地 LiteLLM 网关的接入与模型切换（默认 `glm-5.2`）在 Studio UI 的 Settings 里完成，无需改代码。
+
 ---
 
 ## 协作模式
