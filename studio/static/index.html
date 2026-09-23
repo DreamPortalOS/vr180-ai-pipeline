@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Immersive Node Studio</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-dot"></span>
+      Immersive Node Studio
+    </div>
+    <div class="project-name" id="projectName">untitled</div>
+    <div class="actions">
+      <button id="btnDemo" type="button" title="载入简易演示">演示</button>
+      <button id="btnDual" type="button" title="脚本→分镜图→审核→视频→拼合→配乐→球幕/VR180 导出">生产流程</button>
+      <button id="btnSave" type="button">保存</button>
+      <button id="btnLoad" type="button">打开</button>
+      <button id="btnSaveServer" type="button" title="保存到本机工程库">存库</button>
+      <button id="btnProjects" type="button" title="最近工程">工程</button>
+      <button id="btnClear" type="button" title="清空画布">清空</button>
+      <button id="btnRun" type="button" class="primary" title="Ctrl+Enter">▶ 运行</button>
+      <input id="fileInput" type="file" accept="application/json,.json" hidden />
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section>
+        <h2>节点库</h2>
+        <input id="paletteSearch" class="search" type="search" placeholder="搜索节点…" />
+        <div id="nodePalette" class="palette"></div>
+      </section>
+      <section>
+        <h2>操作</h2>
+        <p class="hint">
+          从左侧点选添加节点 · 拖右侧端口连到左侧端口 · 拖节点标题移动<br/>
+          双击/选中改参数 · Delete 删除 · Ctrl+Enter 运行 · Ctrl+S 保存
+        </p>
+      </section>
+      <section>
+        <h2>后端</h2>
+        <p class="hint" id="backendStatus">检测中…</p>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap" id="canvasWrap">
+      <canvas id="canvas"></canvas>
+      <div class="canvas-overlay" id="canvasEmpty">
+        <div class="empty-card">
+          <strong>Immersive Node Studio</strong>
+          <p>点「生产流程」开始：脚本 → 分镜图 → 视频 → 拼合 → 配乐 → 导出</p>
+          <button id="btnEmptyDual" type="button" class="primary">载入生产流程</button>
+        </div>
+      </div>
+      <div id="statusBar" class="status">ready</div>
+      <div class="status-legend">
+        <span class="lg idle"></span>空闲
+        <span class="lg run"></span>运行
+        <span class="lg ok"></span>成功
+        <span class="lg err"></span>失败
+        <span class="lg skip"></span>跳过
+      </div>
+    </section>
+
+    <aside class="inspector right-rail">
+      <div class="tabs">
+        <button type="button" class="tab active" data-tab="inspect">检查器</button>
+        <button type="button" class="tab" data-tab="dome">3D 球幕</button>
+        <button type="button" class="tab" data-tab="specs">画幅/场馆</button>
+        <button type="button" class="tab" data-tab="projects">工程</button>
+      </div>
+
+      <div class="tab-panel active" id="tab-inspect">
+        <section>
+          <h2>检查器</h2>
+          <div id="inspectorBody" class="inspector-body">
+            <p class="hint">选中画布上的节点以编辑参数</p>
+          </div>
+        </section>
+        <section class="grow">
+          <h2>运行结果</h2>
+          <div id="galleryBox" class="gallery-box hidden"></div>
+          <pre id="runOut" class="run-out">尚未运行</pre>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="tab-dome">
+        <section>
+          <h2>穹面 3D 预览</h2>
+          <p class="hint">拖拽旋转 · 滚轮缩放 · 黄线=实心覆盖边界 · 红=留白区</p>
+          <canvas id="domeCanvas" class="dome-canvas" width="480" height="280"></canvas>
+          <div class="dome-actions">
+            <label class="file-btn">
+              加载母版/分镜图
+              <input id="domeFile" type="file" accept="image/*,video/*" hidden />
+            </label>
+            <button type="button" id="btnCovGood">合规预设</button>
+            <button type="button" id="btnCovBad">坏母版预设</button>
+          </div>
+          <div id="covReadout" class="cov-readout">加载中…</div>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="tab-specs">
+        <section>
+          <h2>画幅比例对照</h2>
+          <div id="ratioList" class="ratio-list"></div>
+        </section>
+        <section>
+          <h2>场馆参数（12m Fulldome.pro）</h2>
+          <div id="venueFacts"></div>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="tab-projects">
+        <section>
+          <h2>最近工程</h2>
+          <div id="projectsList" class="projects-list">
+            <p class="hint">点「工程」刷新</p>
+          </div>
+        </section>
+        <section>
+          <h2>本地 LiteLLM / 供应商</h2>
+          <div id="settingsForm" class="settings-form">
+            <label>LiteLLM Base URL<input id="setLlmUrl" type="text" placeholder="http://127.0.0.1:4000" /></label>
+            <label>LiteLLM Model<input id="setLlmModel" type="text" placeholder="gpt-4o-mini / glm-5.2 / …" /></label>
+            <label>LiteLLM API Key<input id="setLlmKey" type="password" placeholder="sk-…（写入服务器 settings，不进 git）" /></label>
+            <label>SenseNova Base URL<input id="setSnUrl" type="text" placeholder="https://…" /></label>
+            <label>SenseNova Model<input id="setSnModel" type="text" /></label>
+            <div class="gallery-actions" style="margin-top:10px">
+              <button type="button" id="btnSettingsLoad">读取</button>
+              <button type="button" id="btnSettingsSave" class="primary">保存设置</button>
+            </div>
+            <p class="hint" id="settingsStatus">密钥保存在 work_root/studio_settings.json，不会写入工程 JSON / git。</p>
+          </div>
+        </section>
+      </div>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+  <script src="preview3d.js"></script>
+</body>
+</html>
