@@ -483,6 +483,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fixed GOP length in frames (1s seek-precision default when --preset "
         "pcvr/standalone is set). 0 = let ffmpeg pick. Explicit value wins over preset.",
     )
+    parser.add_argument(
+        "--pix-fmt",
+        default="yuv420p",
+        help=(
+            "Output pixel format (default: yuv420p, 8-bit — byte-identical to the "
+            "pre-S-6 stream). Pass yuv420p10le for a 10-bit HEVC delivery master "
+            "(Quest HMD; reduces banding on graded footage). Validation is ffmpeg's."
+        ),
+    )
     # D-2 (#79): downstream playback presets — PCVR / Quest standalone / source.
     # A preset is a starting point: an explicit --codec / --crf / --bitrate / --gop
     # always wins (see resolve_playback).  ``source`` (default) fills in nothing,
@@ -2621,6 +2630,8 @@ _STREAMING_SUPPORTED: dict[str, str] = {
     "hw_encoder": "NVENC hardware encoding",
     "preset": "playback preset",
     "gop": "GOP length",
+    # S-6 (#397): forwarded to StreamingPipeline's pix_fmt (the output -pix_fmt).
+    "pix_fmt": "output pixel format",
     "comfort": "comfort preset",
     "depth_model": "depth backend",
     "stereo_model": "stereo backend",
@@ -3483,6 +3494,7 @@ def main():
             gop=getattr(args, "gop", None),
             force_idr=getattr(args, "_preset_force_idr", False),
             faststart=getattr(args, "_preset_faststart", None),
+            pix_fmt=getattr(args, "pix_fmt", "yuv420p"),
             depth_estimator=depth_backend,
             stereo_renderer=stereo_backend,
             depth_backend_name=depth_backend_name,

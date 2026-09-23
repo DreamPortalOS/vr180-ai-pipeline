@@ -219,6 +219,50 @@ def _make_estimator(backend: DepthCrafterBackend, cache_dir: Path) -> DepthCraft
         return DepthCrafterEstimator(backend=backend, cache_dir=cache_dir)
 
 
+def test_cache_dir_env_var_redirects_root(tmp_path: Path, monkeypatch) -> None:
+    """S-6 (#397): VR180_DEPTH_CACHE_DIR relocates the cache root.
+
+    From a git worktree ``_REPO_ROOT`` points at the worktree, where the
+    gitignored ``models/.cache/depth`` does not exist — so the real 8 GB
+    content-keyed cache (lives only in the primary checkout) silently misses
+    and DepthCrafter re-infers the whole clip.  The env var lets a worktree
+    point at the primary checkout's cache; the constructor honours it when no
+    explicit ``cache_dir`` arg is given.
+    """
+    primary = tmp_path / "primary_cache"
+    primary.mkdir()
+    monkeypatch.setenv("VR180_DEPTH_CACHE_DIR", str(primary))
+    backend = CountingBackend()
+    with patch("pipeline.depth_crafter._assert_cuda"):
+        est = DepthCrafterEstimator(backend=backend)  # no cache_dir arg
+    assert Path(est.cache_dir) == primary.resolve()
+
+
+def test_explicit_cache_dir_arg_beats_env_var(tmp_path: Path, monkeypatch) -> None:
+    """S-6 (#397): an explicit cache_dir arg wins over VR180_DEPTH_CACHE_DIR."""
+    monkeypatch.setenv("VR180_DEPTH_CACHE_DIR", str(tmp_path / "env_cache"))
+    explicit = tmp_path / "explicit_cache"
+    backend = CountingBackend()
+    with patch("pipeline.depth_crafter._assert_cuda"):
+        est = DepthCrafterEstimator(backend=backend, cache_dir=explicit)
+    assert Path(est.cache_dir) == explicit
+
+
+def test_no_env_no_arg_falls_to_module_default(tmp_path: Path, monkeypatch) -> None:
+    """Without env or arg, the module-level default applies (byte-identical pre-S-6).
+
+    The autouse ``_cache_dir_redirect`` fixture monkeypatches the module
+    constant to a tmp dir; the constructor must still read that current value.
+    """
+    monkeypatch.delenv("VR180_DEPTH_CACHE_DIR", raising=False)
+    import pipeline.depth_crafter as dc
+
+    backend = CountingBackend()
+    with patch("pipeline.depth_crafter._assert_cuda"):
+        est = DepthCrafterEstimator(backend=backend)
+    assert Path(est.cache_dir) == Path(dc._DEFAULT_DEPTH_CACHE_DIR)
+
+
 def test_second_call_hits_cache_and_skips_backend(tmp_path: Path) -> None:
     """Same input + same params twice → second call hits, backend NOT called again."""
     backend = CountingBackend(num_frames=3)

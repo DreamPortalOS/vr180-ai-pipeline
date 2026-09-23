@@ -434,6 +434,17 @@ INREPO_MODEL_DIR = _REPO_ROOT / "models" / "DepthCrafter"
 # ``models/.cache/depth`` dir, which is gitignored alongside ``models/``.
 # Tests override this with a ``tmp_path``-based ``cache_dir`` so the repo
 # working tree is never polluted with real cache files.
+#
+# S-6 (#397): ``_REPO_ROOT`` is derived from ``__file__``, so running the
+# pipeline from a *git worktree* resolves the cache root to
+# ``<worktree>/models/.cache/depth`` — a path that does not exist, because
+# ``models/`` is gitignored and only ever lives in the primary checkout.  The
+# 8 GB content-keyed depth cache then silently misses and DepthCrafter
+# re-infers the whole clip (the exact miss the cache exists to prevent).  An
+# explicit env-var override (``VR180_DEPTH_CACHE_DIR``) lets a worktree point
+# at the primary checkout's real cache; the default (no env var) is unchanged
+# and tests still pass ``cache_dir=tmp_path`` directly, so CI is unaffected.
+_DEPTH_CACHE_DIR_ENV = "VR180_DEPTH_CACHE_DIR"
 _DEFAULT_DEPTH_CACHE_DIR = _REPO_ROOT / "models" / ".cache" / "depth"
 
 # 12 GB VRAM-safe default for the short-side resolution cap.  The official
@@ -909,8 +920,20 @@ class DepthCrafterEstimator:
         # defaults so every existing call site (``build_depth_backend`` and
         # the streaming path) keeps working unchanged — #168 was rejected
         # for breaking call sites by adding a required arg.
+        #
+        # S-6 (#397): precedence is explicit ``cache_dir`` arg >
+        # ``VR180_DEPTH_CACHE_DIR`` env > the module-level default.  The env
+        # branch is what lets a git-worktree run reuse the primary checkout's
+        # cache (see ``_DEFAULT_DEPTH_CACHE_DIR``); tests that monkeypatch the
+        # module constant still win when no env var is set (``_isolated_env``
+        # scrubs ``VR180_DEPTH_CACHE_DIR``), so the autouse redirect holds.
         self.use_cache = use_cache
-        self.cache_dir = Path(cache_dir) if cache_dir is not None else _DEFAULT_DEPTH_CACHE_DIR
+        if cache_dir is not None:
+            self.cache_dir = Path(cache_dir)
+        elif os.environ.get(_DEPTH_CACHE_DIR_ENV):
+            self.cache_dir = Path(os.environ[_DEPTH_CACHE_DIR_ENV]).resolve()
+        else:
+            self.cache_dir = _DEFAULT_DEPTH_CACHE_DIR
 
     def estimate_video(
         self,
