@@ -2422,6 +2422,232 @@ def test_radial_basis_is_centred_and_normalised() -> None:
 
 
 # ---------------------------------------------------------------------------
+# anchor — angular verdict on the fisheye route (G-12 #372, #398)
+# ---------------------------------------------------------------------------
+#
+# The area band (8–15 %) was measured on Red Raion's *plane* stills.  The VR180
+# route maps a flat source onto a 180° sphere via an equidistant fisheye, under
+# which 8 % of the frame is ≈51° of the viewer's field — what the owner reported
+# as "still too big, it blocks the forward view" across three Quest rounds,
+# while the tool was calling it 偏小.  #372 is the card; #398 lands it.  The
+# fisheye route now judges by angular size (6–12°) and FAILs both sides with a
+# suggested rescale; the rect route keeps the area band unchanged.
+
+
+def test_anchor_angle_is_the_closed_form() -> None:
+    """The conversion itself, asserted against the #372 table.
+
+    ``deg = √area × fov`` (equivalent-square width × angular span), so 8 %
+    area is ≈28 % width is ≈51° at fov 180 — the three numbers #372's table
+    carries and that the owner's Quest feedback calibrated against.  The rect
+    route swaps ``fov`` for ``--src-hfov`` on the same linear rule.
+    """
+    assert csq.anchor_angle(0.08, "fisheye", fisheye_fov=180.0) == pytest.approx(math.sqrt(0.08) * 180.0, rel=1e-9)
+    # 8 % area -> ~51° at fisheye-fov 180 (the acceptance number).
+    assert csq.anchor_angle(0.08, "fisheye") == pytest.approx(50.91, abs=0.5)
+    # width 1/20 -> area 1/400 -> 9° at fov 180 (the other acceptance number).
+    assert csq.anchor_angle((1 / 20) ** 2, "fisheye") == pytest.approx(9.0, abs=0.01)
+    # rectilinear uses src_hfov on the same linear rule.
+    assert csq.anchor_angle(0.25, "rect", src_hfov=90.0) == pytest.approx(math.sqrt(0.25) * 90.0, rel=1e-9)
+    assert csq.anchor_angle(0.0, "fisheye") == 0.0
+
+
+def test_synthetic_anchor_at_8_percent_area_reports_about_51_deg_and_fails_too_big() -> None:
+    """Acceptance (#398): 8 % area under fisheye-180 reports ~51° and FAILs 太大.
+
+    The same anchor the rect route calls a clean PASS (it is inside the 8–15 %
+    band) reads ≈51° on the fisheye route — well above the 12° ceiling — so it
+    FAILs with 偏大 and a shrink factor, which is the advice the owner's three
+    Quest rounds were asking for and not getting.  The area is read off the real
+    detector (``anchor_stats`` on :func:`subject_frame`), so the verdict is taken
+    on the same number the tool actually reports, not on a hand-set dict.
+    """
+    stats = csq.anchor_stats(subject_frame(0.08))
+    assert stats["found"], "the 8 % fixture must clear the detection floor"
+
+    result = csq.check_anchor([stats], projection="fisheye", fisheye_fov=180.0)
+
+    assert result.status == csq.STATUS_FAIL, f"{result.status}: {result.detail}"
+    assert result.measured["anchor_verdict"] == "too_big"
+    assert result.measured["anchor_deg"] == pytest.approx(51, abs=2.0), (
+        f"8 % area must read ~51° at fov 180, got {result.measured['anchor_deg']}"
+    )
+    assert "偏大" in result.detail
+    assert result.measured["suggested_scale"] == pytest.approx(
+        csq.ANCHOR_MAX_DEG / result.measured["anchor_deg"], rel=1e-3
+    )
+    assert result.measured["suggested_scale"] < 1.0, "too-big must suggest a shrink (< 1)"
+
+
+def test_synthetic_anchor_at_one_twentieth_width_reports_about_9_deg_and_passes() -> None:
+    """Acceptance (#398): width 1/20 -> ~9° -> PASS on the fisheye route.
+
+    Asserted on a synthetic ``found`` dict rather than on :func:`subject_frame`
+    because the detector's own 0.8 % area floor corresponds to ≈16° at fov 180
+    — directly above the whole 6–12° pass band — so no anchor the real detector
+    can find at 180° is small enough to land in the band.  A 9° subject would
+    need a sub-floor detection that the rescue path turns into false anchors
+    (see :func:`test_fisheye_floor_keeps_subjectless_frames_anchorless`); the
+    verdict logic itself is what this test pins, on a frame the caller has
+    vouched for.
+    """
+    frame = {"found": True, "area": (1 / 20) ** 2, "offset": 0.1, "components": 1}
+    result = csq.check_anchor([frame], projection="fisheye", fisheye_fov=180.0)
+
+    assert result.status == csq.STATUS_PASS, f"{result.status}: {result.detail}"
+    assert result.measured["anchor_verdict"] == "ok"
+    assert result.measured["anchor_deg"] == pytest.approx(9.0, abs=0.01)
+    assert result.measured["suggested_scale"] is None
+
+
+def test_a_too_small_anchor_fails_and_suggests_an_enlarge_factor() -> None:
+    """Below :data:`ANCHOR_MIN_DEG` the fisheye route FAILs 太小 with a grow factor.
+
+    The mirror of the too-big case: a vouched-for 4° anchor is real but too
+    small to hold the eye, so it FAILs (not WARNs) and the suggested factor is a
+    number > 1 that would enlarge it past the 6° floor.
+    """
+    area = (4.0 / 180.0) ** 2  # 4° at fov 180
+    frame = {"found": True, "area": area, "offset": 0.1, "components": 1}
+    result = csq.check_anchor([frame], projection="fisheye", fisheye_fov=180.0)
+
+    assert result.status == csq.STATUS_FAIL, f"{result.status}: {result.detail}"
+    assert result.measured["anchor_verdict"] == "too_small"
+    assert result.measured["anchor_deg"] == pytest.approx(4.0, abs=0.01)
+    assert "偏小" in result.detail
+    assert result.measured["suggested_scale"] == pytest.approx(6.0 / 4.0, rel=1e-3)
+    assert result.measured["suggested_scale"] > 1.0, "too-small must suggest an enlarge (> 1)"
+
+
+def test_fisheye_failure_gates_the_run_but_rect_warn_does_not() -> None:
+    """The whole point of making the fisheye verdict a FAIL: it can stop a run.
+
+    A too-big anchor on the rect route is a WARN (exit 0, the shot is merely not
+    to spec); the same anchor on the fisheye route is a FAIL (exit 1, the subject
+    is the wrong size and the generation must be redone).  #372's complaint was
+    that the tool's advice pointed the wrong way — this is the gate that makes
+    the right advice actually bite.
+    """
+    stats = csq.anchor_stats(subject_frame(0.08))
+    rect = csq.SourceReport(source="f.png", checks=[csq.check_anchor([stats])])
+    fish = csq.SourceReport(source="f.png", checks=[csq.check_anchor([stats], projection="fisheye", fisheye_fov=180.0)])
+    assert rect.exit_code == 0
+    assert fish.exit_code == 1
+    assert fish.failed is True
+
+
+def test_the_rect_route_reports_the_angle_but_still_judges_by_area() -> None:
+    """Backward compatibility: rect keeps the area band, and ``anchor_deg`` is context only.
+
+    The 8 % anchor is inside the rect band, so it PASSes on area — and the
+    angle is reported (≈51° at the default fov would be nonsensical for a dome,
+    so here it is reported at the default ``src_hfov`` 70°), but moving the
+    angle never moves the verdict.  This is the seam that lets the rect suite
+    stay unchanged while the fisheye route gets the new logic.
+    """
+    stats = csq.anchor_stats(subject_frame(0.08))
+    result = csq.check_anchor([stats])  # default projection="rect"
+
+    assert result.measured["projection"] == "rect"
+    assert "anchor_deg" in result.measured
+    assert result.measured["anchor_deg"] == pytest.approx(math.sqrt(stats["area"]) * csq.DEFAULT_SRC_HFOV, rel=1e-3)
+    # The verdict key exists and is set, but the rect route's pass/fail is the
+    # area band's, not the angle band's.
+    assert result.measured["anchor_verdict"] == "ok"
+
+
+def test_fisheye_floor_keeps_subjectless_frames_anchorless(monkeypatch, tmp_path: Path) -> None:
+    """The lowered fisheye floor must not fabricate anchors out of speck.
+
+    Lowering the area floor to let a 9° anchor through is only safe if empty
+    frames stay empty.  A low area floor plus the rescue path amplifies sub-floor
+    speck four- to five-fold (measured: 9 of 11 subjectless fixtures report a
+    found anchor at area-floor 0.003), which is why :func:`run_checks` gates the
+    rescue off on the fisheye route.  This runs the subjectless fixtures through
+    the full ``run_checks`` fisheye path and demands every one comes back
+    ``missing`` — the end-to-end proof that the floor + no-rescue combination
+    holds, not just the unit-level one.
+    """
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"not really a video")
+    info = csq.ProbeInfo(width=FRAME_SIZE, height=FRAME_SIZE, fps=24.0, duration=4.0, nb_frames=96, pix_fmt="yuv420p")
+    monkeypatch.setattr(csq, "probe_source", lambda *a, **k: info)
+
+    subjectless = [subjectless_frame(seed=s) for s in range(1, 9)] + [
+        flat_frame(),
+        empty_centre_frame(),
+        rim_damped_frame(0.18),
+    ]
+
+    def feeder_of(f):
+        # Bind ``f`` now (default-arg), not at call time — the loop rebinds the
+        # name each iteration, so a bare closure would hand every run the last
+        # frame.
+        return lambda *a, _f=f, **k: iter([(_f, _f)])
+
+    for frame in subjectless:
+        monkeypatch.setattr(csq, "iter_frame_pairs", feeder_of(frame))
+        report = csq.run_checks(clip, input_projection="fisheye", fisheye_fov=180.0)
+        anchor = next(c for c in report.checks if c.name == "anchor")
+        assert anchor.status == csq.STATUS_WARN, (
+            f"a subjectless frame fabricated an anchor under the fisheye floor: {anchor.detail}"
+        )
+        assert anchor.measured["anchor_verdict"] == "missing"
+        assert anchor.measured["detected_frames"] == 0
+
+
+def test_run_checks_fisheye_fails_an_oversized_real_anchor() -> None:
+    """End-to-end on the fisheye route: a real 11 % subject reads ~60° and FAILs.
+
+    The :func:`anchored_outflow_frames` fixture's 0.11-area hero is a clean PASS
+    on the rect route (inside the band); on the fisheye route it subtends ≈60°,
+    well past the 12° ceiling, so the anchor check FAILs too-big with a shrink
+    factor.  This is the case the owner kept hitting: a subject the area band
+    called fine that was in fact too big once mapped onto the sphere.
+    """
+    present = {"found": True, "area": 0.11, "offset": 0.1, "components": 1}
+    result = csq.check_anchor([present], projection="fisheye", fisheye_fov=180.0)
+    assert result.status == csq.STATUS_FAIL
+    assert result.measured["anchor_deg"] == pytest.approx(math.sqrt(0.11) * 180.0, rel=1e-3)
+    assert result.measured["anchor_verdict"] == "too_big"
+
+
+def test_fisheye_json_carries_the_new_fields() -> None:
+    """The machine-readable payload ships ``anchor_deg`` / ``anchor_verdict`` / ``suggested_scale``.
+
+    A consumer that disagrees with the verdict has to be able to read the angle
+    and the rescale factor without re-running the analysis, the same contract
+    the rect route's ``area``/``offset`` already meet.
+    """
+    stats = csq.anchor_stats(subject_frame(0.08))
+    report = csq.SourceReport(
+        source="f.png",
+        checks=[csq.check_anchor([stats], projection="fisheye", fisheye_fov=180.0)],
+    )
+    payload = json.loads(json.dumps(report.to_dict(), ensure_ascii=False))
+    anchor = payload["checks"][0]["measured"]
+    assert {"anchor_deg", "anchor_verdict", "suggested_scale"} <= set(anchor)
+    assert anchor["anchor_verdict"] == "too_big"
+    assert anchor["suggested_scale"] is not None
+
+
+def test_reverting_to_the_area_verdict_turns_the_too_big_fail_red() -> None:
+    """Mutation check (#372): without the angle verdict the too-big FAIL disappears.
+
+    Force the rect (area) route on the 8 % anchor and the FAIL becomes a PASS/WARN
+    on area — i.e. the angle logic is what produces the owner-requested 太大
+    verdict, not something incidental.  This is the card's "把换算去掉退回纯
+    面积判定，上面断言必须变红" applied at the verdict level.
+    """
+    stats = csq.anchor_stats(subject_frame(0.08))
+    angle = csq.check_anchor([stats], projection="fisheye", fisheye_fov=180.0)
+    area = csq.check_anchor([stats])  # default rect route = the pre-#398 behaviour
+
+    assert angle.status == csq.STATUS_FAIL
+    assert area.status != csq.STATUS_FAIL, "the area route must not FAIL an 8 % anchor — that is the bug #372 filed"
+
+
+# ---------------------------------------------------------------------------
 # CLI contract + repo discipline
 # ---------------------------------------------------------------------------
 
@@ -2496,3 +2722,41 @@ def test_script_never_writes_next_to_the_source() -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open":
             raise AssertionError("check_source_quality must not open files for writing")
+
+
+def test_small_real_anchor_survives_the_fisheye_contrast_gate(monkeypatch, tmp_path: Path) -> None:
+    """A real ~8° subject (below the rect floor) is still found on the fisheye route.
+
+    The contrast gate (:data:`csq.ANCHOR_SMALL_MIN_CONTRAST`) rejects speck, but a
+    subject that stands out from its surroundings must pass it — otherwise the
+    lowered floor would buy nothing and every 6–12° anchor would read missing.
+    """
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"not really a video")
+    info = csq.ProbeInfo(width=FRAME_SIZE, height=FRAME_SIZE, fps=24.0, duration=4.0, nb_frames=96, pix_fmt="yuv420p")
+    monkeypatch.setattr(csq, "probe_source", lambda *a, **k: info)
+    frame = subject_frame(0.0025)
+    monkeypatch.setattr(csq, "iter_frame_pairs", lambda *a, **k: iter([(frame, frame)]))
+
+    report = csq.run_checks(clip, input_projection="fisheye", fisheye_fov=180.0)
+    anchor = next(c for c in report.checks if c.name == "anchor")
+
+    assert anchor.measured["detected_frames"] == 1, anchor.detail
+    assert anchor.measured["anchor_verdict"] == "ok", anchor.detail
+    assert 6.0 <= anchor.measured["anchor_deg"] <= 12.0
+
+
+def test_anchor_local_contrast_separates_speck_from_subjects() -> None:
+    """The measured split the gate relies on: speck < threshold < real subjects."""
+    floor = (csq.ANCHOR_MIN_DEG_FLOOR / 180.0) ** 2
+    speck = [subjectless_frame(seed=s) for s in range(1, 9)] + [empty_centre_frame()]
+    for frame in speck:
+        stats = csq.anchor_stats(frame, min_area=floor, rescue=False)
+        if stats["found"]:
+            assert csq.anchor_local_contrast(frame, stats) < csq.ANCHOR_SMALL_MIN_CONTRAST
+    for area in (0.002, 0.0025, 0.004):
+        frame = subject_frame(area)
+        stats = csq.anchor_stats(frame, min_area=floor, rescue=False)
+        assert stats["found"]
+        assert csq.anchor_local_contrast(frame, stats) > csq.ANCHOR_SMALL_MIN_CONTRAST
+    assert csq.anchor_local_contrast(flat_frame(), {"found": False, "area": 0.0}) == 0.0
