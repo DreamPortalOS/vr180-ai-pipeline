@@ -472,74 +472,113 @@
   }
 
   // ------------------------------------------------------------ analysis
-  function analyzeImage(img) {
-    const SIZE = 256;
-    const BINS = 128;
+  // Coverage is measured by the SERVER, not in the browser. The 3D panel POSTs
+  // its image to /api/coverage, which runs studio.coverage.analyze_frame — the
+  // one shared full-ring-fill scan used by scripts/dome_qa.py and the Studio
+  // qa.dome_coverage node — so the panel, the node and the release gate read
+  // the same number for the same master. The old client-side scan
+  // (analyzeImage / edgeAt(0.98), a third algorithm) is gone: it could disagree
+  // with the server on the same frame (issue #405). The frontend now only draws
+  // the coverage circle; the readout text is the server's.
+
+  function canvasToBlob(canvas) {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob(
+        (blob) => (blob ? resolve(blob) : reject(new Error("canvas.toBlob returned no blob"))),
+        "image/png",
+        90,
+      );
+    });
+  }
+
+  /** Draw *img* onto a capped offscreen canvas (keeps the upload small; the
+   * server downscales to its own ANALYZE_MAX_DIM, coverage r/R is scale-invariant). */
+  function imageToCanvas(img, maxDim = 512) {
+    const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
+    const w = Math.max(1, Math.round((img.width || 1) * scale));
+    const h = Math.max(1, Math.round((img.height || 1) * scale));
     const c = document.createElement("canvas");
-    c.width = SIZE;
-    c.height = SIZE;
+    c.width = w;
+    c.height = h;
     const ctx = c.getContext("2d", { willReadFrequently: true });
-    ctx.drawImage(img, 0, 0, SIZE, SIZE);
-    let data;
-    try {
-      data = ctx.getImageData(0, 0, SIZE, SIZE).data;
-    } catch (e) {
-      return { error: "tainted" };
-    }
-    const thr = 4;
-    const total = new Float64Array(BINS);
-    const content = new Float64Array(BINS);
-    let outerT = 0;
-    let outerC = 0;
-    for (let y = 0; y < SIZE; y++) {
-      const dy = ((y + 0.5) / SIZE) * 2 - 1;
-      for (let x = 0; x < SIZE; x++) {
-        const dx = ((x + 0.5) / SIZE) * 2 - 1;
-        const rr = Math.sqrt(dx * dx + dy * dy);
-        if (rr > 1) continue;
-        const i = (y * SIZE + x) * 4;
-        const lum = 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
-        const has = lum >= thr ? 1 : 0;
-        const bin = Math.min(BINS - 1, (rr * BINS) | 0);
-        total[bin] += 1;
-        content[bin] += has;
-        if (rr >= 0.8 && rr <= 0.98) {
-          outerT += 1;
-          outerC += has;
+    ctx.drawImage(img, 0, 0, w, h);
+    return c;
+  }
+
+  /** tiny deterministic PRNG so preset domes are textured (not a flat pedestal
+   * the server's texture-energy scan would ignore) and stable across clicks. */
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /** Synthetic domemaster filled out to r=fillR with random texture; outside
+   * the fill and outside the inscribed circle is pure black. The server reads
+   * this image, so a preset's verdict comes from the shared scan, not a number
+   * hardcoded in the button. */
+  function makeDomeCanvas(fillR, size = 256, seed = 0xfeed) {
+    const c = document.createElement("canvas");
+    c.width = size;
+    c.height = size;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    const cx = (size - 1) / 2;
+    const cy = (size - 1) / 2;
+    const R = size / 2;
+    const rng = mulberry32(seed);
+    const img = ctx.createImageData(size, size);
+    const d = img.data;
+    for (let y = 0; y < size; y++) {
+      const dy = y - cy;
+      for (let x = 0; x < size; x++) {
+        const i = (y * size + x) * 4;
+        const rr = Math.sqrt((x - cx) * (x - cx) + dy * dy) / R;
+        if (rr <= 1.0 && rr <= fillR) {
+          const base = rng() * 255;
+          d[i] = base;
+          d[i + 1] = (base + rng() * 64) % 256;
+          d[i + 2] = (base + rng() * 128) % 256;
+          d[i + 3] = 255;
+        } else {
+          d[i] = 0;
+          d[i + 1] = 0;
+          d[i + 2] = 0;
+          d[i + 3] = 255;
         }
       }
     }
-    const fill = new Float64Array(BINS);
-    for (let b = 0; b < BINS; b++) fill[b] = total[b] > 0 ? content[b] / total[b] : 0;
-    function edgeAt(th) {
-      for (let k = BINS - 1; k >= 1; k--) {
-        if (fill[k] >= th && fill[k - 1] >= th) return (k + 1) / BINS;
+    ctx.putImageData(img, 0, 0);
+    return c;
+  }
+
+  /** POST a canvas image to the server and return its coverage stats.
+   * Resolves to {error} on any failure so the UI can degrade gracefully. */
+  async function analyzeOnServer(canvas) {
+    let blob;
+    try {
+      blob = await canvasToBlob(canvas);
+    } catch (err) {
+      return { error: err.message || "toBlob failed" };
+    }
+    try {
+      const res = await fetch("/api/coverage", {
+        method: "POST",
+        headers: { "Content-Type": "image/png" },
+        body: blob,
+      });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        return { error: `HTTP ${res.status}${txt ? ": " + txt.slice(0, 120) : ""}` };
       }
-      return 0;
+      return await res.json();
+    } catch (err) {
+      return { error: err.message || "network" };
     }
-    const coverageRadius = edgeAt(0.98);
-    const coverageDeg = coverageRadius * 90;
-    const outerFill = outerT > 0 ? outerC / outerT : 0;
-    let level = "bad";
-    let text = "不合规：内容未铺满。";
-    if (coverageDeg >= 85) {
-      level = "ok";
-      text = "合规：内容铺到地平线附近。";
-    } else if (coverageDeg >= 75) {
-      level = "warn";
-      text = "轻微留白：外缘数度无内容。";
-    } else {
-      text = `不合规：实心只到天顶角 ${coverageDeg.toFixed(1)}°（r=${coverageRadius.toFixed(2)}），外圈 ${ (outerFill * 100).toFixed(1) }% 有内容。`;
-    }
-    return {
-      coverageRadius,
-      coverageDeg,
-      softRadius: Math.max(coverageRadius, edgeAt(0.5)),
-      outerFill,
-      solidAngleFrac: 1 - Math.cos((coverageDeg * Math.PI) / 180),
-      level,
-      text,
-    };
   }
 
   // ---------------------------------------------------------- UI wiring
@@ -592,7 +631,8 @@
     const box = el("covReadout");
     if (!box) return;
     if (!stats || stats.error) {
-      box.innerHTML = `<div class="cov-bad">无法测量（${stats && stats.error === "tainted" ? "file:// 请用 http 打开" : "无数据"}）</div>`;
+      const why = stats && stats.error ? stats.error : "无数据";
+      box.innerHTML = `<div class="cov-bad">无法测量（${why}）</div>`;
       return;
     }
     const cls = stats.level === "ok" ? "cov-ok" : stats.level === "warn" ? "cov-warn" : "cov-bad";
@@ -607,6 +647,11 @@
         <div><span>覆盖立体角</span><b>${(stats.solidAngleFrac * 100).toFixed(1)}%</b></div>
       </div>
       <p class="hint">${stats.text}</p>`;
+  }
+
+  function setCoverageLoading(msg = "服务端测量中…") {
+    const box = el("covReadout");
+    if (box) box.innerHTML = `<div class="cov-main cov-warn"><div class="cov-deg">…</div><div class="cov-sub">${msg}</div></div>`;
   }
 
   function bootStudioPanel() {
@@ -642,46 +687,35 @@
         if (!f) return;
         const url = URL.createObjectURL(f);
         const img = new Image();
-        img.onload = () => {
-          const stats = analyzeImage(img);
+        img.onload = async () => {
+          // Frontend only draws the circle; the reading is the server's
+          // (issue #405).
+          const stats = await analyzeOnServer(imageToCanvas(img));
           applyStats(stats, img);
           URL.revokeObjectURL(url);
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(url);
+          setCoverageUi({ error: "图片解码失败" });
         };
         img.src = url;
       });
     }
 
-    // buttons for known presets
-    el("btnCovGood") &&
-      el("btnCovGood").addEventListener("click", () => {
-        preview.setImage(null);
-        preview.hasTexture = false;
-        preview.setCoverage(0.94);
-        setCoverageUi({
-          coverageRadius: 0.94,
-          coverageDeg: 84.6,
-          softRadius: 0.96,
-          outerFill: 0.92,
-          solidAngleFrac: 0.9,
-          level: "ok",
-          text: "预设：合规母版（覆盖到 ~85°）。",
-        });
-      });
-    el("btnCovBad") &&
-      el("btnCovBad").addEventListener("click", () => {
-        preview.setImage(null);
-        preview.hasTexture = false;
-        preview.setCoverage(0.6);
-        setCoverageUi({
-          coverageRadius: 0.6,
-          coverageDeg: 54,
-          softRadius: 0.65,
-          outerFill: 0.08,
-          solidAngleFrac: 0.415,
-          level: "bad",
-          text: "预设：坏母版（内容只到 r=0.6，外圈大量留白）。",
-        });
-      });
+    // buttons for known presets: the image is still generated on the frontend,
+    // but the reading is measured by the server (issue #405).
+    const presetCoverage = async (fillR) => {
+      preview.setImage(null);
+      preview.hasTexture = false;
+      preview.setCoverage(-1);
+      setCoverageLoading();
+      const canvas = makeDomeCanvas(fillR);
+      const stats = await analyzeOnServer(canvas);
+      preview.setImage(canvas);
+      applyStats(stats, null);
+    };
+    el("btnCovGood") && el("btnCovGood").addEventListener("click", () => presetCoverage(0.98));
+    el("btnCovBad") && el("btnCovBad").addEventListener("click", () => presetCoverage(0.6));
 
     // accept coverage report from studio run via global event
     window.addEventListener("studio:coverage", (ev) => {
