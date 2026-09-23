@@ -58,7 +58,13 @@ if str(_REPO_ROOT) not in sys.path:
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
+# The coverage-radius scan is a single shared algorithm (issue #401): it lives
+# in ``studio.coverage`` so this gate and the Studio ``qa.dome_coverage`` node
+# read the same number from the same master. Re-export the shared constants
+# and primitives rather than re-implementing the scan here.
+import studio.coverage as _coverage  # noqa: E402
 from pipeline.spherical_injector import _find_box_recursive  # noqa: E402
+from studio.coverage import _downscale, _gray, _radial_map  # noqa: E402
 
 DEFAULT_SIZE = 4096
 DEFAULT_FRAMES = 5
@@ -67,16 +73,15 @@ DEFAULT_MASK_THRESH = 8.0
 # Per-pixel content floor: a pixel is "content" when its gray value OR its
 # local texture energy exceeds this. 16 matches the brightness floor used to
 # derive the gate on a real 4K domemaster (content ends ~r/R 0.65).
-DEFAULT_CONTENT_THRESH = 16.0
+DEFAULT_CONTENT_THRESH = _coverage.CONTENT_THRESH
 # A ring passes the coverage scan only when this fraction of its pixels are
 # content (full-circumference fill), not merely "any azimuth has content".
-DEFAULT_RING_FILL = 0.9
-
+DEFAULT_RING_FILL = _coverage.RING_FILL
 # Annulus resolution of the coverage scan (1/50 R = 0.02 R per ring).
-NBINS = 50
+NBINS = _coverage.NBINS
 # Frames are downscaled to this max dimension before analysis — coverage r/R
 # and mask means are scale-invariant, full-4K analysis only costs RAM.
-ANALYZE_MAX_DIM = 1024
+ANALYZE_MAX_DIM = _coverage.ANALYZE_MAX_DIM
 
 # Acceptance verdicts: the bottom line is a plain PASS/FAIL so a failing
 # domemaster (e.g. insufficient rim coverage) is not misread as "domemaster".
@@ -184,96 +189,47 @@ def _scan_stereo_boxes(path: str) -> list[str]:
     return found
 
 
-def _gray(frame: np.ndarray) -> np.ndarray:
-    """BGR/RGB/gray frame -> float32 gray image."""
-    arr = np.asarray(frame, dtype=np.float32)
-    if arr.ndim == 3:
-        arr = arr.mean(axis=2)
-    return arr
-
-
-def _radial_map(h: int, w: int) -> np.ndarray:
-    """Per-pixel r/R from the frame centre (R = half the side)."""
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    return np.sqrt((xx - (w - 1) / 2.0) ** 2 + (yy - (h - 1) / 2.0) ** 2) / (min(h, w) / 2.0)
-
-
 def analyze_frame(
     frame: np.ndarray,
-    mask_thresh: float = DEFAULT_MASK_THRESH,
+    *,
     content_thresh: float = DEFAULT_CONTENT_THRESH,
     ring_fill: float = DEFAULT_RING_FILL,
 ) -> dict:
-    """Pure-numpy per-frame analysis (no I/O — unit-testable without ffmpeg).
+    """Per-frame analysis: the shared coverage scan plus the zenith report.
+
+    The coverage radius, mask means and per-ring profile come from the single
+    shared scan in ``studio.coverage.analyze_frame`` (issue #401) so this gate
+    and the Studio ``qa.dome_coverage`` node read the same number on the same
+    master. This wrapper adds the zenith orientation report (centre-disc vs
+    bottom-forward texture energy), which is reported only and never FAILs.
 
     Returns dict with outside_mean / inside_mean (mask means), coverage_r
     (outermost ring whose content-pixel fraction clears *ring_fill*, as r/R),
     zenith_center / zenith_bottom (mean texture energy of centre disc vs
     bottom patch), and ring_profile (per-ring {r, fill, mean} for review).
-
-    Coverage is a *full-circumference* measure: a ring passes only when at
-    least ``ring_fill`` of its pixels are content (bright or textured), so a
-    disc that merely fills one side of every ring cannot push the reported
-    radius out to the rim — the half-dome regression this gate exists to catch.
     """
+    stats = _coverage.analyze_frame(frame, content_thresh=content_thresh, ring_fill=ring_fill)
+
+    # Zenith orientation (report only): mean texture energy of the centre disc
+    # vs the bottom-forward horizon patch. Computed locally — it is a dome
+    # orientation readout, not part of the shared coverage scan.
     gray = _gray(frame)
     h, w = gray.shape
     rr = _radial_map(h, w)
-    inside = rr <= 1.0
-
-    outside_mean = float(gray[~inside].mean()) if (~inside).any() else 0.0
-    inside_mean = float(gray[inside].mean()) if inside.any() else 0.0
-
-    # Local texture energy: |gray - blurred| isolates edges/texture while a
-    # flat pedestal (e.g. uniform gray fill) scores ~0.
-    blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=3.0)
-    energy = np.abs(gray - blur)
-
-    # Per-pixel "has content": bright OR textured. A ring is judged by how
-    # much of its circumference is content (fill fraction), not by whether any
-    # single azimuth happens to be bright — that old rule let a half-filled
-    # disc read as fully covered.
-    has_content = (gray > content_thresh) | (energy > content_thresh)
-
-    ring_fill_frac = np.zeros(NBINS, dtype=np.float64)
-    ring_mean = np.zeros(NBINS, dtype=np.float64)
-    for i in range(NBINS):
-        lo, hi = i / NBINS, (i + 1) / NBINS
-        m = (rr > lo) & (rr <= hi) & inside
-        if m.any():
-            ring_fill_frac[i] = float(has_content[m].mean())
-            ring_mean[i] = float(gray[m].mean())
-
-    passing = ring_fill_frac >= ring_fill
-    outer = int(np.nonzero(passing)[0].max()) if passing.any() else -1
-    coverage_r = (outer + 1) / NBINS if outer >= 0 else 0.0
-
+    energy = np.abs(gray - cv2.GaussianBlur(gray, (0, 0), sigmaX=3.0))
     center = rr <= 0.25
     zenith_center = float(energy[center].mean()) if center.any() else 0.0
     fwd = (rr <= 1.0) & (np.mgrid[0:h, 0:w][0].astype(np.float32) > h * 0.72)
     zenith_bottom = float(energy[fwd].mean()) if fwd.any() else 0.0
 
-    ring_profile = [
-        {"r": (i + 1) / NBINS, "fill": float(ring_fill_frac[i]), "mean": float(ring_mean[i])} for i in range(NBINS)
-    ]
-
     return {
-        "outside_mean": outside_mean,
-        "inside_mean": inside_mean,
-        "coverage_r": coverage_r,
+        "outside_mean": stats.outside_mean,
+        "inside_mean": stats.inside_mean,
+        "coverage_r": stats.coverage_radius,
         "zenith_center": zenith_center,
         "zenith_bottom": zenith_bottom,
-        "ring_profile": ring_profile,
+        "ring_profile": stats.ring_profile,
     }
-
-
-def _downscale(frame: np.ndarray) -> np.ndarray:
-    h, w = frame.shape[:2]
-    m = max(h, w)
-    if m <= ANALYZE_MAX_DIM:
-        return frame
-    scale = ANALYZE_MAX_DIM / float(m)
-    return cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
 
 
 def sample_frames(
@@ -401,10 +357,7 @@ def run_qa(
     report.frames_sampled = len(sampled)
     report.checks.append(Check("frame sampling", "pass", f"{len(sampled)} frame(s) sampled"))
 
-    per = [
-        analyze_frame(_downscale(f), mask_thresh=mask_thresh, content_thresh=content_thresh, ring_fill=ring_fill)
-        for f in sampled
-    ]
+    per = [analyze_frame(_downscale(f), content_thresh=content_thresh, ring_fill=ring_fill) for f in sampled]
     report.coverage_r = min(p["coverage_r"] for p in per)
     report.outside_mean = max(p["outside_mean"] for p in per)
     report.inside_mean = min(p["inside_mean"] for p in per)

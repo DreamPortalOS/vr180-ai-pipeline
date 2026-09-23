@@ -202,6 +202,9 @@ def _make_streaming_magic_args(**overrides):
     args.depth_model = "depth-anything"
     args.stereo_model = "default"
     args.copy_audio_from = None
+    # S-4 (#396): same truthy-MagicMock trap as copy_audio_from — pin the
+    # ambience-mix flag off so the wiring test does not trip the new branch.
+    args.audio_mix = None
     args.no_ffmpeg_v360 = False
     args.outpaint = "none"
     args.outpaint_mask_threshold = 10
