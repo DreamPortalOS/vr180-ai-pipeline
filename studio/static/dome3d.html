@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Dome 3D / Specs — standalone</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    body { display: grid; grid-template-columns: 1.2fr 1fr; gap: 12px; padding: 12px; height: 100%; }
+    .pane { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; overflow: auto; }
+    h2 { margin: 0 0 8px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+  </style>
+</head>
+<body>
+  <div class="pane">
+    <h2>穹面 3D 预览</h2>
+    <canvas id="domeCanvas" class="dome-canvas" style="height:320px"></canvas>
+    <div class="dome-actions">
+      <label class="file-btn">加载母版<input id="domeFile" type="file" accept="image/*" hidden /></label>
+      <button type="button" id="btnCovGood">合规预设</button>
+      <button type="button" id="btnCovBad">坏母版预设</button>
+    </div>
+    <div id="covReadout" class="cov-readout"></div>
+  </div>
+  <div class="pane">
+    <h2>画幅比例</h2>
+    <div id="ratioList" class="ratio-list"></div>
+    <h2 style="margin-top:16px">场馆参数</h2>
+    <div id="venueFacts"></div>
+  </div>
+  <script src="preview3d.js"></script>
+</body>
+</html>

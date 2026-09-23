@@ -77,3 +77,6 @@ third_party/
 
 # Cline private scratch state (NOT the shared CLINE_TASK_BOARD.md)
 .cline-state.md
+
+# Studio local QA screenshots / scratch
+studio/static/_qa/

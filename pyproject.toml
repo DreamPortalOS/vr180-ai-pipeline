@@ -41,7 +41,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["pipeline*", "integrations*"]
+include = ["pipeline*", "integrations*", "studio*"]
 
 [project.scripts]
 vr180-pipeline = "scripts.run_pipeline:main"
@@ -52,7 +52,7 @@ vr180-pipeline = "scripts.run_pipeline:main"
 [tool.ruff]
 target-version = "py310"
 line-length = 120
-src = ["pipeline", "scripts", "tests"]
+src = ["pipeline", "scripts", "studio", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -76,7 +76,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["pipeline"]
+known-first-party = ["pipeline", "integrations", "studio"]
 
 [tool.ruff.format]
 quote-style = "double"

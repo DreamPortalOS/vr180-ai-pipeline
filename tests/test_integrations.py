@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import numpy as np
 import pytest
+
 from integrations.base import GenerationResult, VideoGenProvider
 from integrations.factory import get_provider, list_providers
 from integrations.kling import KlingProvider
@@ -1733,6 +1734,7 @@ class TestLocalSVDMockBackend:
     def test_generate_from_image_full_path_with_mock(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
         import cv2
         import numpy as np
+
         from integrations.local_svd import LocalSVDProvider, MockSVDBackend
 
         monkeypatch.setenv("SVD_PROVIDER_OUTPUT_DIR", str(tmp_path))
@@ -1761,6 +1763,7 @@ class TestLocalSVDMockBackend:
         """Mock backend must be called with the params the provider chose."""
         import cv2
         import numpy as np
+
         from integrations.local_svd import LocalSVDProvider, MockSVDBackend
 
         monkeypatch.setenv("SVD_PROVIDER_OUTPUT_DIR", str(tmp_path))
@@ -1811,6 +1814,7 @@ class TestLocalSVDMockBackend:
         """Backend.load() must run before backend.generate()."""
         import cv2
         import numpy as np
+
         from integrations.local_svd import LocalSVDProvider, MockSVDBackend
 
         monkeypatch.setenv("SVD_PROVIDER_OUTPUT_DIR", str(tmp_path))
