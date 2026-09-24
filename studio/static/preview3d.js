@@ -244,14 +244,31 @@
       return new Float32Array([m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]);
     }
 
+    /** The vertical-flip multiplier the dome and camera shaders upload as
+     * uVFlip, composing frontIsBottom with the quick vFlip — the tested pure
+     * formula in DomeProj.effectiveVFlip, with the inline fallback matching it
+     * should the module not have loaded (it always loads before preview3d.js). */
+    _effVFlip() {
+      const DP = window.DomeProj;
+      return DP
+        ? DP.effectiveVFlip(this.frontIsBottom, this.vFlip)
+        : this.frontIsBottom
+          ? this.vFlip
+          : -this.vFlip;
+    }
+
     /** Set yaw/pitch/roll (degrees) and recompute; emits onOrientChange. */
     setOrientation(o) {
       this.orient.yaw = o.yaw != null ? o.yaw : this.orient.yaw;
       this.orient.pitch = o.pitch != null ? o.pitch : this.orient.pitch;
       this.orient.roll = o.roll != null ? o.roll : this.orient.roll;
       if (o.frontIsBottom != null) {
+        // Do NOT fold frontIsBottom into vFlip's sign here: the shaders compose
+        // the two via DomeProj.effectiveVFlip(frontIsBottom, vFlip), and mutating
+        // vFlip too double-negated the front-to-top toggle into a no-op.  Keep
+        // the two states independent — the 「正前方=圆下方/圆上方」 toggle and the
+        // quick 垂直翻转 button each flip on their own.
         this.frontIsBottom = o.frontIsBottom;
-        this.vFlip = o.frontIsBottom ? Math.abs(this.vFlip) : -Math.abs(this.vFlip);
       }
       if (o.uFlip != null) this.uFlip = o.uFlip;
       if (o.vFlip != null) this.vFlip = o.vFlip;
@@ -491,7 +508,7 @@
       gl.uniform1f(this.uDome.covR, this.coverageR);
       gl.uniformMatrix3fv(this.uDome.orient, false, this._orientMat());
       gl.uniform1f(this.uDome.uFlip, this.uFlip);
-      gl.uniform1f(this.uDome.vFlip, this.frontIsBottom ? this.vFlip : -this.vFlip);
+      gl.uniform1f(this.uDome.vFlip, this._effVFlip());
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.tex);
       gl.uniform1i(this.uDome.tex, 0);
@@ -700,7 +717,7 @@
       gl.uniform1f(this.u.hasTex, p.hasTexture ? 1 : 0);
       gl.uniformMatrix3fv(this.u.orient, false, p._orientMat());
       gl.uniform1f(this.u.uFlip, p.uFlip);
-      gl.uniform1f(this.u.vFlip, p.frontIsBottom ? p.vFlip : -p.vFlip);
+      gl.uniform1f(this.u.vFlip, p._effVFlip());
       gl.uniform3f(this.u.cam, p.camera.yaw, p.camera.pitch, p.camera.halfFov);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, p.tex);

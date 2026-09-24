@@ -152,6 +152,20 @@
     return sourceToOutput(src, orient);
   }
 
+  /** Vertical multiplier a shader uploads as ``uVFlip`` — the composition of
+   * the frontIsBottom convention with the quick vertical-flip state, as one
+   * number.  The dome/camera shaders compute
+   * ``v = 0.5 + 0.5*r*cos(phi)*uVFlip``; the audience front (phi=0, cos=1)
+   * lands at the bottom of the circle (v=1) for +1 and the top (v=0) for -1.
+   * This is the multiplier form of dirToMasterUV's ``if(!frontIsBottom) v=1-v``:
+   * with vFlip=+1 it reproduces that math exactly, and a -1 vFlip layers the
+   * quick vertical flip on top.  Extracted so the dome and camera shaders share
+   * one tested formula instead of two inline ternaries that can drift (and did
+   * — see the setOrientation/vFlip double-negation fixed in preview3d.js). */
+  function effectiveVFlip(frontIsBottom, vFlip) {
+    return frontIsBottom ? vFlip : -vFlip;
+  }
+
   /** Build a camera ray direction (in the OUTPUT dome frame) for a fragment
    * at normalised coords (nx,ny in [-1,1]) given camera yaw/pitch (degrees,
    * about the dome's vertical / right axes) and half-FOV (degrees).  The
@@ -223,6 +237,7 @@
     outputToSource: outputToSource,
     dirToMasterUV: dirToMasterUV,
     masterUVToDir: masterUVToDir,
+    effectiveVFlip: effectiveVFlip,
     cameraRay: cameraRay,
     cameraFrustumDirs: cameraFrustumDirs,
     exportCliParams: exportCliParams,

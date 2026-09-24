@@ -113,6 +113,21 @@ test("the front-flip toggle moves the audience front to the top of the circle", 
   closeVec(unit(DP.masterUVToDir(uv.u, uv.v, ZERO, false)), unit(d), 1e-6);
 });
 
+test("effectiveVFlip composes the front convention and the quick vertical flip", () => {
+  // The shaders upload uVFlip = effectiveVFlip(frontIsBottom, vFlip) and compute
+  // v = 0.5 + 0.5*r*cos(phi)*uVFlip; front (phi=0) lands at the bottom for +1
+  // and the top for -1.  This pins the 「正前方=圆下方/圆上方」 toggle and the
+  // quick 垂直翻转 button together — a previous setOrientation mutated vFlip
+  // on the toggle, double-negating it into a no-op.
+  assert.equal(DP.effectiveVFlip(true, 1), 1, "front@bottom, no quick flip");
+  assert.equal(DP.effectiveVFlip(false, 1), -1, "front@top (the toggle)");
+  assert.equal(DP.effectiveVFlip(true, -1), -1, "vertical quick flip -> front@top");
+  assert.equal(DP.effectiveVFlip(false, -1), 1, "front@top + vert flip -> front@bottom");
+  // multiplier form of dirToMasterUV's v = 1 - v flip, for vFlip = +1
+  close(DP.dirToMasterUV([0, 0, 1], ZERO, true).v, 0.5 + 0.5 * DP.effectiveVFlip(true, 1));
+  close(DP.dirToMasterUV([0, 0, 1], ZERO, false).v, 0.5 + 0.5 * DP.effectiveVFlip(false, 1));
+});
+
 // ---------------------------------------------------------------- orientation
 test("zero orientation is the identity transform", () => {
   // outputToSource(v, ZERO) == v and sourceToOutput(v, ZERO) == v.

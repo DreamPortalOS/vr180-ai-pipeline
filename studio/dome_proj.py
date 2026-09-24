@@ -185,6 +185,22 @@ def master_uv_to_dir(u: float, v: float, orient: Mapping[str, float], front_is_b
     return source_to_output(src, orient)
 
 
+def effective_v_flip(front_is_bottom: bool, v_flip: float) -> float:
+    """Vertical multiplier the shaders upload for ``uVFlip``.
+
+    The composition of the front-is-bottom convention with the quick
+    vertical-flip state, as a single number — the multiplier form of
+    :func:`dir_to_master_uv`'s ``v = 1 - v`` front-to-top flip.  With
+    ``v_flip = +1`` it reproduces that math exactly (front at the bottom for
+    ``+1``, at the top for ``-1``); a ``-1`` ``v_flip`` layers the quick
+    vertical flip on top.  Both Studio shaders (dome surface + camera 2D
+    viewport) call this so they share one tested formula instead of two inline
+    ternaries that can drift.
+    """
+
+    return v_flip if front_is_bottom else -v_flip
+
+
 def camera_ray(nx: float, ny: float, cam_yaw: float, cam_pitch: float, half_fov_deg: float) -> Vec3:
     """Camera ray (in the OUTPUT dome frame) for fragment ``(nx, ny)`` in ``[-1, 1]``.
 
@@ -264,6 +280,7 @@ __all__ = [
     "camera_ray",
     "dir_from_theta_phi",
     "dir_to_master_uv",
+    "effective_v_flip",
     "export_cli_params",
     "master_uv_to_dir",
     "mat_mul3",

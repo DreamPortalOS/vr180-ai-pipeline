@@ -39,6 +39,7 @@ from studio.dome_proj import (
     camera_ray,
     dir_from_theta_phi,
     dir_to_master_uv,
+    effective_v_flip,
     export_cli_params,
     master_uv_to_dir,
     orient_matrix,
@@ -188,6 +189,28 @@ def test_front_flip_toggle_moves_front_to_top() -> None:
     uv = dir_to_master_uv(d, ZERO, front_is_bottom=False)
     back = _unit(master_uv_to_dir(uv["u"], uv["v"], ZERO, front_is_bottom=False))
     _close_vec(back, _unit(d), 1e-6, "front-top round-trip")
+
+
+def test_effective_v_flip_composes_front_convention_and_quick_flip() -> None:
+    """The shaders' uVFlip multiplier = effective_v_flip(front, vflip).
+
+    Pinning this protects the 「正前方=圆下方/圆上方」 toggle (issue #416): a
+    previous preview3d.js mutated vFlip on the toggle, which double-negated
+    against the shader's own frontIsBottom ternary into a no-op.  The multiplier
+    form is the tested pure version of ``dir_to_master_uv``'s ``v = 1 - v`` flip:
+    front at the bottom needs +1, at the top -1, and a -1 quick-flip layers on
+    top of whichever convention is active.
+    """
+
+    assert effective_v_flip(True, 1) == 1, "front@bottom, no quick flip"
+    assert effective_v_flip(False, 1) == -1, "front@top (the toggle)"
+    assert effective_v_flip(True, -1) == -1, "vertical quick flip -> front@top"
+    assert effective_v_flip(False, -1) == 1, "front@top + vert flip -> front@bottom"
+    # matches dir_to_master_uv's own front flip for v_flip=+1 (the default)
+    front = dir_to_master_uv((0, 0, 1), ZERO, front_is_bottom=True)
+    _close(front["v"], 0.5 + 0.5 * 1 * effective_v_flip(True, 1), msg="front@bottom multiplier")
+    front_top = dir_to_master_uv((0, 0, 1), ZERO, front_is_bottom=False)
+    _close(front_top["v"], 0.5 + 0.5 * 1 * effective_v_flip(False, 1), msg="front@top multiplier")
 
 
 # -------------------------------------------------------------------- camera
