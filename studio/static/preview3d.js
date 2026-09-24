@@ -427,20 +427,35 @@
       this.covCount = v.length / 3;
     }
 
-    setImage(img) {
-      const gl = this.gl;
-      if (!img) {
-        this.hasTexture = false;
-        return;
-      }
-      gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    /** Upload the current master into *gl*'s own texture object *tex*.
+     *
+     * WebGL texture objects belong to the context that created them: binding
+     * another context's texture raises INVALID_OPERATION and the sampler reads
+     * black.  The 3D dome and the camera viewport run in separate contexts, so
+     * each uploads its own GPU copy from the one shared source image.  Returns
+     * false when there is nothing to upload. */
+    uploadTexture(gl, tex) {
+      if (!this.image) return false;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.image);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      this.hasTexture = true;
+      return true;
+    }
+
+    setImage(img) {
+      this.image = img || null;
+      // Bumped on every change so the camera viewport (a different WebGL
+      // context) knows to re-upload its own copy of the texture.
+      this.texVersion = (this.texVersion || 0) + 1;
+      if (!img) {
+        this.hasTexture = false;
+        return;
+      }
+      this.hasTexture = this.uploadTexture(this.gl, this.tex);
     }
 
     _bindEvents() {
@@ -634,6 +649,8 @@
       this.gl = canvas.getContext("webgl", { antialias: true, alpha: false });
       if (!this.gl) throw new Error("WebGL unavailable");
       this.raf = 0;
+      this.tex = this.gl.createTexture(); // this context's own copy of the master
+      this.texVersion = -1; // forces the first upload
       this._init();
       this._loop();
     }
@@ -721,13 +738,21 @@
       gl.clear(gl.COLOR_BUFFER_BIT);
       gl.useProgram(this.prog);
       const p = this.preview;
-      gl.uniform1f(this.u.hasTex, p.hasTexture ? 1 : 0);
+      // Re-upload whenever the master changes: p.tex lives in the *preview's*
+      // context and WebGL objects do not cross contexts (binding a foreign
+      // texture is an INVALID_OPERATION and samples black), so this viewport
+      // keeps its own copy in its own context, fed from the same source image.
+      if (p.hasTexture && this.texVersion !== p.texVersion) {
+        if (p.uploadTexture(gl, this.tex)) this.texVersion = p.texVersion;
+      }
+      if (!p.hasTexture) this.texVersion = -1;
+      gl.uniform1f(this.u.hasTex, this.texVersion === p.texVersion && p.hasTexture ? 1 : 0);
       gl.uniformMatrix3fv(this.u.orient, false, p._orientMat());
       gl.uniform1f(this.u.uFlip, p.uFlip);
       gl.uniform1f(this.u.vFlip, p._effVFlip());
       gl.uniform3f(this.u.cam, p.camera.yaw, p.camera.pitch, p.camera.halfFov);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, p.tex);
+      gl.bindTexture(gl.TEXTURE_2D, this.tex);
       gl.uniform1i(this.u.tex, 0);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
       gl.enableVertexAttribArray(this.u.aPos);
