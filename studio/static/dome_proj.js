@@ -201,8 +201,14 @@
 
   /** The five frustum corner rays (near plane centre + 4 corners) in the OUTPUT
    * frame, for drawing the camera's view-volume wireframe in the 3D view.
-   * Returns an array of [origin, dir] segments expressed as direction vectors
-   * from the dome centre (camera at centre). */
+   * Corner order is (-1,-1), (1,-1), (1,1), (-1,1) — the near-plane quad walked
+   * around the perimeter, so consecutive corners are adjacent and the quad's
+   * edges do not cross.
+   *
+   * The rays come back in the *projection* frame (+z = audience front).  The 3D
+   * scene's geometry frame has the front at −z, so a caller drawing them as
+   * scene geometry must bridge with ``domeRayToSceneDir`` — the same bridge the
+   * dome shader does inline (see ``sceneDirFromShaderVarying``). */
   function cameraFrustumDirs(camYaw, camPitch, halfFovDeg) {
     var corners = [
       [-1, -1],
@@ -216,6 +222,30 @@
     }
     out.push(cameraRay(0, 0, camYaw, camPitch, halfFovDeg)); // centre / look dir
     return out;
+  }
+
+  /** Bridge a direction from the projection frame (+x right, +y up, **+z =
+   * audience front**) into the 3D scene's geometry frame (+x right, +y up, **−z
+   * = audience front**, matching ``preview3d.js``'s ``dirAt`` and
+   * ``web/dome-preview``).
+   *
+   * This is exactly the axis flip the dome shader applies to its interpolated
+   * geometry direction before projecting it —
+   * ``d = uOrient * vec3(vDir.x, vDir.y, -vDir.z)`` — so camera rays (which are
+   * produced in the projection frame) must take it before they are drawn as
+   * scene geometry.  Without it the camera wireframe renders 180° out in yaw:
+   * a camera "looking at the audience front" (yaw 0) is drawn pointing at the
+   * screen back.  Extracted so the frustum and the shader share one tested
+   * bridge instead of two copies of the negation. */
+  function domeRayToSceneDir(ray) {
+    return [ray[0], ray[1], -ray[2]];
+  }
+
+  /** The geometry-frame direction a shader's interpolated ``vDir`` projects
+   * with, i.e. the frame bridge written out so the JS side can assert the
+   * frustum uses the same one the shader does. */
+  function sceneDirFromShaderVarying(vDir) {
+    return domeRayToSceneDir(vDir);
   }
 
   /** Export the orientation the UI is showing, as the CLI-named params the
@@ -240,6 +270,8 @@
     effectiveVFlip: effectiveVFlip,
     cameraRay: cameraRay,
     cameraFrustumDirs: cameraFrustumDirs,
+    domeRayToSceneDir: domeRayToSceneDir,
+    sceneDirFromShaderVarying: sceneDirFromShaderVarying,
     exportCliParams: exportCliParams,
   };
 

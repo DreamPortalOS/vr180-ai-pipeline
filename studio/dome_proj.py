@@ -235,12 +235,33 @@ def camera_frustum_dirs(cam_yaw: float, cam_pitch: float, half_fov_deg: float) -
     In the OUTPUT dome frame, for drawing the camera's view-volume wireframe in
     the 3D view (the camera sits at the dome centre, looking outward).  Corner
     order matches the JS: (-1,-1), (1,-1), (1,1), (-1,1), then the centre.
+
+    The rays are in the *projection* frame (+z = audience front); a caller
+    drawing them as 3D-scene geometry must pass them through
+    :func:`dome_ray_to_scene_dir` first, exactly as the dome shader bridges its
+    interpolated direction.  See that function for why.
     """
 
     corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
     out = [camera_ray(c[0], c[1], cam_yaw, cam_pitch, half_fov_deg) for c in corners]
     out.append(camera_ray(0.0, 0.0, cam_yaw, cam_pitch, half_fov_deg))
     return out
+
+
+def dome_ray_to_scene_dir(ray: Vec3) -> Vec3:
+    """Bridge a projection-frame direction into the 3D scene's geometry frame.
+
+    The projection frame is ``+x`` right, ``+y`` up, ``+z`` = audience front.
+    The 3D scene (``preview3d.js``'s ``dirAt``, ``web/dome-preview``) puts the
+    front at ``-z``.  The dome shader bridges the two by negating the varying's
+    z before applying ``uOrient`` (``d = uOrient * vec3(vDir.x, vDir.y,
+    -vDir.z)``); camera rays come out of :func:`camera_ray` in the *projection*
+    frame, so they need the same bridge before being drawn as scene geometry.
+    Skipping it draws the camera wireframe 180° out in yaw — a camera looking at
+    the audience front (yaw 0) renders pointing at the screen back.
+    """
+
+    return (ray[0], ray[1], -ray[2])
 
 
 def _round_half_up(x: float) -> int:
