@@ -34,6 +34,19 @@
         <div id="nodePalette" class="palette"></div>
       </section>
       <section>
+        <h2>素材上传</h2>
+        <div class="upload-row">
+          <label class="file-btn" title="选择本地图片 / 视频，创建输入节点">
+            选择文件…
+            <input id="uploadInput" type="file" accept="image/png,image/jpeg,image/webp,video/mp4,video/quicktime,.png,.jpg,.jpeg,.webp,.mp4,.mov" hidden />
+          </label>
+        </div>
+        <p class="hint">
+          或直接<strong>从桌面把文件拖到画布空白处</strong>，在落点生成输入节点。<br/>
+          支持 png / jpg / webp / mp4 / mov（默认上限 2 GB）
+        </p>
+      </section>
+      <section>
         <h2>操作</h2>
         <p class="hint">
           从左侧点选添加节点 · 拖右侧端口连到左侧端口 · 拖节点标题移动<br/>
