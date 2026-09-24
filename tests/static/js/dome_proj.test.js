@@ -299,6 +299,58 @@ test("the 2D viewport centre maps the camera's look direction onto the master", 
   }
 });
 
+test("domeRayToSceneDir bridges the projection frame to the scene's -z front", () => {
+  // The dome shader negates the varying's z before uOrient; the frustum must
+  // take the same bridge or it renders 180 degrees out in yaw.
+  assert.deepEqual(DP.domeRayToSceneDir([0, 0, 1]), [0, 0, -1]);
+  assert.deepEqual(DP.domeRayToSceneDir([1, 2, 3]), [1, 2, -3]);
+  assert.deepEqual(DP.domeRayToSceneDir([0, 0, 0]), [0, 0, -0]);
+  // involution: bridging twice is the identity
+  for (const d of [[0, 1, 0], [0.3, -0.5, 0.8], [-1, 0, 0]]) {
+    assert.deepEqual(DP.domeRayToSceneDir(DP.domeRayToSceneDir(d)), d);
+  }
+  // the shader-varying helper is the same bridge (one formula, two names)
+  assert.deepEqual(DP.sceneDirFromShaderVarying([0.2, 0.4, 0.9]), [0.2, 0.4, -0.9]);
+});
+
+test("frustum: a camera looking at the audience front is drawn on the scene front axis", () => {
+  // Scene geometry frame (preview3d.js dirAt): +Y zenith, -Z audience front.
+  const sceneFront = [0, 0, -1];
+  const look = DP.domeRayToSceneDir(DP.cameraRay(0, 0, 0, 0, 45));
+  for (let i = 0; i < 3; i++) assert.ok(Math.abs(look[i] - sceneFront[i]) < 1e-12, `look[${i}]`);
+  // +yaw (camera turns right) must stay on the scene's +x side after the bridge
+  const right = DP.domeRayToSceneDir(DP.cameraRay(0, 0, 90, 0, 45));
+  assert.ok(right[0] > 0.99, `+yaw should turn toward scene +x, got ${right[0]}`);
+  // and the zenith camera must point at scene +Y
+  const up = DP.domeRayToSceneDir(DP.cameraRay(0, 0, 0, 90, 45));
+  assert.ok(up[1] > 0.99, `zenith camera should point at +Y, got ${up[1]}`);
+});
+
+test("frustum near-plane corner order walks the perimeter (no crossed edges)", () => {
+  // Consecutive corners of the quad must be adjacent in NDC: the perimeter
+  // order (-1,-1) -> (1,-1) -> (1,1) -> (-1,1) -> wrap, so the drawn edges are
+  // the four sides, never a diagonal.  Two adjacent corners differ in exactly
+  // one NDC axis; a diagonal pair differs in both.
+  const NDC = [
+    [-1, -1],
+    [1, -1],
+    [1, 1],
+    [-1, 1],
+  ];
+  for (let i = 0; i < 4; i++) {
+    const a = NDC[i];
+    const b = NDC[(i + 1) % 4];
+    const sameCount = (a[0] === b[0] ? 1 : 0) + (a[1] === b[1] ? 1 : 0);
+    assert.strictEqual(sameCount, 1, `corners ${i}->${i + 1} must share exactly one axis`);
+  }
+  // and the five rays cameraFrustumDirs returns follow that same order
+  const dirs = DP.cameraFrustumDirs(15, -10, 40);
+  for (let i = 0; i < 4; i++) {
+    assert.deepEqual(dirs[i], DP.cameraRay(NDC[i][0], NDC[i][1], 15, -10, 40), `corner ${i}`);
+  }
+  assert.deepEqual(dirs[4], DP.cameraRay(0, 0, 15, -10, 40));
+});
+
 test("cameraFrustumDirs: 5 unit rays, centre = look direction, corners are wider", () => {
   const dirs = DP.cameraFrustumDirs(30, -20, 50);
   assert.equal(dirs.length, 5);
