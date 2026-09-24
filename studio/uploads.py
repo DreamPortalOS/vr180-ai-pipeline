@@ -141,21 +141,31 @@ def _image_dims(path: Path) -> tuple[int, int]:
         return int(img.width), int(img.height)
 
 
-def _probe_video(path: Path, out_dir: Path, sha: str) -> tuple[int, int, float, str]:
+def probe_video(
+    path: str | Path,
+    *,
+    poster_dir: str | Path | None = None,
+    sha: str | None = None,
+) -> tuple[int, int, float, str]:
     """Probe video resolution/duration and extract a poster frame via ffmpeg.
 
     All ffmpeg invocations use the list form (CLAUDE.md boundary). ffprobe is
     not assumed to be present, so duration/resolution come from one ``ffmpeg
-    -i`` parse pass and the poster from a second seek pass — both via the same
-    binary that is already on PATH.
+    -i`` parse pass and the poster from a second pass — both via the same
+    binary that is already on PATH. ``probe_video`` is the single shared
+    implementation used by both the upload store and the ``input.video`` node
+    so the card readout and the run-time meta can never disagree.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    poster = out_dir / f"{sha}.png"
+    p = Path(path)
+    poster_root = Path(poster_dir) if poster_dir else p.parent
+    poster_root.mkdir(parents=True, exist_ok=True)
+    label = sha or hashlib.sha256(p.name.encode()).hexdigest()[:12]
+    poster = poster_root / f"{label}.png"
     # Grab the very first frame as a PNG the canvas can <img>. Seeking to a
     # fixed offset like 1s would skip past short clips (issue #417: a 0.5s
     # upload produced an empty poster). A failed poster is non-fatal — we
     # still return the probe numbers and let the node show the path instead.
-    poster_cmd = [_FFMPEG, "-y", "-i", str(path), "-frames:v", "1", "-q:v", "2", str(poster)]
+    poster_cmd = [_FFMPEG, "-y", "-i", str(p), "-frames:v", "1", "-q:v", "2", str(poster)]
     try:
         proc = subprocess.run(poster_cmd, capture_output=True, text=True, check=False, timeout=60)
         if proc.returncode != 0 or not poster.is_file():
@@ -165,7 +175,7 @@ def _probe_video(path: Path, out_dir: Path, sha: str) -> tuple[int, int, float, 
 
     # Resolution + duration from stderr (ffmpeg prints stream info there when
     # no output is requested). One pass, regex out the numbers we need.
-    info_cmd = [_FFMPEG, "-i", str(path)]
+    info_cmd = [_FFMPEG, "-i", str(p)]
     width = height = 0
     duration = 0.0
     try:
@@ -214,7 +224,7 @@ class UploadStore:
         if kind == "image":
             width, height = _image_dims(path)
         else:
-            w, h, dur, poster_path = _probe_video(path, self.root, sha)
+            w, h, dur, poster_path = probe_video(path, poster_dir=self.root, sha=sha)
             width, height = (w or None), (h or None)
             duration = dur or None
             poster = poster_path or None
