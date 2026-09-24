@@ -10,6 +10,39 @@
   /** Built-in fallback when API is unreachable (file:// preview). */
   const FALLBACK_TYPES = [
     {
+      type: "input.text",
+      category: "input",
+      label: "文本输入",
+      inputs: [],
+      outputs: [{ name: "text", type: "text" }],
+      param_schema: [
+        { name: "label", type: "string", default: "input", label: "标签" },
+        { name: "text", type: "string", default: "", label: "文本" },
+      ],
+    },
+    {
+      type: "input.image",
+      category: "input",
+      label: "图片输入",
+      inputs: [{ name: "value", type: "image" }],
+      outputs: [
+        { name: "image", type: "image" },
+        { name: "meta", type: "json" },
+      ],
+      param_schema: [{ name: "path", type: "string", default: "", label: "图片路径" }],
+    },
+    {
+      type: "input.video",
+      category: "input",
+      label: "视频输入",
+      inputs: [{ name: "value", type: "video" }],
+      outputs: [
+        { name: "video", type: "video" },
+        { name: "meta", type: "json" },
+      ],
+      param_schema: [{ name: "path", type: "string", default: "", label: "视频路径" }],
+    },
+    {
       type: "script.storyboard",
       category: "script",
       label: "分镜脚本",
@@ -329,21 +362,51 @@
     return res.json();
   }
 
+  /** Palette group ordering — 输入 first so the drop-created nodes are visible. */
+  const PALETTE_GROUPS = [
+    ["input", "输入"],
+    ["script", "脚本"],
+    ["generate", "生成"],
+    ["convert", "转换"],
+    ["qa", "质检"],
+    ["checkpoint", "审核"],
+    ["tool", "工具"],
+    ["export", "导出"],
+  ];
+
   function renderPalette() {
     const q = (state.paletteFilter || "").trim().toLowerCase();
     paletteEl.innerHTML = "";
-    Object.values(state.nodeTypes)
-      .slice()
-      .sort((a, b) => (a.category + a.label).localeCompare(b.category + b.label, "zh"))
-      .forEach((t) => {
-        const hay = (t.type + " " + (t.label || "") + " " + (t.category || "")).toLowerCase();
-        if (q && !hay.includes(q)) return;
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.innerHTML = `<span>${t.label || t.type}</span><span class="cat">${t.category || ""} · ${t.type}</span>`;
-        btn.addEventListener("click", () => addNode(t.type));
-        paletteEl.appendChild(btn);
-      });
+    const types = Object.values(state.nodeTypes);
+    const hayFor = (t) => (t.type + " " + (t.label || "") + " " + (t.category || "")).toLowerCase();
+    const groups = PALETTE_GROUPS.map(([key, label]) => [
+      key,
+      label,
+      types.filter((t) => (t.category || "tool") === key),
+    ]);
+    // Anything with an unlisted category is appended as a final "其他" group.
+    const known = new Set(PALETTE_GROUPS.map((g) => g[0]));
+    const other = types.filter((t) => !known.has(t.category || "tool"));
+    if (other.length) groups.push(["other", "其他", other]);
+
+    groups.forEach(([key, label, items]) => {
+      const rows = items.filter((t) => !q || hayFor(t).includes(q));
+      if (!rows.length) return;
+      const head = document.createElement("div");
+      head.className = "palette-group-title";
+      head.textContent = label;
+      paletteEl.appendChild(head);
+      rows
+        .slice()
+        .sort((a, b) => (a.type + a.label).localeCompare(b.type + b.label, "zh"))
+        .forEach((t) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.innerHTML = `<span>${t.label || t.type}</span><span class="cat">${t.category || ""} · ${t.type}</span>`;
+          btn.addEventListener("click", () => addNode(t.type));
+          paletteEl.appendChild(btn);
+        });
+    });
   }
 
   function addNode(type) {
@@ -511,6 +574,45 @@
       }
 
       const { inputs, outputs } = portPositions(n);
+      // input.image / input.video render a thumbnail or poster frame behind
+      // the ports (input.text keeps the plain card layout).
+      const thumb = inputThumb(n);
+      if (thumb) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(n.pos[0] + 4, n.pos[1] + HEAD_H + 4, NODE_W - 8, NODE_H - HEAD_H - 8);
+        ctx.clip();
+        ctx.fillStyle = "#0a0e14";
+        ctx.fillRect(n.pos[0] + 4, n.pos[1] + HEAD_H + 4, NODE_W - 8, NODE_H - HEAD_H - 8);
+        // Box geometry is shared by both branches: declaring it inside the
+        // loaded branch made the "loading" branch throw ReferenceError and
+        // abort the whole canvas redraw (found in lead browser QA, #417).
+        const bx = n.pos[0] + 4;
+        const by = n.pos[1] + HEAD_H + 4;
+        const bw = NODE_W - 8;
+        const bh = NODE_H - HEAD_H - 8;
+        if (thumb.img && thumb.img.complete && thumb.img.naturalWidth) {
+          // cover-fit, centered
+          const r = Math.max(bw / thumb.img.naturalWidth, bh / thumb.img.naturalHeight);
+          const dw = thumb.img.naturalWidth * r;
+          const dh = thumb.img.naturalHeight * r;
+          ctx.drawImage(thumb.img, bx + (bw - dw) / 2, by + (bh - dh) / 2, dw, dh);
+        } else {
+          ctx.fillStyle = "#8fa0b5";
+          ctx.font = "10px sans-serif";
+          ctx.fillText("加载缩略图…", bx + 6, by + bh / 2 + 3);
+        }
+        ctx.restore();
+        // Kind badge (duration / resolution) in the node corner.
+        if (thumb.badge) {
+          ctx.fillStyle = "rgba(0,0,0,0.62)";
+          ctx.fillRect(n.pos[0] + NODE_W - 72, n.pos[1] + NODE_H - 16, 68, 13);
+          ctx.fillStyle = "#e8eef7";
+          ctx.font = "10px ui-monospace, Consolas, monospace";
+          ctx.fillText(thumb.badge, n.pos[0] + NODE_W - 68, n.pos[1] + NODE_H - 6);
+        }
+      }
+
       inputs.forEach((p) => {
         ctx.fillStyle = portColor(p.type);
         ctx.beginPath();
@@ -537,6 +639,23 @@
     });
 
     ctx.restore();
+
+    // Drag-over affordance: a dashed "drop here" rectangle on the canvas.
+    if (dropHover) {
+      const { w, h } = viewSize();
+      ctx.save();
+      ctx.strokeStyle = "#3d9cf0";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 6]);
+      ctx.strokeRect(6, 6, w - 12, h - 12);
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#3d9cf0";
+      ctx.font = "600 14px 'Segoe UI', 'PingFang SC', sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("松开以在此处新建输入节点", w / 2, 28);
+      ctx.textAlign = "left";
+      ctx.restore();
+    }
   }
 
   function updateEmpty() {
@@ -557,6 +676,47 @@
     inspectorEl.appendChild(head);
 
     (meta.param_schema || []).forEach((p) => {
+      // Path params for input nodes get a file picker, not a raw text field —
+      // typing an absolute path is brittle, and the picker uploads + de-dups.
+      const isPathParam = p.type === "string" && p.name === "path";
+      if (isPathParam && node.type.startsWith("input.")) {
+        const row = document.createElement("div");
+        row.className = "input-path-row";
+        row.style.marginTop = "10px";
+        const hint = document.createElement("div");
+        hint.style.fontSize = "11px";
+        hint.style.color = "var(--muted)";
+        hint.textContent = "素材路径";
+        row.appendChild(hint);
+        const cur = node.params[p.name] || "";
+        const out = document.createElement("div");
+        out.style.cssText =
+          "font-size:11px;font-family:ui-monospace,Consolas,monospace;word-break:break-all;margin-top:3px;color:#b8c7d9";
+        out.textContent = cur || "未选择";
+        row.appendChild(out);
+        const picker = document.createElement("label");
+        picker.type = "button";
+        picker.className = "file-btn";
+        picker.style.cssText = "display:block;margin-top:6px";
+        picker.textContent = node.type === "input.video" ? "重新选择视频…" : "选择图片…";
+        const inp = document.createElement("input");
+        inp.type = "file";
+        inp.accept =
+          node.type === "input.video"
+            ? "video/mp4,video/quicktime,.mp4,.mov"
+            : "image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp";
+        inp.hidden = true;
+        inp.addEventListener("change", () => {
+          if (inp.files && inp.files[0]) {
+            reuploadIntoNode(inp.files[0], node);
+          }
+          inp.value = "";
+        });
+        picker.appendChild(inp);
+        row.appendChild(picker);
+        inspectorEl.appendChild(row);
+        return;
+      }
       const label = document.createElement("label");
       label.textContent = p.label || p.name;
       let field;
@@ -566,6 +726,15 @@
         field.checked = !!node.params[p.name];
         field.addEventListener("change", () => {
           node.params[p.name] = field.checked;
+        });
+      } else if (node.type === "input.text" && p.name === "text") {
+        // input.text edits its payload right on the card — no separate node.
+        field = document.createElement("textarea");
+        field.rows = 6;
+        field.value = node.params[p.name] ?? p.default ?? "";
+        field.placeholder = "在此直接输入文本 / prompt…";
+        field.addEventListener("input", () => {
+          node.params[p.name] = field.value;
         });
       } else if (p.type === "string" && String(p.default || "").length > 40) {
         field = document.createElement("textarea");
@@ -883,6 +1052,50 @@
     { passive: false },
   );
 
+  // --- drag & drop files from the desktop onto the canvas (issue #417) ---
+  // LibTV-style: a file dropped on empty canvas area becomes an input node
+  // at the drop point. Dropping onto an existing node is ignored so it does
+  // not swallow a node drag.
+  let dropHover = false;
+
+  canvas.addEventListener("dragenter", (evt) => {
+    if (!evt.dataTransfer) return;
+    evt.preventDefault();
+    dropHover = true;
+    canvas.style.cursor = "copy";
+    setStatus("松开以在此处新建输入节点");
+    draw();
+  });
+
+  canvas.addEventListener("dragover", (evt) => {
+    // preventDefault is what actually permits the drop.
+    if (!evt.dataTransfer) return;
+    evt.preventDefault();
+    if (evt.dataTransfer.dropEffect !== undefined) evt.dataTransfer.dropEffect = "copy";
+  });
+
+  canvas.addEventListener("dragleave", (evt) => {
+    // Only clear when leaving the canvas element itself (child bubbles).
+    if (evt.target === canvas) {
+      dropHover = false;
+      canvas.style.cursor = "default";
+    }
+  });
+
+  canvas.addEventListener("drop", async (evt) => {
+    evt.preventDefault();
+    dropHover = false;
+    canvas.style.cursor = "default";
+    const files = evt.dataTransfer && evt.dataTransfer.files;
+    if (!files || !files.length) return;
+    // All files land at the same drop point, staggered slightly so the
+    // second one is not hidden behind the first.
+    const p = canvasPoint(evt);
+    for (let i = 0; i < files.length; i += 1) {
+      await uploadToCanvas(files[i], { x: p.x + i * 24, y: p.y + i * 24 });
+    }
+  });
+
   function bindUi() {
     document.getElementById("btnDemo").addEventListener("click", () => loadDemo().catch((e) => setStatus(e.message)));
     document.getElementById("btnDual").addEventListener("click", () => loadDualTemplate().catch((e) => setStatus(e.message)));
@@ -918,6 +1131,15 @@
       if (fileInput.files && fileInput.files[0]) loadProjectFile(fileInput.files[0]);
       fileInput.value = "";
     });
+    const uploadInput = document.getElementById("uploadInput");
+    if (uploadInput) {
+      uploadInput.addEventListener("change", () => {
+        if (uploadInput.files && uploadInput.files[0]) {
+          uploadToCanvas(uploadInput.files[0]);
+        }
+        uploadInput.value = "";
+      });
+    }
     paletteSearch.addEventListener("input", () => {
       state.paletteFilter = paletteSearch.value;
       renderPalette();
@@ -954,6 +1176,158 @@
   function mediaUrl(p) {
     if (!p) return "";
     return `/api/media?path=${encodeURIComponent(p)}`;
+  }
+
+  /**
+   * Upload a File and add the matching input node at ``at`` (canvas coords).
+   * Shared by the sidebar picker and the canvas drop handler.
+   */
+  /**
+   * Re-upload into an existing input node (file picker on its card). Keeps the
+   * node id and position; only the path + cached metadata change.
+   */
+  async function reuploadIntoNode(file, node) {
+    const type = inputTypeForFile(file.name);
+    if (!type || type !== node.type) {
+      setStatus(
+        `文件类型不匹配：${file.name} 需要 ${(state.nodeTypes[node.type] || {}).label || node.type}`
+      );
+      return;
+    }
+    if (!state.online) {
+      setStatus("离线无法上传；请先启动 studio.server");
+      return;
+    }
+    setStatus(`上传中 ${file.name}…`);
+    try {
+      const meta = await uploadFile(file);
+      node.params.path = meta.path;
+      state.inputMeta = state.inputMeta || {};
+      state.inputMeta[node.id] = meta;
+      renderInspector();
+      draw();
+      setStatus(`已更新素材：${meta.kind}`);
+    } catch (err) {
+      setStatus("上传失败: " + (err.message || err));
+    }
+  }
+
+  async function uploadToCanvas(file, at) {
+    const type = inputTypeForFile(file.name);
+    if (!type) {
+      setStatus(`不支持的文件类型：${file.name}（仅 png/jpg/jpeg/webp/mp4/mov）`);
+      return;
+    }
+    if (!state.online) {
+      setStatus("离线无法上传；请先启动 studio.server");
+      return;
+    }
+    setStatus(`上传中 ${file.name}…`);
+    try {
+      const meta = await uploadFile(file);
+      const p = at || { x: 60 + state.project.nodes.length * 44, y: 80 };
+      addInputNodeAt(type, p.x, p.y, meta);
+    } catch (err) {
+      setStatus("上传失败: " + (err.message || err));
+    }
+  }
+
+  function fmtDur(sec) {
+    if (sec == null) return "";
+    const s = Math.round(sec);
+    const m = Math.floor(s / 60);
+    return m > 0 ? `${m}:${String(s % 60).padStart(2, "0")}` : `${s}s`;
+  }
+
+  /**
+   * Resolve the picture + badge for an input node so the canvas can paint a
+   * thumbnail (images) or poster frame (videos). The image is cached in
+   * ``state.thumbCache`` keyed by path so redraws stay synchronous.
+   */
+  function inputThumb(node) {
+    if (!node || !node.type.startsWith("input.")) return null;
+    const meta = (state.inputMeta && state.inputMeta[node.id]) || null;
+    // Prefer the server's poster frame for videos; fall back to the raw path
+    // for images (and videos whose poster failed to render).
+    const src = meta
+      ? (meta.kind === "video" && meta.poster ? meta.poster : node.params && node.params.path)
+      : node.params && node.params.path;
+    if (!src) return null;
+    const url = mediaUrl(src);
+    let img = state.thumbCache && state.thumbCache[url];
+    if (!img) {
+      img = new Image();
+      img.onload = () => draw();
+      img.onerror = () => {
+        delete state.thumbCache[url];
+        draw();
+      };
+      img.src = url;
+      if (!state.thumbCache) state.thumbCache = {};
+      state.thumbCache[url] = img;
+    }
+    let badge = "";
+    if (meta && meta.kind === "video") {
+      const bits = [];
+      if (meta.width && meta.height) bits.push(`${meta.width}x${meta.height}`);
+      if (meta.duration != null) bits.push(fmtDur(meta.duration));
+      badge = bits.join(" ");
+    } else if (meta && meta.kind === "image" && meta.width && meta.height) {
+      badge = `${meta.width}x${meta.height}`;
+    } else if (!meta) {
+      // No server metadata yet (project loaded from disk, not uploaded).
+      badge = node.type === "input.video" ? "▶" : "";
+    }
+    return { img, badge, url };
+  }
+
+  /** Upload one dropped file; returns the server's metadata reply. */
+  async function uploadFile(file) {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    const res = await fetch("/api/upload", { method: "POST", body: form });
+    // Read the body exactly once: a Response stream cannot be consumed twice,
+    // and parsing it a second time on success used to throw "body stream already
+    // read", so no input node was ever created (found in lead browser QA).
+    let body = null;
+    try {
+      body = await res.json();
+    } catch (_) {
+      /* non-JSON body */
+    }
+    if (!res.ok) throw new Error((body && body.detail) || res.statusText);
+    if (!body) throw new Error("upload returned no JSON metadata");
+    return body;
+  }
+
+  /** Pick the input node type for a dropped file from its extension. */
+  function inputTypeForFile(name) {
+    const ext = (name.split(".").pop() || "").toLowerCase();
+    if (["png", "jpg", "jpeg", "webp"].includes(ext)) return "input.image";
+    if (["mp4", "mov"].includes(ext)) return "input.video";
+    return null;
+  }
+
+  /** Create an input node at canvas point (x, y) wired to the uploaded file. */
+  function addInputNodeAt(type, x, y, meta) {
+    const meta0 = state.nodeTypes[type] || { param_schema: [] };
+    const params = {};
+    (meta0.param_schema || []).forEach((p) => {
+      params[p.name] = p.default;
+    });
+    params.path = meta.path;
+    const id = uid("n");
+    state.project.nodes.push({ id, type, pos: [x, y], params, muted: false });
+    // Stash the server metadata so the canvas can show a thumbnail/poster
+    // for this node before the graph is ever run.
+    state.inputMeta = state.inputMeta || {};
+    state.inputMeta[id] = meta;
+    state.selectedId = id;
+    updateEmpty();
+    renderInspector();
+    draw();
+    const label = meta0.label || type;
+    setStatus(`已添加 ${label}（${meta.kind}）`);
   }
 
   function renderGallery(gallery) {

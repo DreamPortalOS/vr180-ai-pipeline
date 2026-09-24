@@ -18,6 +18,7 @@ from studio.models import Project, StudioModelError, empty_demo_project
 from studio.projects import ProjectStore, ProjectStoreError
 from studio.settings import StudioSettings
 from studio.templates import production_pipeline_project
+from studio.uploads import DEFAULT_MAX_BYTES, UploadError, UploadStore, parse_multipart
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -206,6 +207,27 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
         payload = report.to_dict()
         payload["gallery"] = extract_gallery(report)
         return payload
+
+    @app.post("/api/upload")
+    async def upload(request: Request) -> dict[str, Any]:
+        """Accept a single dropped file, store it content-addressed, return
+        metadata. The canvas creates an ``input.image``/``input.video`` node
+        from the reply (issue #417).
+
+        Multipart is parsed from the raw body via the stdlib ``email`` module
+        so the server has no hard dependency on ``python-multipart``; the dev
+        venv and the CPU-only CI runner both import cleanly.
+        """
+        body = await request.body()
+        if not body:
+            raise HTTPException(status_code=400, detail="empty upload body")
+        try:
+            part = parse_multipart(request.headers.get("content-type", ""), body)
+            store = UploadStore(work_root, max_bytes=DEFAULT_MAX_BYTES)
+            meta = store.save(filename=part.filename, data=part.data)
+        except UploadError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return meta.to_dict()
 
     @app.get("/api/projects")
     def list_saved_projects() -> list[dict[str, Any]]:
