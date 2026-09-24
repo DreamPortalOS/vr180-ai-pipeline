@@ -39,6 +39,7 @@ from studio.dome_proj import (
     camera_ray,
     dir_from_theta_phi,
     dir_to_master_uv,
+    dome_ray_to_scene_dir,
     effective_v_flip,
     export_cli_params,
     master_uv_to_dir,
@@ -249,6 +250,60 @@ def test_camera_frustum_dirs_five_unit_rays() -> None:
         _close(math.hypot(d[0], d[1], d[2]), 1.0, 1e-9, "unit")
     _close_vec(dirs[4], camera_ray(0, 0, 30, -20, 50), msg="centre = look dir")
     _close_vec(dirs[0], camera_ray(-1, -1, 30, -20, 50), msg="corner 0")
+
+
+def test_dome_ray_to_scene_dir_is_the_shader_frame_bridge() -> None:
+    """The frustum must be bridged into the scene frame, like the dome shader.
+
+    ``preview3d.js``'s dome fragment shader projects the interpolated geometry
+    direction with ``d = uOrient * vec3(vDir.x, vDir.y, -vDir.z)`` — the scene
+    frame puts the audience front at ``-z`` while every projection helper here
+    puts it at ``+z``.  The camera wireframe is drawn as scene geometry, so it
+    needs the same negation; without it a camera at yaw 0 ("looking at the
+    audience front") renders pointing at the screen back.
+    """
+    _close_vec(dome_ray_to_scene_dir((0, 0, 1)), (0, 0, -1), msg="front -> scene -z")
+    _close_vec(dome_ray_to_scene_dir((1, 2, 3)), (1, 2, -3))
+    # an involution: bridging twice is the identity
+    for d in ((0, 1, 0), (0.3, -0.5, 0.8), (-1, 0, 0)):
+        _close_vec(dome_ray_to_scene_dir(dome_ray_to_scene_dir(d)), d, msg="involution")
+    # the bridge is a reflection, so it preserves length (the wireframe stays on
+    # the unit sphere the dome is drawn on)
+    for d in ((0.2, 0.4, 0.9), (-0.6, 0.6, 0.53)):
+        _close(math.hypot(*dome_ray_to_scene_dir(d)), math.hypot(*d), 1e-12, "length")
+
+
+def test_camera_front_look_dir_lands_on_the_scene_front_axis() -> None:
+    """A camera at (yaw, pitch) = (0, 0) looks at the audience front — which in
+    the 3D scene's geometry frame (``dirAt``: ``-Z`` = front) is ``(0, 0, -1)``.
+
+    This is the orientation half of the checklist: the frustum has to agree with
+    the dome content it is drawn over, and ``+yaw`` has to keep reading as
+    "turn right" after the frame bridge."""
+    look = dome_ray_to_scene_dir(camera_ray(0, 0, 0, 0, 45))
+    _close_vec(look, (0, 0, -1), 1e-12, msg="yaw 0 looks at the scene front")
+    right = dome_ray_to_scene_dir(camera_ray(0, 0, 90, 0, 45))
+    assert right[0] > 0.99, f"+yaw must turn toward scene +x (right), got {right[0]}"
+    up = dome_ray_to_scene_dir(camera_ray(0, 0, 0, 90, 45))
+    assert up[1] > 0.99, f"a zenith camera must point at scene +Y, got {up[1]}"
+
+
+def test_frustum_near_plane_corners_walk_the_perimeter() -> None:
+    """Consecutive frustum corners must be *adjacent* on the near plane.
+
+    The wireframe joins corner ``i`` to corner ``i+1``, so the order has to walk
+    the perimeter — ``(-1,-1) -> (1,-1) -> (1,1) -> (-1,1) -> wrap``.  Adjacent
+    corners differ in exactly one NDC axis; a diagonal pair differs in both, and
+    an order that produced one would draw the near plane's diagonals instead of
+    its sides (as the pre-fix index expression did)."""
+    ndc = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
+    for i in range(4):
+        a, b = ndc[i], ndc[(i + 1) % 4]
+        same = (a[0] == b[0]) + (a[1] == b[1])
+        assert same == 1, f"corners {i}->{(i + 1) % 4} share {same} axes, expected 1"
+    dirs = camera_frustum_dirs(15, -10, 40)
+    for i, (nx, ny) in enumerate(ndc):
+        _close_vec(dirs[i], camera_ray(nx, ny, 15, -10, 40), msg=f"corner {i} order")
 
 
 # ----------------------------------------------------------- export / CLI signs
