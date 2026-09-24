@@ -65,7 +65,8 @@
       </div>
     </section>
 
-    <aside class="inspector right-rail">
+    <aside class="inspector right-rail" id="rightRail">
+      <div class="rail-resizer" id="railResizer" title="拖拽调整面板宽度"></div>
       <div class="tabs">
         <button type="button" class="tab active" data-tab="inspect">检查器</button>
         <button type="button" class="tab" data-tab="dome">3D 球幕</button>
@@ -90,7 +91,7 @@
       <div class="tab-panel" id="tab-dome">
         <section>
           <h2>穹面 3D 预览</h2>
-          <p class="hint">拖拽旋转 · 滚轮缩放 · 黄线=实心覆盖边界 · 红=留白区</p>
+          <p class="hint">拖拽旋转 · 滚轮缩放 · 黄线=实心覆盖边界 · 红=留白区 · 绿线框=机位</p>
           <canvas id="domeCanvas" class="dome-canvas" width="480" height="280"></canvas>
           <div class="dome-actions">
             <label class="file-btn">
@@ -99,8 +100,48 @@
             </label>
             <button type="button" id="btnCovGood">合规预设</button>
             <button type="button" id="btnCovBad">坏母版预设</button>
+            <button type="button" id="btnCamDrag">机位拖拽</button>
           </div>
           <div id="covReadout" class="cov-readout">加载中…</div>
+        </section>
+
+        <section>
+          <h2>方位调整</h2>
+          <p class="hint">只作用于预览；圆心=天顶、圆周=地平线、圆下方=正前方。</p>
+          <div id="orientYawRow"></div>
+          <div id="orientPitchRow"></div>
+          <div id="orientRollRow"></div>
+          <div class="dome-actions">
+            <button type="button" id="btnRot90cw" title="顺时针 90°">↻ 90°</button>
+            <button type="button" id="btnRot90ccw" title="逆时针 90°">↺ 90°</button>
+            <button type="button" id="btnFlipH" title="水平翻转">⇄ H</button>
+            <button type="button" id="btnFlipV" title="垂直翻转">⇅ V</button>
+            <button type="button" id="btnOrientReset">重置</button>
+          </div>
+          <label class="check-row">
+            <input type="checkbox" id="frontIsBottom" checked />
+            <span>正前方 = 圆下方（取消勾选 = 圆上方）</span>
+          </label>
+          <pre id="orientExport" class="orient-export">--dome-pitch 0
+--dome-yaw 0
+--dome-roll 0</pre>
+          <div class="dome-actions">
+            <button type="button" id="btnOrientExport" class="primary">导出到节点参数</button>
+          </div>
+          <p class="hint" id="orientExportStatus"></p>
+        </section>
+
+        <section>
+          <h2>机位视口</h2>
+          <p class="hint">在 3D 视图中放置虚拟相机，下方实时透视画面。</p>
+          <canvas id="camCanvas" class="cam-canvas" width="480" height="270"></canvas>
+          <div id="camReadout" class="cov-readout"></div>
+          <div id="camYawRow"></div>
+          <div id="camPitchRow"></div>
+          <div id="camHalfFovRow"></div>
+          <div class="dome-actions">
+            <button type="button" id="btnCamReset">重置机位</button>
+          </div>
         </section>
       </div>
 
@@ -142,6 +183,7 @@
   </main>
 
   <script src="app.js"></script>
+  <script src="dome_proj.js"></script>
   <script src="preview3d.js"></script>
 </body>
 </html>

@@ -1,6 +1,9 @@
 /* Studio 3D dome preview — offline WebGL, no CDN.
- * Geometry convention matches web/dome-preview:
+ * Geometry convention matches web/dome-preview and dome_proj.js:
  *   +Y zenith, -Z front (audience), y=0 springline, r = zenith/90°.
+ *   domemaster circle centre = zenith, rim = horizon, BOTTOM of circle =
+ *   directly in front of the audience (DECISION_DOME / docs/FULLDOME_USAGE.md).
+ *   Orientation (yaw/pitch/roll) follows v360 rorder=ypr; see dome_proj.js.
  */
 (() => {
   "use strict";
@@ -211,10 +214,67 @@
       this.orbit = { az: 0.7, el: 0.55, dist: 2.85 };
       this.drag = null;
       this.raf = 0;
+      // orientation the dome content is shown at (yaw/pitch/roll, degrees) plus
+      // the quick flips.  frontIsBottom is the standard convention (audience
+      // front = bottom of the circle); uFlip/vFlip are ±1 multipliers that
+      // implement 水平/垂直翻转 and the 正前方=圆上方 toggle.
+      this.orient = { yaw: 0, pitch: 0, roll: 0 };
+      this.frontIsBottom = true;
+      this.uFlip = 1;
+      this.vFlip = 1;
+      // virtual camera for the 2D viewport (yaw/pitch deg, half-FOV deg).
+      this.camera = { yaw: 0, pitch: 45, halfFov: 45 };
+      this.cameraShow = false;
+      this.onOrientChange = null;
       this._initPrograms();
       this._initBuffers();
       this._bindEvents();
       this._loop();
+    }
+
+    /** Build the output→source mat3 for uOrient as a column-major
+     * Float32Array[9] (what WebGL's uniformMatrix3fv expects with
+     * transpose=false).  dome_proj.js's orientMatrix is row-major, so we
+     * transpose here — the math is otherwise identical. */
+    _orientMat() {
+      const DP = window.DomeProj;
+      if (!DP) return new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+      const m = DP.orientMatrix(this.orient); // row-major [0..8]
+      // transpose: column-major = [m0,m3,m6, m1,m4,m7, m2,m5,m8]
+      return new Float32Array([m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]);
+    }
+
+    /** Set yaw/pitch/roll (degrees) and recompute; emits onOrientChange. */
+    setOrientation(o) {
+      this.orient.yaw = o.yaw != null ? o.yaw : this.orient.yaw;
+      this.orient.pitch = o.pitch != null ? o.pitch : this.orient.pitch;
+      this.orient.roll = o.roll != null ? o.roll : this.orient.roll;
+      if (o.frontIsBottom != null) {
+        this.frontIsBottom = o.frontIsBottom;
+        this.vFlip = o.frontIsBottom ? Math.abs(this.vFlip) : -Math.abs(this.vFlip);
+      }
+      if (o.uFlip != null) this.uFlip = o.uFlip;
+      if (o.vFlip != null) this.vFlip = o.vFlip;
+      if (this.onOrientChange) this.onOrientChange(this.getOrientation());
+    }
+
+    getOrientation() {
+      return {
+        yaw: this.orient.yaw,
+        pitch: this.orient.pitch,
+        roll: this.orient.roll,
+        frontIsBottom: this.frontIsBottom,
+        uFlip: this.uFlip,
+        vFlip: this.vFlip,
+        cli: window.DomeProj ? window.DomeProj.exportCliParams(this.orient) : null,
+      };
+    }
+
+    setCamera(c) {
+      if (c.yaw != null) this.camera.yaw = c.yaw;
+      if (c.pitch != null) this.camera.pitch = c.pitch;
+      if (c.halfFov != null) this.camera.halfFov = c.halfFov;
+      if (this.onCamChange) this.onCamChange();
     }
 
     _initPrograms() {
@@ -234,14 +294,20 @@
           "uniform sampler2D uTex;",
           "uniform float uHasTex;",
           "uniform float uCovR;",
+          "uniform mat3 uOrient;", // output→source (v360 rorder=ypr), front=+z
+          "uniform float uUFlip;", // quick horizontal flip (-1/1)
+          "uniform float uVFlip;", // quick vertical flip / front-on-top (-1/1)
           "void main(){",
-          "  vec3 d=normalize(vDir);",
+          "  vec3 d=normalize(uOrient*vec3(vDir.x, vDir.y, -vDir.z));",
           "  float theta=acos(clamp(d.y,-1.0,1.0));",
           "  float r=clamp(theta/1.5707963267,0.0,1.0);",
           "  float h=length(d.xz);",
           "  vec2 uv=vec2(0.5,0.5);",
           "  float phi=0.0;",
-          "  if(h>1e-5){ uv=vec2(0.5+0.5*r*d.x/h, 0.5+0.5*r*(-d.z)/h); phi=atan(d.x,-d.z); }",
+          // front = +z (matches dome_proj.js): phi = atan(d.x, d.z).
+          // front -> BOTTOM of circle: u tracks sin(phi), v tracks cos(phi).
+          "  if(h>1e-5){ phi=atan(d.x, d.z);",
+          "    uv=vec2(0.5+0.5*r*sin(phi)*uUFlip, 0.5+0.5*r*cos(phi)*uVFlip); }",
           "  vec3 col;",
           "  if(uHasTex>0.5){ col=texture2D(uTex,uv).rgb; }",
           "  else {",
@@ -277,6 +343,9 @@
         tex: gl.getUniformLocation(this.domeProg, "uTex"),
         hasTex: gl.getUniformLocation(this.domeProg, "uHasTex"),
         covR: gl.getUniformLocation(this.domeProg, "uCovR"),
+        orient: gl.getUniformLocation(this.domeProg, "uOrient"),
+        uFlip: gl.getUniformLocation(this.domeProg, "uUFlip"),
+        vFlip: gl.getUniformLocation(this.domeProg, "uVFlip"),
         aDir: gl.getAttribLocation(this.domeProg, "aDir"),
       };
       this.uLine = {
@@ -420,6 +489,9 @@
       gl.uniform1f(this.uDome.radius, 1.0);
       gl.uniform1f(this.uDome.hasTex, this.hasTexture ? 1 : 0);
       gl.uniform1f(this.uDome.covR, this.coverageR);
+      gl.uniformMatrix3fv(this.uDome.orient, false, this._orientMat());
+      gl.uniform1f(this.uDome.uFlip, this.uFlip);
+      gl.uniform1f(this.uDome.vFlip, this.frontIsBottom ? this.vFlip : -this.vFlip);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.tex);
       gl.uniform1i(this.uDome.tex, 0);
@@ -428,6 +500,9 @@
       gl.vertexAttribPointer(this.uDome.aDir, 3, gl.FLOAT, false, 0, 0);
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.domeIdx);
       gl.drawElements(gl.TRIANGLES, this.domeCount, gl.UNSIGNED_SHORT, 0);
+
+      // camera frustum wireframe in the 3D view
+      this._drawCameraFrustum(mvp);
 
       // lines
       gl.useProgram(this.lineProg);
@@ -456,6 +531,184 @@
       gl.uniform4f(this.uLine.color, 0.3, 0.85, 0.55, 1);
       // reuse points: draw as points
       gl.drawArrays(gl.POINTS, 0, this.projLower + this.projUpper);
+    }
+
+    /** The camera's frustum as a wireframe drawn from the dome centre out
+     * toward its corners — 4 corner rays + the 4 face edges + the near-plane
+     * quad, rebuilt whenever the camera yaw/pitch/FOV change. */
+    _buildFrustum() {
+      const DP = window.DomeProj;
+      if (!DP) return [];
+      const { yaw, pitch, halfFov } = this.camera;
+      const c = [-1, -1, 1, 1, -1, 1, 1, -1].map((_, i) => {
+        // 4 corners, then re-used for edges below
+        return DP.cameraRay(
+          (i % 4 === 0 || i % 4 === 1 ? -1 : 1),
+          (i % 2 === 0 ? -1 : 1),
+          yaw,
+          pitch,
+          halfFov,
+        );
+      });
+      const look = DP.cameraRay(0, 0, yaw, pitch, halfFov);
+      const L = 1.15; // frustum length (just past the dome surface)
+      const segs = [];
+      c.forEach((d) => {
+        segs.push(0, 0, 0, d[0] * L, d[1] * L, d[2] * L);
+      });
+      // near-plane quad edges
+      segs.push(
+        c[0][0] * L, c[0][1] * L, c[0][2] * L, c[1][0] * L, c[1][1] * L, c[1][2] * L,
+        c[1][0] * L, c[1][1] * L, c[1][2] * L, c[2][0] * L, c[2][1] * L, c[2][2] * L,
+        c[2][0] * L, c[2][1] * L, c[2][2] * L, c[3][0] * L, c[3][1] * L, c[3][2] * L,
+        c[3][0] * L, c[3][1] * L, c[3][2] * L, c[0][0] * L, c[0][1] * L, c[0][2] * L,
+      );
+      segs.push(0, 0, 0, look[0] * L, look[1] * L, look[2] * L); // look direction
+      return segs;
+    }
+
+    _drawCameraFrustum(mvp) {
+      if (!this.cameraShow) return;
+      const gl = this.gl;
+      const segs = this._buildFrustum();
+      if (!segs.length) return;
+      const data = new Float32Array(segs);
+      if (!this.frustumBuf) this.frustumBuf = gl.createBuffer();
+      gl.useProgram(this.lineProg);
+      gl.uniformMatrix4fv(this.uLine.mvp, false, mvp);
+      gl.uniform1f(this.uLine.radius, 1.0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.frustumBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(this.uLine.aPos);
+      gl.vertexAttribPointer(this.uLine.aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.uniform4f(this.uLine.color, 0.24, 0.95, 0.7, 1);
+      gl.drawArrays(gl.LINES, 0, segs.length / 3);
+    }
+
+    _loop() {
+      const tick = () => {
+        this._draw();
+        this.raf = requestAnimationFrame(tick);
+      };
+      tick();
+    }
+
+    destroy() {
+      cancelAnimationFrame(this.raf);
+    }
+  }
+
+  // ------------------------------------------------------- camera 2D viewport
+  /* Renders the perspective 2D frame a virtual camera at the dome centre
+   * would see, by inverse-projecting each fragment's camera ray back onto the
+   * domemaster texture (dome_proj.js).  Shares the DomePreview's WebGL texture
+   * so a freshly loaded master is visible immediately. */
+  class CameraView {
+    constructor(canvas, preview) {
+      this.canvas = canvas;
+      this.preview = preview;
+      this.gl = canvas.getContext("webgl", { antialias: true, alpha: false });
+      if (!this.gl) throw new Error("WebGL unavailable");
+      this.raf = 0;
+      this._init();
+      this._loop();
+    }
+
+    _init() {
+      const gl = this.gl;
+      this.prog = compile(
+        gl,
+        [
+          "attribute vec2 aPos;",
+          "varying vec2 vNdc;",
+          "void main(){ vNdc=aPos; gl_Position=vec4(aPos,0.0,1.0); }",
+        ].join("\n"),
+        [
+          "precision highp float;",
+          "varying vec2 vNdc;",
+          "uniform sampler2D uTex;",
+          "uniform float uHasTex;",
+          "uniform mat3 uOrient;",
+          "uniform float uUFlip;",
+          "uniform float uVFlip;",
+          "uniform vec3 uCam;", // (yaw, pitch deg, halfFov deg)
+          "const float PI=3.14159265358979;",
+          "const float HPI=1.57079632679490;",
+          // dirToMasterUV, inlined to match dome_proj.js exactly.
+          "vec2 dirToUV(vec3 d){",
+          "  d=normalize(uOrient*d);",
+          "  float theta=acos(clamp(d.y,-1.0,1.0));",
+          "  if(theta>HPI+1e-3) return vec2(-1.0);",
+          "  float r=clamp(theta/HPI,0.0,1.0);",
+          "  float h=length(d.xz);",
+          "  if(h<1e-5) return vec2(0.5,0.5);",
+          "  float phi=atan(d.x, d.z);",
+          "  return vec2(0.5+0.5*r*sin(phi)*uUFlip, 0.5+0.5*r*cos(phi)*uVFlip);",
+          "}",
+          // cameraRay, inlined (positive-up/right, +yaw->+x, +pitch->+y).
+          "vec3 camRay(vec2 ndc, float yaw, float pitch, float halfFov){",
+          "  float hh=halfFov*PI/180.0;",
+          "  vec3 ray=normalize(vec3(tan(hh)*ndc.x, tan(hh)*ndc.y, 1.0));",
+          "  float p=pitch*PI/180.0, y=yaw*PI/180.0;",
+          "  float cp=cos(p), sp=sin(p), cy=cos(y), sy=sin(y);",
+          "  vec3 r1=vec3(ray.x, ray.y*cp+ray.z*sp, -ray.y*sp+ray.z*cp);",
+          "  return vec3(r1.x*cy+r1.z*sy, r1.y, -r1.x*sy+r1.z*cy);",
+          "}",
+          "void main(){",
+          "  vec3 ray=camRay(vNdc, uCam.x, uCam.y, uCam.z);",
+          "  vec2 uv=dirToUV(ray);",
+          "  if(uv.x<0.0){ gl_FragColor=vec4(0.02,0.03,0.05,1.0); return; }",
+          "  vec3 col=uHasTex>0.5 ? texture2D(uTex,uv).rgb",
+          "    : vec3(0.08,0.10,0.13)*(0.5+0.5*ray.y);",
+          // subtle vignette so the camera frame reads as a view, not the master
+          "  float vig=1.0-0.18*dot(vNdc,vNdc);",
+          "  gl_FragColor=vec4(col*vig,1.0);",
+          "}",
+        ].join("\n"),
+      );
+      this.u = {
+        tex: gl.getUniformLocation(this.prog, "uTex"),
+        hasTex: gl.getUniformLocation(this.prog, "uHasTex"),
+        orient: gl.getUniformLocation(this.prog, "uOrient"),
+        uFlip: gl.getUniformLocation(this.prog, "uUFlip"),
+        vFlip: gl.getUniformLocation(this.prog, "uVFlip"),
+        cam: gl.getUniformLocation(this.prog, "uCam"),
+        aPos: gl.getAttribLocation(this.prog, "aPos"),
+      };
+      const q = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
+      this.quad = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
+      gl.bufferData(gl.ARRAY_BUFFER, q, gl.STATIC_DRAW);
+    }
+
+    _draw() {
+      const gl = this.gl;
+      const w = this.canvas.clientWidth || 256;
+      const h = this.canvas.clientHeight || 160;
+      const dpr = window.devicePixelRatio || 1;
+      const pw = Math.floor(w * dpr);
+      const ph = Math.floor(h * dpr);
+      if (this.canvas.width !== pw || this.canvas.height !== ph) {
+        this.canvas.width = pw;
+        this.canvas.height = ph;
+      }
+      gl.viewport(0, 0, pw, ph);
+      gl.clearColor(0.02, 0.03, 0.05, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.useProgram(this.prog);
+      const p = this.preview;
+      gl.uniform1f(this.u.hasTex, p.hasTexture ? 1 : 0);
+      gl.uniformMatrix3fv(this.u.orient, false, p._orientMat());
+      gl.uniform1f(this.u.uFlip, p.uFlip);
+      gl.uniform1f(this.u.vFlip, p.frontIsBottom ? p.vFlip : -p.vFlip);
+      gl.uniform3f(this.u.cam, p.camera.yaw, p.camera.pitch, p.camera.halfFov);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, p.tex);
+      gl.uniform1i(this.u.tex, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quad);
+      gl.enableVertexAttribArray(this.u.aPos);
+      gl.vertexAttribPointer(this.u.aPos, 2, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
 
     _loop() {
@@ -669,7 +922,46 @@
     if (box) box.innerHTML = `<div class="cov-main cov-warn"><div class="cov-deg">…</div><div class="cov-sub">${msg}</div></div>`;
   }
 
+  // ---- draggable right panel width, persisted in localStorage (#416) ----
+  function initRailResizer() {
+    const rail = el("rightRail");
+    const handle = el("railResizer");
+    if (!rail || !handle) return;
+    const KEY = "studio.railWidth";
+    const applyPx = (px) => {
+      rail.style.width = `${px}px`;
+      rail.style.flex = "0 0 auto";
+    };
+    const clamp = (px) => {
+      const min = 280;
+      const maxVw = window.innerWidth * 0.7;
+      return Math.max(min, Math.min(maxVw, px));
+    };
+    const saved = Number(localStorage.getItem(KEY));
+    if (saved && saved >= 280) applyPx(clamp(saved));
+    handle.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = rail.getBoundingClientRect().width;
+      const move = (ev) => {
+        // dragging the LEFT edge rightward (toward canvas) makes the panel
+        // narrower; leftward (toward screen edge) makes it wider. Screen-space
+        // width grows as the handle moves left.
+        const w = clamp(startW - (ev.clientX - startX));
+        applyPx(w);
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        localStorage.setItem(KEY, String(Math.round(rail.getBoundingClientRect().width)));
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+    });
+  }
+
   function bootStudioPanel() {
+    initRailResizer();
     const canvas = el("domeCanvas");
     if (!canvas) return;
     let preview;
@@ -732,6 +1024,220 @@
     el("btnCovGood") && el("btnCovGood").addEventListener("click", () => presetCoverage(0.98));
     el("btnCovBad") && el("btnCovBad").addEventListener("click", () => presetCoverage(0.6));
 
+    // ---------------- orientation tools (yaw/pitch/roll + quick transforms)
+    const sliderRow = (key, host, label, hint) => {
+      if (!host) return;
+      host.innerHTML = `
+        <div class="sl-row">
+          <span class="sl-lab">${label}</span>
+          <input class="sl" id="sl-${key}" type="range" min="-180" max="180" step="1" value="0" />
+          <input class="sl-num" id="num-${key}" type="number" min="-180" max="180" step="1" value="0" />
+        </div>
+        <p class="hint">${hint}</p>`;
+      const sl = el(`sl-${key}`);
+      const num = el(`num-${key}`);
+      const push = (v) => {
+        const c = Math.max(-180, Math.min(180, Math.round(Number(v) || 0)));
+        sl.value = String(c);
+        num.value = String(c);
+        preview.setOrientation({ [key]: c });
+      };
+      sl.addEventListener("input", () => push(sl.value));
+      num.addEventListener("change", () => push(num.value));
+    };
+    sliderRow("yaw", el("orientYawRow"), "yaw 旋转", "绕竖直轴转动母版（对应 --dome-yaw）");
+    sliderRow("pitch", el("orientPitchRow"), "pitch 俯仰", "把内容从天顶压低（对应 --dome-pitch，正值向地平线）");
+    sliderRow("roll", el("orientRollRow"), "roll 侧滚", "绕中心旋转母版（对应 --dome-roll）");
+
+    const refreshOrientUi = () => {
+      const o = preview.getOrientation();
+      ["yaw", "pitch", "roll"].forEach((k) => {
+        const sl = el(`sl-${k}`);
+        const num = el(`num-${k}`);
+        if (sl && document.activeElement !== sl) sl.value = String(o[k]);
+        if (num && document.activeElement !== num) num.value = String(o[k]);
+      });
+      const cb = el("frontIsBottom");
+      if (cb && cb.checked !== o.frontIsBottom) cb.checked = o.frontIsBottom;
+      const code = el("orientExport");
+      if (code) {
+        const cli = o.cli || { dome_pitch: o.pitch, dome_yaw: o.yaw, dome_roll: o.roll };
+        code.textContent =
+          `--dome-pitch ${cli.dome_pitch}\n--dome-yaw ${cli.dome_yaw}\n--dome-roll ${cli.dome_roll}`;
+      }
+    };
+    preview.onOrientChange = refreshOrientUi;
+
+    const btnReset = el("btnOrientReset");
+    btnReset &&
+      btnReset.addEventListener("click", () => {
+        preview.orient = { yaw: 0, pitch: 0, roll: 0 };
+        preview.frontIsBottom = true;
+        preview.uFlip = 1;
+        preview.vFlip = 1;
+        preview.setOrientation({});
+      });
+    const rot90 = (d) => () =>
+      preview.setOrientation({ yaw: ((preview.orient.yaw + d + 540) % 360) - 180 });
+    el("btnRot90cw") && el("btnRot90cw").addEventListener("click", rot90(90));
+    el("btnRot90ccw") && el("btnRot90ccw").addEventListener("click", rot90(-90));
+    const flip = (axis) => () =>
+      preview.setOrientation({ [axis]: -preview[axis] });
+    el("btnFlipH") && el("btnFlipH").addEventListener("click", flip("uFlip"));
+    el("btnFlipV") && el("btnFlipV").addEventListener("click", flip("vFlip"));
+    const cbFront = el("frontIsBottom");
+    cbFront &&
+      cbFront.addEventListener("change", () => preview.setOrientation({ frontIsBottom: cbFront.checked }));
+
+    // export into the selected convert.dome node so the run honours the preview.
+    // Reads the inspector DOM (app.js keeps state private) to find a
+    // convert.dome node and its pitch/yaw/roll number fields, then sets them —
+    // the inspector's own change handler writes the value back to node.params.
+    function applyOrientationToNode(cli) {
+      const insp = el("inspectorBody");
+      if (!insp) return false;
+      const typeEl = insp.querySelector(".node-type");
+      if (!typeEl || typeEl.textContent !== "convert.dome") return false;
+      const labels = Array.from(insp.querySelectorAll("label"));
+      let n = 0;
+      const setField = (suffix, value) => {
+        const lab = labels.find((l) => (l.textContent || "").trim().toLowerCase().startsWith(suffix));
+        if (!lab) return;
+        const f = lab.querySelector("input[type=number]");
+        if (!f) return;
+        f.value = String(value);
+        f.dispatchEvent(new Event("change", { bubbles: true }));
+        n++;
+      };
+      setField("pitch", cli.dome_pitch);
+      setField("yaw", cli.dome_yaw);
+      setField("roll", cli.dome_roll);
+      return n > 0;
+    }
+
+    const btnExport = el("btnOrientExport");
+    btnExport &&
+      btnExport.addEventListener("click", () => {
+        const o = preview.getOrientation();
+        const cli = o.cli;
+        if (!cli) return;
+        const applied = applyOrientationToNode(cli);
+        const st = el("orientExportStatus");
+        if (st) {
+          st.textContent = applied
+            ? "已写入选中的 convert.dome 节点 pitch/yaw/roll"
+            : "未选中 convert.dome 节点（参数已复制到剪贴板）";
+          st.className = `hint ${applied ? "ok" : ""}`;
+        }
+        try {
+          navigator.clipboard &&
+            navigator.clipboard.writeText(
+              `--dome-pitch ${cli.dome_pitch} --dome-yaw ${cli.dome_yaw} --dome-roll ${cli.dome_roll}`,
+            );
+        } catch (_) {
+          /* clipboard unavailable; the readout text stays */
+        }
+      });
+
+    // ---------------- camera viewport (virtual camera + 2D perspective)
+    const camCanvas = el("camCanvas");
+    let cam2d = null;
+    if (camCanvas) {
+      try {
+        cam2d = new CameraView(camCanvas, preview);
+      } catch (err) {
+        const host = el("camReadout");
+        if (host) host.innerHTML = `<div class="cov-bad">${err.message}</div>`;
+      }
+    }
+    const camSlider = (key, label, min, max, hint, deg) => {
+      const host = el(`cam${key}Row`);
+      if (!host) return;
+      host.innerHTML = `
+        <div class="sl-row">
+          <span class="sl-lab">${label}</span>
+          <input class="sl" id="cam-${key}" type="range" min="${min}" max="${max}" step="1" value="${deg != null ? deg : min}" />
+          <input class="sl-num" id="camnum-${key}" type="number" min="${min}" max="${max}" step="1" value="${deg != null ? deg : min}" />
+        </div>
+        ${hint ? `<p class="hint">${hint}</p>` : ""}`;
+      const sl = el(`cam-${key}`);
+      const num = el(`camnum-${key}`);
+      const push = (v) => {
+        const n = Math.max(min, Math.min(max, Math.round(Number(v) || min)));
+        if (sl && document.activeElement !== sl) sl.value = String(n);
+        if (num && document.activeElement !== num) num.value = String(n);
+        preview.setCamera({ [key]: n });
+      };
+      sl && sl.addEventListener("input", () => push(sl.value));
+      num && num.addEventListener("change", () => push(num.value));
+    };
+    camSlider("yaw", "cam-yaw", -180, 180, "相机水平朝向", preview.camera.yaw);
+    camSlider("pitch", "cam-pitch", -89, 90, "相机俯仰（+90 = 正对天顶）", preview.camera.pitch);
+    camSlider("halfFov", "cam-halfFov", 15, 85, "相机半视场角", preview.camera.halfFov);
+
+    const camReadout = el("camReadout");
+    const refreshCam = () => {
+      if (!camReadout) return;
+      const DP = window.DomeProj;
+      const ray = DP ? DP.cameraRay(0, 0, preview.camera.yaw, preview.camera.pitch, preview.camera.halfFov) : null;
+      if (!ray) return;
+      const elev = (Math.asin(Math.max(-1, Math.min(1, ray[1]))) * 180) / Math.PI;
+      camReadout.innerHTML = `<p class="hint">视线仰角 <b>${elev.toFixed(0)}°</b>（90°=天顶，0°=地平线，&lt;0=地面）<br/>相机正对天顶时 2D 画面中心 = 母版圆心。</p>`;
+    };
+    preview.onCamChange = refreshCam;
+
+    const camBtnReset = el("btnCamReset");
+    camBtnReset &&
+      camBtnReset.addEventListener("click", () => {
+        preview.setCamera({ yaw: 0, pitch: 45, halfFov: 45 });
+        ["yaw", "pitch", "halfFov"].forEach((k) => {
+          const sl = el(`cam-${k}`);
+          const num = el(`camnum-${k}`);
+          if (sl) sl.value = String(preview.camera[k]);
+          if (num) num.value = String(preview.camera[k]);
+        });
+        refreshCam();
+      });
+    refreshCam();
+
+    // drag the camera in the 3D view: left = yaw, up = pitch
+    const dragCam = { active: false };
+    const camToggle = el("btnCamDrag");
+    if (camToggle) {
+      camToggle.addEventListener("click", () => {
+        dragCam.active = !dragCam.active;
+        preview.cameraShow = dragCam.active;
+        camToggle.textContent = dragCam.active ? "● 机位拖拽开" : "机位拖拽";
+        camToggle.className = `button ${dragCam.active ? "primary" : ""}`;
+      });
+    }
+    const dragStart = (e) => {
+      if (!dragCam.active) return;
+      e.preventDefault();
+      const sx = e.clientX, sy = e.clientY;
+      const oYaw = preview.camera.yaw, oPitch = preview.camera.pitch;
+      const move = (ev) => {
+        preview.setCamera({
+          yaw: Math.max(-180, Math.min(180, oYaw + (ev.clientX - sx) * 0.5)),
+          pitch: Math.max(-89, Math.min(90, oPitch - (ev.clientY - sy) * 0.5)),
+        });
+        ["yaw", "pitch"].forEach((k) => {
+          const sl = el(`cam-${k}`);
+          const num = el(`camnum-${k}`);
+          if (sl && document.activeElement !== sl) sl.value = String(preview.camera[k]);
+          if (num && document.activeElement !== num) num.value = String(preview.camera[k]);
+        });
+        refreshCam();
+      };
+      const up = () => {
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+      };
+      window.addEventListener("mousemove", move);
+      window.addEventListener("mouseup", up);
+    };
+    el("domeCanvas") && el("domeCanvas").addEventListener("mousedown", dragStart);
+
     // accept coverage report from studio run via global event
     window.addEventListener("studio:coverage", (ev) => {
       const d = ev.detail || {};
@@ -759,4 +1265,8 @@
   } else {
     bootStudioPanel();
   }
+
+  // expose constructors for reuse / headless verification
+  window.DomePreview = DomePreview;
+  window.CameraView = CameraView;
 })();
