@@ -299,7 +299,20 @@
     spacePan: null,
     online: false,
     paletteFilter: "",
+    /** Latest server-side run results keyed by node id, for inline previews. */
+    lastRun: null,
+    /** Drawer open/closed state — persisted to localStorage. */
+    drawerOpen: true,
+    drawerHeight: 220,
+    /** Ordered shot ids per node id after a drag-reorder (written back to JSON). */
+    shotOrder: {},
+    /** Checked shot ids per node id. */
+    shotChecked: {},
+    /** Picker: node id → index into node history (0 = latest). */
+    historyIdx: {},
   };
+
+  const LS_DRAWER = "studio.drawer.v1";
 
   const canvas = document.getElementById("canvas");
   const ctx = canvas.getContext("2d");
@@ -574,45 +587,74 @@
       }
 
       const { inputs, outputs } = portPositions(n);
-      // input.image / input.video render a thumbnail or poster frame behind
-      // the ports (input.text keeps the plain card layout).
-      const thumb = inputThumb(n);
+      // Body box geometry (shared by every branch so a variable declared in
+      // one branch can't leak/ReferenceError another — the #417 redraw bug).
+      const bx = n.pos[0] + 4;
+      const by = n.pos[1] + HEAD_H + 4;
+      const bw = NODE_W - 8;
+      const bh = NODE_H - HEAD_H - 8;
+
+      // input.text: draw the text payload inline on the card (issue #418).
+      // Clicking the body opens an overlaid textarea to edit; blur saves.
+      if (n.type === "input.text") {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(bx, by, bw, bh);
+        ctx.clip();
+        ctx.fillStyle = "#0a0e14";
+        ctx.fillRect(bx, by, bw, bh);
+        const txt = String(n.params && n.params.text != null ? n.params.text : "");
+        ctx.fillStyle = txt ? "#cdd9e8" : "#5a6b80";
+        ctx.font = "11px 'Segoe UI', 'PingFang SC', sans-serif";
+        ctx.textBaseline = "top";
+        const lines = txt ? txt.split("\n") : ["（点击输入文本）"];
+        let ty = by + 4;
+        for (let li = 0; li < lines.length && ty < by + bh - 4; li += 1) {
+          const slice = lines[li].slice(0, 26);
+          ctx.fillText(slice, bx + 6, ty);
+          ty += 13;
+        }
+        ctx.textBaseline = "alphabetic";
+        ctx.restore();
+        drawHistoryArrows(n, bx, by, bw);
+        drawPortsAndBadge(n, inputs, outputs, null, bx);
+        return;
+      }
+
+      // image/video nodes (input or output) render a thumbnail or poster frame
+      // behind the ports. nodeRunThumb covers input.* uploads AND run outputs.
+      const thumb = nodeRunThumb(n);
       if (thumb) {
         ctx.save();
         ctx.beginPath();
-        ctx.rect(n.pos[0] + 4, n.pos[1] + HEAD_H + 4, NODE_W - 8, NODE_H - HEAD_H - 8);
+        ctx.rect(bx, by, bw, bh);
         ctx.clip();
         ctx.fillStyle = "#0a0e14";
-        ctx.fillRect(n.pos[0] + 4, n.pos[1] + HEAD_H + 4, NODE_W - 8, NODE_H - HEAD_H - 8);
-        // Box geometry is shared by both branches: declaring it inside the
-        // loaded branch made the "loading" branch throw ReferenceError and
-        // abort the whole canvas redraw (found in lead browser QA, #417).
-        const bx = n.pos[0] + 4;
-        const by = n.pos[1] + HEAD_H + 4;
-        const bw = NODE_W - 8;
-        const bh = NODE_H - HEAD_H - 8;
+        ctx.fillRect(bx, by, bw, bh);
         if (thumb.img && thumb.img.complete && thumb.img.naturalWidth) {
           // cover-fit, centered
           const r = Math.max(bw / thumb.img.naturalWidth, bh / thumb.img.naturalHeight);
           const dw = thumb.img.naturalWidth * r;
           const dh = thumb.img.naturalHeight * r;
           ctx.drawImage(thumb.img, bx + (bw - dw) / 2, by + (bh - dh) / 2, dw, dh);
+        } else if (thumb.placeholder) {
+          ctx.fillStyle = "#5a6b80";
+          ctx.font = "11px sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText(thumb.placeholder, bx + bw / 2, by + bh / 2 + 4);
+          ctx.textAlign = "left";
         } else {
-          ctx.fillStyle = "#8fa0b5";
+          ctx.fillStyle = "#5a6b80";
           ctx.font = "10px sans-serif";
           ctx.fillText("加载缩略图…", bx + 6, by + bh / 2 + 3);
         }
         ctx.restore();
-        // Kind badge (duration / resolution) in the node corner.
-        if (thumb.badge) {
-          ctx.fillStyle = "rgba(0,0,0,0.62)";
-          ctx.fillRect(n.pos[0] + NODE_W - 72, n.pos[1] + NODE_H - 16, 68, 13);
-          ctx.fillStyle = "#e8eef7";
-          ctx.font = "10px ui-monospace, Consolas, monospace";
-          ctx.fillText(thumb.badge, n.pos[0] + NODE_W - 68, n.pos[1] + NODE_H - 6);
-        }
+        drawHistoryArrows(n, bx, by, bw);
+        drawPortsAndBadge(n, inputs, outputs, thumb.badge, bx);
+        return;
       }
 
+      drawHistoryArrows(n, bx, by, bw);
       inputs.forEach((p) => {
         ctx.fillStyle = portColor(p.type);
         ctx.beginPath();
@@ -660,6 +702,128 @@
 
   function updateEmpty() {
     emptyOverlay.classList.toggle("hidden", state.project.nodes.length > 0);
+  }
+
+  /** Draw the ◀▶ history arrows on a node card when history has ≥2 entries. */
+  function drawHistoryArrows(n, bx, by, bw) {
+    const rep = state.lastRun;
+    const entries = (rep && rep.history && rep.history[n.id]) || [];
+    if (entries.length < 2) return;
+    ctx.save();
+    const y = by + 6;
+    for (const [glyph, x] of [["◀", bx + 4], ["▶", bx + bw - 14]]) {
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(x, y - 9, 12, 13);
+      ctx.fillStyle = "#e8eef7";
+      ctx.font = "9px sans-serif";
+      ctx.fillText(glyph, x + 2, y + 1);
+    }
+    // History counter, so the lead can see 1/3 without reading the status bar.
+    const idx = state.historyIdx[n.id];
+    const nCur = idx == null ? entries.length : entries.length - idx;
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(bx + bw / 2 - 14, y - 9, 28, 13);
+    ctx.fillStyle = "#e8eef7";
+    ctx.font = "9px ui-monospace, Consolas, monospace";
+    ctx.fillText(`${nCur}/${entries.length}`, bx + bw / 2 - 9, y + 1);
+    ctx.restore();
+  }
+
+  /** Draw node ports + optional kind badge (factor of the old draw() block). */
+  function drawPortsAndBadge(n, inputs, outputs, badge, bx) {
+    if (badge) {
+      ctx.fillStyle = "rgba(0,0,0,0.62)";
+      ctx.fillRect(n.pos[0] + NODE_W - 72, n.pos[1] + NODE_H - 16, 68, 13);
+      ctx.fillStyle = "#e8eef7";
+      ctx.font = "10px ui-monospace, Consolas, monospace";
+      ctx.fillText(badge, n.pos[0] + NODE_W - 68, n.pos[1] + NODE_H - 6);
+    }
+    inputs.forEach((p) => {
+      ctx.fillStyle = portColor(p.type);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, PORT_R, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "#0b1016";
+      ctx.stroke();
+      ctx.fillStyle = "#8fa0b5";
+      ctx.font = "10px sans-serif";
+      ctx.fillText(p.name, p.x + 9, p.y + 3);
+    });
+    outputs.forEach((p) => {
+      ctx.fillStyle = portColor(p.type);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, PORT_R, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "#0b1016";
+      ctx.stroke();
+      ctx.fillStyle = "#8fa0b5";
+      ctx.font = "10px sans-serif";
+      const tw = ctx.measureText(p.name).width;
+      ctx.fillText(p.name, p.x - 9 - tw, p.y + 3);
+    });
+  }
+
+  /** Single global inline textarea for editing an input.text node on its card. */
+  function editTextNodeInline(node) {
+    if (!node || node.type !== "input.text") return;
+    closeTextNodeEditor();
+    const stage = document.getElementById("canvasStage");
+    if (!stage) return;
+    const ta = document.createElement("textarea");
+    ta.id = "nodeTextEditor";
+    ta.className = "node-text-editor";
+    ta.value = String(node.params.text != null ? node.params.text : "");
+    ta.placeholder = "输入文本 / prompt，失焦保存…";
+    ta.addEventListener("blur", () => {
+      node.params.text = ta.value;
+      ta.remove();
+      draw();
+      renderInspector();
+      setStatus("已保存文本节点");
+    });
+    ta.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape") {
+        evt.preventDefault();
+        ta.blur();
+      }
+      evt.stopPropagation();
+    });
+    const rect = canvas.getBoundingClientRect();
+    const scale = rect.width / (canvas.width / (window.devicePixelRatio || 1)) || 1;
+    const left = rect.left + state.pan.x + node.pos[0] + 4;
+    const top = rect.top + state.pan.y + node.pos[1] + HEAD_H + 4;
+    ta.style.left = left + "px";
+    ta.style.top = top + "px";
+    ta.style.width = (NODE_W - 8) * scale + "px";
+    ta.style.height = (NODE_H - HEAD_H - 8) * scale + "px";
+    stage.appendChild(ta);
+    ta.focus();
+    ta.select();
+  }
+
+  function closeTextNodeEditor() {
+    const ta = document.getElementById("nodeTextEditor");
+    if (ta) ta.remove();
+  }
+
+  /** Click-vs-drag hit test for inline text editing + history arrows. */
+  function nodeCardClickTarget(node, p) {
+    if (!node) return null;
+    const bx = node.pos[0] + 4;
+    const by = node.pos[1] + HEAD_H + 4;
+    const bw = NODE_W - 8;
+    const rep = state.lastRun;
+    const entries = (rep && rep.history && rep.history[node.id]) || [];
+    if (entries.length >= 2) {
+      const ay = by + 6 - 9;
+      const ah = 13;
+      if (p.y >= ay && p.y <= ay + ah) {
+        if (p.x >= bx + 2 && p.x <= bx + 18) return { kind: "history", delta: -1 };
+        if (p.x >= bx + bw - 18 && p.x <= bx + bw - 2) return { kind: "history", delta: 1 };
+      }
+    }
+    if (node.type === "input.text") return { kind: "text" };
+    return null;
   }
 
   function renderInspector() {
@@ -790,6 +954,7 @@
     if (state.selectedId === id) state.selectedId = null;
     updateEmpty();
     renderInspector();
+    renderDrawer();
     draw();
   }
 
@@ -831,8 +996,11 @@
     projectNameEl.textContent = state.project.name || "untitled";
     state.selectedId = null;
     state.status = {};
+    state.lastRun = null;
+    state.historyIdx = {};
     updateEmpty();
     renderInspector();
+    renderDrawer();
     fitView();
   }
 
@@ -915,8 +1083,12 @@
       state.status = Object.fromEntries(
         Object.entries(report.results || {}).map(([id, r]) => [id, r.status]),
       );
+      state.lastRun = report;
       runOutEl.textContent = JSON.stringify(report, null, 2);
-      renderGallery(report.gallery);
+      // Bottom drawer (#418) replaces the right-rail gallery.
+      renderDrawer();
+      // Inline node-card previews from this run's outputs.
+      loadNodeRunPreviews(report);
       // Feed 3D panel if a coverage node ran
       const cov = (report.results && (report.results.n_cov || report.results.cov)) || null;
       if (cov && cov.outputs && cov.outputs.report) {
@@ -969,20 +1141,34 @@
     }
     const node = hitNode(p.x, p.y);
     if (node) {
+      // History arrows (◀▶) on the card take a single click and don't drag.
+      const click = nodeCardClickTarget(node, p);
+      if (click && click.kind === "history") {
+        state.selectedId = node.id;
+        stepNodeHistory(node.id, click.delta);
+        renderInspector();
+        renderDrawer();
+        return;
+      }
       state.selectedId = node.id;
       state.drag = {
         mode: "node",
         id: node.id,
         ox: p.x - node.pos[0],
         oy: p.y - node.pos[1],
+        startX: node.pos[0],
+        startY: node.pos[1],
+        moved: false,
       };
       renderInspector();
+      renderDrawer();
       draw();
       return;
     }
     state.selectedId = null;
     state.drag = { mode: "pan", sx: evt.clientX, sy: evt.clientY, px: state.pan.x, py: state.pan.y };
     renderInspector();
+    renderDrawer();
     draw();
   });
 
@@ -1003,7 +1189,12 @@
     }
     const node = nodeById(state.drag.id);
     if (node) {
-      node.pos = [p.x - state.drag.ox, p.y - state.drag.oy];
+      const nx = p.x - state.drag.ox;
+      const ny = p.y - state.drag.oy;
+      if (Math.abs(nx - state.drag.startX) > 2 || Math.abs(ny - state.drag.startY) > 2) {
+        state.drag.moved = true;
+      }
+      node.pos = [nx, ny];
       draw();
     }
   });
@@ -1028,6 +1219,13 @@
       state.linking = null;
       draw();
     }
+    if (state.drag && state.drag.mode === "node" && !state.drag.moved) {
+      const node = nodeById(state.drag.id);
+      if (node && node.type === "input.text") {
+        // A plain click (no drag) on a text node opens inline editing.
+        editTextNodeInline(node);
+      }
+    }
     state.drag = null;
   });
 
@@ -1037,6 +1235,13 @@
     if (node) {
       state.selectedId = node.id;
       renderInspector();
+      renderDrawer();
+      if (node.type === "input.text") {
+        editTextNodeInline(node);
+        return;
+      }
+      // Double-click an image/video node card to toggle playback inline.
+      toggleNodePlayback(node, p.x, p.y);
     }
   });
 
@@ -1098,6 +1303,7 @@
 
   function bindUi() {
     document.getElementById("btnDemo").addEventListener("click", () => loadDemo().catch((e) => setStatus(e.message)));
+    bindDrawer();
     document.getElementById("btnDual").addEventListener("click", () => loadDualTemplate().catch((e) => setStatus(e.message)));
     document.getElementById("btnEmptyDual").addEventListener("click", () => loadDualTemplate().catch((e) => setStatus(e.message)));
     document.getElementById("btnSave").addEventListener("click", saveProject);
@@ -1159,6 +1365,18 @@
         saveProject();
       }
       if (evt.key === "Delete" && state.selectedId) removeNode(state.selectedId);
+      if (evt.key.toLowerCase() === "b" && !evt.ctrlKey && !evt.metaKey && !evt.altKey) {
+        // Don't steal the key when the user is typing in a text field.
+        const ae = document.activeElement;
+        const typing = ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA" || ae.isContentEditable);
+        if (!typing) {
+          evt.preventDefault();
+          state.drawerOpen = !state.drawerOpen;
+          applyDrawerState();
+          saveDrawerState();
+          if (state.drawerOpen) renderDrawer();
+        }
+      }
       if (evt.key === "Escape") {
         state.linking = null;
         draw();
@@ -1330,33 +1548,539 @@
     setStatus(`已添加 ${label}（${meta.kind}）`);
   }
 
-  function renderGallery(gallery) {
-    const box = document.getElementById("galleryBox");
-    if (!box) return;
-    if (!gallery || (!gallery.sheet && !(gallery.shots && gallery.shots.length))) {
-      box.classList.add("hidden");
-      box.innerHTML = "";
+  /**
+   * Collect the shots array for a storyboard-class node from the latest run
+   * result (or a passed run). Returns [] when the node has no shots yet so
+   * the drawer renders grey "not generated" cards only when the node carries
+   * shot descriptions (issue #418).
+   */
+  function shotsForNode(nodeId, report) {
+    const rep = report || state.lastRun;
+    if (!rep || !rep.results) return [];
+    const res = rep.results[nodeId];
+    if (!res || !res.outputs) return [];
+    const outs = res.outputs;
+    // batch_stills / review: { stills: { shots: [...] } }
+    const stills = outs.stills;
+    if (stills && Array.isArray(stills.shots)) return stills.shots;
+    // shot_list / polish: { shots: { shots: [...] } }
+    const shotsWrap = outs.shots;
+    if (shotsWrap && Array.isArray(shotsWrap.shots)) return shotsWrap.shots;
+    // storyboard node: { storyboard: {...} } (single shot)
+    const sb = outs.storyboard;
+    if (sb && (sb.description || sb.prompt)) return [sb];
+    return [];
+  }
+
+  /**
+   * Pull shot descriptions from the *current params* of a shot_list node so
+   * the drawer can list grey "未生成" cards even before the first run (the
+   * card read-out only happens after /api/run). Falls back to [].
+   */
+  function shotsFromParams(node) {
+    if (!node) return [];
+    if (node.type === "script.shot_list") {
+      const lines = String(node.params.shot_texts || "").split("\n").map((s) => s.trim()).filter(Boolean);
+      const durs = String(node.params.shot_durations || "").split(",").map((s) => s.trim());
+      const motions = String(node.params.motions || "").split(",").map((s) => s.trim());
+      return lines.map((line, i) => ({
+        id: `shot_${String(i + 1).padStart(2, "0")}`,
+        index: i,
+        description: line,
+        motion: motions[i] || "dolly_in",
+        duration: durs[i] ? Number(durs[i]) : 4,
+      }));
+    }
+    if (node.type === "script.storyboard") {
+      const sb = {
+        id: "shot_01",
+        index: 0,
+        description: node.params.prompt || node.params.title || "",
+        duration: Number(node.params.duration) || 5,
+        aspect_ratio: node.params.aspect_ratio || "1:1",
+      };
+      return [sb];
+    }
+    return [];
+  }
+
+  /** Merge params-derived shot shells with run results so grey cards appear pre-run. */
+  function drawerShots(nodeId) {
+    const node = nodeById(nodeId);
+    if (!node) return [];
+    const runShots = shotsForNode(nodeId);
+    const paramShots = shotsFromParams(node);
+    // Prefer run shots (have image), but fall back to param shells so the
+    // drawer lists every intended shot before the first run.
+    if (runShots.length) return runShots;
+    return paramShots;
+  }
+
+  /** Shot-order helpers — accept string ids, ignore null/undefined. */
+  function shotOrderFor(nodeId) {
+    return (state.shotOrder[nodeId] || []).filter((x) => x != null).map(String);
+  }
+
+  function reorderShots(shots, order) {
+    if (!order || !order.length) return shots;
+    const rank = new Map(order.map((id, i) => [id, i]));
+    const known = shots.filter((s) => rank.has(String(s.id)));
+    const missing = shots.filter((s) => !rank.has(String(s.id)));
+    known.sort((a, b) => rank.get(String(a.id)) - rank.get(String(b.id)));
+    return known.concat(missing);
+  }
+
+  function saveDrawerState() {
+    try {
+      localStorage.setItem(
+        LS_DRAWER,
+        JSON.stringify({
+          open: state.drawerOpen,
+          height: state.drawerHeight,
+          shotOrder: state.shotOrder,
+          shotChecked: state.shotChecked,
+        }),
+      );
+    } catch (_) {
+      /* localStorage may be disabled (file:// privacy); non-fatal. */
+    }
+  }
+
+  function loadDrawerState() {
+    try {
+      const raw = localStorage.getItem(LS_DRAWER);
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      if (typeof data.open === "boolean") state.drawerOpen = data.open;
+      if (Number.isFinite(data.height)) state.drawerHeight = Math.max(120, Math.min(520, data.height));
+      if (data.shotOrder && typeof data.shotOrder === "object") state.shotOrder = data.shotOrder;
+      if (data.shotChecked && typeof data.shotChecked === "object") state.shotChecked = data.shotChecked;
+    } catch (_) {
+      /* corrupt entry — ignore and use defaults. */
+    }
+  }
+
+  const drawerEl = document.getElementById("shotDrawer");
+  const drawerBodyEl = document.getElementById("drawerBody");
+  const drawerCardsEl = document.getElementById("drawerCards");
+  const drawerTableWrap = document.getElementById("drawerTableWrap");
+  const drawerTableEl = document.getElementById("drawerTable");
+  const drawerEmptyEl = document.getElementById("drawerEmpty");
+  const drawerToggleBtn = document.getElementById("drawerToggle");
+  const drawerCountEl = document.getElementById("drawerCount");
+  const drawerTitleEl = document.getElementById("drawerTitle");
+
+  let drawerCardsView = "cards"; // cards | table
+
+  function applyDrawerState() {
+    if (!drawerEl) return;
+    drawerEl.classList.toggle("collapsed", !state.drawerOpen);
+    drawerEl.style.setProperty("--drawer-h", state.drawerHeight + "px");
+  }
+
+  function bindDrawer() {
+    loadDrawerState();
+    applyDrawerState();
+    const handle = document.getElementById("drawerHandle");
+    if (handle) {
+      handle.addEventListener("dblclick", () => {
+        state.drawerOpen = !state.drawerOpen;
+        applyDrawerState();
+        saveDrawerState();
+        if (state.drawerOpen) renderDrawer();
+      });
+    }
+    if (drawerToggleBtn) {
+      drawerToggleBtn.addEventListener("click", () => {
+        state.drawerOpen = !state.drawerOpen;
+        applyDrawerState();
+        saveDrawerState();
+        if (state.drawerOpen) renderDrawer();
+      });
+    }
+    // Segment toggles for card/table view.
+    const segCards = document.getElementById("drawerViewCards");
+    const segTable = document.getElementById("drawerViewTable");
+    if (segCards) {
+      segCards.addEventListener("click", () => {
+        drawerCardsView = "cards";
+        segCards.classList.add("active");
+        if (segTable) segTable.classList.remove("active");
+        renderDrawer();
+      });
+    }
+    if (segTable) {
+      segTable.addEventListener("click", () => {
+        drawerCardsView = "table";
+        segTable.classList.add("active");
+        if (segCards) segCards.classList.remove("active");
+        renderDrawer();
+      });
+    }
+    // Drag-to-resize the drawer handle.
+    bindDrawerResize(handle);
+  }
+
+  function bindDrawerResize(handle) {
+    if (!handle) return;
+    let resizing = null;
+    handle.addEventListener("mousedown", (evt) => {
+      if (evt.button !== 0) return;
+      // Avoid starting a resize on a button click inside the handle.
+      if (evt.target.closest("button")) return;
+      resizing = { sy: evt.clientY, sh: state.drawerHeight };
+      document.body.style.cursor = "ns-resize";
+      evt.preventDefault();
+    });
+    window.addEventListener("mousemove", (evt) => {
+      if (!resizing) return;
+      const delta = resizing.sy - evt.clientY; // drag up = taller
+      state.drawerHeight = Math.max(120, Math.min(520, resizing.sh + delta));
+      drawerEl.style.setProperty("--drawer-h", state.drawerHeight + "px");
+    });
+    window.addEventListener("mouseup", () => {
+      if (!resizing) return;
+      resizing = null;
+      document.body.style.cursor = "";
+      saveDrawerState();
+    });
+  }
+
+  /**
+   * Render the bottom drawer for the currently selected storyboard node.
+   * Hidden/empty for non-storyboard selections (the drawer collapses to its
+   * empty hint so the canvas stays usable).
+   */
+  function renderDrawer() {
+    if (!drawerEl || !state.drawerOpen) return;
+    const node = nodeById(state.selectedId);
+    const isSb =
+      node &&
+      ["script.storyboard", "script.shot_list", "text.polish_shots"].includes(node.type);
+    if (!node || !isSb) {
+      drawerEmptyEl.classList.remove("hidden");
+      drawerCardsEl.classList.add("hidden");
+      if (drawerTableWrap) drawerTableWrap.classList.add("hidden");
+      drawerTitleEl.textContent = "分镜";
+      drawerCountEl.textContent = "选中脚本/分镜节点后显示镜头";
       return;
     }
-    box.classList.remove("hidden");
-    const shots = (gallery.shots || [])
-      .map(
-        (s) =>
-          `<li><b>${s.id || "?"}</b> ${s.duration || ""}s — ${s.description || ""}` +
-          (s.image
-            ? `<br/><img class="shot-thumb" src="${mediaUrl(s.image)}" alt="${s.id || ""}" />`
-            : "") +
-          `<br/><span class="sheet-path">${s.image || ""}</span></li>`,
-      )
-      .join("");
-    const sheetImg = gallery.sheet
-      ? `<img class="sheet-thumb" src="${mediaUrl(gallery.sheet)}" alt="contact sheet" />`
-      : "";
-    box.innerHTML = `
-      <div><strong>分镜图廊</strong>（${gallery.count || 0} 镜）</div>
-      <div class="sheet-path">联络表：${gallery.sheet || "—"}</div>
-      ${sheetImg}
-      <ul>${shots}</ul>`;
+    let shots = drawerShots(node.id);
+    const order = shotOrderFor(node.id);
+    if (order.length) shots = reorderShots(shots, order);
+    drawerTitleEl.textContent = (state.nodeTypes[node.type] || {}).label || node.type;
+    const hasImg = shots.filter((s) => s.image).length;
+    drawerCountEl.textContent = `${shots.length} 镜 · ${hasImg} 已生成`;
+    if (!shots.length) {
+      drawerEmptyEl.classList.remove("hidden");
+      drawerCardsEl.classList.add("hidden");
+      if (drawerTableWrap) drawerTableWrap.classList.add("hidden");
+      return;
+    }
+    drawerEmptyEl.classList.add("hidden");
+    if (drawerCardsView === "cards") {
+      if (drawerTableWrap) drawerTableWrap.classList.add("hidden");
+      drawerCardsEl.classList.remove("hidden");
+      renderDrawerCards(node.id, shots);
+    } else {
+      drawerCardsEl.classList.add("hidden");
+      if (drawerTableWrap) drawerTableWrap.classList.remove("hidden");
+      renderDrawerTable(node.id, shots);
+    }
+  }
+
+  function shotStatusClass(shot) {
+    if (shot.error) return "err";
+    if (shot.image) return "ok";
+    return "";
+  }
+
+  function checkedShotIds(nodeId, shots) {
+    const set = state.shotChecked[nodeId] || [];
+    if (set.length) return new Set(set.map(String));
+    // default: all checked
+    return new Set(shots.map((s) => String(s.id)));
+  }
+
+  function toggleShotChecked(nodeId, shotId, shots) {
+    const all = checkedShotIds(nodeId, shots);
+    if (all.has(String(shotId))) all.delete(String(shotId));
+    else all.add(String(shotId));
+    state.shotChecked[nodeId] = shots.map((s) => String(s.id)).filter((id) => all.has(id));
+    saveDrawerState();
+    renderDrawer();
+  }
+
+  function renderDrawerCards(nodeId, shots) {
+    drawerCardsEl.innerHTML = "";
+    const checked = checkedShotIds(nodeId, shots);
+    shots.forEach((shot, idx) => {
+      const card = document.createElement("div");
+      card.className = "shot-card";
+      card.draggable = true;
+      card.dataset.id = String(shot.id);
+      card.dataset.idx = String(idx);
+
+      const thumb = document.createElement("div");
+      thumb.className = "thumb" + (shot.image ? "" : " placeholder");
+      if (shot.image) {
+        const img = document.createElement("img");
+        img.src = mediaUrl(shot.image);
+        img.alt = shot.id || "";
+        img.loading = "lazy";
+        img.onerror = () => {
+          thumb.classList.add("placeholder");
+          thumb.innerHTML = "";
+        };
+        thumb.appendChild(img);
+      }
+      const dot = document.createElement("span");
+      dot.className = "status-dot " + shotStatusClass(shot);
+      thumb.appendChild(dot);
+      const pick = document.createElement("span");
+      pick.className = "pick" + (checked.has(String(shot.id)) ? " on" : "");
+      pick.title = "勾选参与生成";
+      pick.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleShotChecked(nodeId, shot.id, shots);
+      });
+      thumb.appendChild(pick);
+      card.appendChild(thumb);
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const no = document.createElement("div");
+      no.innerHTML = `<span class="no">${shot.id || idx + 1}</span> <span class="dur">${fmtDur(shot.duration)}</span>`;
+      meta.appendChild(no);
+      const desc = document.createElement("div");
+      desc.className = "desc";
+      desc.textContent = shot.description || shot.motion || "";
+      desc.title = shot.description || "";
+      meta.appendChild(desc);
+      card.appendChild(meta);
+
+      bindDragReorder(card, nodeId, shots);
+      drawerCardsEl.appendChild(card);
+    });
+  }
+
+  function renderDrawerTable(nodeId, shots) {
+    if (!drawerTableEl) return;
+    drawerTableEl.innerHTML = "";
+    const thead = document.createElement("thead");
+    thead.innerHTML =
+      "<tr><th>#</th><th>状态</th><th>镜头</th><th class='desc'>描述</th><th>时长</th><th>运动</th></tr>";
+    drawerTableEl.appendChild(thead);
+    const checked = checkedShotIds(nodeId, shots);
+    const tbody = document.createElement("tbody");
+    shots.forEach((shot, idx) => {
+      const tr = document.createElement("tr");
+      tr.draggable = true;
+      tr.dataset.id = String(shot.id);
+      tr.dataset.idx = String(idx);
+      const cells = [
+        `<td>${shot.id || idx + 1}</td>`,
+        `<td><span class="status-dot ${shotStatusClass(shot)}"></span></td>`,
+        `<td><span class="pick ${checked.has(String(shot.id)) ? "on" : ""}" title="勾选"></span></td>`,
+        `<td class="desc">${escapeHtml(shot.description || "")}</td>`,
+        `<td>${fmtDur(shot.duration)}</td>`,
+        `<td>${escapeHtml(shot.motion || "")}</td>`,
+      ];
+      tr.innerHTML = cells.join("");
+      const pick = tr.querySelector(".pick");
+      if (pick) pick.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleShotChecked(nodeId, shot.id, shots);
+      });
+      bindDragReorder(tr, nodeId, shots);
+      tbody.appendChild(tr);
+    });
+    drawerTableEl.appendChild(tbody);
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  /** HTML5 drag-reorder for drawer cards/rows; writes back to state.shotOrder. */
+  function bindDragReorder(el, nodeId, shots) {
+    let dragId = null;
+    el.addEventListener("dragstart", (evt) => {
+      dragId = el.dataset.id;
+      el.classList.add("dragging");
+      if (evt.dataTransfer) {
+        evt.dataTransfer.effectAllowed = "move";
+        try {
+          evt.dataTransfer.setData("text/plain", dragId);
+        } catch (_) {
+          /* some browsers reject setData under file://; rely on closure var */
+        }
+      }
+    });
+    el.addEventListener("dragend", () => {
+      el.classList.remove("dragging");
+      drawerCardsEl.querySelectorAll(".drag-over").forEach((n) => n.classList.remove("drag-over"));
+    });
+    el.addEventListener("dragover", (evt) => {
+      evt.preventDefault();
+      if (evt.dataTransfer) evt.dataTransfer.dropEffect = "move";
+    });
+    el.addEventListener("dragenter", () => el.classList.add("drag-over"));
+    el.addEventListener("dragleave", () => el.classList.remove("drag-over"));
+    el.addEventListener("drop", (evt) => {
+      evt.preventDefault();
+      el.classList.remove("drag-over");
+      const targetId = el.dataset.id;
+      if (!dragId || dragId === targetId) return;
+      const order = shots.map((s) => String(s.id));
+      const from = order.indexOf(dragId);
+      const to = order.indexOf(targetId);
+      if (from < 0 || to < 0) return;
+      const [moved] = order.splice(from, 1);
+      order.splice(to, 0, moved);
+      state.shotOrder[nodeId] = order;
+      saveDrawerState();
+      renderDrawer();
+    });
+  }
+
+  /**
+   * Resolve the inline preview artefact (image path or video poster) for an
+   * output-producing node after a run. Returns null for nodes without a
+   * previewable result. Supports the ◀▶ history switcher: when ``idx`` is
+   * set, it picks that entry from the node's history (0 = newest).
+   */
+  function nodeRunThumb(node, idx) {
+    if (!node) return null;
+    // input.* nodes keep using their upload-derived thumbnail (inputThumb).
+    if (node.type.startsWith("input.")) return inputThumb(node);
+    const rep = state.lastRun;
+    if (!rep || !rep.results) return null;
+    // When the ◀▶ switcher is engaged, read from the history entries.
+    let outputs = null;
+    const histIdx = state.historyIdx[node.id];
+    if (histIdx != null) {
+      const entries = (rep.history && rep.history[node.id]) || [];
+      const entry = entries[entries.length - 1 - histIdx];
+      if (entry) outputs = entry.outputs;
+    }
+    if (!outputs) outputs = (rep.results[node.id] || {}).outputs || {};
+    // image.batch_stills → first still's image (or contact sheet).
+    const stills = outputs.stills;
+    if (stills && Array.isArray(stills.shots)) {
+      const withImg = stills.shots.filter((s) => s.image);
+      if (withImg.length) return { img: cachedImage(mediaUrl(withImg[0].image)), badge: `${withImg.length}/${stills.shots.length}` };
+      if (stills.shots.length) return { placeholder: "未生成", badge: `0/${stills.shots.length}` };
+    }
+    // generic image output port
+    for (const key of ["image", "sheet", "poster"]) {
+      if (outputs[key]) return { img: cachedImage(mediaUrl(outputs[key])), badge: "" };
+    }
+    // video outputs: outputs.video may be a path or { path, poster }
+    const v = outputs.video;
+    if (v) {
+      const path = typeof v === "string" ? v : v.path || v.url;
+      const poster = typeof v === "object" ? v.poster : null;
+      if (poster) return { img: cachedImage(mediaUrl(poster)), video: path, badge: "▶" };
+      if (path) return { placeholder: "▶ 视频", video: path, badge: "▶" };
+    }
+    // convert/export nodes with manifest
+    const path = outputs.path;
+    if (typeof path === "string" && /\.(png|jpe?g|webp|mp4|mov)$/i.test(path)) {
+      if (/\.(mp4|mov)$/i.test(path)) return { placeholder: "▶ 视频", video: path, badge: "▶" };
+      return { img: cachedImage(mediaUrl(path)), badge: "" };
+    }
+    return null;
+  }
+
+  /** Cache + load an Image for a media path; returns the <img> (maybe not yet
+   *  loaded) and triggers a redraw on load. */
+  function cachedImage(url) {
+    if (!url) return null;
+    if (!state.thumbCache) state.thumbCache = {};
+    let img = state.thumbCache[url];
+    if (!img) {
+      img = new Image();
+      img.onload = () => draw();
+      img.onerror = () => {
+        delete state.thumbCache[url];
+        draw();
+      };
+      img.src = url;
+      state.thumbCache[url] = img;
+    }
+    return img;
+  }
+
+  /** After a run, force a redraw so node cards pick up new thumbnails. */
+  function loadNodeRunPreviews(report) {
+    draw();
+  }
+
+  /**
+   * ◀▶ history switcher for the selected node. Steps the history index by
+   * ``delta`` (-1 = ◀ older, +1 = ▶ newer) and clamps within the node's
+   * recorded history length. Bounded so it can't run past the newest entry.
+   */
+  function stepNodeHistory(nodeId, delta) {
+    const rep = state.lastRun;
+    const entries = (rep && rep.history && rep.history[nodeId]) || [];
+    if (entries.length < 2) {
+      setStatus("该节点暂无更多历史结果");
+      return;
+    }
+    let cur = state.historyIdx[nodeId] == null ? 0 : state.historyIdx[nodeId];
+    cur = Math.max(0, Math.min(entries.length - 1, cur + delta));
+    state.historyIdx[nodeId] = cur;
+    draw();
+    const human = entries.length - cur; // 1 = newest
+    setStatus(`历史结果 ${human}/${entries.length}`);
+  }
+
+  /** Floating inline video player for double-click on a video-output node. */
+  function toggleNodePlayback(node, x, y) {
+    if (!node) return;
+    // input.video nodes already have a poster; output video nodes need a path.
+    let videoPath = null;
+    const thumb = nodeRunThumb(node);
+    if (thumb && thumb.video) videoPath = thumb.video;
+    if (node.type === "input.video" && node.params && node.params.path) {
+      videoPath = node.params.path;
+    }
+    if (!videoPath) return;
+    openInlineVideo(node.id, videoPath);
+  }
+
+  function openInlineVideo(nodeId, path) {
+    closeInlineVideo();
+    const v = document.createElement("video");
+    v.id = "inlineVideo_" + nodeId;
+    v.src = mediaUrl(path);
+    v.controls = true;
+    v.autoplay = true;
+    v.style.cssText =
+      "position:fixed;right:342px;bottom:36px;width:min(42vw,520px);max-height:46vh;border-radius:10px;border:1px solid var(--border);box-shadow:var(--shadow);background:#000;z-index:20";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "✕";
+    close.style.cssText =
+      "position:fixed;right:342px;bottom:calc(36px + min(46vh,420px) + 4px);z-index:21";
+    close.addEventListener("click", closeInlineVideo);
+    close.id = "inlineVideoClose";
+    document.body.appendChild(v);
+    document.body.appendChild(close);
+    setStatus("双击节点已打开内联播放器");
+  }
+
+  function closeInlineVideo() {
+    const v = document.querySelector("[id^='inlineVideo_']");
+    const c = document.getElementById("inlineVideoClose");
+    if (v) v.remove();
+    if (c) c.remove();
   }
 
   async function saveToServer() {

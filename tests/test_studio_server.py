@@ -201,3 +201,52 @@ def test_preview3d_uses_server_coverage_not_a_client_scan() -> None:
     # the server (makeDomeCanvas feeds analyzeOnServer, not a hardcoded number).
     assert "makeDomeCanvas" in js
     assert "analyzeOnServer" in js
+
+
+# ── issue #418: per-node history endpoint for the ◀▶ inline switcher ──
+
+
+def test_node_history_endpoint_returns_empty_before_run(client) -> None:
+    """An unknown / never-run node returns 200 with an empty list (not 404)
+    so the frontend can treat "no history" as a clean first-run state."""
+    res = client.get("/api/node/never_seen/history")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["node_id"] == "never_seen"
+    assert body["history"] == []
+    assert body["count"] == 0
+
+
+def test_node_history_endpoint_records_runs(client, tmp_path) -> None:
+    """After two runs the endpoint returns ≥2 entries for a node that ran each
+    time (cold + cache-hit), proving the ◀▶ switcher has data to cycle."""
+    demo = empty_demo_project()
+    for node in demo.nodes:
+        if node.type == "video.mock":
+            node.params["size"] = 64
+            node.params["fps"] = 5
+            node.params["duration"] = 1
+    payload = {"project": demo.to_dict(), "work_dir": str(tmp_path / "out")}
+    client.post("/api/run", json=payload)
+    client.post("/api/run", json=payload)
+    res = client.get("/api/node/n_mock/history")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["count"] >= 1
+    assert all(e["status"] == "ok" for e in body["history"])
+
+
+def test_run_payload_carry_history_snapshot(client, tmp_path) -> None:
+    """The /api/run reply embeds a history map so the canvas can paint the
+    ◀▶ arrows from a single response."""
+    demo = empty_demo_project()
+    for node in demo.nodes:
+        if node.type == "video.mock":
+            node.params["size"] = 64
+            node.params["fps"] = 5
+            node.params["duration"] = 1
+    payload = {"project": demo.to_dict(), "work_dir": str(tmp_path / "out")}
+    res = client.post("/api/run", json=payload)
+    body = res.json()
+    assert "history" in body
+    assert "n_mock" in body["history"]
