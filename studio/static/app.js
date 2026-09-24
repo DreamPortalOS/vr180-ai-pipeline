@@ -584,11 +584,14 @@
         ctx.clip();
         ctx.fillStyle = "#0a0e14";
         ctx.fillRect(n.pos[0] + 4, n.pos[1] + HEAD_H + 4, NODE_W - 8, NODE_H - HEAD_H - 8);
+        // Box geometry is shared by both branches: declaring it inside the
+        // loaded branch made the "loading" branch throw ReferenceError and
+        // abort the whole canvas redraw (found in lead browser QA, #417).
+        const bx = n.pos[0] + 4;
+        const by = n.pos[1] + HEAD_H + 4;
+        const bw = NODE_W - 8;
+        const bh = NODE_H - HEAD_H - 8;
         if (thumb.img && thumb.img.complete && thumb.img.naturalWidth) {
-          const bx = n.pos[0] + 4;
-          const by = n.pos[1] + HEAD_H + 4;
-          const bw = NODE_W - 8;
-          const bh = NODE_H - HEAD_H - 8;
           // cover-fit, centered
           const r = Math.max(bw / thumb.img.naturalWidth, bh / thumb.img.naturalHeight);
           const dw = thumb.img.naturalWidth * r;
@@ -1283,15 +1286,18 @@
     const form = new FormData();
     form.append("file", file, file.name);
     const res = await fetch("/api/upload", { method: "POST", body: form });
-    let detail = res.statusText;
+    // Read the body exactly once: a Response stream cannot be consumed twice,
+    // and parsing it a second time on success used to throw "body stream already
+    // read", so no input node was ever created (found in lead browser QA).
+    let body = null;
     try {
-      const body = await res.json();
-      detail = body.detail || JSON.stringify(body);
+      body = await res.json();
     } catch (_) {
-      /* ignore — non-JSON body */
+      /* non-JSON body */
     }
-    if (!res.ok) throw new Error(detail);
-    return res.json();
+    if (!res.ok) throw new Error((body && body.detail) || res.statusText);
+    if (!body) throw new Error("upload returned no JSON metadata");
+    return body;
   }
 
   /** Pick the input node type for a dropped file from its extension. */
