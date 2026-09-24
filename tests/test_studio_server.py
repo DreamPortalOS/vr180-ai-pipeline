@@ -135,6 +135,25 @@ def test_camera_viewport_owns_its_texture_per_context(client) -> None:
     )
 
 
+def test_camera_drag_tool_locks_the_orbit(client) -> None:
+    """issue #416: arming 机位拖拽 must not also orbit the 3D view.
+
+    The orbit handler and the camera-drag handler are both bound to the dome
+    canvas, so without a lock a single drag moved the camera *and* spun the view
+    the operator was aiming against.  Found in headless Chrome (a 60x30px drag
+    with the tool armed moved the camera +30° yaw / -15° pitch and the orbit
+    +0.60 az / +0.30 el); after the fix the orbit delta is exactly 0 while the
+    camera still moves.  There is no browser in CI, so the flag is pinned at the
+    source level: it must exist, gate the orbit's mousedown, and be driven by the
+    toggle — not merely declared."""
+    js = client.get("/preview3d.js").text
+    assert "this.orbitLocked = false" in js, "DomePreview needs the orbit lock"
+    assert "if (this.orbitLocked) return;" in js, "the orbit mousedown must honour the lock"
+    assert "preview.orbitLocked = dragCam.active;" in js, (
+        "the 机位拖拽 toggle must arm/disarm the lock together with cameraShow"
+    )
+
+
 def test_index_ships_orientation_tools_and_camera_viewport(client) -> None:
     """issue #416 acceptance: the orientation sliders, draggable panel, and
     camera viewport are all present in the served index.html."""
