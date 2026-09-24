@@ -281,8 +281,11 @@ class BatchStillNode(StudioNode):
                 "name": "provider",
                 "type": "string",
                 "default": "mock",
-                "label": "provider (mock|file)",
+                "label": "provider (mock|gateway|file)",
             },
+            {"name": "model", "type": "string", "default": "agnes-image-2.5-flash", "label": "gateway 出图模型"},
+            {"name": "variants", "type": "number", "default": 2, "label": "每镜头张数"},
+            {"name": "concurrency", "type": "number", "default": 3, "label": "并发"},
             {
                 "name": "source_dir",
                 "type": "string",
@@ -324,6 +327,8 @@ class BatchStillNode(StudioNode):
                 if not matches:
                     raise FileNotFoundError(f"no still for {sid} in {src_dir}")
                 stills.append({**shot, "image": str(matches[0])})
+        elif provider == "gateway":
+            stills = self._gateway_stills(shots, payload.get("summary") or {}, params, out_dir)
         else:
             for shot in shots:
                 sid = shot.get("id") or f"shot_{shot.get('index')}"
@@ -335,7 +340,10 @@ class BatchStillNode(StudioNode):
 
         # Contact sheet: horizontal strip via ffmpeg hstack if possible, else first still.
         sheet_path = out_dir / "contact_sheet.png"
-        images = [s["image"] for s in stills]
+        images = [s["image"] for s in stills if s.get("image")]
+        if not images:
+            errors = "; ".join(f"{s.get('id')}: {s.get('error')}" for s in stills)
+            raise RuntimeError(f"batch_stills: every shot failed ({errors})")
         if len(images) >= 2:
             inputs_args: list[str] = []
             for img in images:
@@ -367,8 +375,70 @@ class BatchStillNode(StudioNode):
             "sheet": str(sheet_path),
             "out_dir": str(out_dir),
             "review": "人工确认分镜图后再进入视频节点",
+            "failed": [s.get("id") for s in stills if not s.get("image")],
         }
         return {"stills": stills_payload, "sheet": str(sheet_path), "meta": meta}
+
+    @staticmethod
+    def _gateway_stills(
+        shots: list[dict[str, Any]],
+        summary: dict[str, Any],
+        params: dict[str, Any],
+        out_dir: Path,
+        client: Any = None,
+    ) -> list[dict[str, Any]]:
+        """#415: real stills via the LiteLLM gateway, ``variants`` per shot.
+
+        ``image`` is the first variant that succeeded; ``variants`` lists every
+        saved file; a shot whose variants all failed keeps ``image=None`` plus
+        ``error`` so the canvas can mark just that card instead of failing the run.
+        """
+        from studio.nodes.image_gateway import (
+            DEFAULT_CONCURRENCY,
+            DEFAULT_IMAGE_MODEL,
+            DEFAULT_VARIANTS,
+            GatewayImageClient,
+            ImageJob,
+            build_still_prompt,
+            size_for_aspect,
+        )
+        from studio.settings import settings_from_params
+
+        variants = max(1, int(params.get("variants") or DEFAULT_VARIANTS))
+        if client is None:
+            settings = settings_from_params(
+                {"litellm_base_url": params.get("base_url"), "litellm_api_key": params.get("api_key")}
+            )
+            client = GatewayImageClient(
+                settings.litellm_base_url,
+                settings.litellm_api_key,
+                model=str(params.get("model") or DEFAULT_IMAGE_MODEL),
+                size=size_for_aspect(summary.get("aspect_ratio")),
+            )
+        jobs: list[ImageJob] = []
+        prompts: dict[str, str] = {}
+        for shot in shots:
+            sid = shot.get("id") or f"shot_{shot.get('index')}"
+            prompt = build_still_prompt(shot, summary)
+            prompts[sid] = prompt
+            for v in range(1, variants + 1):
+                jobs.append(ImageJob(key=f"{sid}|{v}", prompt=prompt, out_path=out_dir / f"{sid}_v{v}.png"))
+        results = client.generate_many(jobs, concurrency=int(params.get("concurrency") or DEFAULT_CONCURRENCY))
+        by_shot: dict[str, list[Any]] = {}
+        for res in results:
+            by_shot.setdefault(res.key.split("|", 1)[0], []).append(res)
+        stills: list[dict[str, Any]] = []
+        for shot in shots:
+            sid = shot.get("id") or f"shot_{shot.get('index')}"
+            done = [r.path for r in by_shot.get(sid, []) if r.path]
+            errors = [r.error for r in by_shot.get(sid, []) if r.error]
+            entry = {**shot, "image": done[0] if done else None, "variants": done, "still_prompt": prompts[sid]}
+            if not done:
+                entry["error"] = errors[0] if errors else "no image"
+            elif errors:
+                entry["variant_errors"] = errors
+            stills.append(entry)
+        return stills
 
 
 class ReviewGateNode(StudioNode):
