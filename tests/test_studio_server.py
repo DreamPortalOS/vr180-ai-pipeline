@@ -99,6 +99,41 @@ def test_preview3d_and_dome_assets_served(client) -> None:
     assert "画幅" in res.text
 
 
+def test_dome_proj_math_module_served(client) -> None:
+    """issue #416: the pure-JS projection module is served before preview3d.js."""
+    res = client.get("/dome_proj.js")
+    assert res.status_code == 200
+    assert "dirToMasterUV" in res.text
+    assert "exportCliParams" in res.text
+
+
+def test_dome3d_standalone_page_served(client) -> None:
+    """issue #416: the standalone dome 3D / specs page is served (no CDN)."""
+    res = client.get("/dome3d.html")
+    assert res.status_code == 200
+    assert "domeCanvas" in res.text
+    assert "dome_proj.js" in res.text
+
+
+def test_index_ships_orientation_tools_and_camera_viewport(client) -> None:
+    """issue #416 acceptance: the orientation sliders, draggable panel, and
+    camera viewport are all present in the served index.html."""
+    html = client.get("/").text
+    # draggable right panel (left-edge resizer)
+    assert "rightRail" in html and "railResizer" in html
+    # yaw/pitch/roll sliders + quick buttons + front-convention toggle
+    for ident in ("orientYawRow", "orientPitchRow", "orientRollRow", "frontIsBottom"):
+        assert ident in html, f"index.html missing #{ident}"
+    for btn in ("btnOrientReset", "btnRot90cw", "btnRot90ccw", "btnFlipH", "btnFlipV", "btnOrientExport"):
+        assert btn in html, f"index.html missing #{btn}"
+    # CLI export readout uses the --dome-* flag names
+    assert "--dome-pitch" in html and "--dome-yaw" in html and "--dome-roll" in html
+    # camera viewport + its sliders
+    assert "camCanvas" in html
+    for ident in ("camYawRow", "camPitchRow", "camHalfFovRow", "btnCamReset", "btnCamDrag"):
+        assert ident in html, f"index.html missing #{ident}"
+
+
 # ── POST /api/coverage (issue #405) ────────────────────────────────────────
 # The 3D preview asks the server for a coverage reading so it uses the same
 # scan as scripts/dome_qa.py and the qa.dome_coverage node, not a third
