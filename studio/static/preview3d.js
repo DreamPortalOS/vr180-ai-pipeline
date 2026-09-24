@@ -225,6 +225,11 @@
       // virtual camera for the 2D viewport (yaw/pitch deg, half-FOV deg).
       this.camera = { yaw: 0, pitch: 45, halfFov: 45 };
       this.cameraShow = false;
+      // Set while the 机位拖拽 tool is armed: a canvas drag then moves the
+      // *camera*, so the orbit must not also spin underneath it (otherwise the
+      // view rotates while you are placing the camera and the placement is
+      // unpredictable — the two handlers are both bound to the same canvas).
+      this.orbitLocked = false;
       this.onOrientChange = null;
       this._initPrograms();
       this._initBuffers();
@@ -461,6 +466,7 @@
     _bindEvents() {
       const c = this.canvas;
       c.addEventListener("mousedown", (e) => {
+        if (this.orbitLocked) return; // the 机位拖拽 tool owns the drag
         this.drag = { x: e.clientX, y: e.clientY, az: this.orbit.az, el: this.orbit.el };
       });
       window.addEventListener("mouseup", () => {
@@ -1256,6 +1262,7 @@
       camToggle.addEventListener("click", () => {
         dragCam.active = !dragCam.active;
         preview.cameraShow = dragCam.active;
+        preview.orbitLocked = dragCam.active; // one drag, one meaning
         camToggle.textContent = dragCam.active ? "● 机位拖拽开" : "机位拖拽";
         camToggle.className = `button ${dragCam.active ? "primary" : ""}`;
       });
