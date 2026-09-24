@@ -488,3 +488,15 @@ ARK_API_KEY=...   # Seedance
 6. 其它你点名但 PRD 未覆盖的需求（若有请写）
 
 确认后我按 M0 拆 GitHub 任务卡并开始实现。
+
+## 附：真实分镜出图（#415，2026-09-24）
+
+`image.batch_stills` 新增 `provider=gateway`：走公司 LiteLLM 网关的 OpenAI 兼容接口 `POST {litellm_base_url}/v1/images/generations`，密钥复用 Studio 设置里的 LiteLLM Key（不写进工程 JSON）。
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `model` | `agnes-image-2.5-flash` | 约 11 s/张，无水印。`sensenova-u1-fast` 可用但带水印且会自加人物，仅作备选 |
+| `variants` | 2 | 每个镜头出几张；节点输出 `image`=第一张成功的，`variants`=全部 |
+| `concurrency` | 3 | 同时在途的请求数 |
+
+单张失败自动重试 2 次；某镜头全部失败只标记该镜头（`error`），整批只有在全部镜头都失败时才报错。生产模板实测：3 镜头 × 2 张，约 70 s，14 个节点全绿。CI 仍默认 `provider=mock`，测试全部用假 HTTP。

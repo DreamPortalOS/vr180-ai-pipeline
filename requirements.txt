@@ -45,7 +45,8 @@ uvicorn>=0.27.0,<1.0.0
 # Dev
 pytest>=7.0.0,<9.0.0
 pytest-cov>=4.0.0,<6.0.0
-ruff>=0.4.0,<1.0.0
+# 与 `.pre-commit-config.yaml` rev、CI workflow 保持同一版本，升级需三处同改。
+ruff==0.15.18
 
 # System dependency: ffmpeg
 #   Windows: `choco install ffmpeg` or `scoop install ffmpeg`
