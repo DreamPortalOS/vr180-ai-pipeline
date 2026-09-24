@@ -149,6 +149,7 @@ def test_node_gateway_variants_and_partial_failure(tmp_path: Path) -> None:
     assert stills[0]["image"].endswith("shot_01_v1.png") and len(stills[0]["variants"]) == 2
     # first variant failed, second succeeded -> the card still has an image
     assert stills[1]["image"].endswith("shot_02_v2.png") and "error" not in stills[1]
+    assert stills[1]["variant_errors"] == ["HTTPError: 500"]
     assert "canyon" in stills[0]["still_prompt"]
 
 

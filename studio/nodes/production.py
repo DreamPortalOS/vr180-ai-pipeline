@@ -435,6 +435,8 @@ class BatchStillNode(StudioNode):
             entry = {**shot, "image": done[0] if done else None, "variants": done, "still_prompt": prompts[sid]}
             if not done:
                 entry["error"] = errors[0] if errors else "no image"
+            elif errors:
+                entry["variant_errors"] = errors
             stills.append(entry)
         return stills
 
