@@ -39,9 +39,12 @@ NBINS = 50
 # content (full-circumference fill), not merely "any azimuth has content".
 RING_FILL = 0.9
 # Per-pixel content floor: a pixel is "content" when its gray value OR its
-# local texture energy exceeds this. 16 matches the brightness floor used to
-# derive the gate on a real 4K domemaster (content ends ~r/R 0.65).
-CONTENT_THRESH = 16.0
+# local texture energy exceeds this. Projection-mapping holes are true black
+# (≈0), so "empty" only needs to mean *near-black*: 6 keeps the real 4K
+# master failing at r/R≈0.66 while dark-but-full content (deep-sea scenes
+# whose smooth luma sits at 6–16, e.g. video/dome/S2_v2.jpg) now counts as
+# covered instead of being misread as blank (issue #413).
+CONTENT_THRESH = 6.0
 # Frames are downscaled to this max dimension before analysis — coverage r/R
 # and mask means are scale-invariant, full-4K analysis only costs RAM.
 ANALYZE_MAX_DIM = 1024
