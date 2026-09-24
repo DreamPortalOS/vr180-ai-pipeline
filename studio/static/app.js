@@ -1327,9 +1327,14 @@
       state.project = { version: 1, name: "untitled", nodes: [], edges: [], settings: {} };
       state.selectedId = null;
       state.status = {};
+      state.lastRun = null;
+      state.historyIdx = {};
+      closeTextNodeEditor();
+      closeInlineVideo();
       projectNameEl.textContent = "untitled";
       updateEmpty();
       renderInspector();
+      renderDrawer();
       draw();
     });
     document.getElementById("btnRun").addEventListener("click", () => runProject());
@@ -1756,8 +1761,28 @@
     const node = nodeById(state.selectedId);
     const isSb =
       node &&
-      ["script.storyboard", "script.shot_list", "text.polish_shots"].includes(node.type);
-    if (!node || !isSb) {
+      [
+        "script.storyboard",
+        "script.shot_list",
+        "text.polish_shots",
+        "image.batch_stills",
+        "checkpoint.review",
+      ].includes(node.type);
+    let shots = [];
+    let title = "分镜";
+    let scope = null; // for shot-order/checkbox persistence
+    if (node && isSb) {
+      shots = drawerShots(node.id);
+      title = (state.nodeTypes[node.type] || {}).label || node.type;
+      scope = node.id;
+    } else if (state.lastRun && state.lastRun.gallery && state.lastRun.gallery.shots) {
+      // After a run with no storyboard node selected, surface the gallery so
+      // the lead sees every shot card immediately ("运行生产模板后…显示全部镜头卡").
+      shots = state.lastRun.gallery.shots;
+      title = "运行结果分镜";
+      scope = "__run_gallery__";
+    }
+    if (!scope) {
       drawerEmptyEl.classList.remove("hidden");
       drawerCardsEl.classList.add("hidden");
       if (drawerTableWrap) drawerTableWrap.classList.add("hidden");
@@ -1765,10 +1790,9 @@
       drawerCountEl.textContent = "选中脚本/分镜节点后显示镜头";
       return;
     }
-    let shots = drawerShots(node.id);
-    const order = shotOrderFor(node.id);
+    const order = shotOrderFor(scope);
     if (order.length) shots = reorderShots(shots, order);
-    drawerTitleEl.textContent = (state.nodeTypes[node.type] || {}).label || node.type;
+    drawerTitleEl.textContent = title;
     const hasImg = shots.filter((s) => s.image).length;
     drawerCountEl.textContent = `${shots.length} 镜 · ${hasImg} 已生成`;
     if (!shots.length) {
@@ -1781,11 +1805,11 @@
     if (drawerCardsView === "cards") {
       if (drawerTableWrap) drawerTableWrap.classList.add("hidden");
       drawerCardsEl.classList.remove("hidden");
-      renderDrawerCards(node.id, shots);
+      renderDrawerCards(scope, shots);
     } else {
       drawerCardsEl.classList.add("hidden");
       if (drawerTableWrap) drawerTableWrap.classList.remove("hidden");
-      renderDrawerTable(node.id, shots);
+      renderDrawerTable(scope, shots);
     }
   }
 
