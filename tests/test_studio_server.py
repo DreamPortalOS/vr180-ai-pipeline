@@ -115,6 +115,26 @@ def test_dome3d_standalone_page_served(client) -> None:
     assert "dome_proj.js" in res.text
 
 
+def test_camera_viewport_owns_its_texture_per_context(client) -> None:
+    """issue #416: the camera 2D viewport must NOT sample the preview's texture.
+
+    ``CameraView`` renders in its own WebGL context, and a texture object
+    belongs to the context that created it — binding a foreign one raises
+    INVALID_OPERATION and the sampler reads black (verified in headless Chrome:
+    bindError 1282, black sample).  So the viewport has to own a texture in its
+    own context, fed from the shared source image, and the preview has to expose
+    the upload for it.  A regression here silently blanks the 2D frame again,
+    which is exactly the bug this pins."""
+    js = client.get("/preview3d.js").text
+    assert "uploadTexture" in js, "DomePreview must expose uploadTexture(gl, tex)"
+    assert "this.tex = this.gl.createTexture()" in js, "CameraView needs its own texture"
+    assert "p.uploadTexture(gl, this.tex)" in js, "CameraView must upload into its own context"
+    # the old cross-context bind is what must be gone
+    assert "gl.bindTexture(gl.TEXTURE_2D, p.tex)" not in js, (
+        "CameraView must not bind the preview's texture (cross-context -> black)"
+    )
+
+
 def test_index_ships_orientation_tools_and_camera_viewport(client) -> None:
     """issue #416 acceptance: the orientation sliders, draggable panel, and
     camera viewport are all present in the served index.html."""
