@@ -61,11 +61,40 @@ def _full_dome(fill_r: float = 0.95, size: int = SIZE, seed: int = 0) -> np.ndar
     return frame
 
 
+def _dark_smooth_full_dome(size: int = SIZE, lo: float = 8.0, hi: float = 30.0) -> np.ndarray:
+    """Deep-sea-style dome: the whole inscribed circle filled with smooth dark
+    luma in [lo, hi] (≈8–30), true-black corners — the issue #413 repro.
+
+    Faithful to ``video/dome/S2_v2.jpg`` (a dark stone corridor filling the full
+    circle): smooth dark water sits at 6–16 luma, so the retired luma-16 content
+    floor counted the dark sides as "blank" and collapsed coverage to ~0.5/bad
+    even though the disc is fully covered. Lowering ``CONTENT_THRESH`` to 6
+    keeps true-black projection holes (≈0) "empty" while dark-but-real content
+    like this reads as covered.
+    """
+    yy, xx = np.mgrid[0:size, 0:size].astype(float)
+    c = (size - 1) / 2.0
+    rr = np.sqrt((xx - c) ** 2 + (yy - c) ** 2) / (size / 2.0)
+    # Slow radial falloff (brighter centre → darker rim) plus a gentle angular
+    # undulation: smooth (low texture energy) but not a degenerate flat fill.
+    val = hi - (hi - lo) * np.clip(rr, 0.0, 1.0)
+    val = val + 2.0 * np.sin(3.0 * np.arctan2(yy - c, xx - c))
+    val = np.clip(val, lo, hi)
+    frame = np.zeros((size, size, 3), dtype=np.uint8)
+    inside = rr <= 1.0
+    v = val[inside].astype(np.uint8)
+    frame[inside] = np.stack([v] * 3, axis=1)
+    return frame
+
+
 # fill_r that lands the solid coverage zenith angle inside [min_deg=70, WARN_DEG=75)
 # — i.e. level="bad" while coverage_deg >= min_deg. This is the exact frame from
 # the bug report (74.5°, r≈0.83) that read passed=True: it separates the old
 # ``coverage_deg >= min_deg`` rule from the fixed ``passed follows level``.
-BUG_REPORT_FILL_R = 0.80
+# Issue #413 lowered CONTENT_THRESH 16→6, which widens the texture halo at the
+# fill edge by one ring (+0.02 r), so the fixture fill_r moved 0.80 → 0.78 to
+# keep the same reading (73.8°, r=0.82, level="bad").
+BUG_REPORT_FILL_R = 0.78
 
 
 def _probe_data(size: int = SIZE) -> dict:
@@ -215,3 +244,23 @@ class TestHalfDomeRejectedByBoth:
         )
         assert _status(report, "coverage radius") == "fail"
         assert report.verdict == "FAIL"
+
+
+class TestDarkSmoothFullDome:
+    """Issue #413: a dark-but-fully-covered disc (deep-sea style, luma ≈8–30,
+    smooth) must read as covered, not as blank."""
+
+    def test_dark_smooth_dome_is_covered(self) -> None:
+        # The whole disc is filled, just dark. With CONTENT_THRESH=6 the
+        # near-black floor still catches true projection holes (corners stay
+        # outside_mean≈0) while dark-but-real content counts as content.
+        stats = studio_analyze_frame(_dark_smooth_full_dome())
+        assert stats.level != "bad"
+        assert stats.coverage_radius >= 0.9
+
+    def test_dark_smooth_dome_was_blank_at_retired_threshold(self) -> None:
+        # Regression guard: the same frame at the retired luma-16 floor
+        # collapsed to ~0.5/bad — the exact S2_v2.jpg misread this fix targets.
+        stats = studio_analyze_frame(_dark_smooth_full_dome(), content_thresh=16.0)
+        assert stats.level == "bad"
+        assert stats.coverage_radius < 0.9
