@@ -18,7 +18,7 @@ from studio.models import Project, StudioModelError, empty_demo_project
 from studio.projects import ProjectStore, ProjectStoreError
 from studio.settings import StudioSettings
 from studio.templates import production_pipeline_project
-from studio.uploads import UploadError, UploadStore, parse_multipart
+from studio.uploads import DEFAULT_MAX_BYTES, UploadError, UploadStore, parse_multipart
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -223,7 +223,7 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="empty upload body")
         try:
             part = parse_multipart(request.headers.get("content-type", ""), body)
-            store = UploadStore(work_root)
+            store = UploadStore(work_root, max_bytes=DEFAULT_MAX_BYTES)
             meta = store.save(filename=part.filename, data=part.data)
         except UploadError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc

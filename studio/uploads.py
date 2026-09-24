@@ -52,6 +52,17 @@ class FileTooLargeError(UploadError):
     status_code = 413
 
 
+class MalformedMediaError(UploadError):
+    """A file whose extension is allowed but whose bytes do not decode.
+
+    Without this the endpoint would 500 on an extension-valid-but-garbage
+    upload (``UnidentifiedImageError`` / ffmpeg exit code). The extension is
+    only a first filter — the bytes have to be probed too.
+    """
+
+    status_code = 400
+
+
 @dataclass(frozen=True)
 class UploadMeta:
     """Metadata returned to the canvas after a successful upload."""
@@ -137,8 +148,14 @@ def _image_dims(path: Path) -> tuple[int, int]:
         from PIL import Image
     except ImportError as exc:  # pragma: no cover - pillow is in requirements
         raise RuntimeError("Pillow is required to read image dimensions") from exc
-    with Image.open(path) as img:
+    try:
+        with Image.open(path) as img:
+            # ``load()`` forces a full decode; a .png named over garbage
+            # passes the extension check but must not take the server down.
+            img.load()
         return int(img.width), int(img.height)
+    except Exception as exc:
+        raise MalformedMediaError(f"could not decode {path.name} as an image: {exc}") from exc
 
 
 def probe_video(
@@ -168,13 +185,18 @@ def probe_video(
     poster_cmd = [_FFMPEG, "-y", "-i", str(p), "-frames:v", "1", "-q:v", "2", str(poster)]
     try:
         proc = subprocess.run(poster_cmd, capture_output=True, text=True, check=False, timeout=60)
-        if proc.returncode != 0 or not poster.is_file():
-            poster = None  # type: ignore[assignment]
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        poster = None  # type: ignore[assignment]
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise MalformedMediaError(f"ffmpeg probe of {p.name} failed: {exc}") from exc
+    if proc.returncode != 0 or not poster.is_file():
+        raise MalformedMediaError(
+            f"could not decode {p.name} as a video: "
+            f"{(proc.stderr or '').strip()[-200:] or 'poster frame extraction failed'}"
+        )
 
     # Resolution + duration from stderr (ffmpeg prints stream info there when
-    # no output is requested). One pass, regex out the numbers we need.
+    # no output is requested). One pass, regex out the numbers we need. The
+    # poster already proved the file is a real video, so this is best-effort:
+    # an unparseable banner yields zeros rather than a second failure.
     info_cmd = [_FFMPEG, "-i", str(p)]
     width = height = 0
     duration = 0.0
@@ -190,7 +212,7 @@ def probe_video(
     if dur:
         h, mi, s = int(dur.group(1)), int(dur.group(2)), float(dur.group(3))
         duration = h * 3600 + mi * 60 + s
-    return width or 0, height or 0, duration, str(poster) if poster else ""
+    return width, height, duration, str(poster)
 
 
 class UploadStore:
@@ -215,7 +237,17 @@ class UploadStore:
         # Content-addressed: if the exact bytes already landed, skip the write.
         if not dest.is_file():
             dest.write_bytes(data)
-        return self._probe(dest, sha, ext, kind)
+        try:
+            return self._probe(dest, sha, ext, kind)
+        except UploadError:
+            # The bytes did not decode despite an allowed extension. Drop the
+            # bogus file so a re-upload with real bytes is not mistaken for a
+            # cache hit (same sha) and silently served back as malformed.
+            import contextlib
+
+            with contextlib.suppress(OSError):
+                dest.unlink()
+            raise
 
     def _probe(self, path: Path, sha: str, ext: str, kind: str) -> UploadMeta:
         width = height = None
