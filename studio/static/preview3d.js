@@ -552,34 +552,41 @@
 
     /** The camera's frustum as a wireframe drawn from the dome centre out
      * toward its corners — 4 corner rays + the 4 face edges + the near-plane
-     * quad, rebuilt whenever the camera yaw/pitch/FOV change. */
+     * quad, rebuilt whenever the camera yaw/pitch/FOV change.
+     *
+     * The corner rays are walked around the near-plane perimeter (-1,-1),
+     * (1,-1), (1,1), (-1,1) so the quad's edges are adjacent corners, not
+     * diagonals.  They come back in the projection frame (+z = audience front)
+     * and are bridged into the scene's geometry frame (-z = front) before being
+     * drawn — see DomeProj.domeRayToSceneDir; without the bridge the wireframe
+     * renders 180° out in yaw against the dome content it sits on. */
     _buildFrustum() {
       const DP = window.DomeProj;
       if (!DP) return [];
       const { yaw, pitch, halfFov } = this.camera;
-      const c = [-1, -1, 1, 1, -1, 1, 1, -1].map((_, i) => {
-        // 4 corners, then re-used for edges below
-        return DP.cameraRay(
-          (i % 4 === 0 || i % 4 === 1 ? -1 : 1),
-          (i % 2 === 0 ? -1 : 1),
-          yaw,
-          pitch,
-          halfFov,
-        );
-      });
-      const look = DP.cameraRay(0, 0, yaw, pitch, halfFov);
+      const corners = [
+        [-1, -1],
+        [1, -1],
+        [1, 1],
+        [-1, 1],
+      ];
+      const bridge = DP.domeRayToSceneDir
+        ? (d) => DP.domeRayToSceneDir(d)
+        : (d) => [d[0], d[1], -d[2]]; // fallback = the same negation
+      const c = corners.map((k) => bridge(DP.cameraRay(k[0], k[1], yaw, pitch, halfFov)));
+      const look = bridge(DP.cameraRay(0, 0, yaw, pitch, halfFov));
       const L = 1.15; // frustum length (just past the dome surface)
       const segs = [];
       c.forEach((d) => {
         segs.push(0, 0, 0, d[0] * L, d[1] * L, d[2] * L);
       });
-      // near-plane quad edges
-      segs.push(
-        c[0][0] * L, c[0][1] * L, c[0][2] * L, c[1][0] * L, c[1][1] * L, c[1][2] * L,
-        c[1][0] * L, c[1][1] * L, c[1][2] * L, c[2][0] * L, c[2][1] * L, c[2][2] * L,
-        c[2][0] * L, c[2][1] * L, c[2][2] * L, c[3][0] * L, c[3][1] * L, c[3][2] * L,
-        c[3][0] * L, c[3][1] * L, c[3][2] * L, c[0][0] * L, c[0][1] * L, c[0][2] * L,
-      );
+      // near-plane quad edges, corner i -> corner i+1 (wrapping), i.e. the
+      // perimeter of the near plane rather than its diagonals
+      for (let i = 0; i < 4; i++) {
+        const a = c[i];
+        const b = c[(i + 1) % 4];
+        segs.push(a[0] * L, a[1] * L, a[2] * L, b[0] * L, b[1] * L, b[2] * L);
+      }
       segs.push(0, 0, 0, look[0] * L, look[1] * L, look[2] * L); // look direction
       return segs;
     }
