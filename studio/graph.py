@@ -28,10 +28,43 @@ class NodeRunResult:
     cache_hit: bool = False
 
 
+#: How many historical results per node are kept for the ◀▶ history switcher.
+HISTORY_DEPTH = 5
+
+
+@dataclass
+class RunHistory:
+    """Keeps the last ``HISTORY_DEPTH`` results for one node id, newest last.
+
+    Used by the canvas inline-preview arrows (issue #418). Each entry mirrors
+    the shape of ``NodeRunResult.to_dict`` minus ``node_id``.
+    """
+
+    entries: list[dict[str, Any]] = field(default_factory=list)
+
+    def append(self, result: NodeRunResult) -> None:
+        self.entries.append(
+            {
+                "status": result.status,
+                "outputs": {k: _jsonable(v) for k, v in result.outputs.items()},
+                "error": result.error,
+                "cache_hit": result.cache_hit,
+            }
+        )
+        del self.entries[:-HISTORY_DEPTH]
+
+    def to_dict(self) -> dict[str, Any]:
+        return list(self.entries)
+
+    def recent(self, n: int = HISTORY_DEPTH) -> list[dict[str, Any]]:
+        return self.entries[-n:]
+
+
 @dataclass
 class RunReport:
     order: list[str]
     results: dict[str, NodeRunResult] = field(default_factory=dict)
+    history: dict[str, RunHistory] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +78,7 @@ class RunReport:
                 }
                 for nid, r in self.results.items()
             },
+            "history": {nid: hist.to_dict() for nid, hist in self.history.items() if hist.entries},
         }
 
 
@@ -145,6 +179,7 @@ def run_graph(
     dirty_from: str | None = None,
     on_status: Callable[[str, str], None] | None = None,
     cache: dict[str, dict[str, Any]] | None = None,
+    history: dict[str, RunHistory] | None = None,
 ) -> RunReport:
     """Execute the project graph.
 
@@ -173,6 +208,8 @@ def run_graph(
     outputs: dict[str, dict[str, Any]] = {}
     if cache is None:
         cache = {}
+    if history is None:
+        history = {}
 
     run_set: set[str] | None = None
     if only_downstream_of:
@@ -198,6 +235,8 @@ def run_graph(
             outputs[nid] = {}
             set_status(nid, "skipped")
             continue
+        if nid not in history:
+            history[nid] = RunHistory()
 
         upstream: dict[str, Any] = {}
         for port, (src_node, src_port) in incoming[nid].items():
@@ -212,13 +251,15 @@ def run_graph(
 
         key = _cache_key(node.type, node.params, upstream)
         if key in cache and nid not in dirty_set:
-            report.results[nid] = NodeRunResult(
+            cached = NodeRunResult(
                 node_id=nid,
                 status="ok",
                 outputs=dict(cache[key]),
                 cache_hit=True,
             )
+            report.results[nid] = cached
             outputs[nid] = dict(cache[key])
+            history[nid].append(cached)
             set_status(nid, "ok")
             continue
 
@@ -229,15 +270,20 @@ def run_graph(
             result = instance.run(params=node.params, inputs=upstream, work_dir=work_dir, node_id=nid)
         except Exception as exc:
             log.exception("node %s failed", nid)
-            report.results[nid] = NodeRunResult(node_id=nid, status="error", error=str(exc))
+            failed = NodeRunResult(node_id=nid, status="error", error=str(exc))
+            report.results[nid] = failed
+            history[nid].append(failed)
             set_status(nid, "error")
             raise GraphError(f"node {nid!r} ({node.type}) failed: {exc}") from exc
 
         outputs[nid] = result
         cache[key] = dict(result)
-        report.results[nid] = NodeRunResult(node_id=nid, status="ok", outputs=dict(result))
+        ok = NodeRunResult(node_id=nid, status="ok", outputs=dict(result))
+        report.results[nid] = ok
+        history[nid].append(ok)
         set_status(nid, "ok")
 
+    report.history = history
     return report
 
 
@@ -267,6 +313,8 @@ def extract_gallery(report: RunReport | dict[str, Any]) -> dict[str, Any] | None
                         "description": s.get("description"),
                         "image": s.get("image"),
                         "duration": s.get("duration"),
+                        "motion": s.get("motion"),
+                        "index": s.get("index"),
                         "source_node": nid,
                     }
                 )
@@ -280,6 +328,8 @@ def extract_gallery(report: RunReport | dict[str, Any]) -> dict[str, Any] | None
                             "description": s.get("description"),
                             "image": s.get("image"),
                             "duration": s.get("duration"),
+                            "motion": s.get("motion"),
+                            "index": s.get("index"),
                             "source_node": nid,
                         }
                     )
@@ -296,3 +346,24 @@ def list_node_types() -> list[dict[str, Any]]:
         meta = NODE_REGISTRY[type_name].describe()
         catalog.append(meta)
     return catalog
+
+
+#: Script/storyboard node types whose canvas cards drive the bottom drawer
+#: (issue #418): selecting one lists its shots as cards.
+STORYBOARD_NODE_TYPES = frozenset({"script.storyboard", "script.shot_list", "text.polish_shots"})
+
+
+def reorder_shots(shots: list[dict[str, Any]], order: list[str]) -> list[dict[str, Any]]:
+    """Return ``shots`` re-ordered by ``order`` (a permutation of shot ids).
+
+    Ids present in ``order`` come first, in that order; ids not listed keep
+    their original relative order at the end. Unknown ids are ignored so a
+    stale ``shot_order`` stored in an older project JSON cannot drop shots.
+    """
+    if not order:
+        return list(shots)
+    rank = {str(sid): i for i, sid in enumerate(order)}
+    missing = [s for s in shots if str(s.get("id")) not in rank]
+    known = [s for s in shots if str(s.get("id")) in rank]
+    known.sort(key=lambda s: rank[str(s.get("id"))])
+    return known + missing

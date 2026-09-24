@@ -60,22 +60,52 @@
     </aside>
 
     <section class="canvas-wrap" id="canvasWrap">
-      <canvas id="canvas"></canvas>
-      <div class="canvas-overlay" id="canvasEmpty">
-        <div class="empty-card">
-          <strong>Immersive Node Studio</strong>
-          <p>点「生产流程」开始：脚本 → 分镜图 → 视频 → 拼合 → 配乐 → 导出</p>
-          <button id="btnEmptyDual" type="button" class="primary">载入生产流程</button>
+      <div class="canvas-stage" id="canvasStage">
+        <canvas id="canvas"></canvas>
+        <div class="canvas-overlay" id="canvasEmpty">
+          <div class="empty-card">
+            <strong>Immersive Node Studio</strong>
+            <p>点「生产流程」开始：脚本 → 分镜图 → 视频 → 拼合 → 配乐 → 导出</p>
+            <button id="btnEmptyDual" type="button" class="primary">载入生产流程</button>
+          </div>
+        </div>
+        <div id="statusBar" class="status">ready</div>
+        <div class="status-legend">
+          <span class="lg idle"></span>空闲
+          <span class="lg run"></span>运行
+          <span class="lg ok"></span>成功
+          <span class="lg err"></span>失败
+          <span class="lg skip"></span>跳过
         </div>
       </div>
-      <div id="statusBar" class="status">ready</div>
-      <div class="status-legend">
-        <span class="lg idle"></span>空闲
-        <span class="lg run"></span>运行
-        <span class="lg ok"></span>成功
-        <span class="lg err"></span>失败
-        <span class="lg skip"></span>跳过
-      </div>
+
+      <!-- Bottom storyboard drawer (issue #418): replaces the right-rail
+           colour-block gallery. Collapsible with B, height persisted to
+           localStorage. Lists every shot for the selected script/storyboard
+           node; grey "not generated" cards when no image yet. -->
+      <aside class="shot-drawer" id="shotDrawer" aria-label="分镜抽屉">
+        <div class="drawer-handle" id="drawerHandle" title="拖动调整高度 · 双击折叠">
+          <span class="drawer-grip"></span>
+          <div class="drawer-title">
+            <strong id="drawerTitle">分镜</strong>
+            <span class="hint" id="drawerCount">选中脚本/分镜节点后显示镜头</span>
+          </div>
+          <div class="drawer-tools">
+            <button type="button" id="drawerViewCards" class="seg active" title="卡片视图">▦</button>
+            <button type="button" id="drawerViewTable" class="seg" title="表格视图">☰</button>
+            <button type="button" id="drawerToggle" title="开合 (B)">▾</button>
+          </div>
+        </div>
+        <div class="drawer-body" id="drawerBody">
+          <div class="drawer-empty" id="drawerEmpty">
+            <p class="hint">选中一个 <strong>脚本/分镜</strong> 节点，画布下方将列出全部镜头。<br/>勾选控制参与生成；拖动卡片重排镜头顺序（回写工程 JSON）。</p>
+          </div>
+          <div class="drawer-cards" id="drawerCards"></div>
+          <div class="drawer-table-wrap hidden" id="drawerTableWrap">
+            <table class="drawer-table" id="drawerTable"></table>
+          </div>
+        </div>
+      </aside>
     </section>
 
     <aside class="inspector right-rail">
@@ -95,7 +125,6 @@
         </section>
         <section class="grow">
           <h2>运行结果</h2>
-          <div id="galleryBox" class="gallery-box hidden"></div>
           <pre id="runOut" class="run-out">尚未运行</pre>
         </section>
       </div>
