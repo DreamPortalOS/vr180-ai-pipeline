@@ -1206,7 +1206,10 @@
       }
     }
     const camSlider = (key, label, min, max, hint, deg) => {
-      const host = el(`cam${key}Row`);
+      // Row ids are camYawRow / camPitchRow / camHalfFovRow: capitalise the
+      // key. The lower-case lookup found nothing, so the camera sliders never
+      // rendered in the Studio panel (lead browser QA, #416).
+      const host = el(`cam${key.charAt(0).toUpperCase()}${key.slice(1)}Row`);
       if (!host) return;
       host.innerHTML = `
         <div class="sl-row">
