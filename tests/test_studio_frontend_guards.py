@@ -114,3 +114,19 @@ def test_style_css_has_drawer_and_collapsed_rules() -> None:
     assert ".shot-drawer" in css
     assert ".shot-drawer.collapsed" in css
     assert ".shot-card" in css and ".shot-card .thumb.placeholder" in css
+
+
+PREVIEW_JS = APP_JS.parent / "preview3d.js"
+
+
+def test_camera_slider_rows_resolve_to_real_ids() -> None:
+    """#416: camSlider built ``cam${key}Row`` (camyawRow) while index.html has
+    camYawRow, so the camera sliders never rendered in the Studio panel."""
+    src = PREVIEW_JS.read_text(encoding="utf-8")
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    keys = re.findall(r'camSlider\("(\w+)"', src)
+    assert keys, "camSlider calls not found"
+    assert "charAt(0).toUpperCase()" in src, "camSlider must capitalise the key when building the row id"
+    for key in keys:
+        row_id = f"cam{key[0].upper()}{key[1:]}Row"
+        assert f'id="{row_id}"' in html, f"index.html has no #{row_id} for camSlider('{key}')"
