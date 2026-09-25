@@ -276,6 +276,12 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
         def preview3d_js() -> FileResponse:
             return FileResponse(STATIC_DIR / "preview3d.js", media_type="application/javascript")
 
+        @app.get("/dome_proj.js")
+        def dome_proj_js() -> FileResponse:
+            """Pure domemaster projection math (issue #416); loaded before
+            preview3d.js so the preview's shaders match it."""
+            return FileResponse(STATIC_DIR / "dome_proj.js", media_type="application/javascript")
+
         @app.get("/dome3d.html")
         def dome3d_html() -> FileResponse:
             return FileResponse(STATIC_DIR / "dome3d.html", headers={"Cache-Control": "no-store"})

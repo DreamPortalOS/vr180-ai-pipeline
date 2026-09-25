@@ -99,6 +99,80 @@ def test_preview3d_and_dome_assets_served(client) -> None:
     assert "画幅" in res.text
 
 
+def test_dome_proj_math_module_served(client) -> None:
+    """issue #416: the pure-JS projection module is served before preview3d.js."""
+    res = client.get("/dome_proj.js")
+    assert res.status_code == 200
+    assert "dirToMasterUV" in res.text
+    assert "exportCliParams" in res.text
+
+
+def test_dome3d_standalone_page_served(client) -> None:
+    """issue #416: the standalone dome 3D / specs page is served (no CDN)."""
+    res = client.get("/dome3d.html")
+    assert res.status_code == 200
+    assert "domeCanvas" in res.text
+    assert "dome_proj.js" in res.text
+
+
+def test_camera_viewport_owns_its_texture_per_context(client) -> None:
+    """issue #416: the camera 2D viewport must NOT sample the preview's texture.
+
+    ``CameraView`` renders in its own WebGL context, and a texture object
+    belongs to the context that created it — binding a foreign one raises
+    INVALID_OPERATION and the sampler reads black (verified in headless Chrome:
+    bindError 1282, black sample).  So the viewport has to own a texture in its
+    own context, fed from the shared source image, and the preview has to expose
+    the upload for it.  A regression here silently blanks the 2D frame again,
+    which is exactly the bug this pins."""
+    js = client.get("/preview3d.js").text
+    assert "uploadTexture" in js, "DomePreview must expose uploadTexture(gl, tex)"
+    assert "this.tex = this.gl.createTexture()" in js, "CameraView needs its own texture"
+    assert "p.uploadTexture(gl, this.tex)" in js, "CameraView must upload into its own context"
+    # the old cross-context bind is what must be gone
+    assert "gl.bindTexture(gl.TEXTURE_2D, p.tex)" not in js, (
+        "CameraView must not bind the preview's texture (cross-context -> black)"
+    )
+
+
+def test_camera_drag_tool_locks_the_orbit(client) -> None:
+    """issue #416: arming 机位拖拽 must not also orbit the 3D view.
+
+    The orbit handler and the camera-drag handler are both bound to the dome
+    canvas, so without a lock a single drag moved the camera *and* spun the view
+    the operator was aiming against.  Found in headless Chrome (a 60x30px drag
+    with the tool armed moved the camera +30° yaw / -15° pitch and the orbit
+    +0.60 az / +0.30 el); after the fix the orbit delta is exactly 0 while the
+    camera still moves.  There is no browser in CI, so the flag is pinned at the
+    source level: it must exist, gate the orbit's mousedown, and be driven by the
+    toggle — not merely declared."""
+    js = client.get("/preview3d.js").text
+    assert "this.orbitLocked = false" in js, "DomePreview needs the orbit lock"
+    assert "if (this.orbitLocked) return;" in js, "the orbit mousedown must honour the lock"
+    assert "preview.orbitLocked = dragCam.active;" in js, (
+        "the 机位拖拽 toggle must arm/disarm the lock together with cameraShow"
+    )
+
+
+def test_index_ships_orientation_tools_and_camera_viewport(client) -> None:
+    """issue #416 acceptance: the orientation sliders, draggable panel, and
+    camera viewport are all present in the served index.html."""
+    html = client.get("/").text
+    # draggable right panel (left-edge resizer)
+    assert "rightRail" in html and "railResizer" in html
+    # yaw/pitch/roll sliders + quick buttons + front-convention toggle
+    for ident in ("orientYawRow", "orientPitchRow", "orientRollRow", "frontIsBottom"):
+        assert ident in html, f"index.html missing #{ident}"
+    for btn in ("btnOrientReset", "btnRot90cw", "btnRot90ccw", "btnFlipH", "btnFlipV", "btnOrientExport"):
+        assert btn in html, f"index.html missing #{btn}"
+    # CLI export readout uses the --dome-* flag names
+    assert "--dome-pitch" in html and "--dome-yaw" in html and "--dome-roll" in html
+    # camera viewport + its sliders
+    assert "camCanvas" in html
+    for ident in ("camYawRow", "camPitchRow", "camHalfFovRow", "btnCamReset", "btnCamDrag"):
+        assert ident in html, f"index.html missing #{ident}"
+
+
 # ── POST /api/coverage (issue #405) ────────────────────────────────────────
 # The 3D preview asks the server for a coverage reading so it uses the same
 # scan as scripts/dome_qa.py and the qa.dome_coverage node, not a third
