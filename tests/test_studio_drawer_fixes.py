@@ -91,3 +91,14 @@ def test_explicit_gateway_still_fails_loudly(monkeypatch, tmp_path) -> None:
             work_dir=str(tmp_path),
             node_id="n",
         )
+
+
+def test_gallery_keeps_failure_markers() -> None:
+    shots = [
+        {"id": "shot_01", "image": "/ok.png"},
+        {"id": "shot_02", "image": "/shot_02_failed.png", "placeholder": True, "error": "RemoteProtocolError"},
+    ]
+    gallery = extract_gallery({"results": {"n": {"status": "ok", "outputs": {"stills": {"shots": shots}}}}})
+    ok, bad = gallery["shots"]
+    assert ok["placeholder"] is False and ok["error"] is None
+    assert bad["placeholder"] is True and bad["error"] == "RemoteProtocolError"

@@ -316,6 +316,10 @@ def extract_gallery(report: RunReport | dict[str, Any]) -> dict[str, Any] | None
                         "motion": s.get("motion"),
                         "index": s.get("index"),
                         "source_node": nid,
+                        # #418: keep failure info so the drawer can mark
+                        # degraded "generation failed" cards red.
+                        "error": s.get("error"),
+                        "placeholder": bool(s.get("placeholder")),
                     }
                 )
         # also accept top-level list outputs

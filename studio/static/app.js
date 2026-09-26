@@ -1793,8 +1793,10 @@
     const order = shotOrderFor(scope);
     if (order.length) shots = reorderShots(shots, order);
     drawerTitleEl.textContent = title;
-    const hasImg = shots.filter((s) => s.image).length;
-    drawerCountEl.textContent = `${shots.length} 镜 · ${hasImg} 已生成`;
+    // Degraded "generation failed" cards carry an image but are not generated.
+    const hasImg = shots.filter((s) => s.image && !s.placeholder).length;
+    const failed = shots.filter((s) => s.placeholder || s.error).length;
+    drawerCountEl.textContent = `${shots.length} 镜 · ${hasImg} 已生成` + (failed ? ` · ${failed} 失败` : "");
     if (!shots.length) {
       drawerEmptyEl.classList.remove("hidden");
       drawerCardsEl.classList.add("hidden");
