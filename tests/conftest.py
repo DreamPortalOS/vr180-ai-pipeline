@@ -417,3 +417,6 @@ def _isolated_env(monkeypatch) -> None:
     """
     for name in sorted(PROJECT_ENV_VARS):
         monkeypatch.delenv(name, raising=False)
+    # #418: Studio's provider=auto resolves to the real LiteLLM gateway whenever
+    # a local studio_settings.json has a key — keep every test offline.
+    monkeypatch.setenv("STUDIO_OFFLINE", "1")
