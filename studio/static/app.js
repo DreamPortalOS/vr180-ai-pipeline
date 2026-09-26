@@ -238,6 +238,7 @@
       pos: Array.isArray(n.pos) ? [Number(n.pos[0]) || 0, Number(n.pos[1]) || 0] : [0, 0],
       params: n.params || {},
       muted: !!n.muted,
+      locked: !!n.locked,
     }));
     const edges = (raw.edges || []).map((e) => {
       if (e.from_node) {
@@ -278,6 +279,7 @@
         pos: n.pos,
         params: n.params || {},
         muted: !!n.muted,
+        locked: !!n.locked,
       })),
       edges: p.edges.map((e) => ({
         id: e.id,
@@ -299,6 +301,13 @@
     spacePan: null,
     online: false,
     paletteFilter: "",
+    runMode: "all",
+    jobs: [],
+    jobTimer: null,
+    shots: [],
+    /** Checked shot ids per node id (shared by #418 drawer + #419 batch). */
+    shotChecked: {},
+    spotlightDragPort: null,
     /** Latest server-side run results keyed by node id, for inline previews. */
     lastRun: null,
     /** Drawer open/closed state — persisted to localStorage. */
@@ -306,8 +315,6 @@
     drawerHeight: 220,
     /** Ordered shot ids per node id after a drag-reorder (written back to JSON). */
     shotOrder: {},
-    /** Checked shot ids per node id. */
-    shotChecked: {},
     /** Picker: node id → index into node history (0 = latest). */
     historyIdx: {},
   };
@@ -434,12 +441,13 @@
     const n = state.project.nodes.length;
     const x = 40 + ((n * 40) % Math.max(120, w - NODE_W - 80));
     const y = 40 + ((n * 36) % Math.max(100, h - NODE_H - 80));
-    state.project.nodes.push({ id, type, pos: [x - state.pan.x, y - state.pan.y], params, muted: false });
+    state.project.nodes.push({ id, type, pos: [x - state.pan.x, y - state.pan.y], params, muted: false, locked: false });
     state.selectedId = id;
     updateEmpty();
     renderInspector();
     draw();
     setStatus(`已添加 ${meta.label || type}`);
+    return id;
   }
 
   function nodeById(id) {
@@ -508,6 +516,8 @@
     if (st === "error") return "#7a2e35";
     if (st === "running") return "#7a5a1d";
     if (st === "skipped") return "#3a4454";
+    if (st === "locked") return "#5a4a1d";
+    if (st === "cancelled") return "#4a2e3a";
     return "#2a3a52";
   }
 
@@ -584,6 +594,13 @@
         ctx.fillStyle = "rgba(0,0,0,0.35)";
         roundRect(n.pos[0], n.pos[1], NODE_W, NODE_H, 10);
         ctx.fill();
+      }
+      // Locked badge (issue #419): a 🔒 glyph in the title bar so the operator
+      // can see at a glance which nodes will be skipped and reuse last output.
+      if (n.locked) {
+        ctx.fillStyle = "#e6b450";
+        ctx.font = "11px sans-serif";
+        ctx.fillText("🔒", n.pos[0] + NODE_W - 22, n.pos[1] + 15);
       }
 
       const { inputs, outputs } = portPositions(n);
@@ -932,20 +949,39 @@
     del.addEventListener("click", () => removeNode(node.id));
     inspectorEl.appendChild(del);
 
-    const dirty = document.createElement("button");
-    dirty.type = "button";
-    dirty.textContent = "仅重跑此节点下游";
-    dirty.title = "POST /api/run with dirty_from=" + node.id;
-    dirty.style.marginTop = "8px";
-    dirty.addEventListener("click", () => runProject({ dirty_from: node.id }));
-    inspectorEl.appendChild(dirty);
+    // Lock toggle (issue #419): a locked node is skipped in every run and
+    // reuses its last output. Distinct from muting: it freezes one node, not
+    // the downstream branch.
+    const lockRow = document.createElement("label");
+    lockRow.className = "check-row";
+    const lockCb = document.createElement("input");
+    lockCb.type = "checkbox";
+    lockCb.checked = !!node.locked;
+    lockCb.addEventListener("change", () => {
+      node.locked = lockCb.checked;
+      draw();
+      setStatus(node.locked ? `已锁定 ${node.id}（运行时跳过，沿用上次输出）` : `已解锁 ${node.id}`);
+    });
+    lockRow.appendChild(lockCb);
+    const lockTxt = document.createElement("span");
+    lockTxt.textContent = "锁定（跳过运行，沿用上次输出）";
+    lockRow.appendChild(lockTxt);
+    inspectorEl.appendChild(lockRow);
 
-    const onlyAnc = document.createElement("button");
-    onlyAnc.type = "button";
-    onlyAnc.textContent = "仅跑此节点+上游";
-    onlyAnc.style.marginTop = "6px";
-    onlyAnc.addEventListener("click", () => runProject({ only_downstream_of: node.id }));
-    inspectorEl.appendChild(onlyAnc);
+    const runNode = document.createElement("button");
+    runNode.type = "button";
+    runNode.textContent = "仅运行本节点";
+    runNode.title = "run_mode=node · 上游取上次输出";
+    runNode.style.marginTop = "8px";
+    runNode.addEventListener("click", () => runProject({ run_mode: "node", run_node: node.id }));
+    inspectorEl.appendChild(runNode);
+
+    const runDown = document.createElement("button");
+    runDown.type = "button";
+    runDown.textContent = "运行本节点及下游";
+    runDown.style.marginTop = "6px";
+    runDown.addEventListener("click", () => runProject({ run_mode: "downstream", run_node: node.id }));
+    inspectorEl.appendChild(runDown);
   }
 
   function removeNode(id) {
@@ -1056,6 +1092,43 @@
     setStatus("已载入生产流程模板（脚本→分镜图→视频→拼合→配乐→导出）");
   }
 
+  /** Apply a finished run report to the canvas: statuses + drawer + previews + 3D feed.
+   *  Shared by the queued run path (issue #419) so the queue callback and the
+   *  inline-run path land on the same UI updates as #418. */
+  function applyReport(report) {
+    state.status = Object.fromEntries(
+      Object.entries(report.results || {}).map(([id, r]) => [id, r.status]),
+    );
+    state.lastRun = report;
+    runOutEl.textContent = JSON.stringify(report, null, 2);
+    // Bottom drawer (#418) replaces the right-rail gallery.
+    renderDrawer();
+    // Inline node-card previews from this run's outputs.
+    loadNodeRunPreviews(report);
+    // Feed 3D panel if a coverage node ran
+    const cov = (report.results && (report.results.n_cov || report.results.cov)) || null;
+    if (cov && cov.outputs && cov.outputs.report) {
+      const rep = cov.outputs.report;
+      window.dispatchEvent(
+        new CustomEvent("studio:coverage", {
+          detail: {
+            coverageRadius: rep.coverage_radius != null ? rep.coverage_radius : rep.coverageRadius,
+            coverageDeg: rep.coverage_deg != null ? rep.coverage_deg : rep.coverageDeg,
+            softRadius: rep.soft_radius != null ? rep.soft_radius : rep.softRadius,
+            outerFill: rep.outer_fill != null ? rep.outer_fill : rep.outerFill,
+            solidAngleFrac: rep.solid_angle_frac != null ? rep.solid_angle_frac : rep.solidAngleFrac,
+            level: rep.level,
+            text: rep.text,
+          },
+        }),
+      );
+      // auto-switch to dome tab when coverage arrives
+      const domeTab = document.querySelector('.tab[data-tab="dome"]');
+      if (domeTab) domeTab.click();
+    }
+    draw();
+  }
+
   async function runProject(opts) {
     opts = opts || {};
     if (!state.online) {
@@ -1064,54 +1137,39 @@
       setStatus("需要后端才能运行");
       return;
     }
-    const label = opts.dirty_from
-      ? `重跑下游 ${opts.dirty_from}…`
-      : opts.only_downstream_of
-        ? `仅跑 ${opts.only_downstream_of}+上游…`
-        : "运行中…";
+    // The inspector buttons pin a target node; otherwise the top-bar dropdown
+    // picks the scope (issue #419 运行模式).
+    const runMode = opts.run_mode || state.runMode || "all";
+    const runNode = opts.run_node || (runMode !== "all" ? state.selectedId : null);
+    if ((runMode === "node" || runMode === "downstream") && !runNode) {
+      setStatus("请先选中一个目标节点");
+      return;
+    }
+    const label =
+      runMode === "node"
+        ? `仅运行 ${runNode}…`
+        : runMode === "downstream"
+          ? `运行 ${runNode} 及下游…`
+          : "运行全部…";
     setStatus(label);
     runOutEl.textContent = "…";
+    const payload = {
+      project: toServerProject(state.project),
+      run_mode: runMode,
+      run_node: runNode || null,
+      label,
+    };
     try {
-      const payload = { project: toServerProject(state.project) };
-      if (opts.dirty_from) payload.dirty_from = opts.dirty_from;
-      if (opts.only_downstream_of) payload.only_downstream_of = opts.only_downstream_of;
-      const report = await api("/api/run", {
+      const res = await api("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      state.status = Object.fromEntries(
-        Object.entries(report.results || {}).map(([id, r]) => [id, r.status]),
-      );
-      state.lastRun = report;
-      runOutEl.textContent = JSON.stringify(report, null, 2);
-      // Bottom drawer (#418) replaces the right-rail gallery.
-      renderDrawer();
-      // Inline node-card previews from this run's outputs.
-      loadNodeRunPreviews(report);
-      // Feed 3D panel if a coverage node ran
-      const cov = (report.results && (report.results.n_cov || report.results.cov)) || null;
-      if (cov && cov.outputs && cov.outputs.report) {
-        const rep = cov.outputs.report;
-        window.dispatchEvent(
-          new CustomEvent("studio:coverage", {
-            detail: {
-              coverageRadius: rep.coverage_radius != null ? rep.coverage_radius : rep.coverageRadius,
-              coverageDeg: rep.coverage_deg != null ? rep.coverage_deg : rep.coverageDeg,
-              softRadius: rep.soft_radius != null ? rep.soft_radius : rep.softRadius,
-              outerFill: rep.outer_fill != null ? rep.outer_fill : rep.outerFill,
-              solidAngleFrac: rep.solid_angle_frac != null ? rep.solid_angle_frac : rep.solidAngleFrac,
-              level: rep.level,
-              text: rep.text,
-            },
-          }),
-        );
-        // auto-switch to dome tab when coverage arrives
-        const domeTab = document.querySelector('.tab[data-tab="dome"]');
-        if (domeTab) domeTab.click();
-      }
-      setStatus("运行完成");
-      draw();
+      startQueuePolling();
+      await waitForJob(res.job_id, (report) => {
+        applyReport(report);
+        setStatus("运行完成");
+      });
     } catch (err) {
       runOutEl.textContent = String(err.message || err);
       setStatus("运行失败");
@@ -1131,6 +1189,7 @@
       state.linking = {
         fromNode: port.node.id,
         fromPort: port.port.name,
+        fromType: port.port.type,
         x1: port.port.x,
         y1: port.port.y,
         x2: p.x,
@@ -1215,6 +1274,24 @@
           to_port: target.port.name,
         });
         setStatus("已连接");
+      } else if (!hitNode(p.x, p.y)) {
+        // Port drag-out onto empty canvas (issue #419): open the spotlight
+        // listing only nodes whose inputs accept the dragged port's type, then
+        // auto-connect the new node's first matching input on selection.
+        const fromType = state.linking.fromType;
+        const fromNode = state.linking.fromNode;
+        const fromPort = state.linking.fromPort;
+        state.linking = null;
+        draw();
+        openSpotlight({
+          at: { x: p.x, y: p.y },
+          filterType: fromType,
+          onPick: (type) => {
+            const newId = addNode(type);
+            if (newId) autoConnect(newId, fromNode, fromPort, fromType);
+          },
+        });
+        return;
       }
       state.linking = null;
       draw();
@@ -1242,7 +1319,18 @@
       }
       // Double-click an image/video node card to toggle playback inline.
       toggleNodePlayback(node, p.x, p.y);
+    } else {
+      // Double-click on empty canvas opens the add-node spotlight (#419).
+      openSpotlight({ at: { x: p.x, y: p.y } });
     }
+  });
+
+  // Right-click on empty canvas opens the spotlight too (#419).
+  canvas.addEventListener("contextmenu", (evt) => {
+    const p = canvasPoint(evt);
+    if (hitNode(p.x, p.y)) return; // let the node keep its default context
+    evt.preventDefault();
+    openSpotlight({ at: { x: p.x, y: p.y } });
   });
 
   canvas.addEventListener(
@@ -1301,6 +1389,95 @@
     }
   });
 
+  // --- queue (issue #419 队列与停止) --------------------------------------
+  const queuePanel = document.getElementById("queuePanel");
+  const queueList = document.getElementById("queueList");
+  const queueCountEl = document.getElementById("queueCount");
+  const btnQueueStopAll = document.getElementById("btnQueueStopAll");
+
+  function renderQueue() {
+    const running = state.jobs.filter((j) => j.status === "running");
+    queueCountEl.textContent = running.length;
+    if (queuePanel) queuePanel.classList.toggle("hidden", state.jobs.length === 0);
+    if (!queueList) return;
+    if (state.jobs.length === 0) {
+      queueList.innerHTML = "<p class=\"hint\">无任务</p>";
+      if (btnQueueStopAll) btnQueueStopAll.disabled = true;
+      return;
+    }
+    queueList.innerHTML = state.jobs
+      .slice()
+      .sort((a, b) => b.started_at - a.started_at)
+      .map((j) => {
+        const isRunning = j.status === "running";
+        const pct = Math.round(j.progress * 100);
+        return `<div class="queue-item ${j.status}">
+          <div class="queue-info">
+            <span class="queue-label">${j.label || "运行"}</span>
+            <span class="queue-meta">${j.id.slice(0, 6)} · ${j.status} · ${pct}%</span>
+          </div>
+          <div class="queue-bar"><div class="queue-bar-fill" style="width:${pct}%"></div></div>
+          <button type="button" class="danger queue-cancel" data-id="${j.id}" title="取消此任务">${
+          isRunning ? "取消" : "已取消"
+        }</button>
+        </div>`;
+      })
+      .join("");
+    if (btnQueueStopAll) btnQueueStopAll.disabled = running.length === 0;
+  }
+
+  function startQueuePolling() {
+    if (state.jobTimer) return;
+    state.jobTimer = setInterval(async () => {
+      try {
+        state.jobs = await api("/api/jobs");
+        renderQueue();
+        if (state.jobs.every((j) => j.status !== "running")) {
+          clearInterval(state.jobTimer);
+          state.jobTimer = null;
+        }
+      } catch (err) {
+        clearInterval(state.jobTimer);
+        state.jobTimer = null;
+        setStatus("队列刷新失败: " + err.message);
+      }
+    }, 500);
+  }
+
+  function stopAllJobs() {
+    (async () => {
+      try {
+        const { stopped } = await api("/api/jobs/stop-all", { method: "POST" });
+        setStatus(`已停止 ${stopped} 个任务`);
+      } catch (err) {
+        setStatus("停止失败: " + err.message);
+      }
+    })();
+  }
+
+  async function waitForJob(jobId, onDone) {
+    const limit = 300;
+    for (let i = 0; i < limit; i += 1) {
+      const jobs = await api("/api/jobs");
+      const job = jobs.find((j) => j.id === jobId);
+      if (!job) {
+        setStatus("任务丢失: " + jobId);
+        return;
+      }
+      if (job.status === "ok" && job.report) {
+        onDone(job.report);
+        return;
+      }
+      if (job.status === "error" || job.status === "cancelled") {
+        setStatus(job.status === "cancelled" ? "已取消" : "运行失败: " + (job.error || ""));
+        if (job.report) onDone(job.report);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    setStatus("任务超时");
+  }
+
   function bindUi() {
     document.getElementById("btnDemo").addEventListener("click", () => loadDemo().catch((e) => setStatus(e.message)));
     bindDrawer();
@@ -1338,6 +1515,42 @@
       draw();
     });
     document.getElementById("btnRun").addEventListener("click", () => runProject());
+
+    // Run-mode dropdown (全部 / 仅本节点 / 本节点及下游) — the top-bar scope.
+    const runModeEl = document.getElementById("runMode");
+    if (runModeEl) runModeEl.addEventListener("change", () => (state.runMode = runModeEl.value));
+
+    // Global stop + queue panel toggle (issue #419 队列与停止).
+    const btnStop = document.getElementById("btnStop");
+    if (btnStop) btnStop.addEventListener("click", stopAllJobs);
+    const btnQueue = document.getElementById("btnQueue");
+    if (btnQueue) {
+      btnQueue.addEventListener("click", () => {
+        if (!queuePanel) return;
+        queuePanel.classList.toggle("hidden");
+        state.jobs = state.jobs; // refresh render of the panel
+        renderQueue();
+      });
+    }
+    if (btnQueueStopAll) btnQueueStopAll.addEventListener("click", stopAllJobs);
+    if (queueList) {
+      queueList.addEventListener("click", (evt) => {
+        const btn = evt.target.closest(".queue-cancel");
+        if (!btn) return;
+        (async () => {
+          try {
+            await api(`/api/jobs/${btn.dataset.id}/cancel`, { method: "POST" });
+            setStatus("已取消任务 " + btn.dataset.id);
+          } catch (err) {
+            setStatus("取消失败: " + err.message);
+          }
+        })();
+      });
+    }
+
+    // 批量生成视频 (issue #419 只跑勾选镜头) — #418's bindDrawer owns the
+    // drawer toggle/cards; this only wires the batch-submit button.
+    if (btnBatchGen) btnBatchGen.addEventListener("click", () => batchGenerateShots());
     fileInput.addEventListener("change", () => {
       if (fileInput.files && fileInput.files[0]) loadProjectFile(fileInput.files[0]);
       fileInput.value = "";
@@ -1357,9 +1570,20 @@
     });
 
     window.addEventListener("keydown", (evt) => {
-      if (evt.code === "Space") {
-        state.spacePan = true;
-        canvas.style.cursor = "grab";
+      // Don't hijack typing in fields — let inputs handle space/slash/enter.
+      const ae = document.activeElement;
+      const inField =
+        ae &&
+        (ae.tagName === "INPUT" ||
+          ae.tagName === "TEXTAREA" ||
+          ae.tagName === "SELECT" ||
+          ae.isContentEditable);
+      // Spotlight add-node: space or "/" (issue #419). Space used to arm pan;
+      // middle-mouse-drag and the wheel still pan, so the key is free now.
+      if (!inField && (evt.key === "/" || evt.code === "Space")) {
+        evt.preventDefault();
+        openSpotlight({});
+        return;
       }
       if ((evt.ctrlKey || evt.metaKey) && evt.key === "Enter") {
         evt.preventDefault();
@@ -1383,6 +1607,10 @@
         }
       }
       if (evt.key === "Escape") {
+        if (spotlight && !spotlight.classList.contains("hidden")) {
+          closeSpotlight();
+          return;
+        }
         state.linking = null;
         draw();
       }
@@ -1551,6 +1779,137 @@
     draw();
     const label = meta0.label || type;
     setStatus(`已添加 ${label}（${meta.kind}）`);
+  }
+
+  // --- Spotlight add-node (issue #419) ----------------------------------
+  const spotlight = document.getElementById("spotlight");
+  const spotlightInput = document.getElementById("spotlightInput");
+  const spotlightResults = document.getElementById("spotlightResults");
+  let spotlightState = null;
+
+  function typesAccepting(type) {
+    // `any` accepts everything; exact name matches; otherwise no match.
+    return Object.values(state.nodeTypes).filter((t) => {
+      const ins = t.inputs || [];
+      return ins.some((p) => p.type === "any" || p.type === type);
+    });
+  }
+
+  function autoConnect(toNode, fromNode, fromPort, fromType) {
+    const meta = state.nodeTypes[nodeById(toNode).type] || {};
+    const inPort = (meta.inputs || []).find(
+      (p) => p.type === "any" || p.type === fromType,
+    );
+    if (!inPort) return;
+    state.project.edges = state.project.edges.filter(
+      (e) => !(e.to_node === toNode && e.to_port === inPort.name),
+    );
+    state.project.edges.push({
+      id: uid("e"),
+      from_node: fromNode,
+      from_port: fromPort,
+      to_node: toNode,
+      to_port: inPort.name,
+    });
+    setStatus("已自动连接");
+    draw();
+  }
+
+  function renderSpotlightResults(q) {
+    if (!spotlightState) return;
+    const pool = spotlightState.filterType
+      ? typesAccepting(spotlightState.filterType)
+      : Object.values(state.nodeTypes);
+    const hay = (t) => (t.type + " " + (t.label || "") + " " + (t.category || "")).toLowerCase();
+    const rows = pool
+      .filter((t) => !q || hay(t).includes(q))
+      .slice()
+      .sort((a, b) => (a.label + a.type).localeCompare(b.label + b.type, "zh"))
+      .slice(0, 12);
+    spotlightResults.innerHTML = rows.length
+      ? rows
+          .map(
+            (t, i) =>
+              `<button type="button" class="spotlight-row" data-i="${i}"><span>${t.label || t.type}</span>` +
+              `<span class="cat">${t.category || ""} · ${t.type}</span></button>`,
+          )
+          .join("")
+      : '<p class="hint">无匹配节点</p>';
+    spotlightState.rows = rows;
+    if (rows[0]) spotlightResults.querySelector(".spotlight-row")?.classList.add("active");
+  }
+
+  function openSpotlight(opts) {
+    opts = opts || {};
+    spotlightState = { filterType: null, onPick: null, rows: [] };
+    if (opts.filterType) spotlightState.filterType = opts.filterType;
+    if (opts.onPick) spotlightState.onPick = opts.onPick;
+    spotlight.classList.remove("hidden");
+    spotlightInput.value = "";
+    spotlightInput.focus();
+    const hint = opts.filterType ? `只显示可接「${opts.filterType}」的节点` : "";
+    spotlightInput.placeholder = hint || "搜索节点名 / 中文标签 / 类型…";
+    renderSpotlightResults("");
+    // Place the new node at the cursor when picked, else viewport centre.
+    spotlightState.at = opts.at || centerCanvasPoint();
+  }
+
+  function closeSpotlight() {
+    spotlight.classList.add("hidden");
+    spotlightState = null;
+  }
+
+  function centerCanvasPoint() {
+    const { w, h } = viewSize();
+    return { x: w / 2 - state.pan.x, y: h / 2 - state.pan.y };
+  }
+
+  function pickSpotlightRow(i) {
+    if (!spotlightState || !spotlightState.rows || !spotlightState.rows[i]) return;
+    const t = spotlightState.rows[i];
+    const at = spotlightState.at || centerCanvasPoint();
+    const onPick = spotlightState.onPick;
+    closeSpotlight();
+    if (onPick) {
+      onPick(t.type, at);
+    } else {
+      addNode(t.type);
+    }
+  }
+
+  if (spotlightInput) {
+    spotlightInput.addEventListener("input", () => renderSpotlightResults(spotlightInput.value.trim().toLowerCase()));
+    spotlightInput.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape") {
+        closeSpotlight();
+      } else if (evt.key === "Enter") {
+        evt.preventDefault();
+        const active = spotlightResults.querySelector(".spotlight-row.active");
+        const idx = active ? Number(active.dataset.i) : 0;
+        pickSpotlightRow(idx);
+      } else if (evt.key === "ArrowDown" || evt.key === "ArrowUp") {
+        evt.preventDefault();
+        const rows = Array.from(spotlightResults.querySelectorAll(".spotlight-row"));
+        if (!rows.length) return;
+        let cur = spotlightResults.querySelector(".spotlight-row.active");
+        let idx = cur ? rows.indexOf(cur) : -1;
+        idx = evt.key === "ArrowDown" ? (idx + 1) % rows.length : (idx - 1 + rows.length) % rows.length;
+        rows.forEach((r) => r.classList.remove("active"));
+        rows[idx].classList.add("active");
+        rows[idx].scrollIntoView({ block: "nearest" });
+      }
+    });
+  }
+  if (spotlightResults) {
+    spotlightResults.addEventListener("click", (evt) => {
+      const row = evt.target.closest(".spotlight-row");
+      if (row) pickSpotlightRow(Number(row.dataset.i));
+    });
+  }
+  if (spotlight) {
+    spotlight.addEventListener("mousedown", (evt) => {
+      if (evt.target === spotlight) closeSpotlight();
+    });
   }
 
   /**
@@ -1782,6 +2141,11 @@
       title = "运行结果分镜";
       scope = "__run_gallery__";
     }
+    // Remember what the drawer shows so 批量生成 acts on exactly these cards
+    // (including the __run_gallery__ scope and the default all-checked state).
+    state.drawerScope = scope;
+    state.drawerScopeShots = shots;
+    updateBatchButton();
     if (!scope) {
       drawerEmptyEl.classList.remove("hidden");
       drawerCardsEl.classList.add("hidden");
@@ -2109,6 +2473,66 @@
     if (c) c.remove();
   }
 
+  // --- batch generate from checked shots (issue #419 只跑勾选镜头) -------
+  // #418 owns the bottom storyboard drawer and the shotChecked state
+  // ({nodeId: [shotId,...]}). This collects every checked shot across all
+  // storyboard nodes and submits one video job per shot via /api/batch-shots.
+  const btnBatchGen = document.getElementById("btnBatchGen");
+
+  function collectCheckedShots() {
+    // #419 lead QA: this used to walk project nodes and read only explicit
+    // shotChecked entries, so the default "all checked" drawer (and the
+    // __run_gallery__ scope after a run) collected nothing and the button
+    // stayed disabled. Act on the cards the drawer is actually showing.
+    const scope = state.drawerScope;
+    const shots = state.drawerScopeShots || [];
+    if (!scope || !shots.length) return [];
+    const checked = checkedShotIds(scope, shots);
+    const seen = new Set();
+    const out = [];
+    for (const shot of shots) {
+      const key = String(shot.id);
+      if (!checked.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      out.push(shot);
+    }
+    return out;
+  }
+
+  function updateBatchButton() {
+    if (btnBatchGen) btnBatchGen.disabled = collectCheckedShots().length === 0;
+  }
+
+  async function batchGenerateShots() {
+    if (!state.online) {
+      setStatus("离线无法提交任务；请先启动 studio.server");
+      return;
+    }
+    const selected = collectCheckedShots();
+    if (!selected.length) {
+      setStatus("请先在分镜抽屉勾选镜头");
+      return;
+    }
+    setStatus(`批量提交 ${selected.length} 个镜头任务…`);
+    try {
+      const shots = selected.map((s) => ({
+        id: String(s.id),
+        description: s.description || "",
+        duration: s.duration != null ? Number(s.duration) : null,
+      }));
+      const res = await api("/api/batch-shots", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ shots }),
+      });
+      startQueuePolling();
+      setStatus(`已提交 ${res.submitted} 个镜头任务`);
+      renderQueue();
+    } catch (err) {
+      setStatus("批量提交失败: " + err.message);
+    }
+  }
+
   async function saveToServer() {
     if (!state.online) {
       setStatus("离线无法存库；请先启动 studio.server");
@@ -2259,6 +2683,8 @@
     bindUi();
     renderPalette();
     updateEmpty();
+    renderQueue();
+    updateBatchButton();
     resizeCanvas();
     try {
       const health = await api("/api/health");
