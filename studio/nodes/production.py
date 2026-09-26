@@ -260,6 +260,18 @@ def _write_placeholder_png(path: Path, *, w: int, h: int, seed: int, label: str)
     path.write_bytes(png)
 
 
+def _write_failed_png(path: Path, *, w: int, h: int) -> None:
+    """Dark grey card with a short ASCII note, drawn with Pillow (a repo dependency)."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (w, h), (38, 42, 48))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([4, 4, w - 5, h - 5], outline=(120, 60, 60), width=2)
+    draw.text((12, h // 2 - 12), "generation failed", fill=(220, 150, 150))
+    draw.text((12, h // 2 + 4), "gateway unavailable - rerun", fill=(170, 170, 170))
+    img.save(path)
+
+
 def resolve_stills_provider(params: dict[str, Any]) -> str:
     """``auto`` → ``gateway`` when LiteLLM settings are configured, else ``mock``.
 
@@ -351,6 +363,18 @@ class BatchStillNode(StudioNode):
                 stills.append({**shot, "image": str(matches[0])})
         elif provider == "gateway":
             stills = self._gateway_stills(shots, payload.get("summary") or {}, params, out_dir)
+            if str(params.get("provider") or "").lower() == "auto":
+                # auto degrades instead of failing the whole run when the
+                # gateway is down: a dark "generation failed" card per missing
+                # shot keeps downstream nodes running and reads as a failure,
+                # not as the colour blocks the owner reported (#418).
+                for entry in stills:
+                    if not entry.get("image"):
+                        sid = entry.get("id") or f"shot_{entry.get('index')}"
+                        path = out_dir / f"{sid}_failed.png"
+                        _write_failed_png(path, w=w, h=h)
+                        entry["image"] = str(path)
+                        entry["placeholder"] = True
         else:
             for shot in shots:
                 sid = shot.get("id") or f"shot_{shot.get('index')}"

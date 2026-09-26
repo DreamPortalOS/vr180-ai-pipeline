@@ -55,3 +55,39 @@ def test_gallery_dedupes_pass_through_nodes() -> None:
     assert [s["id"] for s in gallery["shots"]] == ["shot_01", "shot_02", "shot_03"]
     assert gallery["count"] == 3
     assert all(s["source_node"] == "n_stills" for s in gallery["shots"])
+
+
+SHOTS = [{"id": "shot_01", "index": 0, "description": "rim"}, {"id": "shot_02", "index": 1, "description": "gorge"}]
+
+
+def _all_failed(shots, summary, params, out_dir):
+    return [{**s, "image": None, "error": "RemoteProtocolError"} for s in shots]
+
+
+def test_auto_degrades_to_failed_cards_when_gateway_is_down(monkeypatch, tmp_path) -> None:
+    import studio.nodes.production as prod
+
+    monkeypatch.setattr(prod, "resolve_stills_provider", lambda params: "gateway")
+    monkeypatch.setattr(prod.BatchStillNode, "_gateway_stills", staticmethod(_all_failed))
+    out = prod.BatchStillNode().run(
+        params={"provider": "auto"},
+        inputs={"shots": {"shots": SHOTS, "summary": {}}},
+        work_dir=str(tmp_path),
+        node_id="n",
+    )
+    shots = out["stills"]["shots"]
+    assert all(s["placeholder"] and s["image"].endswith("_failed.png") for s in shots)
+    assert all(s["error"] == "RemoteProtocolError" for s in shots)
+
+
+def test_explicit_gateway_still_fails_loudly(monkeypatch, tmp_path) -> None:
+    import studio.nodes.production as prod
+
+    monkeypatch.setattr(prod.BatchStillNode, "_gateway_stills", staticmethod(_all_failed))
+    with pytest.raises(RuntimeError, match="every shot failed"):
+        prod.BatchStillNode().run(
+            params={"provider": "gateway"},
+            inputs={"shots": {"shots": SHOTS, "summary": {}}},
+            work_dir=str(tmp_path),
+            node_id="n",
+        )
