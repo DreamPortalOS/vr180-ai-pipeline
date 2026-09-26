@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 
 from studio.coverage import _downscale, analyze_frame
-from studio.graph import GraphError, extract_gallery, list_node_types, run_graph
+from studio.graph import GraphError, RunHistory, extract_gallery, list_node_types, run_graph
 from studio.models import NodeSpec, Project, StudioModelError, empty_demo_project
 from studio.projects import ProjectStore, ProjectStoreError
 from studio.settings import StudioSettings
@@ -180,9 +180,12 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
     app = FastAPI(title="Immersive Node Studio", version="0.1.0")
     work_root = Path(default_work_dir) if default_work_dir else Path(tempfile.gettempdir()) / "vr180-studio"
     work_root.mkdir(parents=True, exist_ok=True)
+    #: content-addressed output cache (same as run_graph's ``cache``)
     run_cache: dict[str, dict[str, Any]] = {}
     last_outputs: dict[str, dict[str, Any]] = {}
     jobs = JobManager()
+    #: per-node result history, keyed by node id (issue #418)
+    run_history: dict[str, RunHistory] = {}
     project_store = ProjectStore(work_root / "projects")
 
     @app.get("/api/health")
@@ -333,6 +336,7 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
                 only_downstream_of=request.only_downstream_of,
                 dirty_from=request.dirty_from,
                 cache=run_cache,
+                history=run_history,
                 last_outputs=last_outputs,
             )
         except GraphError as exc:
@@ -376,6 +380,7 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
                     run_mode=run_mode,
                     run_node=run_node,
                     cache=run_cache,
+                    history=run_history,
                     last_outputs=last_outputs,
                     on_status=on_status,
                     cancel=cancel_event,
@@ -474,6 +479,18 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
             )
             enqueued.append({"job_id": job.id, "shot_id": shot.id, "node_id": node_id, "label": job.label})
         return {"submitted": len(enqueued), "jobs": enqueued}
+
+    @app.get("/api/node/{node_id}/history")
+    def node_history(node_id: str) -> dict[str, Any]:
+        """Return the last 5 run results for one node id (issue #418).
+
+        The canvas ◀▶ buttons on a node card cycle through these entries.
+        Unknown / never-run nodes return an empty list, not 404, so the
+        frontend can treat "no history" as a first-run state.
+        """
+        hist = run_history.get(node_id)
+        entries = hist.recent() if hist else []
+        return {"node_id": node_id, "history": entries, "count": len(entries)}
 
     @app.post("/api/upload")
     async def upload(request: Request) -> dict[str, Any]:

@@ -44,7 +44,7 @@ def production_pipeline_project() -> Project:
                 id="n_stills",
                 type="image.batch_stills",
                 pos=(710, 40),
-                params={"provider": "mock", "width": 320, "height": 320},
+                params={"provider": "auto", "width": 320, "height": 320, "variants": 2},
             ),
             NodeSpec(
                 id="n_review",

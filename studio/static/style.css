@@ -169,6 +169,13 @@ button.primary:hover { filter: brightness(1.06); }
     linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
   background-size: 24px 24px;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.canvas-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
 }
 #canvas {
   display: block;
@@ -722,56 +729,165 @@ button.queue-btn { position: relative; }
 .spotlight-row:hover, .spotlight-row.active { background: #223044; }
 .spotlight-row .cat { color: var(--muted); font-size: 11px; }
 
+.status-legend .lg.lock { background: #5a4a1d; }
+.status-legend .lg.cxl { background: #4a2e3a; }
+
+/* ---- bottom storyboard drawer (#418) ---- */
 .shot-drawer {
-  position: fixed;
-  left: 0;
-  right: 320px;
-  bottom: 0;
-  background: var(--panel);
-  border-top: 1px solid var(--border);
-  z-index: 30;
-  max-height: 40vh;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  height: var(--drawer-h, 220px);
+  min-height: 0;
+  transition: height 0.16s ease;
+  z-index: 4;
 }
+.shot-drawer.collapsed { height: 34px; }
 .shot-drawer.collapsed .drawer-body { display: none; }
-.drawer-toggle {
-  width: 100%;
-  border: none;
-  border-radius: 0;
-  background: var(--panel-2);
-  padding: 6px;
-  font-size: 12px;
-  color: var(--muted);
-}
-.drawer-body { padding: 8px 12px; overflow-y: auto; }
-.drawer-head {
+.drawer-handle {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 8px;
-  flex-wrap: wrap;
+  padding: 0 12px;
+  height: 34px;
+  flex-shrink: 0;
+  cursor: ns-resize;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
 }
-.drawer-head .hint { color: var(--muted); font-size: 11px; }
-.drawer-actions { margin-left: auto; display: flex; gap: 6px; }
-.drawer-actions button { font-size: 12px; padding: 4px 10px; }
-.shot-list {
+.drawer-grip {
+  width: 28px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--muted);
+  opacity: 0.5;
+  flex-shrink: 0;
+}
+.drawer-title { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.drawer-title strong { font-size: 13px; }
+.drawer-title .hint { font-size: 11px; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.drawer-tools { display: flex; gap: 4px; }
+.drawer-tools .seg {
+  padding: 4px 8px;
+  font-size: 13px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+.drawer-tools .seg.active { background: var(--bg); color: var(--ink); border-color: var(--border); }
+.drawer-tools #drawerToggle { cursor: pointer; padding: 4px 9px; }
+.shot-drawer.collapsed #drawerToggle { transform: rotate(180deg); }
+
+.drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px;
+  position: relative;
+}
+.drawer-empty { color: var(--muted); }
+.drawer-empty .hint { line-height: 1.7; }
+.drawer-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+}
+.shot-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+  overflow: hidden;
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  flex-direction: column;
+  cursor: grab;
+  position: relative;
 }
-.shot-item {
+.shot-card.dragging { opacity: 0.45; }
+.shot-card.drag-over { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(61,156,240,0.3); }
+.shot-card .thumb {
+  height: 96px;
+  background: #0a0e14;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+.shot-card .thumb img { width: 100%; height: 100%; object-fit: cover; }
+.shot-card .thumb.placeholder { color: var(--muted); }
+.shot-card .thumb.placeholder::after { content: "未生成"; font-size: 11px; }
+.shot-card .thumb video { width: 100%; height: 100%; object-fit: cover; background: #000; }
+.shot-card .status-dot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #3a4454;
+  box-shadow: 0 0 0 2px rgba(0,0,0,0.4);
+}
+.shot-card .status-dot.ok { background: var(--ok); }
+.shot-card .status-dot.err { background: var(--err); }
+.shot-card .status-dot.run { background: var(--warn); }
+.shot-card .pick {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
   border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel-2);
-  font-size: 12px;
+  background: rgba(10,14,20,0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
 }
-.shot-item b { color: var(--ink); }
-.shot-item .cat { color: var(--muted); font-size: 11px; }
-.status-legend .lg.lock { background: #5a4a1d; }
-.status-legend .lg.cxl { background: #4a2e3a; }
+.shot-card .pick.on { background: var(--accent); border-color: var(--accent); }
+.shot-card .pick.on::after { content: "✓"; color: #041018; font-size: 11px; font-weight: 700; }
+.shot-card .meta { padding: 6px 8px; font-size: 11px; min-width: 0; }
+.shot-card .meta .no { font-weight: 700; color: var(--ink); }
+.shot-card .meta .desc {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.shot-card .meta .dur { color: var(--accent-2); font-family: ui-monospace, Consolas, monospace; }
+
+.drawer-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.drawer-table th, .drawer-table td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.drawer-table th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+.drawer-table td.desc { color: var(--ink); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drawer-table tr { cursor: grab; }
+.drawer-table tr.dragging { opacity: 0.45; }
+.drawer-table .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+
+@media (max-width: 1100px) {
+  .shot-drawer { height: var(--drawer-h, 180px); }
+}
+
+/* Inline editor overlaid on an input.text node card (#418). */
+.node-text-editor {
+  position: fixed;
+  z-index: 15;
+  background: #0a0e14;
+  color: var(--ink);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font: 11px/1.35 "Segoe UI", "PingFang SC", sans-serif;
+  resize: none;
+  outline: none;
+  box-shadow: var(--shadow);
+}
