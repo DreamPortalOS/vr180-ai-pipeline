@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import shutil
 import struct
 import subprocess
@@ -259,6 +260,27 @@ def _write_placeholder_png(path: Path, *, w: int, h: int, seed: int, label: str)
     path.write_bytes(png)
 
 
+def resolve_stills_provider(params: dict[str, Any]) -> str:
+    """``auto`` → ``gateway`` when LiteLLM settings are configured, else ``mock``.
+
+    #418: the production template defaults to ``auto`` so an operator with a
+    configured gateway sees real storyboard stills instead of gradient
+    placeholders, while CI (no settings) and the test suite (``STUDIO_OFFLINE``)
+    stay on ``mock``.
+    """
+    provider = str(params.get("provider") or "mock").lower()
+    if provider != "auto":
+        return provider
+    if os.environ.get("STUDIO_OFFLINE"):
+        return "mock"
+    from studio.settings import settings_from_params
+
+    settings = settings_from_params(
+        {"litellm_base_url": params.get("base_url"), "litellm_api_key": params.get("api_key")}
+    )
+    return "gateway" if settings.litellm_base_url and settings.litellm_api_key else "mock"
+
+
 class BatchStillNode(StudioNode):
     """Generate one still per shot + a contact sheet path for canvas review."""
 
@@ -281,7 +303,7 @@ class BatchStillNode(StudioNode):
                 "name": "provider",
                 "type": "string",
                 "default": "mock",
-                "label": "provider (mock|gateway|file)",
+                "label": "provider (auto|mock|gateway|file)",
             },
             {"name": "model", "type": "string", "default": "agnes-image-2.5-flash", "label": "gateway 出图模型"},
             {"name": "variants", "type": "number", "default": 2, "label": "每镜头张数"},
@@ -312,7 +334,7 @@ class BatchStillNode(StudioNode):
             w += 1
         if h % 2:
             h += 1
-        provider = str(params.get("provider") or "mock").lower()
+        provider = resolve_stills_provider(params)
         out_dir = Path(work_dir) / "studio_out" / node_id / "stills"
         out_dir.mkdir(parents=True, exist_ok=True)
 

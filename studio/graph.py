@@ -334,6 +334,20 @@ def extract_gallery(report: RunReport | dict[str, Any]) -> dict[str, Any] | None
                         }
                     )
 
+    # Pass-through nodes (e.g. checkpoint.review) re-emit the same stills, so
+    # every shot showed up twice in the drawer (lead browser QA, #418). Keep the
+    # first occurrence per shot id — the producing node runs first.
+    seen: set[Any] = set()
+    unique: list[dict[str, Any]] = []
+    for s in shots:
+        key = s.get("id")
+        if key is not None and key in seen:
+            continue
+        if key is not None:
+            seen.add(key)
+        unique.append(s)
+    shots = unique
+
     if not shots and not sheet:
         return None
     return {"sheet": sheet, "shots": shots, "count": len(shots)}
