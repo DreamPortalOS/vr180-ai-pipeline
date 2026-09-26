@@ -21,7 +21,14 @@
       <button id="btnSaveServer" type="button" title="保存到本机工程库">存库</button>
       <button id="btnProjects" type="button" title="最近工程">工程</button>
       <button id="btnClear" type="button" title="清空画布">清空</button>
+      <select id="runMode" class="run-mode" title="运行范围">
+        <option value="all">全部</option>
+        <option value="node">仅本节点</option>
+        <option value="downstream">本节点及下游</option>
+      </select>
       <button id="btnRun" type="button" class="primary" title="Ctrl+Enter">▶ 运行</button>
+      <button id="btnStop" type="button" class="danger" title="停止所有运行中任务" disabled>■ 停止</button>
+      <button id="btnQueue" type="button" class="queue-btn" title="运行队列">队列 <span id="queueCount" class="queue-count">0</span></button>
       <input id="fileInput" type="file" accept="application/json,.json" hidden />
     </div>
   </header>
@@ -75,6 +82,8 @@
         <span class="lg ok"></span>成功
         <span class="lg err"></span>失败
         <span class="lg skip"></span>跳过
+        <span class="lg lock"></span>锁定
+        <span class="lg cxl"></span>取消
       </div>
     </section>
 
@@ -194,6 +203,40 @@
       </div>
     </aside>
   </main>
+
+  <!-- 运行队列下拉（issue #419 队列与停止） -->
+  <div id="queuePanel" class="queue-panel hidden">
+    <div class="queue-head">
+      <strong>运行队列</strong>
+      <button type="button" id="btnQueueStopAll" class="danger">全部停止</button>
+    </div>
+    <div id="queueList" class="queue-list"><p class="hint">无任务</p></div>
+  </div>
+
+  <!-- Spotlight 加节点（issue #419）：空格 / 斜杠 / 双击空白 / 右键空白 -->
+  <div id="spotlight" class="spotlight hidden">
+    <div class="spotlight-card">
+      <input id="spotlightInput" type="search" placeholder="搜索节点名 / 中文标签 / 类型…" autocomplete="off" />
+      <div id="spotlightResults" class="spotlight-results"></div>
+    </div>
+  </div>
+
+  <!-- 分镜抽屉（issue #419 只跑勾选镜头） -->
+  <div id="shotDrawer" class="shot-drawer collapsed">
+    <button type="button" id="shotDrawerToggle" class="drawer-toggle">▲ 分镜</button>
+    <div class="drawer-body">
+      <div class="drawer-head">
+        <strong>分镜镜头</strong>
+        <span class="hint" id="shotDrawerHint">勾选要生成的镜头</span>
+        <div class="drawer-actions">
+          <button type="button" id="btnShotAll">全选</button>
+          <button type="button" id="btnShotNone">全不选</button>
+          <button type="button" id="btnBatchGen" class="primary" disabled>批量生成视频</button>
+        </div>
+      </div>
+      <div id="shotDrawerList" class="shot-list"></div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
   <script src="dome_proj.js"></script>
