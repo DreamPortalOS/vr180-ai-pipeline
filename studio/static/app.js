@@ -2141,6 +2141,11 @@
       title = "运行结果分镜";
       scope = "__run_gallery__";
     }
+    // Remember what the drawer shows so 批量生成 acts on exactly these cards
+    // (including the __run_gallery__ scope and the default all-checked state).
+    state.drawerScope = scope;
+    state.drawerScopeShots = shots;
+    updateBatchButton();
     if (!scope) {
       drawerEmptyEl.classList.remove("hidden");
       drawerCardsEl.classList.add("hidden");
@@ -2475,22 +2480,21 @@
   const btnBatchGen = document.getElementById("btnBatchGen");
 
   function collectCheckedShots() {
-    const out = [];
+    // #419 lead QA: this used to walk project nodes and read only explicit
+    // shotChecked entries, so the default "all checked" drawer (and the
+    // __run_gallery__ scope after a run) collected nothing and the button
+    // stayed disabled. Act on the cards the drawer is actually showing.
+    const scope = state.drawerScope;
+    const shots = state.drawerScopeShots || [];
+    if (!scope || !shots.length) return [];
+    const checked = checkedShotIds(scope, shots);
     const seen = new Set();
-    for (const node of state.project.nodes) {
-      const ids = state.shotChecked[node.id];
-      if (!ids || !ids.length) continue;
-      const shots = drawerShots(node.id);
-      const byId = new Map(shots.map((s) => [String(s.id), s]));
-      for (const sid of ids) {
-        const key = String(sid);
-        if (seen.has(key)) continue;
-        const shot = byId.get(key);
-        if (shot) {
-          seen.add(key);
-          out.push(shot);
-        }
-      }
+    const out = [];
+    for (const shot of shots) {
+      const key = String(shot.id);
+      if (!checked.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      out.push(shot);
     }
     return out;
   }

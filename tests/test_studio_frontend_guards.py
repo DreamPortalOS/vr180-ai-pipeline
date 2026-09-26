@@ -226,3 +226,15 @@ def test_all_changed_js_parse_with_node_check() -> None:
     for js in sorted(APP_JS.parent.glob("*.js")):
         proc = subprocess.run([node, "--check", str(js)], capture_output=True, text=True, timeout=30)
         assert proc.returncode == 0, f"node --check failed for {js.name}:\n{proc.stderr}"
+
+
+def test_batch_generate_uses_the_drawer_scope_and_default_selection() -> None:
+    """#419: collectCheckedShots read only explicit shotChecked entries on project
+    nodes, so the default all-checked drawer (and the __run_gallery__ scope)
+    collected nothing and 批量生成 never fired."""
+    src = APP_JS.read_text(encoding="utf-8")
+    start = src.index("function collectCheckedShots()")
+    body = src[start : src.index("function updateBatchButton()", start)]
+    assert "state.drawerScope" in body
+    assert "checkedShotIds(" in body, "must reuse the drawer's default-all-checked rule"
+    assert "state.drawerScope = scope" in src
