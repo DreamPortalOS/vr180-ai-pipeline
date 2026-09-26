@@ -163,9 +163,11 @@ def test_reorder_shots_empty_order_is_identity() -> None:
     assert reorder_shots(shots, []) == shots
 
 
-def test_extract_gallery_carries_motion_and_source_node() -> None:
+def test_extract_gallery_carries_motion_and_source_node(tmp_path) -> None:
     """The drawer card needs motion + source_node; guard extract_gallery keeps them."""
-    report = run_graph(empty_demo_project(), work_dir=".")
+    # The demo project really runs (and exports), so it must write under tmp_path,
+    # never the repo root (CI's pollution guard caught studio_out/ + studio_export/).
+    report = run_graph(empty_demo_project(), work_dir=str(tmp_path))
     # Inject a stills result as image.batch_stills would produce.
     from studio.graph import NodeRunResult
 
