@@ -26,6 +26,10 @@ class NodeSpec:
     pos: tuple[float, float] = (0.0, 0.0)
     params: dict[str, Any] = field(default_factory=dict)
     muted: bool = False
+    #: Locked nodes never execute in any run mode; they reuse their last output
+    #: (issue #419). Distinct from ``muted``: muted also hides downstream work,
+    #: locked only freezes this node's own output.
+    locked: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +38,7 @@ class NodeSpec:
             "pos": [float(self.pos[0]), float(self.pos[1])],
             "params": dict(self.params),
             "muted": bool(self.muted),
+            "locked": bool(self.locked),
         }
 
     @classmethod
@@ -58,6 +63,7 @@ class NodeSpec:
             pos=(float(pos[0]), float(pos[1])),
             params=dict(params),
             muted=bool(data.get("muted", False)),
+            locked=bool(data.get("locked", False)),
         )
 
 

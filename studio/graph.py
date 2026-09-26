@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,10 +20,18 @@ class GraphError(StudioModelError):
     """Raised when the graph cannot be executed."""
 
 
+#: Run-scope selectors for ``run_graph`` (issue #419):
+#:   "all"        — execute every non-locked node
+#:   "node"       — execute only ``run_node``; its upstream comes from the
+#:                  last run's outputs (``last_outputs``)
+#:   "downstream" — execute ``run_node`` and all of its descendants
+RUN_MODES = frozenset({"all", "node", "downstream"})
+
+
 @dataclass
 class NodeRunResult:
     node_id: str
-    status: str  # idle | running | ok | error | skipped
+    status: str  # idle | running | ok | error | skipped | cancelled
     outputs: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     cache_hit: bool = False
@@ -141,10 +150,14 @@ def run_graph(
     project: Project,
     *,
     work_dir: str,
+    run_mode: str = "all",
+    run_node: str | None = None,
     only_downstream_of: str | None = None,
     dirty_from: str | None = None,
     on_status: Callable[[str, str], None] | None = None,
     cache: dict[str, dict[str, Any]] | None = None,
+    last_outputs: dict[str, dict[str, Any]] | None = None,
+    cancel: threading.Event | None = None,
 ) -> RunReport:
     """Execute the project graph.
 
@@ -154,9 +167,17 @@ def run_graph(
         Validated project document.
     work_dir:
         Absolute directory where nodes may write artefacts (tests use tmp_path).
+    run_mode:
+        One of :data:`RUN_MODES`. ``"all"`` executes every non-locked node;
+        ``"node"`` executes only ``run_node`` (its upstream is taken from the
+        last run's outputs); ``"downstream"`` executes ``run_node`` and all of
+        its descendants. Nodes outside a scoped run are not executed — their
+        last output is reused so scoped nodes can still resolve inputs.
+    run_node:
+        Target node id for ``run_mode`` ``"node"`` / ``"downstream"``.
     only_downstream_of:
-        Optional node id — run only that node and its **ancestors** (inputs
-        needed to produce it). Unrelated/sibling nodes are marked skipped.
+        Legacy alias (issue #359): run that node and its **ancestors**.
+        Prefer ``run_mode`` for new callers; kept so older clients keep working.
     dirty_from:
         Optional node id — force recompute of this node and **descendants**
         by dropping their cache keys for this run; other nodes still use cache.
@@ -165,7 +186,18 @@ def run_graph(
     cache:
         Optional shared dict used as a content-addressed output cache. Pass
         the same dict across runs to skip re-executing unchanged nodes.
+    last_outputs:
+        Optional shared dict ``node_id → last outputs`` kept across runs. A
+        locked node reuses its entry here instead of executing; a scoped run
+        resolves upstream from outside the scope via this dict. The server
+        keeps one alongside ``cache``.
+    cancel:
+        Optional :class:`threading.Event`. When set, the next node about to
+        execute is marked ``cancelled`` and remaining nodes are not started;
+        already-completed outputs are preserved in the report.
     """
+    if run_mode not in RUN_MODES:
+        raise GraphError(f"unknown run_mode {run_mode!r}; expected one of {sorted(RUN_MODES)}")
     order = topological_order(project)
     nodes = project.node_map()
     incoming = incoming_map(project)
@@ -173,9 +205,17 @@ def run_graph(
     outputs: dict[str, dict[str, Any]] = {}
     if cache is None:
         cache = {}
+    if last_outputs is None:
+        last_outputs = {}
 
+    # Resolve the active run set from the requested mode (issue #419). The
+    # legacy only_downstream_of path is preserved as node+ancestors.
     run_set: set[str] | None = None
-    if only_downstream_of:
+    if run_mode in ("node", "downstream"):
+        if not run_node:
+            raise GraphError(f"run_mode={run_mode!r} requires run_node")
+        run_set = {run_node} if run_mode == "node" else descendants_and_self(project, run_node)
+    elif only_downstream_of:
         run_set = ancestors_and_self(project, only_downstream_of)
 
     dirty_set: set[str] = set()
@@ -188,15 +228,38 @@ def run_graph(
 
     for nid in order:
         node = nodes[nid]
+
+        # Locked nodes never execute in any mode; they reuse their last output
+        # (issue #419). A locked node feeding a running one supplies that output.
+        if node.locked:
+            retained = dict(last_outputs.get(nid, {}))
+            outputs[nid] = retained
+            report.results[nid] = NodeRunResult(node_id=nid, status="locked", outputs=dict(retained))
+            set_status(nid, "locked")
+            continue
+
         if node.muted:
             report.results[nid] = NodeRunResult(node_id=nid, status="skipped", outputs={})
             outputs[nid] = {}
             set_status(nid, "skipped")
             continue
+
         if run_set is not None and nid not in run_set:
-            report.results[nid] = NodeRunResult(node_id=nid, status="skipped", outputs={})
-            outputs[nid] = {}
+            # Outside the requested scope: do not execute, but reuse the last
+            # output so a scoped node can still resolve its upstream inputs.
+            retained = dict(last_outputs.get(nid, {}))
+            outputs[nid] = retained
+            report.results[nid] = NodeRunResult(node_id=nid, status="skipped", outputs=dict(retained))
             set_status(nid, "skipped")
+            continue
+
+        # Cancellation point (issue #419): a stop requested before this node
+        # takes effect here, at the node boundary. The node is marked
+        # cancelled and remaining nodes are not started; completed outputs
+        # already in the report survive.
+        if cancel is not None and cancel.is_set():
+            report.results[nid] = NodeRunResult(node_id=nid, status="cancelled", outputs={})
+            set_status(nid, "cancelled")
             continue
 
         upstream: dict[str, Any] = {}
@@ -205,20 +268,23 @@ def run_graph(
             if src_port not in src_out:
                 if run_set is not None and src_node not in run_set:
                     raise GraphError(
-                        f"node {nid!r}: upstream {src_node!r} excluded by only_downstream_of={only_downstream_of!r}"
+                        f"node {nid!r}: upstream {src_node!r} is outside the "
+                        f"run scope and has no last output for port {port!r}"
                     )
                 raise GraphError(f"node {nid!r}: upstream {src_node!r} has no output {src_port!r}")
             upstream[port] = src_out[src_port]
 
         key = _cache_key(node.type, node.params, upstream)
         if key in cache and nid not in dirty_set:
+            outs = dict(cache[key])
             report.results[nid] = NodeRunResult(
                 node_id=nid,
                 status="ok",
-                outputs=dict(cache[key]),
+                outputs=outs,
                 cache_hit=True,
             )
-            outputs[nid] = dict(cache[key])
+            outputs[nid] = outs
+            last_outputs[nid] = dict(outs)
             set_status(nid, "ok")
             continue
 
@@ -235,6 +301,7 @@ def run_graph(
 
         outputs[nid] = result
         cache[key] = dict(result)
+        last_outputs[nid] = dict(result)
         report.results[nid] = NodeRunResult(node_id=nid, status="ok", outputs=dict(result))
         set_status(nid, "ok")
 
