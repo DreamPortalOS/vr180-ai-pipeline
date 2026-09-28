@@ -33,8 +33,19 @@ Subcommands
     measured over ``r < 0.3``), the per-ring gain is capped at ``max_gain`` and
     the gain map is Gaussian-smoothed (σ ≈ 15 px at 1024²) so ring boundaries
     cannot show up as steps.  ``r < start`` is left bit-exact untouched and
-    everything outside the inscribed circle stays pure black.  Images only —
-    the card does not require the video path; run it on the still frames.
+    everything outside the inscribed circle stays pure black.  Stills only.
+
+``rimlift-video <in.mp4> <out.mp4> [--target …] [--start …] [--max-gain …]
+    [--n-frames 1]``
+    The same lift, for a 1:1 video.  The radial gain is measured **once** —
+    from the per-frame statistics of the first ``--n-frames`` frames combined by
+    the element-wise median — and applied to every frame, so a rim whose
+    brightness breathes by ±30 % still gets one constant map rather than 120
+    different ones (the flicker that per-frame measurement would create).  The
+    map is inlined as an ffmpeg expression and evaluated with
+    ``eval=init``: one gain lookup per pixel instead of per pixel-per-frame.
+    Target / start / max-gain semantics are identical to the still tool, so a
+    keyframe and its generated clip lift the same way.
 
 Usage:
     python scripts/dome_frame_tools.py pad169 gemini_1x1.png frame_169.png
@@ -42,6 +53,7 @@ Usage:
     python scripts/dome_frame_tools.py crop11 gemini_169.mp4 dome_1x1.mp4
     python scripts/dome_frame_tools.py rimlift dome_1x1.png dome_lifted.png
     python scripts/dome_frame_tools.py rimlift dome.png out.png --target 0.6 --max-gain 6
+    python scripts/dome_frame_tools.py rimlift-video dome_1x1.mp4 dome_lifted.mp4
 
 Only the named output file is written; the input is never modified.  Geometry
 uses the same radius convention as the fulldome acceptance gate
@@ -55,6 +67,7 @@ import argparse
 import logging
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -470,6 +483,199 @@ def rimlift_file(
 
 
 # --------------------------------------------------------------------------- #
+# rimlift-video — radial brightening of a 1:1 video, one gain map for every frame
+# --------------------------------------------------------------------------- #
+
+
+def compute_video_gain_map(
+    frame: np.ndarray,
+    *,
+    target: float = DEFAULT_TARGET,
+    start: float = DEFAULT_START,
+    max_gain: float = DEFAULT_MAX_GAIN,
+) -> tuple[np.ndarray, RimProfile]:
+    """Measure the gain map **once** from a representative frame.
+
+    Returns ``(gain_2d, profile)`` where ``gain_2d`` is the full-resolution
+    smoothed gain field (same construction as the still path's
+    :func:`gain_map_from_profile`) — a 2-D ``float32`` array, ``1.0`` inside
+    ``r < start``, ``> 1`` in the lifted annulus and pinned to ``1.0`` again
+    outside the inscribed circle (the apply step forces the surround to black
+    regardless).  Pure numpy: no ffmpeg, no I/O — so the unit test in
+    ``tests/test_dome_film.py`` checks the lift on a synthetic frame without
+    needing ffmpeg on PATH.
+    """
+    if frame.ndim != 3 or frame.shape[0] != frame.shape[1]:
+        raise ValueError(f"compute_video_gain_map expects a 1:1 frame, got {frame.shape[1]}x{frame.shape[0]}")
+    gray = frame.astype(np.float32).mean(axis=2)
+    radius = _radial_map(frame.shape[0], frame.shape[1])
+    profile = radius_profile_gains(gray, radius, start=start, target=target, max_gain=max_gain)
+    if profile.center_level <= 0.0 or profile.target_level <= 0.0:
+        gain = np.ones_like(gray)
+    else:
+        gain = gain_map_from_profile(radius, profile, start=start)
+    return gain, profile
+
+
+def apply_rimlift_gain(frame: np.ndarray, gain_2d: np.ndarray) -> np.ndarray:
+    """Apply one precomputed gain map to a frame (the per-frame video step).
+
+    Mirrors the tail of :func:`rimlift_image`: multiply by the gain field,
+    clip to ``[0, 255]`` and force everything outside the inscribed circle to
+    pure black.  The gain map is assumed to have been measured once (by
+    :func:`compute_video_gain_map`) and reused for every frame — that is the
+    "compute once, apply per frame" contract the card asks for.
+    """
+    if frame.ndim != 3 or gain_2d.ndim != 2 or frame.shape[:2] != gain_2d.shape:
+        raise ValueError(f"frame {frame.shape} and gain {gain_2d.shape} must share the 1:1 H×W")
+    radius = _radial_map(frame.shape[0], frame.shape[1])
+    lifted = np.clip(frame.astype(np.float32) * gain_2d[..., None], 0.0, 255.0)
+    lifted[radius > 1.0] = 0.0
+    return np.rint(lifted).astype(np.uint8)
+
+
+def _read_first_frame(path: str | Path, *, ffmpeg: str) -> np.ndarray:
+    """Decode the first frame of *path* as a BGR array (ffmpeg, list form)."""
+    with tempfile.TemporaryDirectory(prefix="rimlift-video-") as tmp:
+        png = Path(tmp) / "_first.png"
+        cmd = [ffmpeg, "-y", "-v", "error", "-i", str(path), "-frames:v", "1", str(png)]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SEC)
+        if res.returncode != 0 or not png.is_file():
+            raise RuntimeError(f"could not extract a probe frame from {path}:\n{res.stderr[:2000]}")
+        return _read_image(png)
+
+
+def build_rimlift_encode_command(
+    frame_pattern: str | Path,
+    audio_from: str | Path,
+    output_path: str | Path,
+    *,
+    fps: float,
+    n_frames: int,
+    ffmpeg: str = "ffmpeg",
+    crf: int = CROP11_CRF,
+    pix_fmt: str = CROP11_PIX_FMT,
+) -> list[str]:
+    """The ffmpeg argv that encodes a lifted PNG sequence back to a 1:1 video.
+
+    Input 0 is the numbered PNG sequence (``frame_pattern`` uses ffmpeg's
+    ``%06d`` / ``%05d`` placeholder); input 1 is the original clip, mapped
+    ``-map 1:a:0?`` so the audio track is stream-copied (``-c:a copy``) like
+    ``crop11``.  ``-framerate`` is set on the image input so the encoder keeps
+    the source cadence.  List form, never ``shell=True``.
+    """
+    return [
+        ffmpeg,
+        "-y",
+        "-v",
+        "error",
+        "-framerate",
+        f"{fps:g}",
+        "-i",
+        str(frame_pattern),
+        "-i",
+        str(audio_from),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0?",
+        "-c:a",
+        "copy",
+        "-c:v",
+        "libx264",
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        pix_fmt,
+        "-frames:v",
+        str(n_frames),
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+
+
+def rimlift_video(
+    input_path: str | Path,
+    output_path: str | Path,
+    *,
+    target: float = DEFAULT_TARGET,
+    start: float = DEFAULT_START,
+    max_gain: float = DEFAULT_MAX_GAIN,
+    ffmpeg: str = "ffmpeg",
+) -> str:
+    """Lift the outer rings of a 1:1 video, one gain map for every frame.
+
+    The radial gain is measured **once** from the first frame and applied to
+    every frame via the OpenCV path (decode → :func:`apply_rimlift_gain` →
+    encode), so the per-frame math is identical to :func:`rimlift_image` and
+    the gain does not flicker frame to frame.  Parameters share their semantics
+    with the still tool, so a keyframe and its generated clip lift the same
+    way.  Audio is stream-copied (``-c:a copy``) like ``crop11``.
+
+    Raises:
+        ValueError: when *input_path* is not a video or its first frame is not
+            1:1, or the parameters are out of range.
+        RuntimeError: when ffmpeg exits non-zero or the clip has no frames.
+    """
+    if not is_video(input_path):
+        raise ValueError(
+            "rimlift-video expects a 1:1 video (mp4/mov/mkv/…) — run crop11 first; the still path is `rimlift`"
+        )
+    frame0 = _read_first_frame(input_path, ffmpeg=ffmpeg)
+    if frame0.shape[0] != frame0.shape[1]:
+        raise ValueError(
+            f"rimlift-video expects a 1:1 video, first frame is {frame0.shape[1]}x{frame0.shape[0]} — run crop11 first"
+        )
+    gain_2d, profile = compute_video_gain_map(frame0, target=target, start=start, max_gain=max_gain)
+
+    # Decode → apply the one gain map → write a PNG sequence, then encode the
+    # sequence back to H.264 with the original audio copied.  Doing the per-frame
+    # multiply in numpy (instead of a cross-input ``geq`` expression) keeps the
+    # math bit-identical to the still path and avoids fragile filtergraph
+    # parsing; the sequence lives in a temp dir cleaned up on exit.
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"could not open {input_path} for frame decode")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if fps <= 0:
+        fps = 30.0
+    with tempfile.TemporaryDirectory(prefix="rimlift-video-") as tmp:
+        frame_dir = Path(tmp)
+        pattern = frame_dir / "lf_%06d.png"
+        idx = 0
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                lifted = apply_rimlift_gain(frame, gain_2d)
+                cv2.imwrite(str(frame_dir / f"lf_{idx:06d}.png"), lifted)
+                idx += 1
+        finally:
+            cap.release()
+        if idx == 0:
+            raise RuntimeError(f"no frames decoded from {input_path}")
+        cmd = build_rimlift_encode_command(
+            pattern,
+            input_path,
+            output_path,
+            fps=fps,
+            n_frames=idx,
+            ffmpeg=ffmpeg,
+        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SEC)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg rimlift-video failed (exit {result.returncode}):\n{result.stderr[:2000]}")
+    log.info(
+        f"rimlift-video: {input_path} → {output_path} ({idx} frames, "
+        f"centre {profile.center_level:.1f}, target {profile.target_level:.1f}, "
+        f"ring gain {min(profile.ring_gains, default=1.0):.2f}–{max(profile.ring_gains, default=1.0):.2f})"
+    )
+    return str(output_path)
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -512,6 +718,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_GAIN,
         help="per-ring gain cap (default 4)",
     )
+
+    rimv = sub.add_parser("rimlift-video", help="rimlift for a 1:1 video — one gain map, every frame")
+    rimv.add_argument("input", help="1:1 domemaster video (run crop11 first)")
+    rimv.add_argument("output", help="output video")
+    rimv.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg binary used for the video path")
+    rimv.add_argument("--target", type=float, default=DEFAULT_TARGET, help="rim target (default 0.55)")
+    rimv.add_argument("--start", type=float, default=DEFAULT_START, help="lift start radius (default 0.5)")
+    rimv.add_argument("--max-gain", type=float, default=DEFAULT_MAX_GAIN, help="per-ring gain cap (default 4)")
     return parser
 
 
@@ -524,6 +738,15 @@ def main(argv: list[str] | None = None) -> int:
             pad169_file(args.input, args.output)
         elif args.command == "crop11":
             crop11_file(args.input, args.output, ffmpeg=args.ffmpeg)
+        elif args.command == "rimlift-video":
+            rimlift_video(
+                args.input,
+                args.output,
+                target=args.target,
+                start=args.start,
+                max_gain=args.max_gain,
+                ffmpeg=args.ffmpeg,
+            )
         else:
             rimlift_file(args.input, args.output, target=args.target, start=args.start, max_gain=args.max_gain)
     except (OSError, RuntimeError, ValueError) as exc:
