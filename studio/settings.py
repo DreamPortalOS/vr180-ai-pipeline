@@ -44,7 +44,7 @@ class StudioSettings:
         for p in candidates:
             if p.is_file():
                 try:
-                    data = json.loads(p.read_text(encoding="utf-8"))
+                    data = json.loads(p.read_text(encoding="utf-8-sig"))
                     break
                 except (OSError, json.JSONDecodeError):
                     continue

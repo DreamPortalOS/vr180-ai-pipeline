@@ -238,7 +238,7 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
         if path.is_file():
             import json
 
-            current = json.loads(path.read_text(encoding="utf-8"))
+            current = json.loads(path.read_text(encoding="utf-8-sig"))
         payload = patch.model_dump(exclude_none=True)
         current.update(payload)
         import json

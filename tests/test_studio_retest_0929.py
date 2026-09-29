@@ -167,3 +167,14 @@ def test_drawer_card_shows_batch_video_result() -> None:
     body = _function_body(src, "batchGenerateShots")
     assert "image:" in body and "motion:" in body
     assert "shot-video" in _function_body(src, "renderDrawerCards")
+
+
+def test_settings_file_with_bom_is_read(tmp_path) -> None:
+    """PowerShell 5 ``Set-Content -Encoding utf8`` writes a BOM; do not drop the file."""
+    from studio.settings import StudioSettings
+
+    p = tmp_path / "studio_settings.json"
+    p.write_bytes(b'\xef\xbb\xbf{"litellm_base_url": "http://gw", "litellm_api_key": "k"}')
+    s = StudioSettings.load(p)
+    assert s.litellm_base_url == "http://gw"
+    assert s.litellm_api_key == "k"
