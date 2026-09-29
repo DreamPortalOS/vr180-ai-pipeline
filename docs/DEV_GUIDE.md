@@ -135,6 +135,36 @@ VR180 / Fulldome 转换本身只产出无声视频，音频由两个独立模块
   混音后重新注入 sv3d/st3d（issue #91：`-c:v copy` + 重映射音轨会丢 sample-entry 盒子），
   dome 路线无球形盒子故跳过该步。
 
+### 2.4 穹顶短片合成：scripts/dome_film.py（D-1, #427）
+
+owner 首部穹顶短片的关键帧已就绪（`video/dome/S1.jpg` … `S4_rimlift.jpg`），各场
+视频由 Gemini 以 **16:9 ~1080p** 出片。`scripts/dome_film.py` 把一条 JSON 计划串成
+成片，复用既有工具、零新增依赖：
+
+```
+每场: crop11(16:9→1:1) → rimlift-video(外圈提亮, 单一增益图) → 放大到 size²
+全片: 交叉淡化拼接 → 可选音轨混入 → H.265 10-bit size² 成片 → dome_qa 报告
+```
+
+- **计划文件**（`--plan`）：`{"size":4096,"upscale":"lanczos","crossfade":1.0,
+  "audio":"path/or/null","audio_gain_db":0,"scenes":[{"clip":"a.mp4",
+  "trim_start":0.0,"trim_end":null,"rimlift":true,"is_169":true}]}`。相对路径按计划
+  文件目录解析。
+- **几何/提亮/拼接/混音/验收**全部复用：`dome_frame_tools` 的 `crop11` /
+  `rimlift-video`（参数与图片版一致）、`pipeline.segment_concat`（xfade）、
+  `pipeline.audio_mix`、`scripts/dome_qa.py`（JSON 报告写在成片旁）。
+- **放大**：`lanczos` 默认（纯 ffmpeg，任意机器）；`seedvr2` 走现有
+  `--video-upscale seedvr2` 的 `pipeline.video_upscaler.SeedVR2Upscaler`（12GB 默认参数）；
+  圆外始终置纯黑。
+- 所有 ffmpeg/ffprobe 调用 **subprocess list 形式**（禁 `shell=True`）；中间产物在
+  临时目录，成功即清理，`--keep-intermediates` 保留到 `<output>_work/`；`--dry-run`
+  只打印每步命令与预计尺寸/时长，不写任何文件。
+
+  ```bash
+  python scripts/dome_film.py --plan plan.json --output dome_film.mp4
+  python scripts/dome_film.py --plan plan.json --output dome_film.mp4 --dry-run
+  ```
+
 ---
 
 ## 3. 目标架构
