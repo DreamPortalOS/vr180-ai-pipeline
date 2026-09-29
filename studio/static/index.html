@@ -98,6 +98,7 @@
           <div class="drawer-title">
             <strong id="drawerTitle">分镜</strong>
             <span class="hint" id="drawerCount">选中脚本/分镜节点后显示镜头</span>
+            <span class="gw-warn hidden" id="gwWarn" title="provider=auto 在未配置网关时退回占位图">⚠ 未配置出图网关，分镜为占位图 · <a href="#" id="gwWarnLink">去配置</a></span>
           </div>
           <div class="drawer-tools">
             <button type="button" id="drawerViewCards" class="seg active" title="卡片视图">▦</button>
@@ -238,7 +239,11 @@
   <div id="queuePanel" class="queue-panel hidden">
     <div class="queue-head">
       <strong>运行队列</strong>
-      <button type="button" id="btnQueueStopAll" class="danger">全部停止</button>
+      <span class="queue-head-actions">
+        <button type="button" id="btnQueueClear" title="移除已完成 / 失败 / 已取消的任务">清除已结束</button>
+        <button type="button" id="btnQueueStopAll" class="danger">全部停止</button>
+        <button type="button" id="btnQueueClose" class="queue-close" title="收起（Esc）">✕</button>
+      </span>
     </div>
     <div id="queueList" class="queue-list"><p class="hint">无任务</p></div>
   </div>

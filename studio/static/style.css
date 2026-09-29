@@ -85,7 +85,7 @@ button.primary:hover { filter: brightness(1.06); }
 
 .layout {
   display: grid;
-  grid-template-columns: 240px 1fr 320px;
+  grid-template-columns: 240px minmax(0, 1fr) var(--rail-w, 320px);
   height: calc(100% - 52px);
   min-height: 0;
 }
@@ -278,7 +278,7 @@ button.primary:hover { filter: brightness(1.06); }
 }
 
 @media (max-width: 1100px) {
-  .layout { grid-template-columns: 200px 1fr 260px; }
+  .layout { grid-template-columns: 200px minmax(0, 1fr) var(--rail-w, 260px); }
 }
 
 /* ---- right rail tabs ---- */
@@ -683,6 +683,12 @@ button.queue-btn { position: relative; }
 .queue-item.cancelled { opacity: 0.6; }
 .queue-item.cancelled .queue-bar-fill { background: var(--err); }
 .queue-cancel { font-size: 11px; padding: 2px 8px; }
+.queue-head-actions { display: flex; gap: 6px; align-items: center; }
+.queue-head-actions button { font-size: 11px; padding: 3px 8px; }
+.queue-close { min-width: 26px; }
+.queue-state { font-size: 11px; color: var(--muted); align-self: center; }
+.queue-state.ok { color: var(--ok, #58c48a); }
+.queue-state.error, .queue-state.cancelled { color: var(--err); }
 
 .spotlight {
   position: fixed;
@@ -891,3 +897,27 @@ button.queue-btn { position: relative; }
   outline: none;
   box-shadow: var(--shadow);
 }
+
+/* T1 09-29: gateway-not-configured notice in the drawer header */
+.gw-warn { color: var(--warn, #f0b541); font-size: 12px; margin-left: 10px; }
+.gw-warn a { color: var(--accent); }
+.gw-warn.hidden { display: none; }
+
+/* T1 09-29: per-shot batch video result on the drawer card */
+.shot-video {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  min-width: 26px;
+  height: 26px;
+  border-radius: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  background: rgba(6, 10, 16, 0.75);
+  color: var(--ink);
+  border: 1px solid var(--border);
+}
+.shot-video.ok { cursor: pointer; background: var(--accent); color: #041018; }
+.shot-video.error, .shot-video.cancelled { color: var(--err); }

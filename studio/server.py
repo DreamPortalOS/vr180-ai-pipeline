@@ -56,6 +56,9 @@ class ShotSpec(BaseModel):
     id: str
     description: str = ""
     duration: float | None = None
+    #: storyboard still on disk; when present the shot renders from it
+    image: str | None = None
+    motion: str | None = None
 
 
 class BatchShotRequest(BaseModel):
@@ -166,6 +169,14 @@ class JobManager:
             job.cancel_event.set()
             return True
 
+    def clear_finished(self) -> int:
+        """Drop every finished job from the list; returns how many were removed."""
+        with self._lock:
+            done = [k for k, j in self._jobs.items() if j.finished_at is not None]
+            for k in done:
+                del self._jobs[k]
+        return len(done)
+
     def cancel_all(self) -> int:
         """Stop every running job; returns how many were actually cancelled."""
         with self._lock:
@@ -227,7 +238,7 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
         if path.is_file():
             import json
 
-            current = json.loads(path.read_text(encoding="utf-8"))
+            current = json.loads(path.read_text(encoding="utf-8-sig"))
         payload = patch.model_dump(exclude_none=True)
         current.update(payload)
         import json
@@ -431,6 +442,10 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
         n = jobs.cancel_all()
         return {"stopped": n}
 
+    @app.post("/api/jobs/clear")
+    def clear_jobs() -> dict[str, Any]:
+        return {"cleared": jobs.clear_finished()}
+
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel_job(job_id: str) -> dict[str, Any]:
         ok = jobs.cancel(job_id)
@@ -458,18 +473,36 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
             prompt = (shot.description or shot.id or "shot")[:512]
             duration = max(1.0, min(10.0, float(shot.duration or 1)))
             node_id = f"n_shot_{shot.id[:24]}"
-            project = Project(
-                name=f"batch:{shot.id}",
-                nodes=[
-                    NodeSpec(
-                        id=node_id,
-                        type="video.mock",
-                        pos=(0, 0),
-                        params={"prompt": prompt, "duration": duration, "size": 64, "fps": 5},
-                    )
-                ],
-                edges=[],
-            )
+            if shot.image and Path(shot.image).is_file():
+                # T1 09-29: render the shot from its real storyboard still (with
+                # the storyboard's camera move) instead of a 64px mock clip.
+                spec = NodeSpec(
+                    id=node_id,
+                    type="video.from_stills",
+                    pos=(0, 0),
+                    params={
+                        "shots": [
+                            {
+                                "id": shot.id,
+                                "description": shot.description,
+                                "image": shot.image,
+                                "duration": duration,
+                                "motion": shot.motion or "static",
+                            }
+                        ],
+                        "size": 512,
+                        "fps": 24,
+                        "max_clips": 1,
+                    },
+                )
+            else:
+                spec = NodeSpec(
+                    id=node_id,
+                    type="video.mock",
+                    pos=(0, 0),
+                    params={"prompt": prompt, "duration": duration, "size": 64, "fps": 5},
+                )
+            project = Project(name=f"batch:{shot.id}", nodes=[spec], edges=[])
             job = _enqueue(
                 project=project,
                 work_dir=work_dir / "batch" / shot.id[:24],

@@ -303,6 +303,9 @@
     paletteFilter: "",
     runMode: "all",
     jobs: [],
+    queueOpen: false,
+    shotJobs: {}, // batch job id -> shot id
+    shotVideos: {}, // shot id -> {status, video?, error?}
     jobTimer: null,
     shots: [],
     /** Checked shot ids per node id (shared by #418 drawer + #419 batch). */
@@ -1395,10 +1398,30 @@
   const queueCountEl = document.getElementById("queueCount");
   const btnQueueStopAll = document.getElementById("btnQueueStopAll");
 
+  const JOB_STATUS_LABEL = {
+    queued: "排队中",
+    running: "运行中",
+    ok: "完成",
+    error: "失败",
+    cancelled: "已取消",
+  };
+
+  function setQueueOpen(open) {
+    state.queueOpen = Boolean(open);
+    renderQueue();
+  }
+
   function renderQueue() {
-    const running = state.jobs.filter((j) => j.status === "running");
+    const running = state.jobs.filter((j) => j.status === "running" || j.status === "queued");
     queueCountEl.textContent = running.length;
-    if (queuePanel) queuePanel.classList.toggle("hidden", state.jobs.length === 0);
+    const btnStop = document.getElementById("btnStop");
+    if (btnStop) btnStop.disabled = running.length === 0;
+    // T1 09-29: visibility is the operator's choice only. Polling used to force
+    // the panel open whenever any job existed, so it could never be closed and
+    // covered the right rail for the rest of the session.
+    if (queuePanel) queuePanel.classList.toggle("hidden", !state.queueOpen);
+    const btnQueueClear = document.getElementById("btnQueueClear");
+    if (btnQueueClear) btnQueueClear.disabled = state.jobs.length === running.length;
     if (!queueList) return;
     if (state.jobs.length === 0) {
       queueList.innerHTML = "<p class=\"hint\">无任务</p>";
@@ -1409,21 +1432,67 @@
       .slice()
       .sort((a, b) => b.started_at - a.started_at)
       .map((j) => {
-        const isRunning = j.status === "running";
+        const active = j.status === "running" || j.status === "queued";
         const pct = Math.round(j.progress * 100);
+        const label = JOB_STATUS_LABEL[j.status] || j.status;
+        const action = active
+          ? `<button type="button" class="danger queue-cancel" data-id="${j.id}" title="取消此任务">取消</button>`
+          : `<span class="queue-state ${j.status}">${label}</span>`;
         return `<div class="queue-item ${j.status}">
           <div class="queue-info">
             <span class="queue-label">${j.label || "运行"}</span>
-            <span class="queue-meta">${j.id.slice(0, 6)} · ${j.status} · ${pct}%</span>
+            <span class="queue-meta">${j.id.slice(0, 6)} · ${label} · ${pct}%</span>
           </div>
+          ${action}
           <div class="queue-bar"><div class="queue-bar-fill" style="width:${pct}%"></div></div>
-          <button type="button" class="danger queue-cancel" data-id="${j.id}" title="取消此任务">${
-          isRunning ? "取消" : "已取消"
-        }</button>
         </div>`;
       })
       .join("");
     if (btnQueueStopAll) btnQueueStopAll.disabled = running.length === 0;
+  }
+
+  /** Map finished batch-shot jobs onto their drawer cards; true if any changed. */
+  function harvestShotVideos() {
+    let changed = false;
+    for (const job of state.jobs) {
+      const shotId = state.shotJobs[job.id];
+      if (!shotId || job.status === "running" || job.status === "queued") continue;
+      delete state.shotJobs[job.id];
+      changed = true;
+      if (job.status !== "ok") {
+        state.shotVideos[shotId] = { status: job.status, error: job.error || "" };
+        continue;
+      }
+      let video = null;
+      const results = (job.report && job.report.results) || {};
+      for (const res of Object.values(results)) {
+        const outs = (res && res.outputs) || {};
+        const clips = outs.videos && outs.videos.clips;
+        if (Array.isArray(clips) && clips.length) video = clips[0].video;
+        else if (typeof outs.video === "string") video = outs.video;
+      }
+      state.shotVideos[shotId] = video ? { status: "ok", video } : { status: "error", error: "无视频输出" };
+    }
+    return changed;
+  }
+
+  async function refreshJobs() {
+    try {
+      state.jobs = await api("/api/jobs");
+    } catch (err) {
+      setStatus("队列刷新失败: " + err.message);
+    }
+    renderQueue();
+  }
+
+  async function clearFinishedJobs() {
+    try {
+      const { cleared } = await api("/api/jobs/clear", { method: "POST" });
+      setStatus(`已清除 ${cleared} 个已结束任务`);
+    } catch (err) {
+      setStatus("清除失败: " + err.message);
+    }
+    await refreshJobs();
   }
 
   function startQueuePolling() {
@@ -1431,8 +1500,9 @@
     state.jobTimer = setInterval(async () => {
       try {
         state.jobs = await api("/api/jobs");
+        if (harvestShotVideos()) renderDrawer();
         renderQueue();
-        if (state.jobs.every((j) => j.status !== "running")) {
+        if (state.jobs.every((j) => j.status !== "running" && j.status !== "queued")) {
           clearInterval(state.jobTimer);
           state.jobTimer = null;
         }
@@ -1448,10 +1518,12 @@
     (async () => {
       try {
         const { stopped } = await api("/api/jobs/stop-all", { method: "POST" });
-        setStatus(`已停止 ${stopped} 个任务`);
+        setStatus(stopped ? `已停止 ${stopped} 个任务` : "没有运行中的任务");
       } catch (err) {
         setStatus("停止失败: " + err.message);
       }
+      await refreshJobs();
+      startQueuePolling();
     })();
   }
 
@@ -1487,6 +1559,15 @@
     const btnSaveServer = document.getElementById("btnSaveServer");
     if (btnSaveServer) btnSaveServer.addEventListener("click", () => saveToServer());
     const btnProjects = document.getElementById("btnProjects");
+    const gwWarnLink = document.getElementById("gwWarnLink");
+    if (gwWarnLink && btnProjects) {
+      gwWarnLink.addEventListener("click", (evt) => {
+        evt.preventDefault();
+        btnProjects.click();
+        const url = document.getElementById("setLlmUrl");
+        if (url) url.focus();
+      });
+    }
     if (btnProjects) {
       btnProjects.addEventListener("click", () => {
         const t = document.querySelector('.tab[data-tab="projects"]');
@@ -1527,12 +1608,24 @@
     if (btnQueue) {
       btnQueue.addEventListener("click", () => {
         if (!queuePanel) return;
-        queuePanel.classList.toggle("hidden");
-        state.jobs = state.jobs; // refresh render of the panel
-        renderQueue();
+        setQueueOpen(!state.queueOpen);
+        if (state.queueOpen && state.online) refreshJobs();
       });
     }
     if (btnQueueStopAll) btnQueueStopAll.addEventListener("click", stopAllJobs);
+    const btnQueueClear = document.getElementById("btnQueueClear");
+    if (btnQueueClear) btnQueueClear.addEventListener("click", clearFinishedJobs);
+    const btnQueueClose = document.getElementById("btnQueueClose");
+    if (btnQueueClose) btnQueueClose.addEventListener("click", () => setQueueOpen(false));
+    // Click anywhere outside the dropdown (and its toggle) or press Esc to fold it.
+    document.addEventListener("mousedown", (evt) => {
+      if (!state.queueOpen || !queuePanel) return;
+      if (queuePanel.contains(evt.target) || (btnQueue && btnQueue.contains(evt.target))) return;
+      setQueueOpen(false);
+    });
+    document.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape" && state.queueOpen) setQueueOpen(false);
+    });
     if (queueList) {
       queueList.addEventListener("click", (evt) => {
         const btn = evt.target.closest(".queue-cancel");
@@ -1542,8 +1635,9 @@
             await api(`/api/jobs/${btn.dataset.id}/cancel`, { method: "POST" });
             setStatus("已取消任务 " + btn.dataset.id);
           } catch (err) {
-            setStatus("取消失败: " + err.message);
+            setStatus("取消失败（任务可能已结束）: " + err.message);
           }
+          await refreshJobs();
         })();
       });
     }
@@ -2235,6 +2329,26 @@
         toggleShotChecked(nodeId, shot.id, shots);
       });
       thumb.appendChild(pick);
+      const sv = state.shotVideos[String(shot.id)];
+      if (sv) {
+        const badge = document.createElement("span");
+        badge.className = "shot-video " + sv.status;
+        if (sv.status === "ok") {
+          badge.textContent = "▶";
+          badge.title = "播放生成的镜头视频";
+          badge.addEventListener("click", (e) => {
+            e.stopPropagation();
+            openInlineVideo("shot_" + shot.id, sv.video);
+          });
+        } else if (sv.status === "running") {
+          badge.textContent = "…";
+          badge.title = "视频生成中";
+        } else {
+          badge.textContent = "!";
+          badge.title = "视频生成失败 " + (sv.error || sv.status);
+        }
+        thumb.appendChild(badge);
+      }
       card.appendChild(thumb);
 
       const meta = document.createElement("div");
@@ -2519,15 +2633,24 @@
         id: String(s.id),
         description: s.description || "",
         duration: s.duration != null ? Number(s.duration) : null,
+        // T1 09-29: send the still + camera move so the server renders the
+        // real storyboard frame instead of a 64px mock clip.
+        image: s.image && !s.placeholder ? s.image : null,
+        motion: s.motion || null,
       }));
       const res = await api("/api/batch-shots", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ shots }),
       });
+      for (const j of res.jobs || []) {
+        state.shotJobs[j.job_id] = String(j.shot_id);
+        state.shotVideos[String(j.shot_id)] = { status: "running" };
+      }
       startQueuePolling();
-      setStatus(`已提交 ${res.submitted} 个镜头任务`);
+      setStatus(`已提交 ${res.submitted} 个镜头 → 生成中，完成后卡片出现 ▶（点「队列」看进度）`);
       renderQueue();
+      renderDrawer();
     } catch (err) {
       setStatus("批量提交失败: " + err.message);
     }
@@ -2608,6 +2731,14 @@
     await loadSettings();
   }
 
+  // T1 09-29: with no gateway configured, provider=auto silently fell back to
+  // gradient placeholders and the operator had no way to tell why. Say so in
+  // the drawer header and link straight to the settings form.
+  function showGatewayWarning(show) {
+    const warn = document.getElementById("gwWarn");
+    if (warn) warn.classList.toggle("hidden", !show);
+  }
+
   async function loadSettings() {
     if (!state.online) return;
     try {
@@ -2620,6 +2751,7 @@
       set("setLlmModel", s.litellm_model);
       set("setSnUrl", s.sensenova_base_url);
       set("setSnModel", s.sensenova_model);
+      showGatewayWarning(!(s.litellm_base_url && s.litellm_api_key_set));
       const st = document.getElementById("settingsStatus");
       if (st) {
         st.textContent = s.litellm_api_key_set
@@ -2656,6 +2788,7 @@
       });
       const st = document.getElementById("settingsStatus");
       if (st) st.textContent = `已保存 · base=${s.litellm_base_url || "—"} model=${s.litellm_model || "—"}`;
+      showGatewayWarning(!(s.litellm_base_url && s.litellm_api_key_set));
       setStatus("供应商设置已保存到本机");
     } catch (err) {
       setStatus("设置保存失败: " + err.message);
@@ -2690,6 +2823,7 @@
       const health = await api("/api/health");
       setBackend(true, `已连接 · ${health.work_root || ""}`);
       await loadCatalogFromApi();
+      await loadSettings();
     } catch (_) {
       setBackend(false, "离线模式：可编辑画布；运行需 python -m studio.server");
     }
