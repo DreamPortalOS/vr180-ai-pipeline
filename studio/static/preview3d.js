@@ -211,6 +211,10 @@
       this.coverageR = opts.coverageR != null ? opts.coverageR : -1;
       this.hasTexture = false;
       this.tex = gl.createTexture();
+      // Source kind being rendered ("image" | "video"), its current frame
+      // (ImageBitmap | canvas | HTMLVideoElement) and the shared video clock.
+      this.kind = null;
+      this.video = null;
       this.orbit = { az: 0.7, el: 0.55, dist: 2.85 };
       this.drag = null;
       this.raf = 0;
@@ -438,12 +442,21 @@
      * another context's texture raises INVALID_OPERATION and the sampler reads
      * black.  The 3D dome and the camera viewport run in separate contexts, so
      * each uploads its own GPU copy from the one shared source image.  Returns
-     * false when there is nothing to upload. */
+     * false when there is nothing to upload.
+     *
+     * For a video, the source is an HTMLVideoElement: texImage2D re-uploads the
+     * current frame on demand (not every redraw).  An HTMLImageElement /
+     * canvas is uploaded once per version bump. */
     uploadTexture(gl, tex) {
-      if (!this.image) return false;
+      if (this.kind === "video") {
+        if (!this.video || this.video.readyState < 2) return false;
+      } else if (!this.image) {
+        return false;
+      }
       gl.bindTexture(gl.TEXTURE_2D, tex);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.image);
+      const src = this.kind === "video" ? this.video : this.image;
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -451,8 +464,39 @@
       return true;
     }
 
+    /** Whether a new video frame needs uploading to the GPU this tick. A video
+     * only re-uploads when advancing (playing) or right after a seek — not on
+     * every redraw while paused (would burn GPU on an unchanged frame). */
+    _videoFrameIsFresh() {
+      if (this.kind !== "video" || !this.video) return false;
+      // readyState < HAVE_CURRENT_DATA (2): nothing to upload yet.
+      if (this.video.readyState < 2) return false;
+      // paused and not mid-seek: the frame is static, nothing new.
+      if (this.video.paused && !this.seeking) return false;
+      return true;
+    }
+
+    /** Per-tick texture upkeep shared by both render loops: upload a fresh
+     * video frame into BOTH contexts' textures when one is available, and
+     * bump texVersion so the camera viewport re-uploads its own copy. */
+    _tickVideoTexture() {
+      if (this.kind !== "video") return;
+      if (!this._videoFrameIsFresh()) return;
+      // Upload into the dome context's own texture.
+      this.uploadTexture(this.gl, this.tex);
+      this.seeking = false;
+      // The camera viewport watches this version; bump so it re-uploads its
+      // own copy next draw.
+      this.texVersion = (this.texVersion || 0) + 1;
+    }
+
     setImage(img) {
       this.image = img || null;
+      this.kind = img ? "image" : null;
+      // A video source is managed via setVideo(); if an image arrives, drop
+      // any video so the two paths cannot both be bound at once.
+      this.video = null;
+      this.seeking = false;
       // Bumped on every change so the camera viewport (a different WebGL
       // context) knows to re-upload its own copy of the texture.
       this.texVersion = (this.texVersion || 0) + 1;
@@ -460,6 +504,28 @@
         this.hasTexture = false;
         return;
       }
+      this.hasTexture = this.uploadTexture(this.gl, this.tex);
+    }
+
+    /** Bind an HTMLVideoElement as the texture source (issue #428).  Unlike
+     * images, the video element keeps producing frames; texImage2D(video) is
+     * re-run per tick only while playing or after a seek (see
+     * _tickVideoTexture).  The element is the same instance the player
+     * controls (play/pause/seek/loop) mutate, so the 3D dome and the 机位
+     * viewport stay in lockstep with the controls. */
+    setVideo(v) {
+      this.video = v || null;
+      this.seeking = false;
+      if (!v) {
+        this.kind = null;
+        this.hasTexture = false;
+        return;
+      }
+      this.kind = "video";
+      this.image = null;
+      // Bump so the camera viewport uploads its first copy once a frame is
+      // ready; subsequent ticks keep both in sync.
+      this.texVersion = (this.texVersion || 0) + 1;
       this.hasTexture = this.uploadTexture(this.gl, this.tex);
     }
 
@@ -505,6 +571,9 @@
 
     _draw() {
       const gl = this.gl;
+      // Per-tick video upkeep: re-upload a fresh frame only while the video is
+      // playing or right after a seek, into this context's own texture.
+      this._tickVideoTexture();
       const w = this.canvas.clientWidth || 300;
       const h = this.canvas.clientHeight || 200;
       const dpr = window.devicePixelRatio || 1;
@@ -747,11 +816,15 @@
       // Re-upload whenever the master changes: p.tex lives in the *preview's*
       // context and WebGL objects do not cross contexts (binding a foreign
       // texture is an INVALID_OPERATION and samples black), so this viewport
-      // keeps its own copy in its own context, fed from the same source image.
-      if (p.hasTexture && this.texVersion !== p.texVersion) {
-        if (p.uploadTexture(gl, this.tex)) this.texVersion = p.texVersion;
+      // keeps its own copy in its own context, fed from the same source.
+      //
+      // For a video, hasTexture is the snapshot at load time, so gate on
+      // texVersion (bumped each time a new frame is uploaded) and let
+      // uploadTexture itself return false when the video has no frame yet.
+      if (this.texVersion !== p.texVersion && p.uploadTexture(gl, this.tex)) {
+        this.texVersion = p.texVersion;
       }
-      if (!p.hasTexture) this.texVersion = -1;
+      if (p.kind !== "video" && !p.hasTexture) this.texVersion = -1;
       gl.uniform1f(this.u.hasTex, this.texVersion === p.texVersion && p.hasTexture ? 1 : 0);
       gl.uniformMatrix3fv(this.u.orient, false, p._orientMat());
       gl.uniform1f(this.u.uFlip, p.uFlip);
