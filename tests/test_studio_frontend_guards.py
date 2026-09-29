@@ -238,3 +238,102 @@ def test_batch_generate_uses_the_drawer_scope_and_default_selection() -> None:
     assert "state.drawerScope" in body
     assert "checkedShotIds(" in body, "must reuse the drawer's default-all-checked rule"
     assert "state.drawerScope = scope" in src
+
+
+# ----------------------------------------------------------------- #428
+# Dome panel loads MP4/MOV as a <video> texture (texImage2D(video) per
+# tick), with player controls (play/pause, scrub, loop) and coverage POSTed
+# only when paused — never continuously during playback. The image load
+# path must not regress.
+
+
+def test_issue_428_video_texture_branch_exists() -> None:
+    """uploadTexture must dispatch on kind=="video" and feed the
+    HTMLVideoElement to texImage2D; setVideo must bind it as the source."""
+    src = PREVIEW_JS.read_text(encoding="utf-8")
+    assert "setVideo(v)" in src, "DomePreview must expose setVideo(video)"
+    assert 'this.kind = "video"' in src, "a video source kind must be tracked"
+    # texImage2D's source is the video when kind is video, else the image.
+    assert 'this.kind === "video" ? this.video : this.image' in src, (
+        "uploadTexture must pass the HTMLVideoElement to texImage2D for video"
+    )
+    assert "gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src)" in src, (
+        "texImage2D must upload the chosen source"
+    )
+
+
+def test_issue_428_per_frame_upload_only_on_play_or_seek() -> None:
+    """The per-tick video upload must be gated so it fires only while the video
+    is playing OR right after a seek — not every redraw while paused (would
+    burn GPU on an unchanged frame). This is the acceptance criterion:
+    '每帧纹理更新只在播放或 seek 时发生'."""
+    src = PREVIEW_JS.read_text(encoding="utf-8")
+    assert "_videoFrameIsFresh" in src, "a freshness gate must exist"
+    # The gate early-returns (no upload) when paused AND not seeking.
+    assert "this.video.paused" in src and "this.seeking" in src, (
+        "_videoFrameIsFresh must early-return when paused and not seeking"
+    )
+    # _tickVideoTexture (called from _draw) gates the upload on freshness.
+    assert "if (!this._videoFrameIsFresh()) return;" in src, (
+        "_tickVideoTexture must skip the upload when no fresh frame is available"
+    )
+    assert "this._tickVideoTexture();" in src, "_draw must drive the per-tick upkeep"
+    # The camera viewport must NOT reset texVersion for video (it gates on the
+    # version bump instead of the static hasTexture flag, so a video that
+    # wasn't ready at load still recovers once frames arrive).
+    assert 'p.kind !== "video" && !p.hasTexture' in src
+
+
+def test_issue_428_coverage_measured_only_when_paused() -> None:
+    """Coverage POSTs happen on pause/seek/load — never continuously during
+    playback. measureCurrentFrame must skip while playing, and timeupdate
+    must only refresh the UI (not POST)."""
+    src = PREVIEW_JS.read_text(encoding="utf-8")
+    assert "measureCurrentFrame" in src
+    # Skips while playing (or while a seek is mid-flight).
+    assert "!videoEl.paused" in src and "videoEl.seeking" in src
+    # pause / seeked both trigger one measurement.
+    assert '"pause"' in src and '"seeked"' in src
+    # timeupdate only refreshes the UI — it must NOT call measureCurrentFrame.
+    assert 'addEventListener("timeupdate", () => refreshPlayerUi())' in src, (
+        "timeupdate must not POST coverage on every frame during playback"
+    )
+
+
+def test_issue_428_player_controls_resolve_to_real_ids() -> None:
+    """The player markup must exist in index.html with the ids preview3d.js
+    looks up, so a wrong-case id doesn't silently disable a control (the class
+    of bug this guard closes for #416)."""
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    for ident in (
+        "domePlayer",
+        "btnPlayPause",
+        "domeProgress",
+        "domeLoop",
+        "domeCurTime",
+        "domeDur",
+    ):
+        assert f'id="{ident}"' in html, f"index.html missing player element #{ident}"
+
+
+def test_issue_428_player_styles_present() -> None:
+    css = STYLE_CSS.read_text(encoding="utf-8")
+    for cls in (".dome-player", ".player-progress", ".player-time", ".dome-video"):
+        assert cls in css, f"style.css missing player rule {cls}"
+    # The hidden state for the player must be defined (toggled until a video loads).
+    assert ".dome-player.hidden" in css
+    # A disabled control must visually read as disabled (the play button starts
+    # disabled until a video is bound).
+    assert "button:disabled" in css
+
+
+def test_issue_428_image_load_path_not_regressed() -> None:
+    """Loading an image still measures it on the server and applies the stats;
+    the new video dispatch did not replace the image branch."""
+    src = PREVIEW_JS.read_text(encoding="utf-8")
+    assert "new Image()" in src, "image load branch must remain"
+    assert "analyzeOnServer(imageToCanvas(img))" in src
+    assert "applyStats(stats, img)" in src
+    # The file input still accepts both images and video.
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    assert 'accept="image/*,video/*"' in html
