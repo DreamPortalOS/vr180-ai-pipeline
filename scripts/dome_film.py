@@ -231,14 +231,17 @@ def _black_circle_and_scale_filter(size: int) -> str:
     input frame) and the scale is lanczos to the square delivery canvas — one
     filtergraph so the crop11→upscale hops stay a single encode.  The mask
     predicate is the exact one :func:`dome_frame_tools.crop11_filter` uses, so
-    a 1:1 input and a 16:9 input end on the same black surround.
+    a 1:1 input and a 16:9 input end on the same black surround.  The chain is
+    labelled ``[dome]`` so ``-filter_complex``'s input pad is explicit (an
+    unlabelled chain in ``-filter_complex`` cannot bind to the input stream).
     """
     circle = dft.geq_circle_expression()
-    return (
+    body = (
         "format=gbrp,"
         f"geq=r='if({circle},r(X,Y),0)':g='if({circle},g(X,Y),0)':b='if({circle},b(X,Y),0)',"
         f"scale={size}:{size}:flags=lanczos,format={dft.CROP11_PIX_FMT}"
     )
+    return f"[0:v]{body}[dome]"
 
 
 def build_upscale_command(input_path: Path, output_path: Path, size: int, *, ffmpeg: str = _FFMPEG) -> list[str]:
@@ -258,7 +261,7 @@ def build_upscale_command(input_path: Path, output_path: Path, size: int, *, ffm
         "-filter_complex",
         _black_circle_and_scale_filter(size),
         "-map",
-        "0:v:0",
+        "[dome]",
         "-map",
         "0:a:0?",
         "-c:a",
@@ -399,7 +402,10 @@ def compose(plan: Plan, output_path: Path, *, keep_intermediates: bool, dry_run:
         total = 0.0
         print(f"# dome_film dry-run — {n} scene(s), size {plan.size}², crossfade {plan.crossfade}s")
         for i, scene in enumerate(plan.scenes):
-            dur = _probe(scene.clip)["duration"] if scene.clip.is_file() else None
+            try:
+                dur = _probe(scene.clip)["duration"]
+            except (ConcatError, OSError, RuntimeError):
+                dur = None
             if dur is not None:
                 start = scene.trim_start or 0.0
                 end = scene.trim_end if scene.trim_end is not None else dur
