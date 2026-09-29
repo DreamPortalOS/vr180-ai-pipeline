@@ -1119,30 +1119,193 @@
       setCoverageUi(stats);
     };
 
+    // ---------------- dome video player (issue #428) ----------------
+    // One hidden <video> element is the shared source for the 3D dome, the 机位
+    // viewport and the player controls (play/pause, scrub, loop).  texImage2D
+    // reads its current frame; see DomePreview.setVideo / _tickVideoTexture.
+    const videoEl = document.createElement("video");
+    videoEl.playsInline = true;
+    videoEl.muted = true;
+    videoEl.preload = "auto";
+    videoEl.loop = false;
+    videoEl.crossOrigin = "anonymous";
+    videoEl.className = "dome-video";
+    document.body.appendChild(videoEl); // attached so the element can decode
+
+    let dragScrubbing = false; // the progress range is being dragged
+    const fmtTime = (s) => {
+      if (!Number.isFinite(s) || s < 0) s = 0;
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    };
+
+    const setPlayerEnabled = (on) => {
+      const btn = el("btnPlayPause");
+      const prog = el("domeProgress");
+      const loop = el("domeLoop");
+      if (btn) btn.disabled = !on;
+      if (prog) prog.disabled = !on;
+      if (loop) loop.disabled = !on;
+    };
+
+    const refreshPlayerUi = () => {
+      const btn = el("btnPlayPause");
+      if (btn) btn.textContent = videoEl.paused ? "▶ 播放" : "❚❚ 暂停";
+      const dur = el("domeDur");
+      if (dur) dur.textContent = fmtTime(videoEl.duration);
+      const cur = el("domeCurTime");
+      if (cur) cur.textContent = fmtTime(videoEl.currentTime);
+      const prog = el("domeProgress");
+      if (prog && !dragScrubbing && videoEl.duration) {
+        prog.value = String(Math.round((videoEl.currentTime / videoEl.duration) * 1000));
+      }
+    };
+
+    /** Deactivate the video source (preset image / still loaded).  Pausing the
+     * element also stops the texture updating, so the 3D dome keeps the last
+     * frame shown; the controls go back to disabled. */
+    const setVideoActive = (active) => {
+      setPlayerEnabled(active);
+      const player = el("domePlayer");
+      if (player) player.classList.toggle("hidden", !active);
+      if (!active && videoEl) videoEl.pause();
+    };
+
+    /** Measure the current frame once — paused video, after a seek, or a
+     * freshly loaded image.  Deliberately skipped while playing (the coverage
+     * number would describe a moving frame) and while a seek is in flight. */
+    const measureCurrentFrame = async () => {
+      if (preview.kind !== "video" || !videoEl) return;
+      if (!videoEl.paused || videoEl.readyState < 2 || videoEl.seeking) return;
+      const w = videoEl.videoWidth || 0;
+      const h = videoEl.videoHeight || 0;
+      if (!w || !h) return;
+      setCoverageLoading();
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(videoEl, 0, 0, w, h);
+      const stats = await analyzeOnServer(c);
+      // Guard against a stale response landing after the source changed.
+      if (preview.video !== videoEl) return;
+      if (stats && stats.coverageRadius != null) preview.setCoverage(stats.coverageRadius);
+      setCoverageUi(stats);
+    };
+
+    const loadDomeVideo = (url, name) => {
+      setVideoActive(true);
+      preview.setImage(null); // drops any image texture and sets kind=null
+      preview.setVideo(videoEl);
+      setCoverageLoading(`载入视频 ${name}…`);
+      videoEl.src = url;
+      videoEl.load();
+      videoEl.onloadeddata = () => {
+        preview.setVideo(videoEl); // (re)upload once a frame actually exists
+        refreshPlayerUi();
+        measureCurrentFrame();
+      };
+    };
+
+    const btnPlay = el("btnPlayPause");
+    if (btnPlay) {
+      btnPlay.addEventListener("click", () => {
+        if (preview.video !== videoEl) return;
+        if (videoEl.paused) {
+          videoEl.play().catch(() => {});
+        } else {
+          videoEl.pause();
+        }
+      });
+    }
+
+    const prog = el("domeProgress");
+    if (prog) {
+      prog.addEventListener("input", () => {
+        if (preview.video !== videoEl || !videoEl.duration) return;
+        dragScrubbing = true;
+        videoEl.currentTime = (Number(prog.value) / 1000) * videoEl.duration;
+      });
+      prog.addEventListener("change", () => {
+        dragScrubbing = false;
+        refreshPlayerUi();
+        measureCurrentFrame(); // scrubbed to a new frame while paused
+      });
+    }
+
+    const loopCb = el("domeLoop");
+    if (loopCb) {
+      loopCb.addEventListener("change", () => {
+        videoEl.loop = loopCb.checked;
+      });
+    }
+
+    videoEl.addEventListener("play", () => {
+      // Drop the stale measurement: it describes the previous frame.
+      setCoverageLoading("播放中…");
+      refreshPlayerUi();
+    });
+    videoEl.addEventListener("pause", () => {
+      refreshPlayerUi();
+      measureCurrentFrame();
+    });
+    videoEl.addEventListener("seeking", () => {
+      // Unblock the per-tick upload so the new frame reaches the textures.
+      preview.seeking = true;
+      setCoverageLoading("定位中…");
+    });
+    videoEl.addEventListener("seeked", () => {
+      refreshPlayerUi();
+      measureCurrentFrame();
+    });
+    videoEl.addEventListener("timeupdate", () => refreshPlayerUi());
+    videoEl.addEventListener("ended", () => {
+      if (videoEl.loop) {
+        videoEl.currentTime = 0;
+        videoEl.play().catch(() => {});
+      } else {
+        refreshPlayerUi();
+        measureCurrentFrame();
+      }
+    });
+
+    // No video loaded yet: keep the controls disabled until one arrives.
+    setVideoActive(false);
+
     if (file) {
       file.addEventListener("change", () => {
         const f = file.files && file.files[0];
         if (!f) return;
         const url = URL.createObjectURL(f);
-        const img = new Image();
-        img.onload = async () => {
-          // Frontend only draws the circle; the reading is the server's
-          // (issue #405).
-          const stats = await analyzeOnServer(imageToCanvas(img));
-          applyStats(stats, img);
-          URL.revokeObjectURL(url);
-        };
-        img.onerror = () => {
-          URL.revokeObjectURL(url);
-          setCoverageUi({ error: "图片解码失败" });
-        };
-        img.src = url;
+        const isVideo =
+          (f.type && f.type.startsWith("video/")) || /\.(mp4|mov|webm|m4v)$/i.test(f.name || "");
+        if (isVideo) {
+          loadDomeVideo(url, f.name || "视频");
+        } else {
+          const img = new Image();
+          img.onload = async () => {
+            // Frontend only draws the circle; the reading is the server's
+            // (issue #405).
+            setVideoActive(false);
+            const stats = await analyzeOnServer(imageToCanvas(img));
+            applyStats(stats, img);
+            URL.revokeObjectURL(url);
+          };
+          img.onerror = () => {
+            URL.revokeObjectURL(url);
+            setVideoActive(false);
+            setCoverageUi({ error: "图片解码失败" });
+          };
+          img.src = url;
+        }
       });
     }
 
     // buttons for known presets: the image is still generated on the frontend,
     // but the reading is measured by the server (issue #405).
     const presetCoverage = async (fillR) => {
+      setVideoActive(false);
       preview.setImage(null);
       preview.hasTexture = false;
       preview.setCoverage(-1);
