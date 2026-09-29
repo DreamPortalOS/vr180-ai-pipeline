@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -101,3 +103,67 @@ def test_clear_endpoint(tmp_path) -> None:
     res = client.post("/api/jobs/clear")
     assert res.status_code == 200
     assert res.json() == {"cleared": 0}
+
+
+def test_motion_filter_known_and_static() -> None:
+    from studio.nodes.production import motion_filter
+
+    assert motion_filter("static", frames=48, fps=24, size=512) is None
+    assert motion_filter("weird", frames=48, fps=24, size=512) is None
+    zin = motion_filter("dolly_in", frames=48, fps=24, size=512)
+    assert zin is not None and "zoompan" in zin and "d=48" in zin and "s=512x512" in zin
+    assert "1+0.18*on/47" in zin
+    assert "1.18-0.18*on/47" in motion_filter("pull_out", frames=48, fps=24, size=512)
+    assert "(1-on/47)" in motion_filter("pan_left", frames=48, fps=24, size=512)
+
+
+def test_clip_command_is_list_argv() -> None:
+    from studio.nodes.production import clip_command
+
+    cmd = clip_command("a.png", "b.mp4", dur=2, fps=24, size=512, motion="dolly_in")
+    assert isinstance(cmd, list) and cmd[-1] == "b.mp4"
+    assert "-frames:v" in cmd and cmd[cmd.index("-frames:v") + 1] == "48"
+    static = clip_command("a.png", "b.mp4", dur=2, fps=24, size=512, motion="static")
+    assert "-loop" in static
+
+
+def test_batch_shot_with_still_renders_real_clip(tmp_path) -> None:
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not on PATH")
+    from PIL import Image
+
+    still = tmp_path / "s1.png"
+    Image.new("RGB", (320, 180), (40, 90, 160)).save(still)
+    client = TestClient(create_app(default_work_dir=str(tmp_path / "w")))
+    shot = {"id": "s1", "description": "d", "duration": 1, "image": str(still), "motion": "dolly_in"}
+    res = client.post("/api/batch-shots", json={"shots": [shot, {"id": "s2", "duration": 1}]})
+    assert res.status_code == 200, res.text
+    ids = [j["job_id"] for j in res.json()["jobs"]]
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        listed = {j["id"]: j for j in client.get("/api/jobs").json()}
+        if all(listed[i]["status"] in {"ok", "error", "cancelled"} for i in ids):
+            break
+        time.sleep(0.1)
+    real, mock = listed[ids[0]], listed[ids[1]]
+    assert real["status"] == "ok", real
+    clip = next(iter(real["report"]["results"].values()))["outputs"]["videos"]["clips"][0]["video"]
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "stream=width", "-of", "csv=p=0", clip],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode == 0:
+        assert probe.stdout.strip() == "512"
+    # a shot with no still still falls back to the mock clip
+    assert mock["status"] == "ok"
+    assert "video" in next(iter(mock["report"]["results"].values()))["outputs"]
+
+
+def test_drawer_card_shows_batch_video_result() -> None:
+    src = APP_JS.read_text(encoding="utf-8")
+    assert "function harvestShotVideos(" in src
+    body = _function_body(src, "batchGenerateShots")
+    assert "image:" in body and "motion:" in body
+    assert "shot-video" in _function_body(src, "renderDrawerCards")

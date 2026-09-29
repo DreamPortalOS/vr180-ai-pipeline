@@ -304,6 +304,8 @@
     runMode: "all",
     jobs: [],
     queueOpen: false,
+    shotJobs: {}, // batch job id -> shot id
+    shotVideos: {}, // shot id -> {status, video?, error?}
     jobTimer: null,
     shots: [],
     /** Checked shot ids per node id (shared by #418 drawer + #419 batch). */
@@ -1449,6 +1451,31 @@
     if (btnQueueStopAll) btnQueueStopAll.disabled = running.length === 0;
   }
 
+  /** Map finished batch-shot jobs onto their drawer cards; true if any changed. */
+  function harvestShotVideos() {
+    let changed = false;
+    for (const job of state.jobs) {
+      const shotId = state.shotJobs[job.id];
+      if (!shotId || job.status === "running" || job.status === "queued") continue;
+      delete state.shotJobs[job.id];
+      changed = true;
+      if (job.status !== "ok") {
+        state.shotVideos[shotId] = { status: job.status, error: job.error || "" };
+        continue;
+      }
+      let video = null;
+      const results = (job.report && job.report.results) || {};
+      for (const res of Object.values(results)) {
+        const outs = (res && res.outputs) || {};
+        const clips = outs.videos && outs.videos.clips;
+        if (Array.isArray(clips) && clips.length) video = clips[0].video;
+        else if (typeof outs.video === "string") video = outs.video;
+      }
+      state.shotVideos[shotId] = video ? { status: "ok", video } : { status: "error", error: "无视频输出" };
+    }
+    return changed;
+  }
+
   async function refreshJobs() {
     try {
       state.jobs = await api("/api/jobs");
@@ -1473,8 +1500,9 @@
     state.jobTimer = setInterval(async () => {
       try {
         state.jobs = await api("/api/jobs");
+        if (harvestShotVideos()) renderDrawer();
         renderQueue();
-        if (state.jobs.every((j) => j.status !== "running")) {
+        if (state.jobs.every((j) => j.status !== "running" && j.status !== "queued")) {
           clearInterval(state.jobTimer);
           state.jobTimer = null;
         }
@@ -2301,6 +2329,26 @@
         toggleShotChecked(nodeId, shot.id, shots);
       });
       thumb.appendChild(pick);
+      const sv = state.shotVideos[String(shot.id)];
+      if (sv) {
+        const badge = document.createElement("span");
+        badge.className = "shot-video " + sv.status;
+        if (sv.status === "ok") {
+          badge.textContent = "▶";
+          badge.title = "播放生成的镜头视频";
+          badge.addEventListener("click", (e) => {
+            e.stopPropagation();
+            openInlineVideo("shot_" + shot.id, sv.video);
+          });
+        } else if (sv.status === "running") {
+          badge.textContent = "…";
+          badge.title = "视频生成中";
+        } else {
+          badge.textContent = "!";
+          badge.title = "视频生成失败 " + (sv.error || sv.status);
+        }
+        thumb.appendChild(badge);
+      }
       card.appendChild(thumb);
 
       const meta = document.createElement("div");
@@ -2585,15 +2633,24 @@
         id: String(s.id),
         description: s.description || "",
         duration: s.duration != null ? Number(s.duration) : null,
+        // T1 09-29: send the still + camera move so the server renders the
+        // real storyboard frame instead of a 64px mock clip.
+        image: s.image && !s.placeholder ? s.image : null,
+        motion: s.motion || null,
       }));
       const res = await api("/api/batch-shots", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ shots }),
       });
+      for (const j of res.jobs || []) {
+        state.shotJobs[j.job_id] = String(j.shot_id);
+        state.shotVideos[String(j.shot_id)] = { status: "running" };
+      }
       startQueuePolling();
-      setStatus(`已提交 ${res.submitted} 个镜头任务`);
+      setStatus(`已提交 ${res.submitted} 个镜头 → 生成中，完成后卡片出现 ▶（点「队列」看进度）`);
       renderQueue();
+      renderDrawer();
     } catch (err) {
       setStatus("批量提交失败: " + err.message);
     }

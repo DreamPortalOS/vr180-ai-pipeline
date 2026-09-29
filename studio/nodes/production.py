@@ -550,6 +550,92 @@ class ReviewGateNode(StudioNode):
 # ---------------------------------------------------------------------------
 
 
+_MOTION_ALIASES = {
+    "dolly_in": "in",
+    "push_in": "in",
+    "zoom_in": "in",
+    "push": "in",
+    "dolly_out": "out",
+    "pull_out": "out",
+    "zoom_out": "out",
+    "pull": "out",
+    "pan_left": "left",
+    "pan_right": "right",
+}
+
+
+def motion_filter(motion: str, *, frames: int, fps: int, size: int) -> str | None:
+    """ffmpeg ``zoompan`` expression for a storyboard camera move, or ``None``.
+
+    An animatic stand-in for image-to-video: a slow push / pull / pan across the
+    still so a storyboard reads as motion before a real I2V backend runs.
+    Unknown or ``static`` moves return ``None`` (hold the frame).
+    """
+    kind = _MOTION_ALIASES.get(motion.lower())
+    if kind is None:
+        return None
+    n = max(1, frames - 1)
+    zoom = {
+        "in": f"1+0.18*on/{n}",
+        "out": f"1.18-0.18*on/{n}",
+        "left": "1.15",
+        "right": "1.15",
+    }[kind]
+    x = {
+        "left": f"(iw-iw/zoom)*(1-on/{n})",
+        "right": f"(iw-iw/zoom)*on/{n}",
+    }.get(kind, "iw/2-(iw/zoom/2)")
+    # Upscale first so zoompan's integer crop steps do not visibly jitter.
+    big = size * 4
+    return (
+        f"scale={big}:{big}:force_original_aspect_ratio=increase,crop={big}:{big},"
+        f"zoompan=z='{zoom}':x='{x}':y='ih/2-(ih/zoom/2)':d={frames}:s={size}x{size}:fps={fps}"
+    )
+
+
+def clip_command(still: str, out: str, *, dur: float, fps: int, size: int, motion: str) -> list[str]:
+    """Build the ffmpeg argv that renders one storyboard still into a clip."""
+    frames = max(1, round(dur * fps))
+    zp = motion_filter(motion, frames=frames, fps=fps, size=size)
+    if zp is None:
+        return [
+            _FFMPEG,
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+            still,
+            "-t",
+            str(dur),
+            "-vf",
+            f"scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}",
+            "-r",
+            str(fps),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            out,
+        ]
+    return [
+        _FFMPEG,
+        "-y",
+        "-i",
+        still,
+        "-vf",
+        zp,
+        "-frames:v",
+        str(frames),
+        "-r",
+        str(fps),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        "libx264",
+        out,
+    ]
+
+
 class VideosFromStillsNode(StudioNode):
     """Per-shot short clip from each storyboard still (mock I2V; seedance later)."""
 
@@ -569,6 +655,12 @@ class VideosFromStillsNode(StudioNode):
             {"name": "fps", "type": "number", "default": 12, "label": "帧率"},
             {"name": "size", "type": "number", "default": 256, "label": "短边像素"},
             {"name": "max_clips", "type": "number", "default": 8, "label": "最多镜头数"},
+            {
+                "name": "motion",
+                "type": "string",
+                "default": "auto",
+                "label": "镜头运动 (auto=按分镜 / static / dolly_in / dolly_out / pan_left / pan_right)",
+            },
         ]
 
     def run(
@@ -580,6 +672,9 @@ class VideosFromStillsNode(StudioNode):
         node_id: str,
     ) -> dict[str, Any]:
         payload = inputs.get("stills")
+        if payload is None and isinstance(params.get("shots"), list):
+            # Drawer 批量生成视频 submits one-shot graphs with the still inline.
+            payload = {"shots": params["shots"]}
         if not isinstance(payload, dict) or "shots" not in payload:
             raise ValueError("from_stills requires stills json")
         shots = payload["shots"]
@@ -605,25 +700,10 @@ class VideosFromStillsNode(StudioNode):
             dur = float(shot.get("duration") or 4)
             dur = max(1.0, min(dur, 10.0))
             out_path = out_dir / f"{shot.get('id') or 'clip'}.mp4"
-            cmd = [
-                _FFMPEG,
-                "-y",
-                "-loop",
-                "1",
-                "-i",
-                str(still),
-                "-t",
-                str(dur),
-                "-vf",
-                f"scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}",
-                "-r",
-                str(fps),
-                "-pix_fmt",
-                "yuv420p",
-                "-c:v",
-                "libx264",
-                str(out_path),
-            ]
+            motion = str(params.get("motion") or "auto").lower()
+            if motion == "auto":
+                motion = str(shot.get("motion") or "static").lower()
+            cmd = clip_command(str(still), str(out_path), dur=dur, fps=fps, size=size, motion=motion)
             proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
             if proc.returncode != 0 or not out_path.is_file():
                 raise RuntimeError(f"clip render failed for {shot.get('id')}: {(proc.stderr or '')[-300:]}")
