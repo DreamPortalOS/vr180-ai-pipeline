@@ -303,6 +303,7 @@
     paletteFilter: "",
     runMode: "all",
     jobs: [],
+    queueOpen: false,
     jobTimer: null,
     shots: [],
     /** Checked shot ids per node id (shared by #418 drawer + #419 batch). */
@@ -1395,10 +1396,30 @@
   const queueCountEl = document.getElementById("queueCount");
   const btnQueueStopAll = document.getElementById("btnQueueStopAll");
 
+  const JOB_STATUS_LABEL = {
+    queued: "排队中",
+    running: "运行中",
+    ok: "完成",
+    error: "失败",
+    cancelled: "已取消",
+  };
+
+  function setQueueOpen(open) {
+    state.queueOpen = Boolean(open);
+    renderQueue();
+  }
+
   function renderQueue() {
-    const running = state.jobs.filter((j) => j.status === "running");
+    const running = state.jobs.filter((j) => j.status === "running" || j.status === "queued");
     queueCountEl.textContent = running.length;
-    if (queuePanel) queuePanel.classList.toggle("hidden", state.jobs.length === 0);
+    const btnStop = document.getElementById("btnStop");
+    if (btnStop) btnStop.disabled = running.length === 0;
+    // T1 09-29: visibility is the operator's choice only. Polling used to force
+    // the panel open whenever any job existed, so it could never be closed and
+    // covered the right rail for the rest of the session.
+    if (queuePanel) queuePanel.classList.toggle("hidden", !state.queueOpen);
+    const btnQueueClear = document.getElementById("btnQueueClear");
+    if (btnQueueClear) btnQueueClear.disabled = state.jobs.length === running.length;
     if (!queueList) return;
     if (state.jobs.length === 0) {
       queueList.innerHTML = "<p class=\"hint\">无任务</p>";
@@ -1409,21 +1430,42 @@
       .slice()
       .sort((a, b) => b.started_at - a.started_at)
       .map((j) => {
-        const isRunning = j.status === "running";
+        const active = j.status === "running" || j.status === "queued";
         const pct = Math.round(j.progress * 100);
+        const label = JOB_STATUS_LABEL[j.status] || j.status;
+        const action = active
+          ? `<button type="button" class="danger queue-cancel" data-id="${j.id}" title="取消此任务">取消</button>`
+          : `<span class="queue-state ${j.status}">${label}</span>`;
         return `<div class="queue-item ${j.status}">
           <div class="queue-info">
             <span class="queue-label">${j.label || "运行"}</span>
-            <span class="queue-meta">${j.id.slice(0, 6)} · ${j.status} · ${pct}%</span>
+            <span class="queue-meta">${j.id.slice(0, 6)} · ${label} · ${pct}%</span>
           </div>
+          ${action}
           <div class="queue-bar"><div class="queue-bar-fill" style="width:${pct}%"></div></div>
-          <button type="button" class="danger queue-cancel" data-id="${j.id}" title="取消此任务">${
-          isRunning ? "取消" : "已取消"
-        }</button>
         </div>`;
       })
       .join("");
     if (btnQueueStopAll) btnQueueStopAll.disabled = running.length === 0;
+  }
+
+  async function refreshJobs() {
+    try {
+      state.jobs = await api("/api/jobs");
+    } catch (err) {
+      setStatus("队列刷新失败: " + err.message);
+    }
+    renderQueue();
+  }
+
+  async function clearFinishedJobs() {
+    try {
+      const { cleared } = await api("/api/jobs/clear", { method: "POST" });
+      setStatus(`已清除 ${cleared} 个已结束任务`);
+    } catch (err) {
+      setStatus("清除失败: " + err.message);
+    }
+    await refreshJobs();
   }
 
   function startQueuePolling() {
@@ -1448,10 +1490,12 @@
     (async () => {
       try {
         const { stopped } = await api("/api/jobs/stop-all", { method: "POST" });
-        setStatus(`已停止 ${stopped} 个任务`);
+        setStatus(stopped ? `已停止 ${stopped} 个任务` : "没有运行中的任务");
       } catch (err) {
         setStatus("停止失败: " + err.message);
       }
+      await refreshJobs();
+      startQueuePolling();
     })();
   }
 
@@ -1487,6 +1531,15 @@
     const btnSaveServer = document.getElementById("btnSaveServer");
     if (btnSaveServer) btnSaveServer.addEventListener("click", () => saveToServer());
     const btnProjects = document.getElementById("btnProjects");
+    const gwWarnLink = document.getElementById("gwWarnLink");
+    if (gwWarnLink && btnProjects) {
+      gwWarnLink.addEventListener("click", (evt) => {
+        evt.preventDefault();
+        btnProjects.click();
+        const url = document.getElementById("setLlmUrl");
+        if (url) url.focus();
+      });
+    }
     if (btnProjects) {
       btnProjects.addEventListener("click", () => {
         const t = document.querySelector('.tab[data-tab="projects"]');
@@ -1527,12 +1580,24 @@
     if (btnQueue) {
       btnQueue.addEventListener("click", () => {
         if (!queuePanel) return;
-        queuePanel.classList.toggle("hidden");
-        state.jobs = state.jobs; // refresh render of the panel
-        renderQueue();
+        setQueueOpen(!state.queueOpen);
+        if (state.queueOpen && state.online) refreshJobs();
       });
     }
     if (btnQueueStopAll) btnQueueStopAll.addEventListener("click", stopAllJobs);
+    const btnQueueClear = document.getElementById("btnQueueClear");
+    if (btnQueueClear) btnQueueClear.addEventListener("click", clearFinishedJobs);
+    const btnQueueClose = document.getElementById("btnQueueClose");
+    if (btnQueueClose) btnQueueClose.addEventListener("click", () => setQueueOpen(false));
+    // Click anywhere outside the dropdown (and its toggle) or press Esc to fold it.
+    document.addEventListener("mousedown", (evt) => {
+      if (!state.queueOpen || !queuePanel) return;
+      if (queuePanel.contains(evt.target) || (btnQueue && btnQueue.contains(evt.target))) return;
+      setQueueOpen(false);
+    });
+    document.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape" && state.queueOpen) setQueueOpen(false);
+    });
     if (queueList) {
       queueList.addEventListener("click", (evt) => {
         const btn = evt.target.closest(".queue-cancel");
@@ -1542,8 +1607,9 @@
             await api(`/api/jobs/${btn.dataset.id}/cancel`, { method: "POST" });
             setStatus("已取消任务 " + btn.dataset.id);
           } catch (err) {
-            setStatus("取消失败: " + err.message);
+            setStatus("取消失败（任务可能已结束）: " + err.message);
           }
+          await refreshJobs();
         })();
       });
     }
@@ -2608,6 +2674,14 @@
     await loadSettings();
   }
 
+  // T1 09-29: with no gateway configured, provider=auto silently fell back to
+  // gradient placeholders and the operator had no way to tell why. Say so in
+  // the drawer header and link straight to the settings form.
+  function showGatewayWarning(show) {
+    const warn = document.getElementById("gwWarn");
+    if (warn) warn.classList.toggle("hidden", !show);
+  }
+
   async function loadSettings() {
     if (!state.online) return;
     try {
@@ -2620,6 +2694,7 @@
       set("setLlmModel", s.litellm_model);
       set("setSnUrl", s.sensenova_base_url);
       set("setSnModel", s.sensenova_model);
+      showGatewayWarning(!(s.litellm_base_url && s.litellm_api_key_set));
       const st = document.getElementById("settingsStatus");
       if (st) {
         st.textContent = s.litellm_api_key_set
@@ -2656,6 +2731,7 @@
       });
       const st = document.getElementById("settingsStatus");
       if (st) st.textContent = `已保存 · base=${s.litellm_base_url || "—"} model=${s.litellm_model || "—"}`;
+      showGatewayWarning(!(s.litellm_base_url && s.litellm_api_key_set));
       setStatus("供应商设置已保存到本机");
     } catch (err) {
       setStatus("设置保存失败: " + err.message);
@@ -2690,6 +2766,7 @@
       const health = await api("/api/health");
       setBackend(true, `已连接 · ${health.work_root || ""}`);
       await loadCatalogFromApi();
+      await loadSettings();
     } catch (_) {
       setBackend(false, "离线模式：可编辑画布；运行需 python -m studio.server");
     }

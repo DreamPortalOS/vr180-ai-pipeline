@@ -166,6 +166,14 @@ class JobManager:
             job.cancel_event.set()
             return True
 
+    def clear_finished(self) -> int:
+        """Drop every finished job from the list; returns how many were removed."""
+        with self._lock:
+            done = [k for k, j in self._jobs.items() if j.finished_at is not None]
+            for k in done:
+                del self._jobs[k]
+        return len(done)
+
     def cancel_all(self) -> int:
         """Stop every running job; returns how many were actually cancelled."""
         with self._lock:
@@ -430,6 +438,10 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
     def stop_all_jobs() -> dict[str, Any]:
         n = jobs.cancel_all()
         return {"stopped": n}
+
+    @app.post("/api/jobs/clear")
+    def clear_jobs() -> dict[str, Any]:
+        return {"cleared": jobs.clear_finished()}
 
     @app.post("/api/jobs/{job_id}/cancel")
     def cancel_job(job_id: str) -> dict[str, Any]:

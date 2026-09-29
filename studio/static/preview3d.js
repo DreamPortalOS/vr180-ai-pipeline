@@ -983,9 +983,12 @@
     const handle = el("railResizer");
     if (!rail || !handle) return;
     const KEY = "studio.railWidth";
+    // T2 09-29: the layout is a CSS grid, so widening the <aside> itself only
+    // overflowed its fixed 320px column to the right (off-screen). Resize the
+    // grid track instead; the canvas column (minmax(0, 1fr)) gives way.
+    const layout = rail.closest(".layout") || rail.parentElement;
     const applyPx = (px) => {
-      rail.style.width = `${px}px`;
-      rail.style.flex = "0 0 auto";
+      layout.style.setProperty("--rail-w", `${Math.round(px)}px`);
     };
     const clamp = (px) => {
       const min = 280;
