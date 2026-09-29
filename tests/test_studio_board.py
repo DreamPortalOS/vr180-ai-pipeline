@@ -170,3 +170,48 @@ def test_board_concat_joins_clips(client, tmp_path) -> None:
     assert job["status"] == "ok", job
     out = job["report"]["results"]["n_board_concat"]["outputs"]["video"]
     assert out.endswith("film.mp4") and Path(out).is_file()
+
+
+# --- frontend guards (分镜板 lives in app.js; the lead browser-QAs it) ---------
+
+STATIC = Path(__file__).resolve().parent.parent / "studio" / "static"
+
+
+def _body(src: str, name: str) -> str:
+    start = src.index(f"function {name}(")
+    brace = src.index("{", start)
+    depth = 0
+    for i in range(brace, len(src)):
+        depth += {"{": 1, "}": -1}.get(src[i], 0)
+        if depth == 0:
+            return src[brace : i + 1]
+    raise AssertionError(name)
+
+
+def test_frontend_board_wiring() -> None:
+    src = (STATIC / "app.js").read_text(encoding="utf-8")
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    assert 'id="btnNewBoard"' in html and 'id="btnNewBoardEmpty"' in html
+    assert "renderBoard(node)" in _body(src, "renderDrawer")
+    assert "/api/board/images" in _body(src, "generateBoardImages")
+    assert "/api/board/concat" in _body(src, "concatBoardFilm")
+    # 出视频 and 批量生成视频 share one submit path that sends the still.
+    assert "submitShotVideos(" in _body(src, "batchGenerateShots")
+    assert "/api/batch-shots" in _body(src, "submitShotVideos")
+    # finished jobs are folded back into the board (shot.video persists in params)
+    assert "harvestBoardJobs()" in src
+    assert "shot.video = sv.video" in _body(src, "harvestBoardJobs")
+
+
+def test_frontend_board_drag_only_from_grip() -> None:
+    """Cards must not be draggable by default, or the prompt textarea cannot select text."""
+    body = _body((STATIC / "app.js").read_text(encoding="utf-8"), "bindBoardDrag")
+    assert 'grip.addEventListener("mousedown"' in body
+    assert "card.draggable = false" in body
+
+
+def test_inspector_handles_json_and_options_params() -> None:
+    src = (STATIC / "app.js").read_text(encoding="utf-8")
+    body = _body(src, "renderInspector")
+    assert 'p.type === "json"' in body
+    assert "Array.isArray(p.options)" in body

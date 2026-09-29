@@ -306,6 +306,9 @@
     queueOpen: false,
     shotJobs: {}, // batch job id -> shot id
     shotVideos: {}, // shot id -> {status, video?, error?}
+    boardBusy: {}, // 分镜板 shot id -> true while 出图 is in flight
+    boardVariants: 2, // 分镜板 candidates per 出图
+    filmJobs: {}, // 拼接成片 job id -> board node id
     jobTimer: null,
     shots: [],
     /** Checked shot ids per node id (shared by #418 drawer + #419 batch). */
@@ -901,10 +904,26 @@
         inspectorEl.appendChild(row);
         return;
       }
+      if (p.type === "json") {
+        // Structured params (分镜板 shots) are edited in their own UI, not as raw JSON.
+        const note = document.createElement("p");
+        note.className = "hint";
+        note.textContent = `${p.label || p.name}`;
+        inspectorEl.appendChild(note);
+        return;
+      }
       const label = document.createElement("label");
       label.textContent = p.label || p.name;
       let field;
-      if (p.type === "boolean") {
+      if (Array.isArray(p.options) && p.options.length) {
+        field = document.createElement("select");
+        const cur = node.params[p.name] ?? p.default;
+        p.options.forEach(([v, l]) => field.add(new Option(l, v, false, v === cur)));
+        field.addEventListener("change", () => {
+          node.params[p.name] = field.value;
+          renderDrawer();
+        });
+      } else if (p.type === "boolean") {
         field = document.createElement("input");
         field.type = "checkbox";
         field.checked = !!node.params[p.name];
@@ -1500,7 +1519,8 @@
     state.jobTimer = setInterval(async () => {
       try {
         state.jobs = await api("/api/jobs");
-        if (harvestShotVideos()) renderDrawer();
+        const shotsChanged = harvestShotVideos();
+        if (harvestBoardJobs() || shotsChanged) renderDrawer();
         renderQueue();
         if (state.jobs.every((j) => j.status !== "running" && j.status !== "queued")) {
           clearInterval(state.jobTimer);
@@ -2175,6 +2195,11 @@
         renderDrawer();
       });
     }
+    // 分镜板: create a board node and open it in the drawer.
+    for (const id of ["btnNewBoard", "btnNewBoardEmpty"]) {
+      const b = document.getElementById(id);
+      if (b) b.addEventListener("click", () => createBoardNode());
+    }
     // Drag-to-resize the drawer handle.
     bindDrawerResize(handle);
   }
@@ -2212,6 +2237,11 @@
   function renderDrawer() {
     if (!drawerEl || !state.drawerOpen) return;
     const node = nodeById(state.selectedId);
+    if (isBoardNode(node)) {
+      renderBoard(node);
+      return;
+    }
+    drawerCardsEl.classList.remove("board-mode");
     const isSb =
       node &&
       [
@@ -2587,6 +2617,478 @@
     if (c) c.remove();
   }
 
+  // --- 分镜板 (manual storyboard board) ------------------------------------
+  // The owner's basic loop, no auto shot-splitting: write a prompt per shot →
+  // 出图 (N candidates via /api/board/images) → pick one → set 时长/运镜 →
+  // 出视频 (per shot, /api/batch-shots) → 拼接成片 (/api/board/concat).
+  // Everything the operator edits lives in node.params.shots, so 保存/存库
+  // round-trips the whole board.
+  const BOARD_MOTIONS = [
+    ["static", "固定"],
+    ["dolly_in", "推近"],
+    ["dolly_out", "拉远"],
+    ["pan_left", "左摇"],
+    ["pan_right", "右摇"],
+  ];
+  const BOARD_ASPECT_LABELS = [
+    ["dome", "1:1 穹顶母版"],
+    ["16:9", "16:9 平面"],
+    ["2:1", "2:1 VR180"],
+  ];
+
+  function isBoardNode(node) {
+    return Boolean(node && node.type === "storyboard.board");
+  }
+
+  function boardShots(node) {
+    if (!Array.isArray(node.params.shots)) node.params.shots = [];
+    return node.params.shots;
+  }
+
+  function newBoardShot(prompt) {
+    return { id: uid("s"), prompt: prompt || "", duration: 4, motion: "dolly_in", image: null, variants: [], video: null };
+  }
+
+  function boardShotVideo(shot) {
+    const sv = state.shotVideos[String(shot.id)];
+    if (sv && sv.status === "ok") return sv.video;
+    return shot.video || null;
+  }
+
+  function createBoardNode() {
+    const id = addNode("storyboard.board");
+    const node = id && nodeById(id);
+    if (!node) {
+      setStatus("节点目录未加载：请先启动 studio.server");
+      return null;
+    }
+    node.params.shots = [newBoardShot("")];
+    state.drawerOpen = true;
+    if (state.drawerHeight < 420) state.drawerHeight = 420;
+    applyDrawerState();
+    saveDrawerState();
+    renderDrawer();
+    draw();
+    setStatus("已新建分镜板：在下方写每一镜的描述，点「出图」");
+    return node;
+  }
+
+  /** Board shots in the shape the batch / checked-shot helpers expect. */
+  function boardScopeShots(node) {
+    return boardShots(node).map((s) => ({
+      id: s.id,
+      description: s.prompt || "",
+      image: s.image,
+      duration: s.duration,
+      motion: s.motion,
+    }));
+  }
+
+  function renderBoard(node) {
+    const shots = boardShots(node);
+    state.drawerScope = "board:" + node.id;
+    state.drawerScopeShots = boardScopeShots(node).filter((s) => s.image);
+    updateBatchButton();
+    drawerTitleEl.textContent = "分镜板";
+    const withImg = shots.filter((s) => s.image).length;
+    const withVid = shots.filter((s) => boardShotVideo(s)).length;
+    drawerCountEl.textContent = `${shots.length} 镜 · ${withImg} 已选图 · ${withVid} 有视频`;
+    drawerEmptyEl.classList.add("hidden");
+    if (drawerTableWrap) drawerTableWrap.classList.add("hidden");
+    drawerCardsEl.classList.remove("hidden");
+    drawerCardsEl.classList.add("board-mode");
+    drawerCardsEl.innerHTML = "";
+
+    drawerCardsEl.appendChild(renderBoardBar(node));
+    const row = document.createElement("div");
+    row.className = "board-row";
+    const checked = checkedShotIds(state.drawerScope, shots);
+    shots.forEach((shot, idx) => row.appendChild(renderBoardCard(node, shot, idx, checked)));
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "board-add";
+    add.id = "boardAddShot";
+    add.textContent = "+ 新镜头";
+    add.addEventListener("click", () => {
+      shots.push(newBoardShot(""));
+      renderDrawer();
+    });
+    row.appendChild(add);
+    drawerCardsEl.appendChild(row);
+  }
+
+  function renderBoardBar(node) {
+    const bar = document.createElement("div");
+    bar.className = "board-bar";
+    const aspect = document.createElement("select");
+    aspect.className = "run-mode";
+    aspect.title = "画幅：决定出图比例与构图约束";
+    BOARD_ASPECT_LABELS.forEach(([v, l]) => aspect.add(new Option(l, v, false, (node.params.aspect || "dome") === v)));
+    aspect.addEventListener("change", () => {
+      node.params.aspect = aspect.value;
+      renderDrawer();
+    });
+    const nSel = document.createElement("select");
+    nSel.className = "run-mode";
+    nSel.title = "每次出图张数（候选）";
+    [1, 2, 3, 4].forEach((n) => nSel.add(new Option(`每次 ${n} 张`, String(n), false, state.boardVariants === n)));
+    nSel.addEventListener("change", () => (state.boardVariants = Number(nSel.value)));
+    const style = document.createElement("input");
+    style.type = "text";
+    style.className = "board-style";
+    style.placeholder = "统一风格（可选，附加到每镜）";
+    style.value = node.params.style || "";
+    style.addEventListener("change", () => (node.params.style = style.value));
+    const genAll = document.createElement("button");
+    genAll.type = "button";
+    genAll.textContent = "全部出图";
+    genAll.title = "为所有「有描述、还没选图」的镜头出图";
+    genAll.addEventListener("click", () => {
+      const todo = boardShots(node).filter((s) => (s.prompt || "").trim() && !s.image);
+      if (!todo.length) {
+        setStatus("没有待出图的镜头（都已选图，或描述为空）");
+        return;
+      }
+      todo.forEach((s) => generateBoardImages(node, s));
+    });
+    const film = document.createElement("button");
+    film.type = "button";
+    film.className = "primary";
+    film.id = "boardFilm";
+    film.textContent = "拼接成片";
+    film.title = "按分镜板顺序拼接已生成的镜头视频";
+    film.addEventListener("click", () => concatBoardFilm(node));
+    bar.append(aspect, nSel, style, genAll, film);
+    if (node.params.film) {
+      const play = document.createElement("button");
+      play.type = "button";
+      play.textContent = "▶ 成片";
+      play.addEventListener("click", () => openInlineVideo("board_film", node.params.film));
+      bar.appendChild(play);
+    }
+    return bar;
+  }
+
+  function renderBoardCard(node, shot, idx, checked) {
+    const shots = boardShots(node);
+    const card = document.createElement("div");
+    card.className = "board-card";
+    card.dataset.id = String(shot.id);
+    const busy = Boolean(state.boardBusy[shot.id]);
+
+    const head = document.createElement("div");
+    head.className = "bc-head";
+    const grip = document.createElement("span");
+    grip.className = "bc-grip";
+    grip.title = "拖动排序";
+    grip.textContent = "⋮⋮";
+    const no = document.createElement("span");
+    no.className = "no";
+    no.textContent = `#${idx + 1}`;
+    const pick = document.createElement("input");
+    pick.type = "checkbox";
+    pick.title = "勾选参与「批量生成视频」";
+    pick.checked = checked.has(String(shot.id));
+    pick.addEventListener("change", () => toggleShotChecked(state.drawerScope, shot.id, shots));
+    const spacer = document.createElement("span");
+    spacer.style.flex = "1";
+    const dup = document.createElement("button");
+    dup.type = "button";
+    dup.className = "bc-dup";
+    dup.title = "复制这一镜";
+    dup.textContent = "⧉";
+    dup.addEventListener("click", () => {
+      shots.splice(idx + 1, 0, { ...shot, id: uid("s"), variants: [...(shot.variants || [])], video: null });
+      renderDrawer();
+    });
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "bc-del";
+    del.title = "删除这一镜";
+    del.textContent = "✕";
+    del.addEventListener("click", () => {
+      shots.splice(idx, 1);
+      renderDrawer();
+    });
+    head.append(grip, no, pick, spacer, dup, del);
+    card.appendChild(head);
+
+    const thumb = document.createElement("div");
+    thumb.className = `bc-thumb aspect-${(node.params.aspect || "dome").replace(":", "x")}`;
+    if (shot.image) {
+      const img = document.createElement("img");
+      img.src = mediaUrl(shot.image);
+      img.alt = shot.prompt || "";
+      img.title = "点击放大";
+      img.addEventListener("click", () => openImageLightbox(shot.image));
+      thumb.appendChild(img);
+      if (busy) {
+        const b = document.createElement("span");
+        b.className = "bc-busy";
+        b.textContent = "出图中…";
+        thumb.appendChild(b);
+      }
+    } else {
+      const empty = document.createElement("span");
+      empty.className = "bc-empty";
+      empty.textContent = busy ? "出图中…" : "未出图";
+      thumb.appendChild(empty);
+    }
+    const sv = state.shotVideos[String(shot.id)];
+    const vid = boardShotVideo(shot);
+    if (vid || sv) {
+      const badge = document.createElement("span");
+      const status = vid ? "ok" : sv.status;
+      badge.className = "shot-video " + status;
+      badge.textContent = vid ? "▶" : status === "running" ? "…" : "!";
+      badge.title = vid ? "播放这一镜的视频" : status === "running" ? "视频生成中" : "视频生成失败 " + (sv.error || "");
+      if (vid) {
+        badge.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openInlineVideo("shot_" + shot.id, vid);
+        });
+      }
+      thumb.appendChild(badge);
+    }
+    card.appendChild(thumb);
+
+    const variants = shot.variants || [];
+    if (variants.length > 1) {
+      const strip = document.createElement("div");
+      strip.className = "bc-variants";
+      variants.forEach((v) => {
+        const im = document.createElement("img");
+        im.src = mediaUrl(v);
+        if (v === shot.image) im.className = "on";
+        im.title = "选用这张";
+        im.addEventListener("click", () => {
+          shot.image = v;
+          shot.video = null;
+          delete state.shotVideos[String(shot.id)];
+          renderDrawer();
+        });
+        strip.appendChild(im);
+      });
+      card.appendChild(strip);
+    }
+
+    const prompt = document.createElement("textarea");
+    prompt.className = "bc-prompt";
+    prompt.rows = 3;
+    prompt.placeholder = "这一镜画什么：场景、主体、光线、镜头感…";
+    prompt.value = shot.prompt || "";
+    prompt.addEventListener("input", () => (shot.prompt = prompt.value));
+    card.appendChild(prompt);
+
+    const rowEl = document.createElement("div");
+    rowEl.className = "bc-row";
+    const durL = document.createElement("label");
+    durL.textContent = "时长";
+    const dur = document.createElement("input");
+    dur.type = "number";
+    dur.min = "1";
+    dur.max = "10";
+    dur.step = "0.5";
+    dur.value = shot.duration != null ? shot.duration : 4;
+    dur.addEventListener("change", () => {
+      shot.duration = Math.max(1, Math.min(10, Number(dur.value) || 4));
+      dur.value = shot.duration;
+    });
+    durL.appendChild(dur);
+    const motL = document.createElement("label");
+    motL.textContent = "运镜";
+    const mot = document.createElement("select");
+    BOARD_MOTIONS.forEach(([v, l]) => mot.add(new Option(l, v, false, (shot.motion || "static") === v)));
+    mot.addEventListener("change", () => (shot.motion = mot.value));
+    motL.appendChild(mot);
+    rowEl.append(durL, motL);
+    card.appendChild(rowEl);
+
+    const actions = document.createElement("div");
+    actions.className = "bc-actions";
+    const gen = document.createElement("button");
+    gen.type = "button";
+    gen.className = "primary bc-gen";
+    gen.disabled = busy;
+    gen.textContent = busy ? "出图中…" : shot.image ? "重新出图" : "出图";
+    gen.addEventListener("click", () => generateBoardImages(node, shot));
+    const up = document.createElement("label");
+    up.className = "file-btn";
+    up.textContent = "上传图";
+    up.title = "用自己的图（PNG/JPG）作为这一镜";
+    const upIn = document.createElement("input");
+    upIn.type = "file";
+    upIn.className = "bc-upload";
+    upIn.accept = "image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp";
+    upIn.hidden = true;
+    upIn.addEventListener("change", async () => {
+      const f = upIn.files && upIn.files[0];
+      upIn.value = "";
+      if (!f) return;
+      try {
+        const meta = await uploadFile(f);
+        shot.variants = [...(shot.variants || []), meta.path];
+        shot.image = meta.path;
+        shot.video = null;
+        delete state.shotVideos[String(shot.id)];
+        renderDrawer();
+        setStatus(`#${idx + 1} 已用上传的图`);
+      } catch (err) {
+        setStatus("上传失败: " + err.message);
+      }
+    });
+    up.appendChild(upIn);
+    const vbtn = document.createElement("button");
+    vbtn.type = "button";
+    vbtn.className = "bc-video";
+    vbtn.textContent = "出视频";
+    vbtn.disabled = !shot.image || Boolean(sv && sv.status === "running");
+    vbtn.title = shot.image ? "用选定的图 + 运镜生成这一镜视频" : "先出图或上传图";
+    vbtn.addEventListener("click", () =>
+      submitShotVideos([
+        { id: shot.id, description: shot.prompt, image: shot.image, duration: shot.duration, motion: shot.motion },
+      ]),
+    );
+    actions.append(gen, up, vbtn);
+    card.appendChild(actions);
+
+    bindBoardDrag(card, grip, node, idx);
+    return card;
+  }
+
+  /** Reorder by dragging the ⋮⋮ grip only, so textareas keep normal text selection. */
+  function bindBoardDrag(card, grip, node, idx) {
+    grip.addEventListener("mousedown", () => (card.draggable = true));
+    card.addEventListener("dragstart", (e) => {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/board-idx", String(idx));
+      card.classList.add("dragging");
+    });
+    card.addEventListener("dragend", () => {
+      card.draggable = false;
+      card.classList.remove("dragging");
+    });
+    card.addEventListener("dragover", (e) => {
+      if (e.dataTransfer.types.includes("text/board-idx")) e.preventDefault();
+    });
+    card.addEventListener("drop", (e) => {
+      const from = Number(e.dataTransfer.getData("text/board-idx"));
+      if (!Number.isInteger(from) || from === idx) return;
+      e.preventDefault();
+      const shots = boardShots(node);
+      const [moved] = shots.splice(from, 1);
+      shots.splice(idx, 0, moved);
+      renderDrawer();
+    });
+  }
+
+  async function generateBoardImages(node, shot) {
+    if (!state.online) {
+      setStatus("离线无法出图；请先启动 studio.server");
+      return;
+    }
+    if (!(shot.prompt || "").trim()) {
+      setStatus("先写这一镜的描述再出图");
+      return;
+    }
+    state.boardBusy[shot.id] = true;
+    renderDrawer();
+    try {
+      const res = await api("/api/board/images", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          shot_id: shot.id,
+          prompt: shot.prompt,
+          aspect: node.params.aspect || "dome",
+          style: node.params.style || "",
+          n: state.boardVariants,
+        }),
+      });
+      shot.variants = [...res.images, ...(shot.variants || [])].slice(0, 12);
+      shot.image = res.images[0];
+      shot.video = null;
+      delete state.shotVideos[String(shot.id)];
+      showGatewayWarning(res.provider === "mock");
+      const warn = res.errors && res.errors.length ? `（${res.errors.length} 张失败）` : "";
+      setStatus(
+        res.provider === "mock"
+          ? "未配置出图网关：生成的是占位图"
+          : `出图完成 ${res.images.length} 张${warn}，点小图可换选`,
+      );
+    } catch (err) {
+      setStatus("出图失败: " + err.message);
+    } finally {
+      delete state.boardBusy[shot.id];
+      renderDrawer();
+    }
+  }
+
+  async function concatBoardFilm(node) {
+    const shots = boardShots(node);
+    const videos = shots.map(boardShotVideo).filter(Boolean);
+    if (!videos.length) {
+      setStatus("还没有镜头视频：先给镜头「出视频」");
+      return;
+    }
+    const missing = shots.length - videos.length;
+    try {
+      const res = await api("/api/board/concat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videos, filename: "board_film.mp4" }),
+      });
+      state.filmJobs[res.job_id] = node.id;
+      startQueuePolling();
+      setStatus(`拼接成片：${videos.length} 镜` + (missing ? `（跳过 ${missing} 个无视频的镜头）` : "") + " …");
+    } catch (err) {
+      setStatus("拼接失败: " + err.message);
+    }
+  }
+
+  /** Board-side bookkeeping for finished jobs: persist shot videos, surface films. */
+  function harvestBoardJobs() {
+    let changed = false;
+    for (const node of state.project.nodes) {
+      if (!isBoardNode(node)) continue;
+      for (const shot of boardShots(node)) {
+        const sv = state.shotVideos[String(shot.id)];
+        if (sv && sv.status === "ok" && shot.video !== sv.video) {
+          shot.video = sv.video;
+          changed = true;
+        }
+      }
+    }
+    for (const job of state.jobs) {
+      const nodeId = state.filmJobs[job.id];
+      if (!nodeId || job.status === "running" || job.status === "queued") continue;
+      delete state.filmJobs[job.id];
+      changed = true;
+      const res = job.report && job.report.results && job.report.results.n_board_concat;
+      const film = res && res.outputs && res.outputs.video;
+      const node = nodeById(nodeId);
+      if (job.status === "ok" && film && node) {
+        node.params.film = film;
+        setStatus("成片完成 ▶");
+        openInlineVideo("board_film", film);
+      } else {
+        setStatus("拼接失败: " + (job.error || job.status));
+      }
+    }
+    return changed;
+  }
+
+  function openImageLightbox(path) {
+    const box = document.createElement("div");
+    box.className = "lightbox";
+    box.title = "点击关闭";
+    const img = document.createElement("img");
+    img.src = mediaUrl(path);
+    box.appendChild(img);
+    box.addEventListener("click", () => box.remove());
+    document.body.appendChild(box);
+  }
+
   // --- batch generate from checked shots (issue #419 只跑勾选镜头) -------
   // #418 owns the bottom storyboard drawer and the shotChecked state
   // ({nodeId: [shotId,...]}). This collects every checked shot across all
@@ -2618,16 +3120,21 @@
   }
 
   async function batchGenerateShots() {
-    if (!state.online) {
-      setStatus("离线无法提交任务；请先启动 studio.server");
-      return;
-    }
     const selected = collectCheckedShots();
     if (!selected.length) {
       setStatus("请先在分镜抽屉勾选镜头");
       return;
     }
-    setStatus(`批量提交 ${selected.length} 个镜头任务…`);
+    await submitShotVideos(selected);
+  }
+
+  /** Queue one shot → video job per shot (drawer batch and 分镜板 出视频 share this). */
+  async function submitShotVideos(selected) {
+    if (!state.online) {
+      setStatus("离线无法提交任务；请先启动 studio.server");
+      return;
+    }
+    setStatus(`提交 ${selected.length} 个镜头视频任务…`);
     try {
       const shots = selected.map((s) => ({
         id: String(s.id),
@@ -2652,7 +3159,7 @@
       renderQueue();
       renderDrawer();
     } catch (err) {
-      setStatus("批量提交失败: " + err.message);
+      setStatus("提交失败: " + err.message);
     }
   }
 

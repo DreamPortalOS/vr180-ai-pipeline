@@ -921,3 +921,117 @@ button.queue-btn { position: relative; }
 }
 .shot-video.ok { cursor: pointer; background: var(--accent); color: #041018; }
 .shot-video.error, .shot-video.cancelled { color: var(--err); }
+
+/* ── 分镜板 (manual storyboard board) ─────────────────────────────────── */
+.drawer-cards.board-mode { display: flex; flex-direction: column; gap: 8px; grid-template-columns: none; }
+.board-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.board-bar button { font-size: 12px; padding: 5px 10px; }
+.board-style {
+  flex: 1 1 220px;
+  min-width: 160px;
+  background: var(--panel-2);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.board-row { display: flex; gap: 10px; align-items: stretch; overflow-x: auto; padding-bottom: 6px; }
+.board-card {
+  flex: 0 0 230px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 12px;
+}
+.board-card.dragging { opacity: 0.5; }
+.bc-head { display: flex; align-items: center; gap: 6px; }
+.bc-head button { padding: 1px 6px; font-size: 12px; }
+.bc-grip { cursor: grab; color: var(--muted); user-select: none; letter-spacing: -2px; }
+.bc-head .no { font-weight: 700; color: var(--ink); }
+.bc-thumb {
+  position: relative;
+  width: 100%;
+  background: #0a0e14;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.bc-thumb.aspect-dome { aspect-ratio: 1 / 1; }
+.bc-thumb.aspect-16x9 { aspect-ratio: 16 / 9; }
+.bc-thumb.aspect-2x1 { aspect-ratio: 2 / 1; }
+.bc-thumb img { width: 100%; height: 100%; object-fit: cover; cursor: zoom-in; }
+.bc-empty { color: var(--muted); }
+.bc-busy {
+  position: absolute;
+  inset: auto 0 0 0;
+  background: rgba(6, 10, 16, 0.7);
+  color: var(--ink);
+  text-align: center;
+  padding: 3px;
+}
+.bc-variants { display: flex; gap: 4px; overflow-x: auto; }
+.bc-variants img {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 2px solid transparent;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.bc-variants img.on { border-color: var(--accent); }
+.bc-prompt {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 54px;
+  background: #0b1016;
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 6px;
+  font: inherit;
+  font-size: 12px;
+}
+.bc-row { display: flex; gap: 8px; }
+.bc-row label { display: flex; align-items: center; gap: 4px; color: var(--muted); }
+.bc-row input, .bc-row select {
+  width: 64px;
+  background: #0b1016;
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 4px;
+  font: inherit;
+  font-size: 12px;
+}
+.bc-row select { width: 72px; }
+.bc-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.bc-actions button, .bc-actions .file-btn { font-size: 12px; padding: 4px 9px; }
+.board-add {
+  flex: 0 0 120px;
+  border: 1px dashed var(--border);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 10px;
+}
+.board-add:hover { color: var(--ink); border-color: var(--accent); }
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: rgba(3, 6, 10, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+.lightbox img { max-width: 92vw; max-height: 92vh; border-radius: 8px; }

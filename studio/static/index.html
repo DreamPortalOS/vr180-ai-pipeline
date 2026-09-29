@@ -101,6 +101,7 @@
             <span class="gw-warn hidden" id="gwWarn" title="provider=auto 在未配置网关时退回占位图">⚠ 未配置出图网关，分镜为占位图 · <a href="#" id="gwWarnLink">去配置</a></span>
           </div>
           <div class="drawer-tools">
+            <button type="button" id="btnNewBoard" title="新建一个手动分镜板：逐镜写描述 → 出图 → 出视频">＋ 分镜板</button>
             <button type="button" id="drawerViewCards" class="seg active" title="卡片视图">▦</button>
             <button type="button" id="drawerViewTable" class="seg" title="表格视图">☰</button>
             <button type="button" id="btnBatchGen" class="primary" title="只提交已勾选的镜头" disabled>批量生成视频</button>
@@ -110,6 +111,7 @@
         <div class="drawer-body" id="drawerBody">
           <div class="drawer-empty" id="drawerEmpty">
             <p class="hint">选中一个 <strong>脚本/分镜</strong> 节点，画布下方将列出全部镜头。<br/>勾选控制参与生成；拖动卡片重排镜头顺序（回写工程 JSON）。</p>
+            <p><button type="button" id="btnNewBoardEmpty" class="primary">＋ 新建分镜板</button> <span class="hint">手动逐镜写描述 → 出图选图 → 调时长/运镜 → 出视频 → 拼接成片</span></p>
           </div>
           <div class="drawer-cards" id="drawerCards"></div>
           <div class="drawer-table-wrap hidden" id="drawerTableWrap">
