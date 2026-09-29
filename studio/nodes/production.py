@@ -755,6 +755,9 @@ class ConcatVideosNode(StudioNode):
         node_id: str,
     ) -> dict[str, Any]:
         payload = inputs.get("videos")
+        if payload is None and isinstance(params.get("clips"), list):
+            # 分镜板「拼接成片」submits a one-node graph with the clips inline.
+            payload = {"clips": params["clips"]}
         if not isinstance(payload, dict) or "clips" not in payload:
             raise ValueError("concat requires videos json with clips[]")
         clips = payload["clips"]

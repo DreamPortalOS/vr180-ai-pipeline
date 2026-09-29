@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from studio.nodes.base import StudioNode
+from studio.nodes.board import StoryboardBoardNode
 from studio.nodes.convert import DomeConvertNode, DomeCoverageNode, Vr180ConvertNode
 from studio.nodes.export import ExportBundleNode
 from studio.nodes.input import InputImageNode, InputTextNode, InputVideoNode
@@ -48,6 +49,7 @@ __all__ = [
     "SeedanceVideoNode",
     "Seedvr2UpscaleNode",
     "ShotListNode",
+    "StoryboardBoardNode",
     "StoryboardNode",
     "StudioNode",
     "VideosFromStillsNode",
@@ -70,6 +72,7 @@ def _bootstrap() -> None:
         BgmToneNode,
         AudioMuxNode,
         StoryboardNode,
+        StoryboardBoardNode,
         LlmPolishNode,
         MockVideoNode,
         SeedanceVideoNode,
