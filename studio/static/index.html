@@ -150,12 +150,25 @@
           <canvas id="domeCanvas" class="dome-canvas" width="480" height="280"></canvas>
           <div class="dome-actions">
             <label class="file-btn">
-              加载母版/分镜图
+              加载母版/分镜图/视频
               <input id="domeFile" type="file" accept="image/*,video/*" hidden />
             </label>
             <button type="button" id="btnCovGood">合规预设</button>
             <button type="button" id="btnCovBad">坏母版预设</button>
             <button type="button" id="btnCamDrag">机位拖拽</button>
+          </div>
+          <div class="dome-player hidden" id="domePlayer">
+            <div class="player-actions">
+              <button type="button" id="btnPlayPause" disabled>▶ 播放</button>
+              <label class="check-row loop-row">
+                <input type="checkbox" id="domeLoop" disabled />
+                <span>循环</span>
+              </label>
+            </div>
+            <div class="player-scrub">
+              <input id="domeProgress" class="player-progress" type="range" min="0" max="1000" step="1" value="0" disabled />
+              <span class="player-time"><span id="domeCurTime">00:00</span> / <span id="domeDur">00:00</span></span>
+            </div>
           </div>
           <div id="covReadout" class="cov-readout">加载中…</div>
         </section>
