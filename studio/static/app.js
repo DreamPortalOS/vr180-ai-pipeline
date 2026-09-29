@@ -2630,11 +2630,22 @@
     ["pan_left", "左摇"],
     ["pan_right", "右摇"],
   ];
+  // A domemaster may only rotate about the zenith: zooming or panning a
+  // fisheye frame crops its rim and breaks the dome mapping.
+  const DOME_MOTIONS = [
+    ["static", "固定"],
+    ["rotate_left", "左旋"],
+    ["rotate_right", "右旋"],
+  ];
   const BOARD_ASPECT_LABELS = [
     ["dome", "1:1 穹顶母版"],
     ["16:9", "16:9 平面"],
     ["2:1", "2:1 VR180"],
   ];
+
+  function boardMotions(node) {
+    return (node.params.aspect || "dome") === "dome" ? DOME_MOTIONS : BOARD_MOTIONS;
+  }
 
   function isBoardNode(node) {
     return Boolean(node && node.type === "storyboard.board");
@@ -2646,7 +2657,7 @@
   }
 
   function newBoardShot(prompt) {
-    return { id: uid("s"), prompt: prompt || "", duration: 4, motion: "dolly_in", image: null, variants: [], video: null };
+    return { id: uid("s"), prompt: prompt || "", duration: 4, motion: "static", image: null, variants: [], video: null };
   }
 
   function boardShotVideo(shot) {
@@ -2664,7 +2675,7 @@
     }
     node.params.shots = [newBoardShot("")];
     state.drawerOpen = true;
-    if (state.drawerHeight < 420) state.drawerHeight = 420;
+    if (state.drawerHeight < 500) state.drawerHeight = 500;
     applyDrawerState();
     saveDrawerState();
     renderDrawer();
@@ -2898,7 +2909,9 @@
     const motL = document.createElement("label");
     motL.textContent = "运镜";
     const mot = document.createElement("select");
-    BOARD_MOTIONS.forEach(([v, l]) => mot.add(new Option(l, v, false, (shot.motion || "static") === v)));
+    const motions = boardMotions(node);
+    if (!motions.some(([v]) => v === shot.motion)) shot.motion = "static";
+    motions.forEach(([v, l]) => mot.add(new Option(l, v, false, shot.motion === v)));
     mot.addEventListener("change", () => (shot.motion = mot.value));
     motL.appendChild(mot);
     rowEl.append(durL, motL);

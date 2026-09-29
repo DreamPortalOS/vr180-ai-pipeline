@@ -472,6 +472,20 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"job not running: {job_id}")
         return {"cancelled": job_id}
 
+    def _clip_frame(image: Path, short_side: int = 512) -> list[int]:
+        """Clip size that keeps the still's aspect (16:9 / 2:1 boards stay wide)."""
+        try:
+            from PIL import Image
+
+            with Image.open(image) as im:
+                w, h = im.size
+        except Exception:  # unreadable still: fall back to the square clip
+            return [short_side, short_side]
+        if w <= 0 or h <= 0 or abs(w - h) <= 2:
+            return [short_side, short_side]
+        scale = short_side / min(w, h)
+        return [round(w * scale / 2) * 2, round(h * scale / 2) * 2]
+
     @app.post("/api/batch-shots")
     def batch_shots(request: BatchShotRequest) -> dict[str, Any]:
         """Enqueue one video job per checked shot (issue #419 只跑勾选镜头).
@@ -507,6 +521,7 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
                                 "image": shot.image,
                                 "duration": duration,
                                 "motion": shot.motion or "static",
+                                "frame": _clip_frame(Path(shot.image)),
                             }
                         ],
                         "size": 512,

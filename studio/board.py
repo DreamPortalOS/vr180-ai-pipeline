@@ -35,7 +35,9 @@ BOARD_ASPECTS: dict[str, tuple[str, str]] = {
     "2:1": ("2:1", VR180_CONSTRAINT),
 }
 
-MOTIONS = ("static", "dolly_in", "dolly_out", "pan_left", "pan_right")
+MOTIONS = ("static", "dolly_in", "dolly_out", "pan_left", "pan_right", "rotate_left", "rotate_right")
+#: A domemaster may only rotate about the zenith; push / pan would crop its rim.
+DOME_MOTIONS = ("static", "rotate_left", "rotate_right")
 
 MAX_VARIANTS = 4
 _SAFE_ID = re.compile(r"[^A-Za-z0-9_-]+")
@@ -134,6 +136,7 @@ def board_to_stills(shots: list[dict[str, Any]], aspect: str = "dome") -> dict[s
             pending.append(sid)
             continue
         motion = str(shot.get("motion") or "static")
+        allowed = DOME_MOTIONS if aspect == "dome" else MOTIONS
         out.append(
             {
                 "id": sid,
@@ -141,7 +144,7 @@ def board_to_stills(shots: list[dict[str, Any]], aspect: str = "dome") -> dict[s
                 "description": str(shot.get("prompt") or ""),
                 "image": str(image),
                 "duration": float(shot.get("duration") or 4),
-                "motion": motion if motion in MOTIONS else "static",
+                "motion": motion if motion in allowed else "static",
                 "variants": [str(v) for v in shot.get("variants") or []],
                 "video": shot.get("video"),
             }

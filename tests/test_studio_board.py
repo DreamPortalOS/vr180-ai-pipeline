@@ -215,3 +215,84 @@ def test_inspector_handles_json_and_options_params() -> None:
     body = _body(src, "renderInspector")
     assert 'p.type === "json"' in body
     assert "Array.isArray(p.options)" in body
+
+
+def test_drawer_hidden_blocks_really_hide() -> None:
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert ".shot-drawer .hidden" in css
+
+
+def test_dome_board_only_allows_rotation(tmp_path) -> None:
+    img = tmp_path / "a.png"
+    img.write_bytes(b"x")
+    shots = [
+        {"id": "s1", "image": str(img), "motion": "dolly_in"},
+        {"id": "s2", "image": str(img), "motion": "rotate_left"},
+    ]
+    dome = board_to_stills(shots, "dome")["shots"]
+    assert [s["motion"] for s in dome] == ["static", "rotate_left"]
+    flat = board_to_stills(shots, "16:9")["shots"]
+    assert [s["motion"] for s in flat] == ["dolly_in", "rotate_left"]
+
+
+def test_clip_command_rotation_and_aspect() -> None:
+    from studio.nodes.production import clip_command
+
+    rot = clip_command("a.png", "b.mp4", dur=2, fps=24, size=512, motion="rotate_right")
+    vf = rot[rot.index("-vf") + 1]
+    assert "rotate=a='3.0*PI/180*t':c=black" in vf and "zoompan" not in vf
+    wide = clip_command("a.png", "b.mp4", dur=2, fps=24, size=512, motion="dolly_in", width=912, height=512)
+    vf = wide[wide.index("-vf") + 1]
+    assert "s=912x512" in vf
+    still = clip_command("a.png", "b.mp4", dur=2, fps=24, size=512, motion="static", width=1024, height=512)
+    assert "crop=1024:512" in still[still.index("-vf") + 1]
+
+
+def test_batch_shot_keeps_wide_still_aspect(client, tmp_path) -> None:
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not on PATH")
+    import subprocess
+
+    from PIL import Image
+
+    still = tmp_path / "w" / "wide.png"
+    still.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (1280, 720), (20, 60, 90)).save(still)
+    res = client.post(
+        "/api/batch-shots",
+        json={"shots": [{"id": "w1", "duration": 1, "image": str(still), "motion": "pan_left"}]},
+    )
+    job_id = res.json()["jobs"][0]["job_id"]
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        job = next(j for j in client.get("/api/jobs").json() if j["id"] == job_id)
+        if job["status"] in {"ok", "error", "cancelled"}:
+            break
+        time.sleep(0.1)
+    assert job["status"] == "ok", job
+    clip = next(iter(job["report"]["results"].values()))["outputs"]["videos"]["clips"][0]["video"]
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            clip,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode == 0:
+        assert probe.stdout.strip() == "910,512"
+
+
+def test_frontend_dome_motion_menu() -> None:
+    src = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert '["rotate_left", "左旋"]' in src
+    assert "boardMotions(node)" in _body(src, "renderBoardCard")

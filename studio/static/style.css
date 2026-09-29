@@ -1035,3 +1035,6 @@ button.queue-btn { position: relative; }
   cursor: zoom-out;
 }
 .lightbox img { max-width: 92vw; max-height: 92vh; border-radius: 8px; }
+/* The drawer toggles .hidden on its empty-state / cards / table blocks, but no
+ * rule ever hid them, so the "选中一个脚本/分镜节点" hint sat above every card row. */
+.shot-drawer .hidden { display: none !important; }

@@ -155,7 +155,7 @@ def test_batch_shot_with_still_renders_real_clip(tmp_path) -> None:
         check=False,
     )
     if probe.returncode == 0:
-        assert probe.stdout.strip() == "512"
+        assert probe.stdout.strip() == "910"  # 16:9 still keeps its aspect (short side 512)
     # a shot with no still still falls back to the mock clip
     assert mock["status"] == "ok"
     assert "video" in next(iter(mock["report"]["results"].values()))["outputs"]
