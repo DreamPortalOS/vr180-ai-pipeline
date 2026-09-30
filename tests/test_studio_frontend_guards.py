@@ -216,14 +216,18 @@ def test_issue_419_new_status_colors_have_legend() -> None:
 def test_all_changed_js_parse_with_node_check() -> None:
     """Every JS asset must be syntactically valid; CI has no browser, so a
     ReferenceError/SyntaxError would be invisible until manual QA (the class of
-    bug this guard closes for #417/#416/#418)."""
+    bug this guard closes for #417/#416/#418/#434)."""
     import shutil
     import subprocess
 
     node = shutil.which("node")
     if node is None:
         return  # node unavailable in CI; the static asserts above still guard
-    for js in sorted(APP_JS.parent.glob("*.js")):
+    js_files = sorted(APP_JS.parent.glob("*.js"))
+    xr_dir = APP_JS.parent / "xr"
+    if xr_dir.is_dir():
+        js_files += sorted(xr_dir.glob("*.js"))
+    for js in js_files:
         proc = subprocess.run([node, "--check", str(js)], capture_output=True, text=True, timeout=30)
         assert proc.returncode == 0, f"node --check failed for {js.name}:\n{proc.stderr}"
 
@@ -337,3 +341,77 @@ def test_issue_428_image_load_path_not_regressed() -> None:
     # The file input still accepts both images and video.
     html = INDEX_HTML.read_text(encoding="utf-8")
     assert 'accept="image/*,video/*"' in html
+
+
+# ── issue #434: Quest dome VR viewer source-level guards ──────────────────
+# CI has no browser, so the class of bug that shipped on recent cards (response
+# body read twice, block-scoped var used outside its block, wrong-case element
+# id, a button that never enabled) is invisible until the lead's headless
+# pass.  These pin the structure that prevents each.
+
+XR_DIR = APP_JS.parent / "xr"
+XR_JS = XR_DIR / "dome_xr.js"
+XR_HTML = XR_DIR / "dome_xr.html"
+
+
+def test_xr_upload_reads_response_body_once() -> None:
+    """#434: a second ``await res.json()`` would throw 'body stream already
+    read' and the uploaded master would never become the picked source (the
+    #417 bug class repeating on the XR picker)."""
+    body = _function_body(XR_JS.read_text(encoding="utf-8"), "uploadFile")
+    reads = re.findall(r"\bawait\s+res\.(json|text|blob|arrayBuffer)\(\)", body)
+    assert len(reads) == 1, f"uploadFile must read the response once, found {reads}"
+
+
+def test_xr_b_key_ignores_text_fields() -> None:
+    """B toggles the overlay but must not fire while typing in an input or
+    textarea (would eat every 'b' keystroke in the tilt/seat/radius fields)."""
+    body = _function_body_sync(XR_JS.read_text(encoding="utf-8"), "onKeyDown")
+    assert '"b"' in body, "B key must be handled"
+    assert "INPUT" in body and "TEXTAREA" in body, "must skip INPUT/TEXTAREA"
+    assert "isContentEditable" in body, "must skip contentEditable fields"
+
+
+def test_xr_enter_button_enables_when_a_source_is_picked() -> None:
+    """btnEnterVR starts disabled (HTML) and must enable once a master is
+    picked — otherwise the operator can never enter VR (the never-enabled
+    button bug class)."""
+    body = _function_body_sync(XR_JS.read_text(encoding="utf-8"), "pickSource")
+    assert "btnEnterVR" in body
+    assert ".disabled = false" in body, "pickSource must enable btnEnterVR"
+    # and it must start disabled in the markup
+    assert 'id="btnEnterVR"' in XR_HTML.read_text(encoding="utf-8")
+    assert "disabled" in XR_HTML.read_text(encoding="utf-8")
+
+
+def test_xr_js_references_only_defined_html_ids() -> None:
+    """Every ``$('id')`` in dome_xr.js must exist in dome_xr.html.  A wrong-case
+    or missing id throws on access and blanks the whole page (the #416 bug
+    class)."""
+    js = XR_JS.read_text(encoding="utf-8")
+    html = XR_HTML.read_text(encoding="utf-8")
+    refs = set(re.findall(r'\$\("([\w-]+)"\)', js))
+    defs = set(re.findall(r'id="([\w-]+)"', html))
+    assert refs, "no $('id') refs found — guard is mis-aimed"
+    missing = refs - defs
+    assert not missing, f"dome_xr.js references ids not in the HTML: {sorted(missing)}"
+
+
+def test_xr_shader_inlines_dir_to_uv_and_bridge() -> None:
+    """The GLSL must inline dirToUV (the formula dome_xr_proj.js exports and the
+    对拍 pins) and take the same geom→proj frame bridge as preview3d.js
+    (``vec3(vDir.x, vDir.y, -vDir.z)``), so the dome the Quest renders is the
+    dome the 2D Studio preview renders — not a third copy of the math."""
+    src = XR_JS.read_text(encoding="utf-8")
+    assert "0.5+0.5*r*sx" in src, "FS must inline dirToUV's u = 0.5+0.5*r·sin(φ)"
+    assert "0.5+0.5*r*cz" in src, "FS must inline dirToUV's v = 0.5+0.5*r·cos(φ)"
+    assert "normalize(vec3(vDir.x, vDir.y, -vDir.z))" in src, "FS must bridge geom→proj"
+
+
+def test_xr_page_is_cdn_free_and_loads_helper_first() -> None:
+    """The /xr page is fully local (no CDN) and loads the pure UV helper before
+    the viewer script so the shader's pure twin is available for guards."""
+    html = XR_HTML.read_text(encoding="utf-8")
+    assert "https://" not in html and "http://" not in html, "/xr must be CDN-free"
+    assert "/xr/dome_xr_proj.js" in html and "/xr/dome_xr.js" in html
+    assert html.index("/xr/dome_xr_proj.js") < html.index("/xr/dome_xr.js")

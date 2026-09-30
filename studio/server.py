@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any
@@ -23,8 +25,18 @@ from studio.projects import ProjectStore, ProjectStoreError
 from studio.settings import StudioSettings
 from studio.templates import production_pipeline_project
 from studio.uploads import DEFAULT_MAX_BYTES, UploadError, UploadStore, parse_multipart
+from studio.xr_https import CertError, ensure_self_signed_cert
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+XR_DIR = STATIC_DIR / "xr"
+
+#: Master formats the Quest dome viewer can texture (issue #434).  Mirrors the
+#: canvas's image/video accept lists in studio/uploads.py but adds ``.webm``
+#: (Quest Browser plays it) and keeps ``.gif`` out (no audio, no gain over a
+#: poster here).
+XR_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp"})
+XR_VIDEO_EXTS = frozenset({".mp4", ".mov", ".webm"})
+XR_MEDIA_EXTS = XR_IMAGE_EXTS | XR_VIDEO_EXTS
 
 
 class ProjectPayload(BaseModel):
@@ -292,6 +304,51 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
             ".json": "application/json",
         }.get(suffix, "application/octet-stream")
         return FileResponse(target, media_type=media_type)
+
+    def _xr_source_entry(path: Path) -> dict[str, Any]:
+        suffix = path.suffix.lower()
+        return {
+            "path": str(path),
+            "name": path.name,
+            "kind": "image" if suffix in XR_IMAGE_EXTS else "video",
+            "size": path.stat().st_size,
+            "media_url": f"/api/media?path={urllib.parse.quote(str(path))}",
+        }
+
+    @app.get("/api/xr/sources")
+    def xr_sources(src: str | None = None) -> dict[str, Any]:
+        """Master list for the Quest dome viewer's 2D 选片 page (issue #434).
+
+        Read-only, work_root-scoped: returns the most recent studio_out
+        image/video files plus the explicit ``?src=`` path (the URL form
+        `?src=<测试 domemaster>` the lead uses).  The path whitelist reuses
+        ``/api/media``'s roots, so a traversal attempt resolves outside and is
+        rejected — 400 for an out-of-root path, 404 for a missing file.
+        """
+        allowed_roots = [work_root.resolve(), Path(tempfile.gettempdir()).resolve()]
+
+        def allowed(target: Path) -> bool:
+            return any(target.is_relative_to(root) for root in allowed_roots)
+
+        sources: list[dict[str, Any]] = []
+        if src:
+            target = Path(src).resolve()
+            if not allowed(target):
+                raise HTTPException(status_code=400, detail=f"src outside studio work_root: {target}")
+            if not target.is_file():
+                raise HTTPException(status_code=404, detail=f"src file not found: {target}")
+            sources.append(_xr_source_entry(target))
+        # Newest first (the last export lands at the top of the pick list).
+        media = (
+            p
+            for p in sorted(work_root.rglob("*"), key=lambda p: p.stat().st_mtime if p.is_file() else 0, reverse=True)
+            if p.is_file() and p.suffix.lower() in XR_MEDIA_EXTS
+        )
+        for p in media:
+            sources.append(_xr_source_entry(p))
+            if len(sources) >= 30:
+                break
+        return {"sources": sources, "work_root": str(work_root)}
 
     @app.get("/api/node-types")
     def node_types() -> list[dict[str, Any]]:
@@ -701,17 +758,69 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
         def dome3d_html() -> FileResponse:
             return FileResponse(STATIC_DIR / "dome3d.html", headers={"Cache-Control": "no-store"})
 
+        @app.get("/xr")
+        def xr_page() -> FileResponse:
+            """Quest dome viewer — 2D 选片 page + VR scene, no CDN (issue #434)."""
+            return FileResponse(XR_DIR / "dome_xr.html", headers={"Cache-Control": "no-store"})
+
+        @app.get("/xr/dome_xr.js")
+        def xr_js() -> FileResponse:
+            return FileResponse(XR_DIR / "dome_xr.js", media_type="application/javascript")
+
+        @app.get("/xr/dome_xr_proj.js")
+        def xr_proj_js() -> FileResponse:
+            """The pure UV helper the GLSL is kept identical to (issue #434)."""
+            return FileResponse(XR_DIR / "dome_xr_proj.js", media_type="application/javascript")
+
     return app
 
 
 app = create_app()
 
 
-def main() -> None:
-    """Dev entry: ``python -m studio.server``."""
+def _build_parser():
+    """``python -m studio.server`` argv — ``--host/--port/--https`` (issue #434).
+
+    Default behaviour is unchanged (127.0.0.1:8787, http) when no flags are
+    given; USB access (``adb reverse``) needs nothing more.  ``--https``
+    generates a self-signed cert (Wi-Fi Quest access) and must stay opt-in so
+    the default `python -m studio.server` never silently changes.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m studio.server")
+    parser.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8787, help="bind port (default 8787)")
+    parser.add_argument(
+        "--https",
+        action="store_true",
+        help="serve over https with a self-signed cert (Wi-Fi access for the Quest dome viewer; "
+        "USB via `adb reverse tcp:8787 tcp:8787` needs no https)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Dev entry: ``python -m studio.server [--host H] [--port P] [--https]``."""
     import uvicorn
 
-    uvicorn.run("studio.server:app", host="127.0.0.1", port=8787, reload=False)
+    args = _build_parser().parse_args(argv)
+    kwargs: dict[str, Any] = {"host": args.host, "port": args.port, "reload": False}
+    if args.https:
+        # Wi-Fi Quest access needs a secure context.  The cert lives in the
+        # same work_root as the module-level app so /api/xr/sources and the
+        # cert share a root.  Catch CertError so the operator gets the USB
+        # hint on stderr (instead of a traceback) and main() exits non-zero.
+        work_root = Path(tempfile.gettempdir()) / "vr180-studio"
+        work_root.mkdir(parents=True, exist_ok=True)
+        try:
+            cert, key = ensure_self_signed_cert(work_root)
+        except CertError as exc:
+            print(f"[studio.server] {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        kwargs["ssl_certfile"] = str(cert)
+        kwargs["ssl_keyfile"] = str(key)
+    uvicorn.run("studio.server:app", **kwargs)
 
 
 if __name__ == "__main__":
