@@ -564,6 +564,12 @@ _MOTION_ALIASES = {
 }
 
 
+#: Domemaster-safe moves: rotating about the zenith keeps the inscribed circle
+#: (and so the horizon / black corners) intact; zooming or panning a fisheye
+#: frame would crop the rim and break the dome mapping.
+_ROTATE_DEG_PER_S = {"rotate_left": -3.0, "rotate_right": 3.0}
+
+
 def motion_filter(motion: str, *, frames: int, fps: int, size: int) -> str | None:
     """ffmpeg ``zoompan`` expression for a storyboard camera move, or ``None``.
 
@@ -593,10 +599,67 @@ def motion_filter(motion: str, *, frames: int, fps: int, size: int) -> str | Non
     )
 
 
-def clip_command(still: str, out: str, *, dur: float, fps: int, size: int, motion: str) -> list[str]:
-    """Build the ffmpeg argv that renders one storyboard still into a clip."""
+def _flat_motion_filter(motion: str, *, frames: int, fps: int, width: int, height: int) -> str:
+    """Same push / pull / pan moves as :func:`motion_filter` for a non-square frame."""
+    kind = _MOTION_ALIASES[motion.lower()]
+    n = max(1, frames - 1)
+    zoom = {"in": f"1+0.18*on/{n}", "out": f"1.18-0.18*on/{n}"}.get(kind, "1.15")
+    x = {"left": f"(iw-iw/zoom)*(1-on/{n})", "right": f"(iw-iw/zoom)*on/{n}"}.get(kind, "iw/2-(iw/zoom/2)")
+    bw, bh = width * 4, height * 4
+    return (
+        f"scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},"
+        f"zoompan=z='{zoom}':x='{x}':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps={fps}"
+    )
+
+
+def clip_command(
+    still: str,
+    out: str,
+    *,
+    dur: float,
+    fps: int,
+    size: int,
+    motion: str,
+    width: int | None = None,
+    height: int | None = None,
+) -> list[str]:
+    """Build the ffmpeg argv that renders one storyboard still into a clip.
+
+    ``width``/``height`` keep a non-square board (16:9, 2:1) at its own aspect;
+    without them the clip is ``size``x``size`` (domemaster / legacy square).
+    """
     frames = max(1, round(dur * fps))
-    zp = motion_filter(motion, frames=frames, fps=fps, size=size)
+    w = int(width or size)
+    h = int(height or size)
+    w, h = w - w % 2, h - h % 2
+    fit = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+    rot = _ROTATE_DEG_PER_S.get(motion.lower())
+    if rot is not None:
+        return [
+            _FFMPEG,
+            "-y",
+            "-loop",
+            "1",
+            "-i",
+            still,
+            "-t",
+            str(dur),
+            "-vf",
+            f"{fit},rotate=a='{rot}*PI/180*t':c=black",
+            "-r",
+            str(fps),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            out,
+        ]
+    if w == h:
+        zp = motion_filter(motion, frames=frames, fps=fps, size=w)
+    elif _MOTION_ALIASES.get(motion.lower()):
+        zp = _flat_motion_filter(motion, frames=frames, fps=fps, width=w, height=h)
+    else:
+        zp = None
     if zp is None:
         return [
             _FFMPEG,
@@ -608,7 +671,7 @@ def clip_command(still: str, out: str, *, dur: float, fps: int, size: int, motio
             "-t",
             str(dur),
             "-vf",
-            f"scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}",
+            fit,
             "-r",
             str(fps),
             "-pix_fmt",
@@ -703,7 +766,17 @@ class VideosFromStillsNode(StudioNode):
             motion = str(params.get("motion") or "auto").lower()
             if motion == "auto":
                 motion = str(shot.get("motion") or "static").lower()
-            cmd = clip_command(str(still), str(out_path), dur=dur, fps=fps, size=size, motion=motion)
+            frame = shot.get("frame") or [size, size]
+            cmd = clip_command(
+                str(still),
+                str(out_path),
+                dur=dur,
+                fps=fps,
+                size=size,
+                motion=motion,
+                width=int(frame[0]),
+                height=int(frame[1]),
+            )
             proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
             if proc.returncode != 0 or not out_path.is_file():
                 raise RuntimeError(f"clip render failed for {shot.get('id')}: {(proc.stderr or '')[-300:]}")
@@ -755,6 +828,9 @@ class ConcatVideosNode(StudioNode):
         node_id: str,
     ) -> dict[str, Any]:
         payload = inputs.get("videos")
+        if payload is None and isinstance(params.get("clips"), list):
+            # 分镜板「拼接成片」submits a one-node graph with the clips inline.
+            payload = {"clips": params["clips"]}
         if not isinstance(payload, dict) or "clips" not in payload:
             raise ValueError("concat requires videos json with clips[]")
         clips = payload["clips"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import time
@@ -77,6 +78,24 @@ class BatchShotRequest(BaseModel):
 class SaveProjectRequest(BaseModel):
     project: dict[str, Any]
     project_id: str | None = None
+
+
+class BoardImageRequest(BaseModel):
+    """分镜板: generate candidate stills for one shot."""
+
+    shot_id: str = "shot"
+    prompt: str = ""
+    aspect: str = "dome"
+    style: str = ""
+    n: int = 2
+    model: str = ""
+
+
+class BoardConcatRequest(BaseModel):
+    """分镜板: join the shot videos in board order into one film."""
+
+    videos: list[str] = Field(default_factory=list)
+    filename: str = "board_film.mp4"
 
 
 class SettingsPatch(BaseModel):
@@ -453,6 +472,20 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"job not running: {job_id}")
         return {"cancelled": job_id}
 
+    def _clip_frame(image: Path, short_side: int = 512) -> list[int]:
+        """Clip size that keeps the still's aspect (16:9 / 2:1 boards stay wide)."""
+        try:
+            from PIL import Image
+
+            with Image.open(image) as im:
+                w, h = im.size
+        except Exception:  # unreadable still: fall back to the square clip
+            return [short_side, short_side]
+        if w <= 0 or h <= 0 or abs(w - h) <= 2:
+            return [short_side, short_side]
+        scale = short_side / min(w, h)
+        return [round(w * scale / 2) * 2, round(h * scale / 2) * 2]
+
     @app.post("/api/batch-shots")
     def batch_shots(request: BatchShotRequest) -> dict[str, Any]:
         """Enqueue one video job per checked shot (issue #419 只跑勾选镜头).
@@ -488,6 +521,7 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
                                 "image": shot.image,
                                 "duration": duration,
                                 "motion": shot.motion or "static",
+                                "frame": _clip_frame(Path(shot.image)),
                             }
                         ],
                         "size": 512,
@@ -512,6 +546,70 @@ def create_app(*, default_work_dir: str | None = None) -> FastAPI:
             )
             enqueued.append({"job_id": job.id, "shot_id": shot.id, "node_id": node_id, "label": job.label})
         return {"submitted": len(enqueued), "jobs": enqueued}
+
+    def _inside_work_root(path: str) -> Path:
+        target = Path(path).resolve()
+        roots = [work_root.resolve(), Path(tempfile.gettempdir()).resolve()]
+        if not any(target.is_relative_to(r) for r in roots):
+            raise HTTPException(status_code=403, detail=f"path outside studio work_root: {target}")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail=f"file not found: {target}")
+        return target
+
+    @app.post("/api/board/images")
+    def board_images(request: BoardImageRequest) -> dict[str, Any]:
+        """Text → image for one 分镜板 shot: ``n`` candidates to pick from.
+
+        Runs synchronously (the gateway takes ~10–20 s per image and the
+        candidates run concurrently); with no gateway configured it returns
+        labelled placeholders and ``provider="mock"`` so the drawer can say so.
+        """
+        from studio.board import BOARD_ASPECTS, generate_shot_images, safe_shot_id
+
+        if request.aspect not in BOARD_ASPECTS:
+            raise HTTPException(status_code=400, detail=f"unknown aspect: {request.aspect}")
+        # STUDIO_OFFLINE (set by the test suite) never reaches the gateway.
+        settings = None if os.environ.get("STUDIO_OFFLINE") else StudioSettings.load(work_root / "studio_settings.json")
+        try:
+            result = generate_shot_images(
+                prompt=request.prompt,
+                aspect=request.aspect,
+                n=request.n,
+                style=request.style,
+                shot_id=request.shot_id,
+                out_dir=work_root / "board" / safe_shot_id(request.shot_id),
+                settings=settings,
+                model=request.model,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not result["images"]:
+            raise HTTPException(status_code=502, detail="出图失败: " + "; ".join(result["errors"])[:400])
+        return result
+
+    @app.post("/api/board/concat")
+    def board_concat(request: BoardConcatRequest) -> dict[str, Any]:
+        """Queue one job that joins the given shot videos in order."""
+        if not request.videos:
+            raise HTTPException(status_code=400, detail="no shot videos to join")
+        clips = [{"video": str(_inside_work_root(v))} for v in request.videos]
+        name = Path(request.filename).name or "board_film.mp4"
+        if not name.lower().endswith(".mp4"):
+            name += ".mp4"
+        node_id = "n_board_concat"
+        project = Project(
+            name="board:concat",
+            nodes=[NodeSpec(id=node_id, type="video.concat", pos=(0, 0), params={"clips": clips, "filename": name})],
+            edges=[],
+        )
+        job = _enqueue(
+            project=project,
+            work_dir=work_root / "board" / "films" / uuid.uuid4().hex[:8],
+            run_mode="all",
+            run_node=None,
+            label=f"拼接成片 {len(clips)} 镜",
+        )
+        return {"job_id": job.id, "label": job.label, "clips": len(clips)}
 
     @app.get("/api/node/{node_id}/history")
     def node_history(node_id: str) -> dict[str, Any]:
