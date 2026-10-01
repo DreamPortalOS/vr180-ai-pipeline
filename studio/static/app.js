@@ -211,6 +211,7 @@
         { id: "n_dome", type: "convert.dome", pos: [20, 400], params: { size: 128 }, muted: false },
         { id: "n_vr", type: "convert.vr180", pos: [250, 400], params: { mode: "mock" }, muted: false },
         { id: "n_export", type: "export.bundle", pos: [480, 400], params: { filename: "final.mp4" }, muted: false },
+        { id: "n_export_dome", type: "export.bundle", pos: [480, 540], params: { filename: "final_dome.mp4" }, muted: false },
       ],
       edges: [
         { id: "e1", from: ["n_brief", "brief"], to: ["n_shots", "brief"] },
@@ -225,6 +226,9 @@
         { id: "e10", from: ["n_mux", "video"], to: ["n_dome", "video"] },
         { id: "e11", from: ["n_mux", "video"], to: ["n_vr", "video"] },
         { id: "e12", from: ["n_vr", "video"], to: ["n_export", "video"] },
+        // Offline fallback has no qa.dome_coverage node, so the dome route exports
+        // the converter output directly (server template wires n_cov.video instead).
+        { id: "e13", from: ["n_dome", "video"], to: ["n_export_dome", "video"] },
       ],
       settings: { workflow: "script→stills→review→video→concat→audio→export" },
     };

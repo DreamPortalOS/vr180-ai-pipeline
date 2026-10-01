@@ -189,6 +189,7 @@ def test_full_production_graph(tmp_path) -> None:
         "n_cov",
         "n_vr",
         "n_export",
+        "n_export_dome",
     ]
     for nid in expected_ok:
         assert report.results[nid].status == "ok", f"{nid}: {report.results[nid].error}"
@@ -206,10 +207,56 @@ def test_full_production_graph(tmp_path) -> None:
     )
     assert manifest["export_path"] == export
 
+    # PRD §9 dual export: the dome route has its own node, file and manifest.
+    dome_export = report.results["n_export_dome"].outputs["path"]
+    assert Path(dome_export).is_file()
+    dome_manifest = json.loads(
+        Path(report.results["n_export_dome"].outputs["manifest"]["manifest_path"]).read_text(encoding="utf-8")
+    )
+    assert dome_manifest["export_path"] == dome_export
+
+    assert export != dome_export
+    assert Path(export).name == "final_master.mp4"
+    assert Path(dome_export).name == "final_dome.mp4"
+    assert Path(export).parent.name == "n_export"
+    assert Path(dome_export).parent.name == "n_export_dome"
+    assert Path(export).parent.parent.name == "studio_export"
+    assert Path(dome_export).parent.parent.name == "studio_export"
+    assert Path(export).read_bytes() != Path(dome_export).read_bytes()
+
+    # Each manifest names the converter output the bundle was copied from. The
+    # VR180 node runs mode=mock here (a passthrough stand-in, NOT genuine
+    # stereo), so this checks routing and byte fidelity only.
+    vr_source = report.results["n_vr"].outputs["video"]
+    dome_source = report.results["n_cov"].outputs["video"]
+    assert manifest["source_video"] == vr_source
+    assert dome_manifest["source_video"] == dome_source
+    # The dome route exports the video produced by the dome converter.
+    assert dome_source == report.results["n_dome"].outputs["video"]
+    assert Path(export).read_bytes() == Path(vr_source).read_bytes()
+    assert Path(dome_export).read_bytes() == Path(dome_source).read_bytes()
+
     # coverage report present
     cov = report.results["n_cov"].outputs["report"]
     assert "coverage_deg" in cov
     assert "level" in cov
+
+
+def test_production_template_wires_both_export_routes() -> None:
+    """The template must feed both export nodes, not just VR180 (PRD §9)."""
+    project = production_pipeline_project()
+    nodes = {n.id: n for n in project.nodes}
+    assert nodes["n_export"].params["filename"] == "final_master.mp4"
+    assert nodes["n_export_dome"].type == "export.bundle"
+    assert nodes["n_export_dome"].params == {"filename": "final_dome.mp4", "subdir": "studio_export"}
+    assert nodes["n_export_dome"].pos != nodes["n_export"].pos
+
+    edges = {(e.from_node, e.from_port, e.to_node, e.to_port) for e in project.edges}
+    assert ("n_cov", "video", "n_export_dome", "video") in edges
+    assert ("n_brief", "style", "n_export_dome", "prompt") in edges
+    # The original VR180 route is unchanged.
+    assert ("n_vr", "video", "n_export", "video") in edges
+    assert ("n_brief", "style", "n_export", "prompt") in edges
 
 
 def test_server_production_template(tmp_path) -> None:
