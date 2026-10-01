@@ -78,6 +78,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
+from scripts.cli_io import configure_console  # noqa: E402
 
 # One radius-map definition for the whole repo (issue #401 unified the QA gate
 # on this one); rimlift's r must be the same r dome_qa.py measures.
@@ -731,6 +732,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Run one subcommand.  Returns the process exit code (0 ok, 1 failed)."""
+    # Issue #441: harden stdout/stderr before argparse prints help/errors (the
+    # module docstring and --help text carry '⇄') and before the first log line.
+    configure_console()
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:

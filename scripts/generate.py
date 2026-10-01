@@ -30,6 +30,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import httpx  # noqa: E402
+from scripts.cli_io import configure_console  # noqa: E402
 
 from integrations.factory import get_provider, list_providers  # noqa: E402
 from integrations.seedance import (  # noqa: E402
@@ -387,6 +388,11 @@ def _resume_and_deliver(provider, args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Issue #441: harden stdout/stderr before argparse prints help/errors and
+    # before the first log/print line.  A Windows console defaults to the locale
+    # codec (GBK here), which cannot encode emoji or '²', so an unhardened write
+    # raises UnicodeEncodeError instead of degrading to an ASCII escape.
+    configure_console()
     parser = build_parser()
     args = parser.parse_args(argv)
 
