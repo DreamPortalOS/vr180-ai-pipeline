@@ -43,6 +43,19 @@ class StudioNode(ABC):
         """Lightweight form schema for the inspector (name/type/default/label)."""
         return []
 
+    @classmethod
+    def cache_is_valid(
+        cls,
+        *,
+        params: dict[str, Any],
+        inputs: dict[str, Any],
+        outputs: dict[str, Any],
+        work_dir: str,
+        node_id: str,
+    ) -> bool:
+        """Allow nodes with materialized artifacts to validate cached outputs."""
+        return True
+
     @abstractmethod
     def run(
         self,
