@@ -100,7 +100,7 @@ class TestStreamingPipeline(unittest.TestCase):
     def test_file_syntax(self):
         """streaming_pipeline.py parses without syntax errors."""
         path = os.path.join(PROJECT_ROOT, "pipeline", "streaming_pipeline.py")
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             ast.parse(f.read())
 
     def test_class_exists(self):
@@ -197,7 +197,7 @@ class TestTiledUpscaling(unittest.TestCase):
     def test_file_syntax(self):
         """upscaler.py parses without syntax errors."""
         path = os.path.join(PROJECT_ROOT, "pipeline", "upscaler.py")
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             ast.parse(f.read())
 
     def test_upscale_tiled_method_exists(self):
@@ -242,12 +242,12 @@ class TestCLIIntegration(unittest.TestCase):
 
     def _read_source(self):
         path = os.path.join(PROJECT_ROOT, "scripts", "run_pipeline.py")
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return f.read()
 
     def test_syntax(self):
         path = os.path.join(PROJECT_ROOT, "scripts", "run_pipeline.py")
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             ast.parse(f.read())
 
     def test_streaming_flag(self):

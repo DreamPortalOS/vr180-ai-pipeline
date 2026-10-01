@@ -57,6 +57,7 @@ from scripts.check_source_quality import (  # noqa: E402
     STATUS_WARN,
     run_checks,
 )
+from scripts.cli_io import configure_console  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
 from pipeline.comfort_presets import COMFORT_PRESETS, DEFAULT_COMFORT, resolve_comfort  # noqa: E402
@@ -3312,6 +3313,12 @@ def _stage_all_body(args, temp_dir, is_sbs, manifest, manifest_skip, manifest_st
 
 
 def main():
+    # Issue #441: harden stdout/stderr *before* argparse prints help/errors and
+    # before any log or pipeline print.  Windows consoles default to the locale
+    # codec (GBK here), which cannot encode '²' (--quality help), emoji or the
+    # box-drawing symbols the pipeline logs — an unhardened write raises
+    # UnicodeEncodeError and takes the whole run down with it.
+    configure_console()
     args = parse_args()
 
     # C-1b (#191): enforce "exactly one" of --input / --inputs.  The argparse
