@@ -2901,6 +2901,13 @@
     dur.max = "10";
     dur.step = "0.5";
     dur.value = shot.duration != null ? shot.duration : 4;
+    // Upload/queue callbacks can redraw this card before the field loses focus.
+    dur.addEventListener("input", () => {
+      const value = Number(dur.value);
+      if (dur.value.trim() && Number.isFinite(value)) {
+        shot.duration = Math.max(1, Math.min(10, value));
+      }
+    });
     dur.addEventListener("change", () => {
       shot.duration = Math.max(1, Math.min(10, Number(dur.value) || 4));
       dur.value = shot.duration;
