@@ -314,7 +314,19 @@ def run_graph(
             upstream[port] = src_out[src_port]
 
         key = _cache_key(node.type, node.params, upstream)
-        if key in cache and nid not in dirty_set:
+        cached_class = NODE_REGISTRY.get(node.type)
+        if (
+            key in cache
+            and nid not in dirty_set
+            and cached_class is not None
+            and cached_class.cache_is_valid(
+                params=node.params,
+                inputs=upstream,
+                outputs=cache[key],
+                work_dir=work_dir,
+                node_id=nid,
+            )
+        ):
             outs = dict(cache[key])
             cached = NodeRunResult(
                 node_id=nid,
