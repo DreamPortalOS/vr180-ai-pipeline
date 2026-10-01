@@ -106,6 +106,12 @@ def production_pipeline_project() -> Project:
                 pos=(710, 420),
                 params={"filename": "final_master.mp4", "subdir": "studio_export"},
             ),
+            NodeSpec(
+                id="n_export_dome",
+                type="export.bundle",
+                pos=(710, 560),
+                params={"filename": "final_dome.mp4", "subdir": "studio_export"},
+            ),
         ],
         edges=[
             EdgeSpec(id="e1", from_node="n_brief", from_port="brief", to_node="n_shots", to_port="brief"),
@@ -125,6 +131,10 @@ def production_pipeline_project() -> Project:
             EdgeSpec(id="e15", from_node="n_mux", from_port="video", to_node="n_vr", to_port="video"),
             EdgeSpec(id="e16", from_node="n_vr", from_port="video", to_node="n_export", to_port="video"),
             EdgeSpec(id="e17", from_node="n_brief", from_port="style", to_node="n_export", to_port="prompt"),
+            # PRD §9 "导出节点可并行出双路": the dome route exports the coverage
+            # node's video (a pass-through of the domemaster master) next to VR180.
+            EdgeSpec(id="e18", from_node="n_cov", from_port="video", to_node="n_export_dome", to_port="video"),
+            EdgeSpec(id="e19", from_node="n_brief", from_port="style", to_node="n_export_dome", to_port="prompt"),
         ],
         settings={
             "workflow": "script→stills→review→video→concat→audio→dual-export",
