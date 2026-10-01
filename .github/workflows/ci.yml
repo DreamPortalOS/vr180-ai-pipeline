@@ -22,8 +22,8 @@ jobs:
           cache: pip
       # 版本必须与 .pre-commit-config.yaml 的 ruff rev 一致，否则本地绿 CI 红。
       - run: pip install ruff==0.15.18
-      - run: ruff check pipeline/ scripts/ tests/
-      - run: ruff format --check pipeline/ scripts/ tests/
+      - run: ruff check pipeline/ scripts/ tests/ studio/
+      - run: ruff format --check pipeline/ scripts/ tests/ studio/
 
   test:
     runs-on: ubuntu-latest
