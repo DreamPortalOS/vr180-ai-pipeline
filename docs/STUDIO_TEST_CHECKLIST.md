@@ -1,7 +1,8 @@
-# Studio 手工/联调测试清单（feat/node-studio-m0）
+# Studio 手工/联调测试清单
 
-> 自动化基线：`pytest tests/ -m "not slow" -q` → **3178 passed**（分支最新）
-> Studio 子集：**55 passed**（本清单对应模块）
+> 下文为历史测试步骤，不代表当前验收状态。2026-10-01 主线基线为 `2a8b1f9`。
+> 最近队列、手工分镜板、视频预览和 Quest XR 的复测步骤见 [当前复测清单](STUDIO_RETEST_20261001.md)。
+> 自动化结果及未验收边界见 [交接审查](reports/STUDIO_TAKEOVER_REVIEW_20261001.md)。
 
 ## A. 环境（5 分钟）
 
@@ -85,8 +86,8 @@
 | H1 | `ruff check studio` | clean |
 | H2 | 全量 `pytest -m "not slow"` | **≥3178 passed** |
 | H3 | `git log origin/main..HEAD` | 多条 feat(studio) 提交 |
-| H4 | PR #380 | OPEN，可审可合 |
-| H5 | PR #376 dome-preview | 与 Studio 3D 算法同源，建议先合 |
+| H4 | 现场查询开放 PR | 以 GitHub 当前 head SHA 与 checks 为准；旧 PR 编号不是待办 |
+| H5 | 3D 与主线映射 | 核对当前共享算法测试，不能以旧分支状态判定 |
 | H6 | 主检出 `tools/cleanup_branches.ps1` | 清僵尸分支（owner 执行） |
 
 ## I. 已知限制（测试时勿当 bug）
