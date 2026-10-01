@@ -84,4 +84,7 @@ Windows 后续 CLI/测试调用显式继承 UTF-8 环境；默认 GBK 路径仍�
 
 一次只派少量、不共享写入范围的任务；Issue 评论作心跳，超过 4 小时无提交/评论/PR 或任务自身超时即人工检查。
 CPU lint/test/e2e 留 GitHub Actions；当前 workflow 的 concurrency 已取消旧分支跑批，不因单纯文档调整增加 GPU 或真实 API job。
-本轮未查询账户实际 Actions 剩余额度，不作余额承诺；没有本仓可验证的多电脑 worker 当前在线状态，不启动重模型并行抢占。
+现场 API 确认本仓为 public，仓库 Actions runners 查询 total_count=0（没有返回仓库可见的自托管 runner）。
+当前三项 CI 均为标准 ubuntu-latest；[GitHub 官方说明](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job)
+规定公开仓库标准托管 runner 免费且不限分钟，因此本仓 CPU CI 不需按私有仓分钟余额节流；并发与服务限流仍需管理。
+未查询账户其他收费项目或存储余额，不作余额承诺；没有本仓可验证的多电脑 worker 当前在线状态，不启动重模型并行抢占。
