@@ -1,3 +1,17 @@
+# Project development rules
+
+Read [shared development policy](https://github.com/Mnesis-Labs/Parthenon/blob/main/docs/WORKER-POLICY.md) before dispatching or accepting work.
+
+- Codex root owns planning, coordination and independent acceptance. Codex CLI via NextScene and Cline CLI implement bounded tasks in separate Git worktrees.
+- Claude Desktop, Claude Code CLI and its account are retired. Do not install, authenticate, call or recreate their configuration.
+- Keep one writer per worktree; preserve dirty changes, worker results and locks. Never treat exit 0, a commit or CI alone as product acceptance.
+- Credentials live in an ignored local credential file, never in source, prompts, logs or command arguments. Worker authentication and state are separate from Desktop.
+- Use task scope, explicit timeouts, required gates and current-SHA evidence. Infrastructure/protocol/quota failures escalate to Codex root; do not relax tests or silently change payment channels.
+- Hardware operations require the attended incremental workflow in `HARDWARE-OPERATIONS.md`. Simulations and static checks do not prove real device behavior.
+- Migration evidence and known boundaries are recorded in [retirement evidence](https://github.com/Mnesis-Labs/Parthenon/blob/main/ops/claude-retirement/README.md). Historical branches are preserved until their work is independently accounted for.
+
+## Migrated project rules (source: CLAUDE.md)
+
 # CLAUDE.md — vr180-ai-pipeline 开发行为规范
 
 你是本仓的开发执行者。任务来源是 **lead 交给你的任务卡**（GitHub Issue 或直接指派）。
